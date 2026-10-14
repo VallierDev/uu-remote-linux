@@ -12,10 +12,20 @@ use crate::capture_setting::VideoSettings;
 
 /// Default frame rate; the viewer's 帧率 setting overrides it per connection.
 pub const FPS: u64 = 60;
-/// IDR every 0.5s. All-intra 60fps measured 30 Mbit/s on the real desktop (saturating
-/// the viewer's Wi-Fi: 3-6 fps received); GOP 30 measured 2.7 Mbit/s at the same CQ18.
-/// A broken prediction chain therefore freezes at most this long.
-const GOP: u64 = 30;
+/// IDR every 2s. All-intra 60fps measured 30 Mbit/s on the real desktop (saturating
+/// the viewer's Wi-Fi: 3-6 fps received). On a static desktop with NVENC CQ18 a 0.5s GOP
+/// measured 7.7 Mbit/s and a 2s GOP 1.9 Mbit/s. A broken prediction chain freezes until the
+/// next IDR or a PLI, so a 2s GOP relies on PLI/FIR recovery being prompt.
+const GOP: u64 = 120;
+
+/// Keyframe interval in frames at the nominal rate. `UU_VIDEO_GOP_SECONDS` overrides the default for tuning.
+fn gop_frames(fps: u32) -> u64 {
+    let seconds = std::env::var("UU_VIDEO_GOP_SECONDS").ok().and_then(|v| v.parse::<f64>().ok());
+    match seconds {
+        Some(s) if s > 0.0 => ((f64::from(fps) * s).round() as u64).max(1),
+        _ => (u64::from(fps) * GOP / FPS).max(1),
+    }
+}
 const MAX_ACCESS_UNIT: usize = 8 * 1024 * 1024;
 
 fn nal_offsets(bytes: &[u8], kind: u8) -> Vec<usize> {
@@ -162,7 +172,7 @@ async fn read_encoder_with(
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
-            gop: (u64::from(settings.fps) * GOP / FPS).max(1) as u32, cq: settings.cq() as u32,
+            gop: gop_frames(settings.fps) as u32, cq: settings.cq() as u32,
             target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
             max_bps: max_kbps * 1000, buffer_bits: (max_kbps / 8).clamp(100, 500) * 1000, gpu,
         };
@@ -174,8 +184,8 @@ async fn read_encoder_with(
     // The separate wayland-capture process produces frames at its own fixed rate.
     if wayland && portal.is_none() { settings.fps = FPS as u32; }
     let fps = settings.fps.to_string();
-    // Keep the IDR interval at 0.5 s whatever the frame rate.
-    let gop = (u64::from(settings.fps) * GOP / FPS).max(1).to_string();
+    // Keep the IDR interval at 2 s whatever the frame rate.
+    let gop = gop_frames(settings.fps).to_string();
     let (maxrate, bufsize) = rate_args(&settings);
     let cq = settings.cq().to_string();
     let target = settings.max_kbps().map_or("16M".to_string(), |k| format!("{}k", k * 3 / 4));
