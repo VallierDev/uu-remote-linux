@@ -87,7 +87,9 @@ pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, 
     let mut context = unsafe { codec::context::Context::wrap(ff::sys::avcodec_alloc_context3(codec.as_ptr()), None) }.encoder().video().map_err(text)?;
     context.set_width(width);
     context.set_height(height);
-    context.set_format(Pixel::YUV420P);
+    // NVENC takes packed BGR0 directly, so the GPU path skips the CPU colour conversion to YUV420P.
+    let pixel = if config.gpu { Pixel::BGRZ } else { Pixel::YUV420P };
+    context.set_format(pixel);
     context.set_time_base(Rational::new(1, config.fps as i32));
     context.set_frame_rate(Some(Rational::new(config.fps as i32, 1)));
     context.set_gop(config.gop);
@@ -121,7 +123,7 @@ pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, 
 
     let mut scaler: Option<(scaling::Context, (Pixel, u32, u32))> = None;
     let mut decoded = frame::Video::empty();
-    let mut yuv = frame::Video::new(Pixel::YUV420P, width, height);
+    let mut converted = frame::Video::new(pixel, width, height);
     let mut packet = Packet::empty();
     let started = Instant::now();
     let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
@@ -146,16 +148,22 @@ pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, 
         let slot = slot.max(last_slot + 1);
         last_slot = slot;
 
-        let key = (decoded.format(), decoded.width(), decoded.height());
-        if scaler.as_ref().map(|(_, k)| *k) != Some(key) {
-            let context = scaling::Context::get(key.0, key.1, key.2, Pixel::YUV420P, width, height, scaling::Flags::BILINEAR).map_err(text)?;
-            scaler = Some((context, key));
-        }
-        if let Some((context, _)) = scaler.as_mut() { context.run(&decoded, &mut yuv).map_err(text)?; }
+        // Pass the capture buffer straight through when it already matches the encoder input.
+        let frame = if decoded.format() == pixel && decoded.width() == width && decoded.height() == height {
+            &mut decoded
+        } else {
+            let key = (decoded.format(), decoded.width(), decoded.height());
+            if scaler.as_ref().map(|(_, k)| *k) != Some(key) {
+                let context = scaling::Context::get(key.0, key.1, key.2, pixel, width, height, scaling::Flags::BILINEAR).map_err(text)?;
+                scaler = Some((context, key));
+            }
+            if let Some((context, _)) = scaler.as_mut() { context.run(&decoded, &mut converted).map_err(text)?; }
+            &mut converted
+        };
 
-        yuv.set_pts(Some(slot));
-        yuv.set_kind(if idr.swap(false, Ordering::AcqRel) { picture::Type::I } else { picture::Type::None });
-        encoder.send_frame(&yuv).map_err(text)?;
+        frame.set_pts(Some(slot));
+        frame.set_kind(if idr.swap(false, Ordering::AcqRel) { picture::Type::I } else { picture::Type::None });
+        encoder.send_frame(frame).map_err(text)?;
         if !drain(&mut encoder, &mut packet, &units)? { return Ok(()); }
     }
     Ok(())
