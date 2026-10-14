@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 use ffmpeg_next as ff;
-use ff::format::{format::Format, Pixel};
+use ff::format::{format::Format, sample, Pixel, Sample};
+use ff::ChannelLayout;
 use ff::util::picture;
 use ff::{codec, encoder, frame, software::scaling, Dictionary, Packet, Rational};
 use tokio::sync::mpsc;
@@ -150,6 +151,93 @@ pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, 
         yuv.set_kind(if idr.swap(false, Ordering::AcqRel) { picture::Type::I } else { picture::Type::None });
         encoder.send_frame(&yuv).map_err(text)?;
         if !drain(&mut encoder, &mut packet, &units)? { return Ok(()); }
+    }
+    Ok(())
+}
+
+/// Encodes a PulseAudio/PipeWire source to Opus in this process. Each Opus packet is sent as is.
+pub fn run_audio(source: &str, units: mpsc::Sender<bytes::Bytes>, stop: Arc<AtomicBool>) -> Result<(), String> {
+    ensure_init()?;
+    let name = CString::new("pulse").map_err(|e| e.to_string())?;
+    let raw = unsafe { ff::sys::av_find_input_format(name.as_ptr()) };
+    if raw.is_null() { return Err("pulse input is not available in this FFmpeg build".into()); }
+    let input_format = Format::Input(unsafe { ff::format::format::Input::wrap(raw as *mut _) });
+    let mut capture_options = Dictionary::new();
+    capture_options.set("fragment_size", "1920");
+    let mut input = ff::format::open_with(&source, &input_format, capture_options).map_err(text)?.input();
+
+    let stream = input.streams().best(ff::media::Type::Audio).ok_or("Pulse source has no audio stream")?;
+    let index = stream.index();
+    let mut decoder = codec::context::Context::from_parameters(stream.parameters()).map_err(text)?.decoder().audio().map_err(text)?;
+
+    let codec = encoder::find_by_name("libopus").ok_or("Opus encoder is not available in this FFmpeg build")?;
+    let mut context = unsafe { codec::context::Context::wrap(ff::sys::avcodec_alloc_context3(codec.as_ptr()), None) }.encoder().audio().map_err(text)?;
+    context.set_rate(48_000);
+    context.set_format(Sample::I16(sample::Type::Packed));
+    // FFmpeg 6 reads the AVChannelLayout field; the deprecated channel_layout alone makes libopus fail with EINVAL.
+    unsafe { ff::sys::av_channel_layout_default(&mut (*context.as_mut_ptr()).ch_layout, 2) };
+    context.set_time_base(Rational::new(1, 48_000));
+    context.set_bit_rate(128_000);
+    let mut options = Dictionary::new();
+    options.set("application", "lowdelay");
+    options.set("frame_duration", "20");
+    let mut encoder = context.open_as_with(codec, options).map_err(text)?;
+    // libopus takes fixed-size frames: 960 samples per channel for 20 ms.
+    let frame_samples = match encoder.frame_size() as usize { 0 => 960, n => n };
+
+    let mut resampler = None;
+    let mut decoded = frame::Audio::empty();
+    let mut converted = frame::Audio::empty();
+    let mut fifo: Vec<i16> = Vec::new();
+    let mut pts: i64 = 0;
+    let mut packet = Packet::empty();
+    for (stream, input_packet) in input.packets() {
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
+        if stream.index() != index { continue; }
+        decoder.send_packet(&input_packet).map_err(text)?;
+        loop {
+            match decoder.receive_frame(&mut decoded) {
+                Ok(()) => {}
+                Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => break,
+                Err(error) => return Err(text(error)),
+            }
+            // The decoder may leave the deprecated channel_layout unset; derive it from the channel count.
+            let source_layout = ChannelLayout::default(i32::from(decoded.channels()));
+            if resampler.is_none() {
+                resampler = Some(ff::software::resampling::Context::get(
+                    decoded.format(), source_layout, decoded.rate(),
+                    Sample::I16(sample::Type::Packed), ChannelLayout::STEREO, 48_000,
+                ).map_err(text)?);
+            }
+            // Keep both layout fields of the decoded frame in step with the resampler's input layout.
+            decoded.set_channel_layout(source_layout);
+            unsafe { ff::sys::av_channel_layout_default(&mut (*decoded.as_mut_ptr()).ch_layout, i32::from(decoded.channels())) };
+            if let Some(resampler) = resampler.as_mut() { resampler.run(&decoded, &mut converted).map_err(text)?; }
+            let samples = converted.samples() * 2;
+            fifo.extend(converted.data(0)[..samples * 2].chunks_exact(2).map(|b| i16::from_ne_bytes([b[0], b[1]])));
+
+            while fifo.len() >= frame_samples * 2 {
+                let mut out = frame::Audio::new(Sample::I16(sample::Type::Packed), frame_samples, ChannelLayout::STEREO);
+                unsafe { ff::sys::av_channel_layout_default(&mut (*out.as_mut_ptr()).ch_layout, 2) };
+                out.set_rate(48_000);
+                out.set_pts(Some(pts));
+                for (dst, src) in out.data_mut(0)[..frame_samples * 4].chunks_exact_mut(2).zip(fifo.drain(..frame_samples * 2)) {
+                    dst.copy_from_slice(&src.to_ne_bytes());
+                }
+                pts += frame_samples as i64;
+                encoder.send_frame(&out).map_err(text)?;
+                loop {
+                    match encoder.receive_packet(&mut packet) {
+                        Ok(()) => {
+                            let data = bytes::Bytes::copy_from_slice(packet.data().unwrap_or_default());
+                            if units.blocking_send(data).is_err() { return Ok(()); }
+                        }
+                        Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => break,
+                        Err(error) => return Err(text(error)),
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

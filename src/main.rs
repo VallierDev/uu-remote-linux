@@ -51,7 +51,7 @@ use webrtc::WebRtcSession;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     // An unknown argument must never fall through to starting a second full host server.
-    const SUBCOMMANDS: [&str; 8] = ["login", "unlock-check", "desktop-probe", "desktop-video-probe", "wayland-capture",
+    const SUBCOMMANDS: [&str; 9] = ["login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
         "wayland-input-probe", "clipboard-acceptance", "portal-acceptance"];
     if let Some(arg) = std::env::args().nth(1).filter(|a| !SUBCOMMANDS.contains(&a.as_str())) {
         let usage = format!("usage: uuremote-server [{}]\n  (no argument: run the host)", SUBCOMMANDS.join(" | "));
@@ -185,6 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let screen=ScreenCapture::new()?;
         capture::keep_display_awake()?;
         return video::probe((screen.width,screen.height),screen.display.clone(),screen.portal.clone(),std::env::args().nth(2)).await.map_err(|e|e.into());
+    }
+    if std::env::args().nth(1).as_deref() == Some("desktop-audio-probe") {
+        return audio::probe(std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(5)).await.map_err(|e| e.into());
     }
     if std::env::args().nth(1).as_deref() == Some("unlock-check") {
         return session_lock::check_from_stdin().map_err(|e| e.into());
