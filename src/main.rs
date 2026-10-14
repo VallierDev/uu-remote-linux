@@ -22,6 +22,8 @@ mod terminal;
 mod webrtc;
 mod video;
 #[cfg(feature = "inproc-av")]
+mod damage_capture;
+#[cfg(feature = "inproc-av")]
 mod inproc_encoder;
 mod capture_setting;
 mod audio;

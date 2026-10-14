@@ -179,6 +179,7 @@ async fn read_encoder_with(
             gop: gop_frames(settings.fps, true) as u32, cq: settings.cq() as u32,
             target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
             max_bps: max_kbps * 1000, buffer_bits: (max_kbps / 8).clamp(100, 500) * 1000, gpu,
+            damage: crate::inproc_encoder::damage_enabled(),
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} pipeline=in-process",
             display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,if gpu{"h264_nvenc"}else{"libx264"});

@@ -12,6 +12,8 @@ use ff::util::picture;
 use ff::{codec, encoder, frame, software::scaling, Dictionary, Packet, Rational};
 use tokio::sync::mpsc;
 
+use crate::damage_capture::DamageCapture;
+
 pub struct Config {
     pub display: String,
     pub input: (u32, u32),
@@ -23,11 +25,18 @@ pub struct Config {
     pub max_bps: i64,
     pub buffer_bits: i64,
     pub gpu: bool,
+    /// Capture on XDamage changes (XShm) instead of x11grab; `UU_CAPTURE=grab` turns it off.
+    pub damage: bool,
 }
 
 /// `UU_VIDEO_PIPELINE=process` keeps the original ffmpeg child-process path.
 pub fn disabled() -> bool {
     std::env::var("UU_VIDEO_PIPELINE").is_ok_and(|v| v == "process")
+}
+
+/// Damage-driven capture is on unless `UU_CAPTURE=grab` asks for x11grab.
+pub fn damage_enabled() -> bool {
+    std::env::var("UU_CAPTURE").map_or(true, |v| v != "grab")
 }
 
 /// In-process capture is used unless the process path is requested, or a bundled FFmpeg prefix
@@ -62,24 +71,8 @@ fn drain(encoder: &mut encoder::Video, packet: &mut Packet, units: &mpsc::Sender
     }
 }
 
-/// Runs until `stop` is set or the receiver is dropped. A set `idr` flag forces the next frame to be an IDR.
-pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>) -> Result<(), String> {
-    ensure_init()?;
-    let name = CString::new("x11grab").map_err(|e| e.to_string())?;
-    let raw = unsafe { ff::sys::av_find_input_format(name.as_ptr()) };
-    if raw.is_null() { return Err("x11grab input is not available in this FFmpeg build".into()); }
-    let input_format = Format::Input(unsafe { ff::format::format::Input::wrap(raw as *mut _) });
-    let mut capture_options = Dictionary::new();
-    capture_options.set("framerate", &config.fps.to_string());
-    capture_options.set("video_size", &format!("{}x{}", config.input.0, config.input.1));
-    // The viewer draws its own pointer; do not bake a second one into the video.
-    capture_options.set("draw_mouse", "0");
-    let mut input = ff::format::open_with(&config.display, &input_format, capture_options).map_err(text)?.input();
-
-    let stream = input.streams().best(ff::media::Type::Video).ok_or("X11 capture has no video stream")?;
-    let index = stream.index();
-    let mut decoder = codec::context::Context::from_parameters(stream.parameters()).map_err(text)?.decoder().video().map_err(text)?;
-
+/// Opens the H.264 encoder for `config`. Returns the encoder, its input pixel format and output size.
+fn open_encoder(config: &Config) -> Result<(encoder::Video, Pixel, u32, u32), String> {
     let (width, height) = config.output.unwrap_or(config.input);
     let codec = encoder::find_by_name(if config.gpu { "h264_nvenc" } else { "libx264" })
         .ok_or("H.264 encoder is not available in this FFmpeg build")?;
@@ -119,7 +112,35 @@ pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, 
         options.set("crf", &cq);
         options.set("x264-params", &x264);
     }
-    let mut encoder = context.open_as_with(codec, options).map_err(text)?;
+    let encoder = context.open_as_with(codec, options).map_err(text)?;
+    Ok((encoder, pixel, width, height))
+}
+
+/// Runs until `stop` is set or the receiver is dropped. A set `idr` flag forces the next frame to be an IDR.
+pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>) -> Result<(), String> {
+    ensure_init()?;
+    if config.damage {
+        match DamageCapture::open(&config.display) {
+            Ok(capture) => return run_damage(config, capture, units, stop, idr),
+            Err(error) => log::warn!("Damage-driven capture unavailable, using x11grab: {error}"),
+        }
+    }
+    let name = CString::new("x11grab").map_err(|e| e.to_string())?;
+    let raw = unsafe { ff::sys::av_find_input_format(name.as_ptr()) };
+    if raw.is_null() { return Err("x11grab input is not available in this FFmpeg build".into()); }
+    let input_format = Format::Input(unsafe { ff::format::format::Input::wrap(raw as *mut _) });
+    let mut capture_options = Dictionary::new();
+    capture_options.set("framerate", &config.fps.to_string());
+    capture_options.set("video_size", &format!("{}x{}", config.input.0, config.input.1));
+    // The viewer draws its own pointer; do not bake a second one into the video.
+    capture_options.set("draw_mouse", "0");
+    let mut input = ff::format::open_with(&config.display, &input_format, capture_options).map_err(text)?.input();
+
+    let stream = input.streams().best(ff::media::Type::Video).ok_or("X11 capture has no video stream")?;
+    let index = stream.index();
+    let mut decoder = codec::context::Context::from_parameters(stream.parameters()).map_err(text)?.decoder().video().map_err(text)?;
+
+    let (mut encoder, pixel, width, height) = open_encoder(&config)?;
 
     let mut scaler: Option<(scaling::Context, (Pixel, u32, u32))> = None;
     let mut decoded = frame::Video::empty();
@@ -167,6 +188,82 @@ pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, 
         if !drain(&mut encoder, &mut packet, &units)? { return Ok(()); }
     }
     Ok(())
+}
+
+/// Damage-driven loop. Damage only marks the picture dirty; a dirty picture is captured and encoded on
+/// the next fixed frame tick, so the stream keeps a steady cadence while the screen moves. The viewer's
+/// jitter buffer grows with irregular arrivals, and irregular sends were what raised its latency.
+/// An idle screen sends a keepalive about once a second so the viewer still sees traffic.
+fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>) -> Result<(), String> {
+    let (mut encoder, pixel, width, height) = open_encoder(&config)?;
+    let (cap_width, cap_height) = capture.size();
+    let mut captured = frame::Video::new(Pixel::BGRZ, cap_width, cap_height);
+    let mut converted = frame::Video::new(pixel, width, height);
+    let mut scaler = None;
+    let mut packet = Packet::empty();
+    let started = Instant::now();
+    let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
+    // Keepalive gaps are random between 15 and 25 fps: a steady 1 fps reads as a stall to the viewer.
+    let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.subsec_nanos()) | 1;
+    let mut keepalive = random_keepalive(&mut seed);
+    let mut dirty = true;
+    let mut next_tick = Instant::now();
+    let mut last_send = Instant::now();
+    let mut last_slot: i64 = -1;
+    loop {
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
+        let deadline = if dirty { next_tick } else { last_send + keepalive };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if capture.wait(wait.max(Duration::from_millis(1)))? {
+            dirty = true;
+            continue;
+        }
+        let now = Instant::now();
+        if dirty && now < next_tick { continue; }
+        if !dirty && now < last_send + keepalive { continue; }
+
+        let source = capture.capture()?;
+        let bytes_per_line = cap_width as usize * 4;
+        let stride = captured.stride(0);
+        let row = bytes_per_line.min(stride);
+        for (y, src) in source.chunks_exact(bytes_per_line).enumerate() {
+            captured.data_mut(0)[y * stride..y * stride + row].copy_from_slice(&src[..row]);
+        }
+
+        let slot = ((started.elapsed().as_micros() * u128::from(config.fps) + 500_000) / 1_000_000) as i64;
+        let slot = slot.max(last_slot + 1);
+        last_slot = slot;
+
+        let frame = if pixel == Pixel::BGRZ && width == cap_width && height == cap_height {
+            &mut captured
+        } else {
+            if scaler.is_none() {
+                scaler = Some(scaling::Context::get(Pixel::BGRZ, cap_width, cap_height, pixel, width, height, scaling::Flags::BILINEAR).map_err(text)?);
+            }
+            if let Some(context) = scaler.as_mut() { context.run(&captured, &mut converted).map_err(text)?; }
+            &mut converted
+        };
+        frame.set_pts(Some(slot));
+        frame.set_kind(if idr.swap(false, Ordering::AcqRel) { picture::Type::I } else { picture::Type::None });
+        encoder.send_frame(frame).map_err(text)?;
+        if !drain(&mut encoder, &mut packet, &units)? { return Ok(()); }
+        let now = Instant::now();
+        if dirty {
+            // Keep the tick phase; after a long idle, restart the phase from now instead of bursting to catch up.
+            next_tick = (next_tick + frame_interval).max(now);
+            dirty = false;
+        }
+        last_send = now;
+        keepalive = random_keepalive(&mut seed);
+    }
+}
+
+/// Picks the next keepalive gap in 40–67 ms (15–25 fps) with a small xorshift generator.
+fn random_keepalive(seed: &mut u32) -> Duration {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 17;
+    *seed ^= *seed << 5;
+    Duration::from_micros(40_000 + u64::from(*seed % 26_700))
 }
 
 /// Encodes a PulseAudio/PipeWire source to Opus in this process. Each Opus packet is sent as is.
