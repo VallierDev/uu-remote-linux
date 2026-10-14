@@ -17,6 +17,9 @@ path = "src/main.rs"
 default = []
 wayland = []
 portal = []
+# In-process capture and encoding through FFmpeg 6 libraries (libavcodec/libavdevice dev packages).
+# Off by default so release binaries do not link the build machine's libav.
+inproc-av = ["dep:ffmpeg-next"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -37,7 +40,7 @@ nix = { version = "0.29", features = ["term", "process", "fs", "ioctl", "signal"
 log = "0.4"
 qrcode = { version = "0.14", default-features = false }
 env_logger = "0.11"
-ffmpeg-next = { version = "6.1", default-features = false, features = ["codec", "format", "device", "software-scaling", "software-resampling"] }
+ffmpeg-next = { version = "6.1", optional = true, default-features = false, features = ["codec", "format", "device", "software-scaling", "software-resampling"] }
 
 [build-dependencies]
 cc = "1.0"

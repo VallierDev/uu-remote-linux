@@ -110,7 +110,9 @@ impl EncoderTask {
     }
 }
 
+#[cfg(feature = "inproc-av")]
 struct StopOnDrop(Arc<AtomicBool>);
+#[cfg(feature = "inproc-av")]
 impl Drop for StopOnDrop { fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Relaxed); } }
 
 async fn read_encoder(
@@ -131,6 +133,7 @@ async fn read_encoder(
 }
 
 /// Capture and encode inside this process; each packet is one access unit.
+#[cfg(feature = "inproc-av")]
 async fn read_inprocess(
     config: crate::inproc_encoder::Config, latest: mpsc::Sender<Arc<CompleteFrame>>,
     sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>,
@@ -165,10 +168,11 @@ fn rate_args(settings: &VideoSettings) -> (String, String) {
 
 async fn read_encoder_with(
     size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,gpu:bool,sequence:Arc<std::sync::atomic::AtomicU64>,
-    mut settings: VideoSettings, idr: Arc<AtomicBool>,
+    mut settings: VideoSettings, #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] idr: Arc<AtomicBool>,
 )->Result<(),String>{
     let wayland=display.starts_with("wayland:");
-    if !wayland && portal.is_none() && !crate::inproc_encoder::disabled() {
+    #[cfg(feature = "inproc-av")]
+    if !wayland && portal.is_none() && crate::inproc_encoder::selected() {
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),

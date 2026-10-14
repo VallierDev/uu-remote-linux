@@ -1,11 +1,16 @@
 //! Desktop sound for the viewer's 声音 menu: the default output's monitor (PulseAudio or
-//! PipeWire-pulse) is encoded to Opus in this process and sent on the negotiated audio m-line.
+//! PipeWire-pulse) is encoded to Opus and sent on the negotiated audio m-line.
+//! Encoding runs in this process with the `inproc-av` feature (unless `UU_FFMPEG_ROOT` is set),
+//! otherwise an FFmpeg child process does it.
 //! PipeWire monitors ignore the sink's mute by default, so 被控端静音运行 keeps the stream audible.
 //! `UU_AUDIO=0` disables it; `UU_AUDIO_SOURCE` picks another Pulse source.
 
+use std::io::Read;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use webrtc::media::io::ogg_reader::OggReader;
 use webrtc::media::Sample;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -15,6 +20,56 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 const FRAME: Duration = Duration::from_millis(20);
 
 pub fn enabled() -> bool { std::env::var("UU_AUDIO").map_or(true, |v| v != "0") }
+
+/// Stops one running encoder when dropped: sets the in-process stop flag, or kills the FFmpeg child.
+struct Stopper { stop: Arc<AtomicBool>, child: Option<Child> }
+impl Drop for Stopper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(child) = self.child.as_mut() { let _ = child.kill(); let _ = child.wait(); }
+    }
+}
+
+fn spawn_encoder(source: &str) -> Result<Child, String> {
+    let mut command = match crate::config::ffmpeg_root() {
+        Some(root) => { let mut c = Command::new(root.join("bin/ffmpeg")); c.env("LD_LIBRARY_PATH", root.join("lib/x86_64-linux-gnu")); c }
+        None => Command::new("ffmpeg"),
+    };
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin",
+            "-f", "pulse", "-fragment_size", "1920", "-i", source, "-vn",
+            "-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "128k", "-application", "lowdelay",
+            "-frame_duration", "20", "-page_duration", "20000", "-flush_packets", "1", "-f", "ogg", "pipe:1"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    command.spawn().map_err(|e| format!("Start audio encoder: {e}"))
+}
+
+/// Reads Opus packets from the FFmpeg child's Ogg output until it ends or `tx` closes. Blocking.
+fn read_packets(stdout: impl Read, tx: &tokio::sync::mpsc::Sender<bytes::Bytes>) -> Result<(), String> {
+    let (mut reader, _) = OggReader::new(stdout, false).map_err(|e| format!("Audio Ogg header: {e}"))?;
+    loop {
+        let (payload, _) = reader.parse_next_page().map_err(|e| format!("Audio Ogg page: {e}"))?;
+        if payload.starts_with(b"OpusTags") { continue; }
+        if tx.blocking_send(payload.freeze()).is_err() { return Ok(()); }
+    }
+}
+
+/// Starts one encoder feeding `tx`. The job ends with its result once the stopper is dropped or `tx` closes.
+fn start(source: &str, tx: tokio::sync::mpsc::Sender<bytes::Bytes>)
+    -> Result<(Stopper, tokio::task::JoinHandle<Result<(), String>>), String> {
+    let stop = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "inproc-av")]
+    if crate::inproc_encoder::selected() {
+        let job = tokio::task::spawn_blocking({
+            let (stop, source) = (stop.clone(), source.to_owned());
+            move || crate::inproc_encoder::run_audio(&source, tx, stop)
+        });
+        return Ok((Stopper { stop, child: None }, job));
+    }
+    let mut child = spawn_encoder(source)?;
+    let stdout = child.stdout.take().ok_or("Encoder stdout missing")?;
+    let job = tokio::task::spawn_blocking(move || read_packets(stdout, &tx));
+    Ok((Stopper { stop, child: Some(child) }, job))
+}
 
 fn closed(pc: &RTCPeerConnection) -> bool {
     matches!(pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed)
@@ -30,11 +85,9 @@ pub async fn stream_audio(pc: Arc<RTCPeerConnection>, track: Arc<TrackLocalStati
     let mut failures = 0u32;
     while !closed(&pc) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(25);
-        let stop = Arc::new(AtomicBool::new(false));
-        let reader = {
-            let stop = stop.clone();
-            let source = source.clone();
-            tokio::task::spawn_blocking(move || crate::inproc_encoder::run_audio(&source, tx, stop))
+        let (stopper, job) = match start(&source, tx) {
+            Ok(started) => started,
+            Err(e) => { log::warn!("{e}"); return; }
         };
         log::info!("Desktop audio started: opus 48k stereo");
         let mut packets = 0u64;
@@ -51,10 +104,10 @@ pub async fn stream_audio(pc: Arc<RTCPeerConnection>, track: Arc<TrackLocalStati
                 _ = health.tick() => if closed(&pc) { break },
             }
         }
-        // Stopping before dropping the receiver lets the encoder thread exit at its next packet.
-        stop.store(true, Ordering::Relaxed);
+        // Dropping the receiver and the stopper ends the encoder at its next packet.
         drop(rx);
-        let result = reader.await.unwrap_or_else(|e| Err(e.to_string()));
+        drop(stopper);
+        let result = job.await.unwrap_or_else(|e| Err(e.to_string()));
         if closed(&pc) { break; }
         log::warn!("Desktop audio stopped after {packets} packets: {:?}", result.err());
         failures = if packets > 250 { 0 } else { failures + 1 };
@@ -68,11 +121,7 @@ pub async fn stream_audio(pc: Arc<RTCPeerConnection>, track: Arc<TrackLocalStati
 pub async fn probe(seconds: u64) -> Result<(), String> {
     let source = std::env::var("UU_AUDIO_SOURCE").unwrap_or_else(|_| "@DEFAULT_MONITOR@".into());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker = {
-        let stop = stop.clone();
-        std::thread::spawn(move || crate::inproc_encoder::run_audio(&source, tx, stop))
-    };
+    let (stopper, job) = start(&source, tx)?;
     let started = std::time::Instant::now();
     let mut packets = 0u64;
     let mut bytes = 0u64;
@@ -90,10 +139,12 @@ pub async fn probe(seconds: u64) -> Result<(), String> {
             _ => break,
         }
     }
-    stop.store(true, Ordering::Relaxed);
-    drop(rx);
     let elapsed = started.elapsed().as_secs_f64();
+    drop(rx);
+    drop(stopper);
     println!("Desktop audio probe: packets={packets} bytes={bytes} kbps={:.1} packets_per_s={:.1} max_gap_ms={}",
         bytes as f64 * 8.0 / 1000.0 / elapsed, packets as f64 / elapsed, max_gap.as_millis());
-    worker.join().map_err(|_| "audio worker panicked".to_string())?
+    // The encoder is stopped on purpose, so its end-of-stream error only matters if nothing arrived.
+    let result = job.await.map_err(|e| e.to_string())?;
+    if packets == 0 { result } else { Ok(()) }
 }

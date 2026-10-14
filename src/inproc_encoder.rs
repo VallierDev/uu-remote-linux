@@ -30,6 +30,12 @@ pub fn disabled() -> bool {
     std::env::var("UU_VIDEO_PIPELINE").is_ok_and(|v| v == "process")
 }
 
+/// In-process capture is used unless the process path is requested, or a bundled FFmpeg prefix
+/// (`UU_FFMPEG_ROOT` / config `ffmpeg_root`) is set: that build was chosen on purpose, so keep using it.
+pub fn selected() -> bool {
+    !disabled() && crate::config::ffmpeg_root().is_none()
+}
+
 fn text(error: ff::Error) -> String { error.to_string() }
 
 fn ensure_init() -> Result<(), String> {
