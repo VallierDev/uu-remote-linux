@@ -18,3 +18,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+
+  test-wayland:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies (X11 + Wayland + portal)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
+            libwayland-dev libxkbcommon-dev libglib2.0-dev libpipewire-0.3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --features wayland,portal

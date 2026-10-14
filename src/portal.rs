@@ -50,13 +50,24 @@ mod native {
             }
             let pointer = unsafe { uu_portal_open_persist(token.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()), save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height) };
             let handle = NonNull::new(pointer).ok_or_else(|| super::error(error))?;
-            Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(true), retry_at: Mutex::new(None), width, height })
+            // A freshly opened session holds no lock-screen frame: only an observed lock (or a
+            // closed stream) must discard the cached frame. Starting "locked" cleared the first
+            // valid frame, and a static desktop sends no new one, so the viewer stayed black (#2).
+            Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), retry_at: Mutex::new(None), width, height })
         }
         pub fn capture(&self, frame: &mut [u8]) -> Result<(), String> {
             let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
-            let locked = *self.locked.borrow() != Some(false);
-            if locked || self.was_locked.swap(locked, std::sync::atomic::Ordering::AcqRel) {
-                self.was_locked.store(locked, std::sync::atomic::Ordering::Release);
+            let state = *self.locked.borrow();
+            if state != Some(false) {
+                // Unknown state (watcher not reported yet): show nothing but keep the cached frame.
+                if state == Some(true) {
+                    self.was_locked.store(true, std::sync::atomic::Ordering::Release);
+                    unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
+                }
+                super::blank(frame); return Ok(());
+            }
+            if self.was_locked.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                // First unlocked capture after a real lock: drop frames captured while locked.
                 unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
                 super::blank(frame); return Ok(());
             }
