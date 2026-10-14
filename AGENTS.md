@@ -36,7 +36,7 @@ Dependencies (Ubuntu/Debian):
 
 ```sh
 sudo apt install build-essential pkg-config \
-    libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev ffmpeg
+    libx11-dev libxext-dev libxtst-dev libxfixes-dev libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev libgtk-3-dev ffmpeg
 # --features wayland:        libwayland-dev libxkbcommon-dev wl-clipboard
 # --features wayland,portal: + libglib2.0-dev libpipewire-0.3-dev
 ```

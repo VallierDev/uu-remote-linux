@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -99,21 +100,49 @@ impl EncoderTask {
     }
 }
 
+struct StopOnDrop(Arc<AtomicBool>);
+impl Drop for StopOnDrop { fn drop(&mut self) { self.0.store(true, std::sync::atomic::Ordering::Relaxed); } }
+
 async fn read_encoder(
     size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     latest: mpsc::Sender<Arc<CompleteFrame>>,
-    settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>,
+    settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>,
 ) -> Result<(), String> {
     // The sequence is shared so a CPU fallback or settings restart continues it (skip statistics stay correct).
-    if !gpu_encoder_requested() { return read_encoder_with(size,display,portal,latest,false,sequence,settings).await; }
-    match read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),true,sequence.clone(),settings).await {
+    if !gpu_encoder_requested() { return read_encoder_with(size,display,portal,latest,false,sequence,settings,idr).await; }
+    match read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),true,sequence.clone(),settings,idr.clone()).await {
         Ok(())=>Ok(()),
         Err(error) if !latest.is_closed()=>{
             log::warn!("NVENC stream unavailable; switching scoped encoder to CPU: {}",error);
-            read_encoder_with(size,display,portal,latest,false,sequence,settings).await
+            read_encoder_with(size,display,portal,latest,false,sequence,settings,idr).await
         },
         Err(error)=>Err(error),
     }
+}
+
+/// Capture and encode inside this process; each packet is one access unit.
+async fn read_inprocess(
+    config: crate::inproc_encoder::Config, latest: mpsc::Sender<Arc<CompleteFrame>>,
+    sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let (units_tx, mut units) = mpsc::channel::<Vec<u8>>(4);
+    let stop = Arc::new(AtomicBool::new(false));
+    // If this future is dropped (reader task aborted), the blocking encoder stops at its next packet.
+    let _stop_on_drop = StopOnDrop(stop.clone());
+    let job = tokio::task::spawn_blocking({
+        let stop = stop.clone();
+        move || crate::inproc_encoder::run(config, units_tx, stop, idr)
+    });
+    let mut gate = DependencyGate::default();
+    while let Some(data) = units.recv().await {
+        let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        gate.submit(&latest, Arc::new(CompleteFrame { sequence, completed_at: Instant::now(), data }));
+        if latest.is_closed() { break; }
+    }
+    // Dropping the receiver also unblocks the encoder if it is waiting to send.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    drop(units);
+    job.await.map_err(|e| format!("Encoder task: {e}"))?
 }
 
 /// Rate-control arguments: constant quality capped at 30M (自动), or capped at the viewer's
@@ -126,10 +155,22 @@ fn rate_args(settings: &VideoSettings) -> (String, String) {
 
 async fn read_encoder_with(
     size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,gpu:bool,sequence:Arc<std::sync::atomic::AtomicU64>,
-    mut settings: VideoSettings,
+    mut settings: VideoSettings, idr: Arc<AtomicBool>,
 )->Result<(),String>{
-    let size = format!("{}x{}", size.0, size.1);
     let wayland=display.starts_with("wayland:");
+    if !wayland && portal.is_none() && !crate::inproc_encoder::disabled() {
+        let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
+        let config = crate::inproc_encoder::Config {
+            display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
+            gop: (u64::from(settings.fps) * GOP / FPS).max(1) as u32, cq: settings.cq() as u32,
+            target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
+            max_bps: max_kbps * 1000, buffer_bits: (max_kbps / 8).clamp(100, 500) * 1000, gpu,
+        };
+        log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} pipeline=in-process",
+            display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,if gpu{"h264_nvenc"}else{"libx264"});
+        return read_inprocess(config, latest, sequence, idr).await;
+    }
+    let size = format!("{}x{}", size.0, size.1);
     // The separate wayland-capture process produces frames at its own fixed rate.
     if wayland && portal.is_none() { settings.fps = FPS as u32; }
     let fps = settings.fps.to_string();
@@ -256,11 +297,13 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
     };
     let (tx,mut rx)=mpsc::channel(4);
     let sequence=Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,VideoSettings::default(),sequence)));
+    let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,VideoSettings::default(),sequence,Arc::new(AtomicBool::new(false)))));
     let mut count=0;
     let mut bytes=0;
-    tokio::time::timeout(Duration::from_secs(15),async {
-        while count<5 {
+    // UU_PROBE_FRAMES lengthens the sample for baseline measurements; default is 5 frames.
+    let wanted:u64=std::env::var("UU_PROBE_FRAMES").ok().and_then(|v|v.parse().ok()).unwrap_or(5);
+    tokio::time::timeout(Duration::from_secs(15+wanted/30),async {
+        while count<wanted {
             let frame=rx.recv().await.ok_or("Video probe encoder ended")?;
             if count==0 && !is_independent_frame(&frame.data) { return Err("Video probe did not begin with IDR".to_owned()); }
             if let Some(file)=file.as_mut() { file.write_all(&frame.data).map_err(|e|e.to_string())?; }
@@ -273,7 +316,7 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
 }
 
 pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<TrackLocalStaticSample>, size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
-    mut settings: tokio::sync::watch::Receiver<VideoSettings>) -> Result<(), String> {
+    mut settings: tokio::sync::watch::Receiver<VideoSettings>, idr: Arc<AtomicBool>) -> Result<(), String> {
     loop {
         if transport_closed(&pc) { return Ok(()); }
         if pc.connection_state() == RTCPeerConnectionState::Connected
@@ -284,7 +327,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<TrackLocalSta
     let (latest, mut receiver) = mpsc::channel(4);
     let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let current = *settings.borrow_and_update();
-    let mut reader = EncoderTask(tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone())));
+    let mut reader = EncoderTask(tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone())));
     let mut previous = None;
     let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
     let mut settings_open = true;
@@ -305,7 +348,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<TrackLocalSta
                 // still queued from the old encoder remain a valid chain before it.
                 let next = *settings.borrow_and_update();
                 timeline.fps = u64::from(next.fps);
-                reader.restart(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone())).await;
+                reader.restart(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone())).await;
             },
             frame = receiver.recv() => {
                 // A closed queue means the reader ended; its JoinHandle carries the reason.

@@ -184,8 +184,11 @@ impl WebRtcSession {
             "video_0".to_owned(),
         ));
 
+        // Set by PLI/FIR; the desktop encoder answers with an IDR on its next frame.
+        let idr_request = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sender = pc.add_track(video_track.clone()).await
             .map_err(|e| format!("Add video track failed: {}", e))?;
+        let idr_on_feedback = idr_request.clone();
         tokio::spawn(async move {
             let mut feedback = [0u8; 1500];
             let mut reports = 0usize;
@@ -193,6 +196,10 @@ impl WebRtcSession {
             while let Ok((packets, _)) = sender.read(&mut feedback).await {
                 for packet in packets {
                     feedback_counts.observe(packet.as_any());
+                    if packet.as_any().is::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
+                        || packet.as_any().is::<webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest>() {
+                        idr_on_feedback.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     if let Some(report) = packet.as_any().downcast_ref::<webrtc::rtcp::receiver_report::ReceiverReport>() {
                         reports += 1;
                         if reports == 1 || reports % 10 == 0 {
@@ -261,7 +268,7 @@ impl WebRtcSession {
         // File/terminal/port-mapping connections carry no desktop video.
         if desktop {
             tokio::spawn(async move {
-                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx).await {
+                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, idr_request).await {
                     log::error!("Live desktop stream stopped: {}", e);
                 }
             });

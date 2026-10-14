@@ -81,7 +81,7 @@ Wayland 下的限制：只支持单屏、固定分辨率；portal 后端暂不�
 
 ```sh
 sudo apt install build-essential pkg-config \
-    libx11-dev libxext-dev libxtst-dev libxfixes-dev \
+    libx11-dev libxext-dev libxtst-dev libxfixes-dev libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev \
     libgtk-3-dev ffmpeg
 # 可选：Wayland 后端
 sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard

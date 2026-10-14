@@ -21,6 +21,7 @@ mod signaling;
 mod terminal;
 mod webrtc;
 mod video;
+mod inproc_encoder;
 mod capture_setting;
 mod audio;
 mod system_actions;
