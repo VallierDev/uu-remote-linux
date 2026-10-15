@@ -157,10 +157,13 @@ fn encoder_options(settings: &VideoSettings, encoder: Encoder, gop: &str) -> Vec
     }
     if settings.codec == VideoCodec::H265 { return cpu_hevc_options(settings, gop); }
     let params = format!("aud=1:repeat-headers=1:scenecut=0:keyint={gop}:min-keyint={gop}");
-    ["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency",
+    let mut options = vec!["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency",
         "-profile:v", profile, "-pix_fmt", pix_fmt, "-g", gop, "-threads", "4",
-        "-crf", &cq, "-maxrate", &maxrate, "-bufsize", &bufsize, "-x264-params", &params]
-        .into_iter().map(str::to_owned).collect()
+        "-maxrate", &maxrate, "-bufsize", &bufsize, "-x264-params", &params];
+    // Capped CRF starves repeated 4K keyframes; use ABR for bitrate presets.
+    if settings.max_kbps().is_some() { options.extend(["-b:v", &target]); }
+    else { options.extend(["-crf", &cq]); }
+    options.into_iter().map(str::to_owned).collect()
 }
 
 fn ffmpeg_command() -> Command {
