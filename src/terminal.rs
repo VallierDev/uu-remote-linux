@@ -104,7 +104,7 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 
-fn spawn(cols: u16, rows: u16, shell: Option<&str>) -> Result<Arc<Session>, String> {
+fn spawn(requested_id: u32, cols: u16, rows: u16, shell: Option<&str>) -> Result<Arc<Session>, String> {
     use std::os::unix::process::CommandExt;
     let win = nix::pty::Winsize { ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: 0, ws_ypixel: 0 };
     let pty = nix::pty::openpty(Some(&win), None).map_err(|e| format!("openpty failed: {e}"))?;
@@ -128,7 +128,13 @@ fn spawn(cols: u16, rows: u16, shell: Option<&str>) -> Result<Arc<Session>, Stri
     }
     let mut child = cmd.spawn().map_err(|e| format!("shell spawn failed: {e}"))?;
     drop(slave);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    // Official Mac 4.42.0 (TerminalManager.open) allocates an ID only for OPEN(0).
+    let id = if requested_id != 0 { requested_id } else {
+        loop {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            if id != 0 && !registry().lock().unwrap().contains_key(&id) { break id; }
+        }
+    };
     let session = Arc::new(Session { id, shell: shell.clone(), created_ms: now_ms(), pid: child.id() as i32,
         master: pty.master, sink: Mutex::new(None), scrollback: Mutex::new(VecDeque::new()) });
     let mut reader = std::fs::File::from(session.master.try_clone().map_err(|e| format!("pty dup failed: {e}"))?);
@@ -207,12 +213,14 @@ impl TerminalConn {
                 let (cols, rows) = dims(&v);
                 let session = match existing {
                     Some(s) => { s.resize(cols, rows); Ok(s) }
-                    None => spawn(cols, rows, v.get("shell").and_then(|s| s.as_str())),
+                    None => spawn(frame.session, cols, rows, v.get("shell").and_then(|s| s.as_str())),
                 };
                 match session {
                     Ok(s) => {
-                        *s.sink.lock().unwrap() = Some(self.out.clone());
+                        // Queue the acknowledgement before the PTY reader can emit live output.
+                        let mut sink = s.sink.lock().unwrap();
                         self.send(OPEN_RESP, s.id, &reply(0, "ok"));
+                        *sink = Some(self.out.clone());
                         let replay: Vec<u8> = s.scrollback.lock().unwrap().iter().copied().collect();
                         if !replay.is_empty() { self.send(STDOUT, s.id, &replay); }
                     }
@@ -241,7 +249,8 @@ impl TerminalConn {
                         "state": if attached { "running" } else { "detached" }, "created_at_ms": s.created_ms})
                 }).collect();
                 log::info!("Terminal list sessions: count={}", sessions.len());
-                self.send(LIST_RESP, 0, serde_json::json!({"code": 0, "message": "ok", "sessions": sessions}).to_string().as_bytes());
+                // Official Mac 4.42.0 (handleListSessionsReq) sends a bare array with the request's header ID.
+                self.send(LIST_RESP, frame.session, serde_json::Value::Array(sessions).to_string().as_bytes());
             }
             UNLOCK_REQ => self.send(UNLOCK_RESP, frame.session, &reply(0, "ok")),
             _ => self.send(ERROR, frame.session, &reply(1, "unsupported frame")),
@@ -268,25 +277,51 @@ mod tests {
         assert_eq!(signal_number(b"whatever"), libc::SIGINT);
     }
     #[test]
-    fn open_spawns_shell_and_streams_output() {
+    fn list_reply_is_an_array_and_preserves_request_id() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let conn = TerminalConn::new(tx);
-        conn.handle(&encode(OPEN, 0, br#"{"cols":100,"rows":30,"shell":"/bin/sh"}"#));
-        let resp = decode(&rx.blocking_recv().unwrap()).unwrap();
-        assert_eq!(resp.kind, OPEN_RESP);
-        assert_eq!(json(&resp.payload)["code"], 0);
-        conn.handle(&encode(STDIN, resp.session, b"echo uu-term-ok; exit 3\n"));
-        let mut seen = Vec::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut exit = None;
-        while std::time::Instant::now() < deadline && exit.is_none() {
-            if let Ok(m) = rx.try_recv() {
-                let f = decode(&m).unwrap();
-                if f.kind == STDOUT { seen.extend(f.payload) } else if f.kind == EXIT { exit = Some(json(&f.payload)["exit_code"].clone()) }
-            } else { std::thread::sleep(std::time::Duration::from_millis(20)); }
+        for request in [0, 7, u32::MAX] {
+            conn.handle(&encode(LIST_REQ, request, &[]));
+            let response = decode(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(response.kind, LIST_RESP);
+            assert_eq!(response.session, request);
+            assert!(json(&response.payload).is_array());
         }
-        assert!(String::from_utf8_lossy(&seen).contains("uu-term-ok"));
-        assert_eq!(exit, Some(serde_json::json!(3)));
+    }
+    #[test]
+    fn open_spawns_shell_and_streams_output() {
+        for requested_id in [0, u32::MAX] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let conn = TerminalConn::new(tx);
+            conn.handle(&encode(OPEN, requested_id, br#"{"cols":100,"rows":30,"shell":"/bin/sh"}"#));
+            let resp = decode(&rx.blocking_recv().unwrap()).unwrap();
+            assert_eq!(resp.kind, OPEN_RESP);
+            assert_eq!(json(&resp.payload)["code"], 0);
+            assert_ne!(resp.session, 0);
+            if requested_id != 0 { assert_eq!(resp.session, requested_id); }
+
+            let (list_tx, mut list_rx) = tokio::sync::mpsc::unbounded_channel();
+            TerminalConn::new(list_tx).handle(&encode(LIST_REQ, 7, &[]));
+            let list = decode(&list_rx.try_recv().unwrap()).unwrap();
+            let sessions: Vec<serde_json::Value> = serde_json::from_slice(&list.payload).unwrap();
+            let session = sessions.iter().find(|s| s["session_id"] == resp.session).unwrap();
+            assert_eq!(session["shell"], "/bin/sh");
+            assert_eq!(session["state"], "running");
+
+            conn.handle(&encode(STDIN, resp.session, b"echo uu-term-ok; exit 3\n"));
+            let mut seen = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut exit = None;
+            while std::time::Instant::now() < deadline && exit.is_none() {
+                if let Ok(m) = rx.try_recv() {
+                    let f = decode(&m).unwrap();
+                    assert_eq!(f.session, resp.session);
+                    if f.kind == STDOUT { seen.extend(f.payload) } else if f.kind == EXIT { exit = Some(json(&f.payload)["exit_code"].clone()) }
+                } else { std::thread::sleep(std::time::Duration::from_millis(20)); }
+            }
+            assert!(String::from_utf8_lossy(&seen).contains("uu-term-ok"));
+            assert_eq!(exit, Some(serde_json::json!(3)));
+        }
     }
 }
 
