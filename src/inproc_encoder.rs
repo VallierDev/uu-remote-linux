@@ -214,10 +214,9 @@ fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<Ve
         if stop.load(Ordering::Relaxed) { return Ok(()); }
         let deadline = if dirty { next_tick } else { last_send + keepalive };
         let wait = deadline.saturating_duration_since(Instant::now());
-        if capture.wait(wait.max(Duration::from_millis(1)))? {
-            dirty = true;
-            continue;
-        }
+        // A change marks the picture dirty and falls through, so a client that damages the root constantly
+        // cannot keep an overdue tick waiting.
+        if capture.wait(wait.max(Duration::from_millis(1)))? { dirty = true; }
         let now = Instant::now();
         if dirty && now < next_tick { continue; }
         if !dirty && now < last_send + keepalive { continue; }
@@ -250,7 +249,8 @@ fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<Ve
         let now = Instant::now();
         if dirty {
             // Keep the tick phase; after a long idle, restart the phase from now instead of bursting to catch up.
-            next_tick = (next_tick + frame_interval).max(now);
+            let next = next_tick + frame_interval;
+            next_tick = if next > now { next } else { now + frame_interval };
             dirty = false;
         }
         last_send = now;

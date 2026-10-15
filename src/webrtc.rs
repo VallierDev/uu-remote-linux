@@ -193,13 +193,14 @@ impl WebRtcSession {
             let mut feedback = [0u8; 1500];
             let mut reports = 0usize;
             let mut feedback_counts = FeedbackCounts::default();
-            let mut keyframe_gate = KeyframeGate::new();
             while let Ok((packets, _)) = sender.read(&mut feedback).await {
                 for packet in packets {
                     feedback_counts.observe(packet.as_any());
                     if packet.as_any().is::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
                         || packet.as_any().is::<webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest>() {
-                        if keyframe_gate.allow(&idr_on_feedback, std::time::Instant::now()) {
+                        // Dedupe only while an IDR is pending; the encoder clears the flag when it emits one,
+                        // so a lost IDR does not block the next recovery request.
+                        if !idr_on_feedback.load(std::sync::atomic::Ordering::Acquire) {
                             idr_on_feedback.store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
@@ -947,21 +948,6 @@ impl FeedbackCounts {
     }
 }
 
-/// Keyframe requests from viewer feedback: at most one accepted per `KEYFRAME_MIN_GAP`, and none while the
-/// previous request still waits for the encoder. Without this, every PLI/FIR forced an IDR, and a lossy link
-/// turned into an IDR storm. The idea follows live777's PLI backoff, written from scratch.
-pub(crate) struct KeyframeGate { last: Option<std::time::Instant> }
-const KEYFRAME_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
-impl KeyframeGate {
-    pub(crate) fn new() -> Self { Self { last: None } }
-    pub(crate) fn allow(&mut self, pending: &std::sync::atomic::AtomicBool, now: std::time::Instant) -> bool {
-        if pending.load(std::sync::atomic::Ordering::Acquire) { return false; }
-        if self.last.is_some_and(|last| now.duration_since(last) < KEYFRAME_MIN_GAP) { return false; }
-        self.last = Some(now);
-        true
-    }
-}
-
 #[cfg(test)]
 mod network_tests {
     use super::*;
@@ -977,22 +963,5 @@ mod network_tests {
         counts.observe(&TransportLayerNack { nacks: vec![NackPair { packet_id: 10, lost_packets: 0b101 }], ..Default::default() });
         counts.observe(&PictureLossIndication::default());
         assert_eq!((counts.nack_packets, counts.pli, counts.fir), (3, 1, 0));
-    }
-    #[test]
-    fn keyframe_gate_drops_request_storms() {
-        use std::sync::atomic::AtomicBool;
-        use std::time::{Duration, Instant};
-        let pending = AtomicBool::new(false);
-        let start = Instant::now();
-        let mut gate = KeyframeGate::new();
-        // A burst of 100 PLIs within one second yields a single accepted request.
-        let accepted = (0..100).filter(|i| gate.allow(&pending, start + Duration::from_millis(*i * 10))).count();
-        assert_eq!(accepted, 1);
-        // While the previous request is still waiting for the encoder, nothing gets through, even after the gap.
-        pending.store(true, std::sync::atomic::Ordering::Release);
-        assert!(!gate.allow(&pending, start + Duration::from_secs(5)));
-        // Once the encoder has answered, the next request is accepted after the gap again.
-        pending.store(false, std::sync::atomic::Ordering::Release);
-        assert!(gate.allow(&pending, start + Duration::from_secs(5)));
     }
 }

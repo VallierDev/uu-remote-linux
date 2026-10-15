@@ -45,7 +45,12 @@ impl DamageCapture {
         if format.bits_per_pixel != 32 { return Err(format!("root depth {depth} is not 32 bits per pixel")); }
         let len = width as usize * height as usize * 4;
 
-        // The segment is marked for removal once attached; the kernel frees it after the last detach.
+        // NonEmpty: one event each time the root goes from clean to damaged; re-armed in `wait`.
+        let damage = conn.generate_id().map_err(text)?;
+        conn.damage_create(damage, root, ReportLevel::NON_EMPTY).map_err(text)?.check().map_err(text)?;
+
+        // Nothing below can fail without also releasing the local mapping, so every error path is covered here.
+        let seg = conn.generate_id().map_err(text)?;
         let shmid = unsafe { libc::shmget(libc::IPC_PRIVATE, len, libc::IPC_CREAT | 0o600) };
         if shmid < 0 { return Err("shmget failed".into()); }
         let shm_ptr = unsafe { libc::shmat(shmid, std::ptr::null(), 0) } as *mut u8;
@@ -53,14 +58,13 @@ impl DamageCapture {
             unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
             return Err("shmat failed".into());
         }
-        let seg = conn.generate_id().map_err(text)?;
-        conn.shm_attach(seg, shmid as u32, false).map_err(text)?.check().map_err(text)?;
+        let attach = conn.shm_attach(seg, shmid as u32, false).map_err(text).and_then(|c| c.check().map_err(text));
+        // Marked for removal either way; the kernel frees it after the last detach.
         unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) };
-
-        // NonEmpty: one event each time the root goes from clean to damaged; re-armed in `wait`.
-        let damage = conn.generate_id().map_err(text)?;
-        conn.damage_create(damage, root, ReportLevel::NON_EMPTY).map_err(text)?.check().map_err(text)?;
-        conn.flush().map_err(text)?;
+        if let Err(error) = attach {
+            unsafe { libc::shmdt(shm_ptr as *const libc::c_void) };
+            return Err(error);
+        }
         Ok(Self { conn, root, damage, damage_event: damage_info.first_event, width, height, seg, shm_ptr, len })
     }
 
