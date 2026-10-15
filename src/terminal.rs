@@ -34,6 +34,7 @@ const MAGIC: &[u8; 4] = b"TERM";
 const HEADER: usize = 16;
 const MAX_PAYLOAD: usize = 0x10_0000;
 const SCROLLBACK: usize = 256 * 1024;
+const OUTPUT_CHUNK: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame { pub kind: u8, pub flags: [u8; 2], pub session: u32, pub payload: Vec<u8> }
@@ -140,7 +141,7 @@ fn spawn(requested_id: u32, cols: u16, rows: u16, shell: Option<&str>) -> Result
     let mut reader = std::fs::File::from(session.master.try_clone().map_err(|e| format!("pty dup failed: {e}"))?);
     let worker = session.clone();
     std::thread::Builder::new().name(format!("uu-term-{id}")).spawn(move || {
-        let mut buf = vec![0u8; 16 * 1024];
+        let mut buf = vec![0u8; OUTPUT_CHUNK];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -222,7 +223,8 @@ impl TerminalConn {
                         self.send(OPEN_RESP, s.id, &reply(0, "ok"));
                         *sink = Some(self.out.clone());
                         let replay: Vec<u8> = s.scrollback.lock().unwrap().iter().copied().collect();
-                        if !replay.is_empty() { self.send(STDOUT, s.id, &replay); }
+                        // A full scrollback exceeds SCTP's 64 KiB outbound message limit.
+                        for chunk in replay.chunks(OUTPUT_CHUNK) { self.send(STDOUT, s.id, chunk); }
                     }
                     Err(e) => { log::warn!("Terminal open failed: {}", e); self.send(OPEN_RESP, frame.session, &reply(1, &e)); }
                 }
@@ -286,6 +288,44 @@ mod tests {
             assert_eq!(response.kind, LIST_RESP);
             assert_eq!(response.session, request);
             assert!(json(&response.payload).is_array());
+        }
+    }
+    #[test]
+    fn reconnect_replays_large_history_in_bounded_frames() {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let id = u32::MAX - 1;
+        let history: Vec<u8> = (0..SCROLLBACK).map(|n| (n % 251) as u8).collect();
+        let session = Arc::new(Session { id, shell: "/bin/sh".into(), created_ms: now_ms(),
+            master: pty.master, pid: 0, sink: Mutex::new(None),
+            scrollback: Mutex::new(history.iter().copied().collect()) });
+        registry().lock().unwrap().insert(id, session.clone());
+        struct Cleanup(u32);
+        impl Drop for Cleanup { fn drop(&mut self) { registry().lock().unwrap().remove(&self.0); } }
+        let _cleanup = Cleanup(id);
+
+        for _ in 0..2 {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let conn = TerminalConn::new(tx);
+            conn.handle(&encode(OPEN, id, br#"{"cols":80,"rows":24}"#));
+            let opened = decode(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(opened.kind, OPEN_RESP);
+            assert_eq!(opened.session, id);
+            let mut replay = Vec::new();
+            while replay.len() < history.len() {
+                let packet = rx.try_recv().unwrap();
+                // SCTP's default outbound limit includes the TERM header.
+                assert!(packet.len() <= 65536, "terminal replay exceeds the SCTP message limit");
+                let frame = decode(&packet).unwrap();
+                assert_eq!(frame.kind, STDOUT);
+                assert_eq!(frame.session, id);
+                replay.extend(frame.payload);
+            }
+            assert!(replay == history, "terminal replay must preserve every byte in order");
+            assert!(session.emit(STDOUT, b"live output"));
+            assert_eq!(decode(&rx.try_recv().unwrap()).unwrap().payload, b"live output");
+            conn.handle(&encode(LIST_REQ, 7, &[]));
+            assert_eq!(decode(&rx.try_recv().unwrap()).unwrap().kind, LIST_RESP);
+            conn.handle(&encode(DETACH, id, &[]));
         }
     }
     #[test]
