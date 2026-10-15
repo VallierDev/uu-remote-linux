@@ -66,6 +66,8 @@ Portal 仅作用于本服务获授权的会话。文件传输、终端等独立�
 
 Wayland 下的限制：只支持单屏、固定分辨率；Hyprland 原生后端默认使用双缓冲流水线 shm screencopy，控制端帧率设置会同步到采集节拍和编码器，但实际帧率仍受合成器、渲染和读回速度限制（旧串行路径在 2560x1600 曾测得约 16～22 帧；流水线只在虚拟机里测量过，不代表实机保证）；portal 后端暂不支持唤醒屏幕和动态分辨率；剪贴板只在控制端的远控窗口处于前台时同步。
 
+原生 Wayland 后端需要合成器提供 `wlr-output-power-management` 才能唤醒已关闭的屏幕；缺少该协议不影响采集和编码。
+
 原生 Wayland 实验选项：`UU_WAYLAND_PIPELINE=0` 可关闭流水线做对照。`UU_WAYLAND_DMABUF=1` 显式尝试 dma-buf→GBM CPU 映射（默认关闭，需要运行时 libgbm；可用 `UU_WAYLAND_DMABUF_DEVICE` 指定 render node，默认 `/dev/dri/renderD128`）。仅支持显式线性修饰符、单平面 8-bit RGB，失败回退 SHM；virgl VM 中只验证了回退，成功导入/映射和硬件加速均未验证。这不是零拷贝 VAAPI 路径；选择 `UU_VIDEO_ENCODER=vaapi` 时仍由 FFmpeg 上传 CPU 帧。
 首次连接时，桌面会弹窗请求「远程桌面 / 屏幕共享」授权，同意后会记住授权。
 
