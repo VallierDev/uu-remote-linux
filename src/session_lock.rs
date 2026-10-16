@@ -136,10 +136,16 @@ type Sequence = std::sync::Arc<std::sync::atomic::AtomicU64>;
 fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() }
 
 /// Message 15 SystemStateChange { 1: SecureDesktopState } on CONTROL.
-pub async fn send_state(channel: &Channel, sequence: &Sequence, locked: bool) {
+pub async fn send_state(channel: &Channel, sequence: &Sequence, locked: bool) -> bool {
     let seq = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let message = crate::initialization::encode_secure_desktop(seq, now(), locked, false, supported());
-    if let Err(e) = channel.send(&bytes::Bytes::from(message)).await { log::warn!("Secure desktop state send failed: {e}"); }
+    match channel.send(&bytes::Bytes::from(message)).await {
+        Ok(_) => {
+            log::info!("Secure desktop state sent: locked={} auto_unlock={}", locked, supported());
+            true
+        }
+        Err(e) => { log::warn!("Secure desktop state send failed: {e}"); false }
+    }
 }
 
 /// Reports the lock state to one desktop viewer: now, then on every change, until it closes.
@@ -149,9 +155,7 @@ pub async fn report_states(channel: Channel, sequence: Sequence, mut state: watc
     loop {
         let locked = *state.borrow_and_update();
         if let Some(locked) = locked.filter(|l| sent != Some(*l)) {
-            send_state(&channel, &sequence, locked).await;
-            log::info!("Secure desktop state sent: locked={} auto_unlock={}", locked, supported());
-            sent = Some(locked);
+            if send_state(&channel, &sequence, locked).await { sent = Some(locked); }
         }
         tokio::select! {
             changed = state.changed() => if changed.is_err() { return; },

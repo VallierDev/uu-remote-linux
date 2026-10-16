@@ -116,6 +116,14 @@ async fn locked_control_unlock_requests_and_tools_work_without_a_video_frame() {
         let echo = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
         let echo: serde_json::Value = serde_json::from_slice(body(body(&echo, 3).unwrap(), 2).unwrap()).unwrap();
         assert_eq!(echo["seq"], 91);
+        // A viewer may discard the unsolicited state before its Echo handshake completes.
+        let state = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 15).await;
+        let secure = body(body(&state, 15).unwrap(), 1).unwrap();
+        assert!(decode_wire(secure).unwrap().iter().any(|f| f.number == 1 && f.value == WireValue::Varint(1)));
+        send(&viewer, "CONTROL_DATA_CHANNEL",
+            crate::initialization::envelope(92, 0, 16, &[8, 1])).await;
+        let state = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 15).await;
+        assert!(body(body(&state, 15).unwrap(), 1).is_some());
         // Missing password exercises the real AUTO_UNLOCK_SYSTEM failure route
         // without invoking PAM or unlocking the local user's desktop.
         send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(1, 0, 3, &[8, 15])).await;

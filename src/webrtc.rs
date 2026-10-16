@@ -939,7 +939,13 @@ impl WebRtcSession {
                                 // QuerySystemState { 1: SS_ID_SECURE_DESKTOP_STATE = 1 } asks for the lock state now.
                                 let query = fields.iter().find_map(|f| match (&f.value, f.number) { (WireValue::Bytes(v), 16) => Some(*v), _ => None });
                                 if let Some(query) = query {
-                                    let id = crate::protocol::decode_wire(query).ok().and_then(|q| q.iter().find_map(|f| match (&f.value, f.number) { (WireValue::Varint(v), 1) => Some(*v), _ => None }));
+                                    let query_fields = crate::protocol::decode_wire(query).ok();
+                                    let id = query_fields.as_ref().and_then(|q| q.iter().find_map(|f| match (&f.value, f.number) { (WireValue::Varint(v), 1) => Some(*v), _ => None }));
+                                    let shape = query_fields.as_ref().map(|fields| fields.iter().map(|field| match &field.value {
+                                        WireValue::Bytes(bytes) => (field.number, "bytes", bytes.len()),
+                                        _ => (field.number, "number", 0),
+                                    }).collect::<Vec<_>>());
+                                    log::info!("CONTROL system-state query: fields={:?} secure_desktop={}", shape, id == Some(1));
                                     if id == Some(1) {
                                         let locked = *lock_for_message.borrow();
                                         crate::session_lock::send_state(&reply_chan, &out_sequence, locked != Some(false)).await;
@@ -995,9 +1001,13 @@ impl WebRtcSession {
                                             if let Err(e) = reply_chan.send(&bytes::Bytes::from(response)).await {
                                                 log::error!("CONTROL echo response failed: {}", e);
                                             } else {
-                                                static RESPONSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                                                if RESPONSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-                                                    log::info!("CONTROL protobuf echo request answered");
+                                                log::info!("CONTROL protobuf echo request answered");
+                                                if desktop {
+                                                    // Mobile failures send QuerySystemState after Echo, while the
+                                                    // successful Mac sends action15 directly. Refresh after the
+                                                    // handshake so an early unsolicited state is not the only one.
+                                                    let locked = *lock_for_message.borrow();
+                                                    crate::session_lock::send_state(&reply_chan, &out_sequence, locked != Some(false)).await;
                                                 }
                                             }
                                         }
