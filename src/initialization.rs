@@ -128,7 +128,8 @@ pub fn encode_screen_sources(seq: u64, timestamp: u64, screens: &[Screen<'_>], c
 }
 
 /// Message.which field 8 CaptureChange. Enum: desktop=0, window=1,
-/// MuMu=2, hook=3, none=99. Caller confirms the active capture before emitting.
+/// MuMu=2, hook=3, none=99. Declares the selected target, not frame readiness:
+/// Android's unlock presenter requires desktop/window here even while locked.
 pub fn encode_capture_change(seq: u64, timestamp: u64, capture_type: i32, type_value: i32, description: &str) -> Result<Vec<u8>, String> {
     if !matches!(capture_type, 0 | 1 | 2 | 3 | 99) {
         return Err("Unknown CaptureChange type".into());

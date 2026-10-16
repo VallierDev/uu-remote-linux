@@ -613,6 +613,22 @@ impl WebRtcSession {
                             });
                             return;
                           }
+                            let early_desktop_selection = desktop && portal_desktop.is_some();
+                            if early_desktop_selection {
+                                // Android 4.43.0's unlock presenter requires CaptureChange
+                                // CT_DESKTOP/CT_WINDOW as well as SecureDesktopState before
+                                // sending UnlockRemoteSystem, even with no video frames.
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let message = crate::initialization::encode_capture_change(
+                                    sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                                    timestamp, 0, 0, "Linux desktop").expect("desktop capture type");
+                                if let Err(error) = channel.send(&bytes::Bytes::from(message)).await {
+                                    log::error!("CONTROL desktop selection failed: {error}");
+                                    return;
+                                }
+                                log::info!("CONTROL initialization field 8 sent (desktop selection before capture)");
+                            }
                             if desktop {
                                 // Report secure-desktop state before waiting for capture,
                                 // so AUTO_UNLOCK_SYSTEM can arrive on this same CONTROL.
@@ -711,6 +727,7 @@ impl WebRtcSession {
                                     log::info!("Desktop codec selected: {:?}", codec); current.codec = codec; true } else { false });
                             }
                             for (field, message) in messages {
+                                if early_desktop_selection && field == 8 { continue; }
                                 if (!desktop || screen.init_error.is_some()) && field == 18 { continue; }
                                 if desktop && screen.init_error.is_some() && matches!(field,7|8) { continue; }
                                 let message = match message {
@@ -1002,13 +1019,6 @@ impl WebRtcSession {
                                                 log::error!("CONTROL echo response failed: {}", e);
                                             } else {
                                                 log::info!("CONTROL protobuf echo request answered");
-                                                if desktop {
-                                                    // Mobile failures send QuerySystemState after Echo, while the
-                                                    // successful Mac sends action15 directly. Refresh after the
-                                                    // handshake so an early unsolicited state is not the only one.
-                                                    let locked = *lock_for_message.borrow();
-                                                    crate::session_lock::send_state(&reply_chan, &out_sequence, locked != Some(false)).await;
-                                                }
                                             }
                                         }
                                     }

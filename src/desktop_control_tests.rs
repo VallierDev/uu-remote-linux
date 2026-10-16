@@ -104,6 +104,14 @@ async fn locked_control_unlock_requests_and_tools_work_without_a_video_frame() {
         let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
             Arc::new(ScreenCapture::unavailable("synthetic locked desktop".into())), locked));
         let (desktop, mut viewer) = connect(input.clone(), true, Some(portal.clone()), &["CONTROL_DATA_CHANNEL"]).await;
+        // Official Android 4.43.0's unlock presenter requires CaptureChange
+        // (desktop/window) before it will use the secure state to send action15.
+        let selected = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 8).await;
+        let selected = decode_wire(body(&selected, 8).unwrap()).unwrap();
+        let capture_type = selected.iter().find_map(|f| match (f.number, &f.value) {
+            (1, WireValue::Varint(value)) => Some(*value), _ => None,
+        }).unwrap_or(0);
+        assert_eq!(capture_type, 0);
         let state = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 15).await;
         let secure = body(body(&state, 15).unwrap(), 1).unwrap();
         assert!(decode_wire(secure).unwrap().iter().any(|f| f.number == 1 && f.value == WireValue::Varint(1)));
@@ -116,10 +124,6 @@ async fn locked_control_unlock_requests_and_tools_work_without_a_video_frame() {
         let echo = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
         let echo: serde_json::Value = serde_json::from_slice(body(body(&echo, 3).unwrap(), 2).unwrap()).unwrap();
         assert_eq!(echo["seq"], 91);
-        // A viewer may discard the unsolicited state before its Echo handshake completes.
-        let state = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 15).await;
-        let secure = body(body(&state, 15).unwrap(), 1).unwrap();
-        assert!(decode_wire(secure).unwrap().iter().any(|f| f.number == 1 && f.value == WireValue::Varint(1)));
         send(&viewer, "CONTROL_DATA_CHANNEL",
             crate::initialization::envelope(92, 0, 16, &[8, 1])).await;
         let state = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 15).await;
