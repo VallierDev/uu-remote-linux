@@ -351,6 +351,7 @@ impl WebRtcSession {
                 let inp = input_inst.clone();
                 let d_reply = d.clone();
                 let input_size = (screen.width, screen.height);
+                let logical_size = screen.portal.as_ref().map_or(input_size, |portal| portal.logical_size());
                 let reply_sequence = out_sequence.clone();
                 let channel_video_settings = peer_video_settings.clone();
                 let channel_actions = peer_actions.clone();
@@ -471,7 +472,7 @@ impl WebRtcSession {
                                     &crate::system_metrics::remote_download_path(&home)))),
                                 (18, Ok(crate::initialization::envelope(next_seq(), timestamp, 18,
                                     &crate::capture_setting::codec_negotiation(screen_size, crate::video::FPS as u32, init_track.supports(crate::capture_setting::VideoCodec::H265))))),
-                                (7, crate::capture_setting::screen_sources(next_seq(), timestamp, screen_size, init_video.borrow().output, "Linux desktop")),
+                                (7, crate::capture_setting::screen_sources(next_seq(), timestamp, screen_size, if screen.init_error.is_none() { logical_size } else { screen_size }, init_video.borrow().output, "Linux desktop")),
                             ];
                             if desktop && screen.init_error.is_none() {
                                 let codec = crate::capture_setting::preferred_codec(init_track.supports(crate::capture_setting::VideoCodec::H264),
@@ -565,7 +566,7 @@ impl WebRtcSession {
                                 let _ = rpc_out.send(crate::initialization::envelope(next(), ts, 22, &response));
                                 let current = *video_settings.borrow();
                                 if current.output != output_before {
-                                    match crate::capture_setting::screen_sources(next(), ts, input_size, current.output, "Linux desktop") {
+                                    match crate::capture_setting::screen_sources(next(), ts, input_size, logical_size, current.output, "Linux desktop") {
                                         Ok(screens) => { let _ = rpc_out.send(screens); },
                                         Err(e) => log::warn!("Screen sources update failed: {}", e),
                                     }

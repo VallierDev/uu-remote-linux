@@ -59,12 +59,14 @@ Portal 仅作用于本服务获授权的会话。文件传输、终端等独立�
 | Xfce | X11 | ✅ 虚拟机测试通过 | 默认 |
 | Cinnamon / MATE | X11 | ✅ 虚拟机测试通过 | 默认 |
 | Hyprland | Wayland（wlroots 原生协议） | 🧪 实验性，虚拟机测试（部分功能受限，见下） | `--features wayland` |
-| GNOME / KDE Plasma | Wayland（xdg-desktop-portal） | 🧪 实验性，虚拟机测试（部分功能受限，见下） | `--features wayland,portal` |
+| GNOME / KDE Plasma | Wayland（xdg-desktop-portal） | 🧪 实验性，验证范围与限制见下 | `--features wayland,portal` |
 
-除 GNOME（X11）外，其余桌面目前都是在虚拟机里测试的。如果你在真机上遇到问题，欢迎[提交 issue](../../issues)，
+GNOME Wayland 的 Portal/EIS 路径已在 Ubuntu 26.04、GNOME 50、单屏 4K/200% 缩放下验证画面和键鼠；锁屏恢复及重连仍待实机验收。除 GNOME 的上述路径和 X11 外，其余桌面目前主要在虚拟机里测试。如果你在真机上遇到问题，欢迎[提交 issue](../../issues)，
 请附上发行版、桌面环境、显卡型号和 `journalctl --user -u uuremote-native.service` 里的相关日志。
 
 Wayland 下的限制：只支持单屏、固定分辨率；Hyprland 原生后端默认使用双缓冲流水线 shm screencopy，控制端帧率设置会同步到采集节拍和编码器，但实际帧率仍受合成器、渲染和读回速度限制（旧串行路径在 2560x1600 曾测得约 16～22 帧；流水线只在虚拟机里测量过，不代表实机保证）；portal 后端暂不支持唤醒屏幕和动态分辨率；剪贴板只在控制端的远控窗口处于前台时同步。
+
+GNOME 缩放桌面在使用 Portal 原生键鼠时，若支持 `ConnectToEIS` 和屏幕 `mapping_id`，通过同一授权会话的 EIS 接口注入输入，按匹配的区域与实际帧尺寸分别映射横纵坐标，没有固定分辨率或缩放倍率，可避免 `NotifyPointerMotionAbsolute` 在缩放时拒绝坐标。Portal 构建需要 libei ≥ 1.1。缺少 EIS 支持时保留旧输入路径及其既有缩放限制；其他初始化错误会明确报告并触发会话恢复。EIS 连接成功后全部输入统一使用 EIS。只采集画面或使用 uinput 时不会初始化 EIS；缺少可选的逻辑尺寸也不阻断采集。键盘沿用项目现有的 Windows VK → evdev 映射。恢复时若物理或逻辑尺寸变化，需要重新连接。此路径仍需实机验证锁屏恢复；多屏、连接中改变分辨率及旋转/镜像变换不属于本次修复范围。
 
 原生 Wayland 后端需要合成器提供 `wlr-output-power-management` 才能唤醒已关闭的屏幕；缺少该协议不影响采集和编码。
 
@@ -97,7 +99,7 @@ sudo apt install build-essential pkg-config \
 # 可选：Wayland 后端
 sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # 可选：GNOME/KDE portal 后端
-sudo apt install libglib2.0-dev libpipewire-0.3-dev
+sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
 ```
 
 - 需要 Rust 工具链（<https://rustup.rs>）。

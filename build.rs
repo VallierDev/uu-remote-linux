@@ -51,10 +51,11 @@ fn main() {
         if std::env::var_os("CARGO_FEATURE_PORTAL").is_some() {
             println!("cargo:rerun-if-changed=c_engine/portal_engine.c");
             println!("cargo:rerun-if-changed=c_engine/portal_engine.h");
+            println!("cargo:rerun-if-changed=c_engine/portal_eis.inc");
             let flags=|kind:&str| {
-                let output=std::process::Command::new("pkg-config").args([kind,"gio-2.0","gio-unix-2.0","libpipewire-0.3"]).output()
-                    .expect("Install pkg-config and GIO/PipeWire development libraries");
-                assert!(output.status.success(),"Portal requires GIO and PipeWire development libraries");
+                let output=std::process::Command::new("pkg-config").args([kind,"gio-2.0","gio-unix-2.0","libpipewire-0.3","libei-1.0 >= 1.1"]).output()
+                    .expect("Install pkg-config and GIO/PipeWire/libei development libraries");
+                assert!(output.status.success(),"Portal requires GIO, PipeWire and libei >= 1.1 development libraries");
                 String::from_utf8(output.stdout).expect("pkg-config flags must be UTF-8")
             };
             let mut build=cc::Build::new();

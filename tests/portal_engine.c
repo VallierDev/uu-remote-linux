@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 /* Protocol-independent C bounds/lifecycle checks; never requests consent. */
 #include <assert.h>
-#include "portal_engine.c"
+#include "../c_engine/portal_engine.c"
 static void clipboard_bounds(void) {
     int fds[2]; uint8_t bytes[8]={0};
     assert(pipe2(fds,O_NONBLOCK)==0);
@@ -14,8 +14,61 @@ static void clipboard_bounds(void) {
     assert(clipboard_io(fds[1],bytes,1,1)==-1); close(fds[1]);
     assert(clipboard_io(-1,bytes,0,1)==0);
 }
+static void capture_with_optional_geometry(int has_size) {
+    struct uu_portal *p = calloc(1, sizeof(*p));
+    assert(p);
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_cond_init(&p->changed, NULL);
+    p->width = p->height = 2;
+    p->absolute_stream_pixels = 1;
+    GVariantBuilder properties, streams, result;
+    g_variant_builder_init(&properties, G_VARIANT_TYPE_VARDICT);
+    if (has_size) g_variant_builder_add(&properties, "{sv}", "size", g_variant_new("(ii)", 1, 1));
+    g_variant_builder_init(&streams, G_VARIANT_TYPE("a(ua{sv})"));
+    g_variant_builder_add(&streams, "(u@a{sv})", 42u, g_variant_builder_end(&properties));
+    g_variant_builder_init(&result, G_VARIANT_TYPE_VARDICT);
+    g_variant_builder_add(&result, "{sv}", "devices", g_variant_new_uint32(3));
+    g_variant_builder_add(&result, "{sv}", "streams", g_variant_builder_end(&streams));
+    GVariant *reply = g_variant_ref_sink(g_variant_builder_end(&result));
+    assert(read_stream_result(p, reply) == 0 && p->node == 42);
+    g_variant_unref(reply);
+    p->frame_length = 16;
+    p->frame = calloc(1, p->frame_length);
+    assert(p->frame);
+    p->sequence = 1;
+    uint8_t pixels[16];
+    /* Optional compositor metadata must not gate capture/uinput. */
+    uu_portal_input_dispatch(p);
+    assert(!p->ei && uu_portal_alive(p));
+    assert(uu_portal_capture(p, pixels, sizeof(pixels)) == 0);
+    uint32_t width, height;
+    uu_portal_logical_size(p, &width, &height);
+    assert(width == (has_size ? 1 : 2) && height == width);
+    if (!has_size) assert(uu_portal_move(p, 1, 1, 0) == 11);
+    assert(!p->ei && uu_portal_alive(p));
+    uu_portal_close(p);
+}
+static void authorization_still_required(void) {
+    const unsigned cases[][2] = {{0,1}, {1,1}, {2,1}, {3,0}, {3,2}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        GVariantBuilder streams, result;
+        g_variant_builder_init(&streams, G_VARIANT_TYPE("a(ua{sv})"));
+        for (unsigned n = 0; n < cases[i][1]; n++)
+            g_variant_builder_add(&streams, "(u@a{sv})", n + 42, empty_options());
+        g_variant_builder_init(&result, G_VARIANT_TYPE_VARDICT);
+        g_variant_builder_add(&result, "{sv}", "devices", g_variant_new_uint32(cases[i][0]));
+        g_variant_builder_add(&result, "{sv}", "streams", g_variant_builder_end(&streams));
+        GVariant *reply = g_variant_ref_sink(g_variant_builder_end(&result));
+        struct uu_portal p = {0};
+        assert(read_stream_result(&p, reply) == 6);
+        g_variant_unref(reply);
+    }
+}
 int main(void) {
     clipboard_bounds();
+    capture_with_optional_geometry(0);
+    capture_with_optional_geometry(1);
+    authorization_still_required();
     struct uu_portal *p = calloc(1, sizeof(*p));
     assert(p);
     pthread_mutex_init(&p->lock, NULL);
@@ -88,7 +141,7 @@ int main(void) {
     assert(uu_portal_clipboard_poll(p,NULL,CLIP_LIMIT)==-1);
     p->error=8;
     assert(!uu_portal_alive(p));
-    assert(uu_portal_key(p, 'a', 1)==9); /* no input into an unusable stream */
+    assert(uu_portal_key(p, 'a', 30, 1)==9); /* no input into an unusable stream */
     p->error=0;
     p->clipboard_enabled=1;
     assert(uu_portal_clipboard_supported(p));

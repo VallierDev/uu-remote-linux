@@ -181,12 +181,13 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
 }
 
 /// Message 7 ScreenSources for the single desktop: native size, scaled choices, current size.
-pub fn screen_sources(seq: u64, timestamp: u64, native: (u32, u32), output: Option<(u32, u32)>, name: &str) -> Result<Vec<u8>, String> {
+pub fn screen_sources(seq: u64, timestamp: u64, native: (u32, u32), logical: (u32, u32), output: Option<(u32, u32)>, name: &str) -> Result<Vec<u8>, String> {
     use crate::initialization::{Screen, WinRect};
     let (w, h) = (native.0 as i32, native.1 as i32);
     let scaled: Vec<(i32, i32)> = scaled_sizes(native).into_iter().map(|(w, h)| (w as i32, h as i32)).collect();
-    let resolution = WinRect { left: 0, top: 0, width: w, height: h, pixel_width: w, pixel_height: h };
-    let screens = [Screen { id: 0, fps: crate::video::FPS as i32, resolution, primary: true, dpr: 1.0,
+    // Screen field 8 is the existing DPR double; WinRect keeps logical and pixel sizes separate.
+    let resolution = WinRect { left: 0, top: 0, width: logical.0 as i32, height: logical.1 as i32, pixel_width: w, pixel_height: h };
+    let screens = [Screen { id: 0, fps: crate::video::FPS as i32, resolution, primary: true, dpr: f64::from(native.0) / f64::from(logical.0),
         display_name: name, video_track_index: 0, screen_type: 0, builtin_screen_type: 0,
         scaled: &scaled, current: output.map(|(w, h)| (w as i32, h as i32)) }];
     crate::initialization::encode_screen_sources(seq, timestamp, &screens, 0)

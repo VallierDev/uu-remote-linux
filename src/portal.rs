@@ -18,11 +18,13 @@ mod native {
         fn uu_portal_clipboard_poll(portal: *mut c_void, text: *mut u8, capacity: usize) -> i32;
         fn uu_portal_close(portal: *mut c_void);
         fn uu_portal_alive(portal: *mut c_void) -> i32;
+        fn uu_portal_input_dispatch(portal: *mut c_void);
+        fn uu_portal_logical_size(portal: *mut c_void, width: *mut u32, height: *mut u32);
         fn uu_portal_reset_frame(portal: *mut c_void);
         fn uu_portal_capture_since(portal: *mut c_void, bgra: *mut u8, length: usize, revision: *mut u64) -> i32;
         fn uu_portal_move(portal: *mut c_void, x: f64, y: f64, relative: i32) -> i32;
         fn uu_portal_button(portal: *mut c_void, button: i32, pressed: i32) -> i32;
-        fn uu_portal_key(portal: *mut c_void, keysym: u32, pressed: i32) -> i32;
+        fn uu_portal_key(portal: *mut c_void, keysym: u32, keycode: i32, pressed: i32) -> i32;
     }
     struct Handle(NonNull<c_void>);
     // The engine owns callback threads; public calls are serialized by Mutex.
@@ -32,8 +34,17 @@ mod native {
         if *version == Some(super::FrameVersion(0, 0)) { return false; }
         super::blank(frame); *version = Some(super::FrameVersion(0, 0)); true
     }
-    pub struct Session { handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, retry_at: Mutex<Option<std::time::Instant>>, pub width: u32, pub height: u32 }
+    pub struct Session { handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, retry_at: Mutex<Option<std::time::Instant>>, pub width: u32, pub height: u32, logical_size: (u32, u32) }
     impl Session {
+        pub fn logical_size(&self) -> (u32, u32) { self.logical_size }
+        fn check_geometry(&self, replacement: &Self) -> Result<(), String> {
+            if (self.width, self.height) != (replacement.width, replacement.height)
+                || self.logical_size != replacement.logical_size {
+                Err("Portal dimensions changed; reconnect required".into())
+            } else {
+                Ok(())
+            }
+        }
         pub fn is_alive(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 })
         }
@@ -56,10 +67,12 @@ mod native {
             }
             let pointer = unsafe { uu_portal_open_persist(token.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()), save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height) };
             let handle = NonNull::new(pointer).ok_or_else(|| super::error(error))?;
+            let (mut logical_width, mut logical_height) = (0, 0);
+            unsafe { uu_portal_logical_size(handle.as_ptr(), &mut logical_width, &mut logical_height) };
             // A freshly opened session holds no lock-screen frame: only an observed lock (or a
             // closed stream) must discard the cached frame. Starting "locked" cleared the first
             // valid frame, and a static desktop sends no new one, so the viewer stayed black (#2).
-            Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), retry_at: Mutex::new(None), width, height })
+            Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), retry_at: Mutex::new(None), width, height, logical_size: (logical_width, logical_height) })
         }
         pub fn capture(&self, frame: &mut [u8]) -> Result<(), String> {
             self.capture_changed(frame, &mut None).map(|_| ())
@@ -67,6 +80,9 @@ mod native {
         pub fn capture_changed(&self, frame: &mut [u8], version: &mut Option<super::FrameVersion>) -> Result<bool, String> {
             if frame.len() != self.width as usize * self.height as usize * 4 { return Err(super::error(11)); }
             let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+            // Drain EIS even on a static desktop so pause/disconnect and sync
+            // events are processed without waiting for remote input.
+            unsafe { uu_portal_input_dispatch(handle.0.as_ptr()) };
             let state = *self.locked.borrow();
             if state != Some(false) {
                 // Unknown state (watcher not reported yet): show nothing but keep the cached frame.
@@ -101,9 +117,7 @@ mod native {
                     }
                 };
                 *retry = None;
-                if replacement.width != self.width || replacement.height != self.height {
-                    return Err("Portal dimensions changed; reconnect required".into());
-                }
+                self.check_geometry(&replacement)?;
                 *handle = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?;
                 log::info!("Portal capture session restored after closure");
             }
@@ -150,7 +164,64 @@ mod native {
             if pressed && *self.locked.borrow() != Some(false) { return Err("Portal input blocked while locked".into()); }
             let symbol = u32::try_from(symbol).map_err(|_| "Invalid Portal keysym")?;
             let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
-            super::check(unsafe { uu_portal_key(handle.0.as_ptr(), symbol, i32::from(pressed)) })
+            let keycode = crate::uinput::keysym_to_evdev(u64::from(symbol)).map_or(-1, i32::from);
+            super::check(unsafe { uu_portal_key(handle.0.as_ptr(), symbol, keycode, i32::from(pressed)) })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::mem::ManuallyDrop;
+
+        struct Fixture(ManuallyDrop<Session>);
+        impl Fixture {
+            fn new(physical: (u32, u32), logical_size: (u32, u32)) -> Self {
+                let (_, locked) = tokio::sync::watch::channel(None);
+                Self(ManuallyDrop::new(Session {
+                    handle: Mutex::new(Handle(NonNull::dangling())),
+                    locked,
+                    was_locked: std::sync::atomic::AtomicBool::new(false),
+                    retry_at: Mutex::new(None),
+                    width: physical.0,
+                    height: physical.1,
+                    logical_size,
+                }))
+            }
+
+            fn session(&self) -> &Session { &self.0 }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let Session { handle, locked, was_locked, retry_at, .. } =
+                    unsafe { ManuallyDrop::take(&mut self.0) };
+                let handle = handle.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::mem::forget(handle);
+                drop((locked, was_locked, retry_at));
+            }
+        }
+
+        #[test]
+        fn logical_size_does_not_depend_on_handle_mutex() {
+            let session = Fixture::new((1920, 1080), (1280, 720));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _handle = session.session().handle.lock().unwrap();
+                panic!("poison test handle mutex");
+            }));
+
+            assert_eq!(session.session().logical_size(), (1280, 720));
+        }
+
+        #[test]
+        fn recovery_rejects_physical_or_logical_geometry_changes() {
+            let original = Fixture::new((1920, 1080), (1280, 720));
+            let same = Fixture::new((1920, 1080), (1280, 720));
+            let physical_changed = Fixture::new((2560, 1440), (1280, 720));
+            let logical_changed = Fixture::new((1920, 1080), (1600, 900));
+
+            assert!(original.session().check_geometry(same.session()).is_ok());
+            assert!(original.session().check_geometry(physical_changed.session()).is_err());
+            assert!(original.session().check_geometry(logical_changed.session()).is_err());
         }
     }
 }
@@ -175,6 +246,7 @@ pub use native::Session as PortalSession;
 pub struct PortalSession { pub width: u32, pub height: u32 }
 #[cfg(not(all(target_os = "linux", feature = "portal")))]
 impl PortalSession {
+    pub fn logical_size(&self) -> (u32, u32) { (self.width, self.height) }
     pub fn clipboard_supported(&self) -> bool { false }
     pub fn clipboard_ready(&self) -> bool { false }
     pub fn clipboard_set(&self, _: &str) -> Result<(), String> { Err(error(2)) }

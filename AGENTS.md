@@ -40,7 +40,7 @@ sudo apt install build-essential pkg-config \
 # --features inproc-av:      libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev
 #                            (FFmpeg 6.x; in-process capture/encoding, Ubuntu 24.04 ships it)
 # --features wayland:        libwayland-dev libxkbcommon-dev wl-clipboard
-# --features wayland,portal: + libglib2.0-dev libpipewire-0.3-dev
+# --features wayland,portal: + libglib2.0-dev libpipewire-0.3-dev libei-dev (libei >= 1.1)
 ```
 
 Rust stable via rustup. Commands:
@@ -139,6 +139,7 @@ every 60 s.
 | `src/initialization.rs`, `src/control_protocol.rs`, `src/protocol.rs` | protobuf encoders/decoders for CONTROL |
 | `src/session_ice.rs`, `src/network_diagnostics.rs` | cloud ICE servers, address-free path diagnostics |
 | `src/desktop_backend.rs`, `src/wayland.rs`, `src/portal*.rs` | backend selection, Hyprland, GNOME/KDE portal |
+| `c_engine/portal_eis.inc` | scaled GNOME input through the existing Portal session's EIS connection; all input must use EIS once connected |
 | `c_engine/x11_engine.c`, `c_engine/clipboard.c` | X11 capture/input/selection |
 | `c_engine/wayland_engine.c`, `c_engine/portal_engine.c` | Wayland and portal engines |
 | `src/assist.rs`, `c_engine/assist_window.c` | remote assistance (guest + account) and the unified GTK main window (assist + account/QR card) |

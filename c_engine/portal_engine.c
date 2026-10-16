@@ -2,6 +2,8 @@
 #include "portal_engine.h"
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
+#include <libei.h>
+#include <poll.h>
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/pod/builder.h>
@@ -47,6 +49,12 @@ struct uu_portal {
     uint32_t node, width, height;
     int logical_width, logical_height;
     int absolute_stream_pixels;
+    struct ei *ei;
+    GList *ei_devices;
+    char *mapping_id;
+    uint32_t ei_sequence;
+    atomic_int ei_failed;
+    int ei_unavailable;
     enum spa_video_format format;
     uint8_t *frame;
     size_t frame_length;
@@ -59,6 +67,7 @@ static pthread_once_t pw_once = PTHREAD_ONCE_INIT;
 static atomic_uint token_sequence = 1;
 static void initialize_pipewire(void) { pw_init(NULL, NULL); }
 static GVariant *empty_options(void) { return g_variant_new_array(G_VARIANT_TYPE("{sv}"), NULL, 0); }
+#include "portal_eis.inc"
 static void fail(struct uu_portal *p, int error) {
     pthread_mutex_lock(&p->lock);
     if (!p->error) p->error = error;
@@ -271,6 +280,27 @@ static int connect_pipewire(struct uu_portal *p) {
     pthread_mutex_unlock(&p->lock);
     return result;
 }
+static int read_stream_result(struct uu_portal *p, GVariant *results) {
+    guint devices = 0;
+    GVariant *streams = g_variant_lookup_value(results, "streams", G_VARIANT_TYPE("a(ua{sv})"));
+    gboolean has_devices = g_variant_lookup(results, "devices", "u", &devices);
+    fprintf(stderr, "Portal authorization result: devices_present=%d device_bits=%u stream_count=%zu\n",
+        has_devices, devices, streams ? (size_t)g_variant_n_children(streams) : 0);
+    int error = 0;
+    if (!has_devices || (devices & 3) != 3 || !streams || g_variant_n_children(streams) != 1) {
+        error = 6;
+    } else {
+        GVariant *entry = g_variant_get_child_value(streams, 0), *properties;
+        g_variant_get(entry, "(u@a{sv})", &p->node, &properties);
+        /* Optional 'size' is compositor logical coordinates, not frame pixels. */
+        g_variant_lookup(properties, "size", "(ii)", &p->logical_width, &p->logical_height);
+        const char *mapping_id = NULL;
+        if (g_variant_lookup(properties, "mapping_id", "&s", &mapping_id)) p->mapping_id = g_strdup(mapping_id);
+        g_variant_unref(properties); g_variant_unref(entry);
+    }
+    if (streams) g_variant_unref(streams);
+    return error;
+}
 struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *), void *data, int *error, uint32_t *width, uint32_t *height) {
     *error = 0; *width = *height = 0;
     struct uu_portal *p = calloc(1, sizeof(*p));
@@ -341,18 +371,7 @@ struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)
     g_variant_lookup(results,"clipboard_enabled","b",&clipboard_enabled);
     p->clipboard_enabled=clipboard_enabled;
     fprintf(stderr,"Portal clipboard permission: granted=%d\n",clipboard_enabled);
-    guint devices = 0; GVariant *streams = g_variant_lookup_value(results, "streams", G_VARIANT_TYPE("a(ua{sv})"));
-    gboolean has_devices=g_variant_lookup(results, "devices", "u", &devices);
-    fprintf(stderr,"Portal authorization result: devices_present=%d device_bits=%u stream_count=%zu\n",has_devices,devices,streams?(size_t)g_variant_n_children(streams):0);
-    if (!has_devices || (devices & 3) != 3 || !streams || g_variant_n_children(streams) != 1) {
-        *error = 6;
-    } else {
-        GVariant *entry = g_variant_get_child_value(streams, 0), *properties;
-        g_variant_get(entry, "(u@a{sv})", &p->node, &properties);
-        /* 'size' is compositor logical coordinates, not the pixel frame size. */
-        g_variant_lookup(properties, "size", "(ii)", &p->logical_width, &p->logical_height);
-        g_variant_unref(properties); g_variant_unref(entry);
-    }
+    *error = read_stream_result(p, results);
     if (!*error) {
         const char *next = NULL;
         if (g_variant_lookup(results, "restore_token", "&s", &next) && next && strlen(next) <= 4096)
@@ -361,7 +380,6 @@ struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)
             version >= 2, restore && *restore, p->restore_token && *p->restore_token);
     }
     if (!*error && p->restore_token && save_token) save_token(p->restore_token, data);
-    if (streams) g_variant_unref(streams);
     g_variant_unref(results);
     if (*error) goto done;
     p->main_loop = g_main_loop_new(p->context, FALSE);
@@ -372,7 +390,7 @@ struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)
     if (*error) { uu_portal_close(p); return NULL; }
     fprintf(stderr, "Portal pointer geometry: frame=%ux%u compositor=%dx%d absolute=%s\n",
         p->width, p->height, p->logical_width, p->logical_height,
-        p->absolute_stream_pixels ? "stream-pixels" : "compositor-logical");
+        p->absolute_stream_pixels ? "stream-pixels-or-eis" : "compositor-logical");
     *width = p->width; *height = p->height;
     return p;
 done:
@@ -390,6 +408,7 @@ static gboolean quit_dbus_loop(gpointer data) { g_main_loop_quit(data); return G
 void uu_portal_close(struct uu_portal *p) {
     if (!p) return;
     atomic_store(&p->closed, 1);
+    portal_eis_close(p);
     if (p->bus && p->session) {
         GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
             NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
@@ -414,6 +433,7 @@ void uu_portal_close(struct uu_portal *p) {
     if (p->main_loop) g_main_loop_unref(p->main_loop);
     if (p->context) g_main_context_unref(p->context);
     if (p->bus) g_object_unref(p->bus);
+    g_free(p->mapping_id);
     g_free(p->clipboard_text); g_free(p->clipboard_mime); g_free(p->restore_token); free(p->session); free(p->frame);
     pthread_cond_destroy(&p->changed); pthread_mutex_destroy(&p->lock); free(p);
 }
@@ -440,11 +460,41 @@ int uu_portal_capture_since(struct uu_portal *p, uint8_t *frame, size_t length, 
     pthread_mutex_unlock(&p->lock); return result;
 }
 int uu_portal_alive(struct uu_portal *p) {
-    if (!p || atomic_load(&p->closed)) return 0;
+    if (!p || atomic_load(&p->closed) || atomic_load(&p->ei_failed)) return 0;
     pthread_mutex_lock(&p->lock);
     int alive = !p->error;
     pthread_mutex_unlock(&p->lock);
     return alive;
+}
+void uu_portal_input_dispatch(struct uu_portal *p) {
+    if (p->ei) portal_eis_dispatch(p);
+}
+static int prepare_input(struct uu_portal *p) {
+    if (!uu_portal_alive(p)) return 9;
+    /* xdg-desktop-portal 1.21 checks Notify absolute positions against logical
+     * stream size, while GNOME 50 forwards them into Mutter's pixel transform.
+     * Initialize EIS only when native input is used, leaving capture/uinput
+     * independent of EIS support. ConnectToEIS disables all Notify* methods. */
+    if (!p->ei && !p->ei_unavailable && p->absolute_stream_pixels &&
+        p->logical_width > 0 && p->logical_height > 0 &&
+        (p->width != (uint32_t)p->logical_width || p->height != (uint32_t)p->logical_height)) {
+        int result = portal_eis_open(p);
+        if (result == PORTAL_EIS_UNSUPPORTED) {
+            p->ei_unavailable = 1;
+            fprintf(stderr, "Portal EIS unavailable; retaining legacy input\n");
+            return 0;
+        }
+        if (result) {
+            /* A timeout may have committed ConnectToEIS at the portal. Any
+             * failure except explicit lack of support needs a fresh session. */
+            atomic_store(&p->ei_failed, 1);
+            static atomic_uint failures;
+            if (atomic_fetch_add(&failures, 1) < 12)
+                fprintf(stderr, "Portal EIS input initialization failed: code=%d\n", result);
+            return result;
+        }
+    }
+    return 0;
 }
 static int notify(struct uu_portal *p, const char *method, GVariant *parameters) {
     if (!uu_portal_alive(p)) { g_variant_ref_sink(parameters); g_variant_unref(parameters); return 9; }
@@ -462,18 +512,29 @@ static int notify(struct uu_portal *p, const char *method, GVariant *parameters)
     }
     g_variant_unref(reply); return 0;
 }
+void uu_portal_logical_size(struct uu_portal *p, uint32_t *width, uint32_t *height) {
+    /* Stream size is optional; unknown logical geometry keeps the existing
+     * pixel-sized inventory without preventing capture or uinput. */
+    int known = p->logical_width > 0 && p->logical_height > 0;
+    *width = known ? (uint32_t)p->logical_width : p->width;
+    *height = known ? (uint32_t)p->logical_height : p->height;
+}
 int uu_portal_move(struct uu_portal *p, double x, double y, int relative) {
     if (!p || !isfinite(x) || !isfinite(y)) return 11;
     if (p->logical_width <= 0 || p->logical_height <= 0 || !p->width || !p->height) return 11;
+    if (!relative && (x < 0 || y < 0 || x >= p->width || y >= p->height)) return 11;
+    int result = prepare_input(p); if (result) return result;
+    if (p->ei) return portal_eis_move(p, x, y, relative);
     if (relative) return notify(p, "NotifyPointerMotion", g_variant_new("(o@a{sv}dd)", p->session, empty_options(),
         x * p->logical_width / p->width, y * p->logical_height / p->height));
-    if (x < 0 || y < 0 || x >= p->width || y >= p->height) return 11;
     return notify(p, "NotifyPointerMotionAbsolute", g_variant_new("(o@a{sv}udd)", p->session, empty_options(), p->node,
         p->absolute_stream_pixels ? x : x * p->logical_width / p->width,
         p->absolute_stream_pixels ? y : y * p->logical_height / p->height));
 }
 int uu_portal_button(struct uu_portal *p, int button, int pressed) {
     if (!p) return 11;
+    int result = prepare_input(p); if (result) return result;
+    if (p->ei) return portal_eis_button(p, button, pressed);
     if (button >= 4 && button <= 7) {
         if (!pressed) return 0;
         return notify(p, "NotifyPointerAxisDiscrete", g_variant_new("(o@a{sv}ui)", p->session, empty_options(),
@@ -483,7 +544,9 @@ int uu_portal_button(struct uu_portal *p, int button, int pressed) {
     if (!code) return 11;
     return notify(p, "NotifyPointerButton", g_variant_new("(o@a{sv}iu)", p->session, empty_options(), code, (guint)!!pressed));
 }
-int uu_portal_key(struct uu_portal *p, uint32_t symbol, int pressed) {
+int uu_portal_key(struct uu_portal *p, uint32_t symbol, int keycode, int pressed) {
     if (!p || !symbol || symbol > INT32_MAX) return 11;
+    int result = prepare_input(p); if (result) return result;
+    if (p->ei) return portal_eis_key(p, keycode, pressed);
     return notify(p, "NotifyKeyboardKeysym", g_variant_new("(o@a{sv}iu)", p->session, empty_options(), (gint)symbol, (guint)!!pressed));
 }

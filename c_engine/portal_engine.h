@@ -14,10 +14,12 @@ int uu_portal_clipboard_ready(struct uu_portal *portal);
 int uu_portal_clipboard_set(struct uu_portal *portal, const uint8_t *text, size_t length);
 int uu_portal_clipboard_poll(struct uu_portal *portal, uint8_t *text, size_t capacity);
 int uu_portal_alive(struct uu_portal *portal);
+void uu_portal_input_dispatch(struct uu_portal *portal);
+void uu_portal_logical_size(struct uu_portal *portal, uint32_t *width, uint32_t *height);
 void uu_portal_reset_frame(struct uu_portal *portal);
 int uu_portal_capture(struct uu_portal *portal, uint8_t *bgra, size_t length);
 int uu_portal_capture_since(struct uu_portal *portal, uint8_t *bgra, size_t length, uint64_t *revision);
 int uu_portal_move(struct uu_portal *portal, double x, double y, int relative);
 int uu_portal_button(struct uu_portal *portal, int button, int pressed);
-int uu_portal_key(struct uu_portal *portal, uint32_t keysym, int pressed);
+int uu_portal_key(struct uu_portal *portal, uint32_t keysym, int keycode, int pressed);
 #endif

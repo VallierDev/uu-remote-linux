@@ -65,15 +65,17 @@ authorized session. Independent file/terminal tool peers do not reset input.
 | Xfce | X11 | ✅ Tested in a VM | default |
 | Cinnamon / MATE | X11 | ✅ Tested in a VM | default |
 | Hyprland | Wayland (native wlroots protocols) | 🧪 Experimental, tested in a VM (some features limited, see below) | `--features wayland` |
-| GNOME / KDE Plasma | Wayland (xdg-desktop-portal) | 🧪 Experimental, tested in a VM (some features limited, see below) | `--features wayland,portal` |
+| GNOME / KDE Plasma | Wayland (xdg-desktop-portal) | 🧪 Experimental; validation scope and limits below | `--features wayland,portal` |
 
-Apart from GNOME on X11, these desktops have been tested in virtual machines so far. If something goes wrong on
+The GNOME Wayland Portal/EIS path has been checked for video and mouse/keyboard input on Ubuntu 26.04, GNOME 50, with one 4K screen at 200% scale; lock recovery and reconnection still need hardware acceptance testing. Apart from that path and GNOME on X11, desktop testing has primarily used virtual machines. If something goes wrong on
 real hardware, please [open an issue](../../issues) with your distribution, desktop, GPU and the relevant lines from
 `journalctl --user -u uuremote-native.service`.
 
 Wayland limits: single screen, fixed resolution. The native Hyprland backend now pipelines two shm screencopy buffers and passes the viewer's requested fps to both capture pacing and the encoder. Actual fps remains limited by the compositor, rendering and readback (the old serial path measured about 16–22 fps at 2560x1600; the pipeline is VM-measured only, not a hardware guarantee). The portal backend does not support screen wake or
 dynamic resolution yet; the clipboard syncs while the viewer's remote window has focus. On the first connection the desktop asks for "Remote Desktop / Screen Sharing"
 permission; the permission is remembered once granted.
+
+Scaled GNOME desktops using native Portal input use EIS on the same authorized session when `ConnectToEIS` and a screen `mapping_id` are available. Each axis is mapped using the matched region and actual frame dimensions, with no fixed resolution or scale factor. This avoids scaled-coordinate rejection by `NotifyPointerMotionAbsolute`. Portal builds require libei >= 1.1. Missing EIS support retains the legacy input path and its existing scaling limitations; other initialization failures are reported and trigger session recovery. After a successful EIS connection, all input uses EIS. Capture alone and uinput do not initialize EIS; missing optional logical dimensions do not block capture. Keyboard input uses the existing Windows VK to evdev mapping. Recovery requires reconnecting if physical or logical dimensions change. Lock recovery still needs hardware acceptance testing; multi-monitor support, live resolution changes, and rotation/reflection transforms are outside this fix's scope.
 
 The native Wayland backend needs `wlr-output-power-management` from the compositor to wake a turned-off screen; without it only wake is unavailable — capture and encoding are unaffected.
 
@@ -111,7 +113,7 @@ sudo apt install build-essential pkg-config \
 # optional: Wayland backend
 sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # optional: GNOME/KDE portal backend
-sudo apt install libglib2.0-dev libpipewire-0.3-dev
+sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
 ```
 
 - A Rust toolchain is required (<https://rustup.rs>).
