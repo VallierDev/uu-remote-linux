@@ -21,6 +21,7 @@
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static struct wl_display *display;
+static struct wl_registry *registry;
 static struct wl_shm *shm;
 static struct wl_seat *seat;
 static struct zwlr_screencopy_manager_v1 *copy_manager;
@@ -72,14 +73,15 @@ struct frame {
     int shm_fd,shm_busy;
     uint32_t shm_width,shm_height,shm_stride,shm_format;
     uint32_t width,height,stride,format,flags;
-    int done,failed,submitted;
+    int done,failed,submitted,released;
     struct zwp_linux_buffer_params_v1 *params;
     struct gbm_bo *bo;
     int bo_fd,dmabuf_used;
     void *map_data;
     uint32_t dma_format,dma_width,dma_height;
+    uint32_t bo_format,bo_width,bo_height;
 };
-static struct frame frames[2]={{.shm_fd=-1},{.shm_fd=-1}};
+static struct frame frames[2]={{.shm_fd=-1,.bo_fd=-1},{.shm_fd=-1,.bo_fd=-1}};
 static unsigned pending;
 
 static uint32_t timestamp(void) {
@@ -189,20 +191,28 @@ static void shm_clear(struct frame *frame) {
     frame->shm_length=0; frame->shm_fd=-1; frame->shm_busy=0;
     frame->shm_width=frame->shm_height=frame->shm_stride=frame->shm_format=0;
 }
+static void dma_clear(struct frame *frame) {
+    if(frame->buffer) wl_buffer_destroy(frame->buffer);
+    if(frame->dmabuf_used && frame->pixels) {
+        gbm.bo_unmap(frame->bo,frame->map_data); frame->pixels=NULL; frame->map_data=NULL;
+    }
+    if(frame->bo) { if(frame->bo_fd>=0)close(frame->bo_fd); gbm.bo_destroy(frame->bo); }
+    frame->buffer=NULL; frame->bo=NULL; frame->bo_fd=-1; frame->dmabuf_used=frame->released=0;
+    frame->bo_format=frame->bo_width=frame->bo_height=0;
+}
 static void frame_clear(struct frame *frame) {
     if(frame->handle) zwlr_screencopy_frame_v1_destroy(frame->handle);
     if(frame->params) zwp_linux_buffer_params_v1_destroy(frame->params);
-    if(frame->buffer) wl_buffer_destroy(frame->buffer);
     if(frame->dmabuf_used && frame->pixels) gbm.bo_unmap(frame->bo,frame->map_data);
-    if(frame->bo) { if(frame->bo_fd>=0)close(frame->bo_fd); gbm.bo_destroy(frame->bo); }
     if(frame->shm_busy) shm_clear(frame);
-    frame->handle=NULL; frame->params=NULL; frame->buffer=NULL;
-    frame->pixels=NULL; frame->map_data=NULL; frame->bo=NULL;
-    frame->bo_fd=-1; frame->dmabuf_used=0;
+    frame->handle=NULL; frame->params=NULL;
+    frame->pixels=NULL; frame->map_data=NULL; frame->dmabuf_used=0;
     frame->width=frame->height=frame->stride=frame->format=frame->flags=0;
     frame->done=frame->failed=frame->submitted=0;
     frame->dma_format=frame->dma_width=frame->dma_height=0;
 }
+static void buffer_release(void*d,struct wl_buffer*b) { ((struct frame*)d)->released=1; }
+static const struct wl_buffer_listener buffer_listener={buffer_release};
 static void frame_fail(struct frame *frame) { frame->failed=frame->done=frame->submitted=1; }
 static void copy_buffer(void*d,struct zwlr_screencopy_frame_v1*f,uint32_t fmt,uint32_t w,uint32_t h,uint32_t s) {
     struct frame *frame=d;
@@ -266,22 +276,33 @@ static void submit_shm(struct frame *frame) {
 static void dma_created(void*d,struct zwp_linux_buffer_params_v1*params,struct wl_buffer*buffer) {
     struct frame *frame=d;
     zwp_linux_buffer_params_v1_destroy(params); frame->params=NULL;
-    shm_clear(frame); frame->pixels=NULL;
+    frame->pixels=NULL;
     frame->buffer=buffer; frame->dmabuf_used=1;
     frame->width=frame->dma_width; frame->height=frame->dma_height;
     frame->format=frame->dma_format==0x34325258 ? WL_SHM_FORMAT_XRGB8888:
         frame->dma_format==0x34325241 ? WL_SHM_FORMAT_ARGB8888:frame->dma_format;
+    wl_buffer_add_listener(buffer,&buffer_listener,frame);
+    frame->released=0;
     zwlr_screencopy_frame_v1_copy(frame->handle,buffer); frame->submitted=1;
 }
 static void dma_failed(void*d,struct zwp_linux_buffer_params_v1*params) {
     struct frame *frame=d;
     zwp_linux_buffer_params_v1_destroy(params); frame->params=NULL;
-    dma_disable("import"); submit_shm(frame);
+    dma_disable("import"); dma_clear(frame); submit_shm(frame);
 }
 static const struct zwp_linux_buffer_params_v1_listener dma_params_listener={dma_created,dma_failed};
 static int dma_start(struct frame *frame) {
     if(!dmabuf_requested || dmabuf_disabled || !gbm.device || frame->failed || !frame->shm_buffer ||
        !(dmabuf_linear_formats&dma_format_bit(frame->dma_format))) return 0;
+    if(frame->buffer && frame->bo && frame->released && frame->bo_width==frame->dma_width &&
+       frame->bo_height==frame->dma_height && frame->bo_format==frame->dma_format) {
+        frame->pixels=NULL; frame->dmabuf_used=1; frame->released=0;
+        frame->width=frame->dma_width; frame->height=frame->dma_height;
+        frame->format=frame->dma_format==0x34325258 ? WL_SHM_FORMAT_XRGB8888:
+            frame->dma_format==0x34325241 ? WL_SHM_FORMAT_ARGB8888:frame->dma_format;
+        zwlr_screencopy_frame_v1_copy(frame->handle,frame->buffer); frame->submitted=1; return 1;
+    }
+    dma_clear(frame);
     /* Single-plane linear RGB only; unsupported imports are asynchronous failures,
        never create_immed protocol errors. No privilege or device probing changes. */
     frame->bo=gbm.bo_create(gbm.device,frame->dma_width,frame->dma_height,frame->dma_format,(1u<<2)|(1u<<4));
@@ -290,7 +311,8 @@ static int dma_start(struct frame *frame) {
     uint32_t stride=gbm.bo_get_stride(frame->bo);
     if(gbm.bo_get_plane_count(frame->bo)!=1 || gbm.bo_get_modifier(frame->bo)!=0 ||
        stride<frame->dma_width*4 || stride>131072 || (uint64_t)stride*frame->dma_height>256*1024*1024 ||
-       (frame->bo_fd=gbm.bo_get_fd(frame->bo))<0) {dma_disable("layout-or-export"); return 0;}
+       (frame->bo_fd=gbm.bo_get_fd(frame->bo))<0) {dma_disable("layout-or-export"); dma_clear(frame); return 0;}
+    frame->bo_format=frame->dma_format; frame->bo_width=frame->dma_width; frame->bo_height=frame->dma_height;
     frame->params=zwp_linux_dmabuf_v1_create_params(dmabuf);
     zwp_linux_buffer_params_v1_add_listener(frame->params,&dma_params_listener,frame);
     zwp_linux_buffer_params_v1_add(frame->params,frame->bo_fd,0,gbm.bo_get_offset(frame->bo,0),stride,0,0);
@@ -311,14 +333,25 @@ static void reset(void) {
     if (key_state) xkb_state_unref(key_state);
     if (keymap) xkb_keymap_unref(keymap);
     if (xkb) xkb_context_unref(xkb);
-    for(unsigned i=0;i<2;i++) { frame_clear(&frames[i]); shm_clear(&frames[i]); }
+    for(unsigned i=0;i<2;i++) { frame_clear(&frames[i]); dma_clear(&frames[i]); shm_clear(&frames[i]); }
     if(gbm.device) gbm.device_destroy(gbm.device);
     if(gbm.fd>=0) close(gbm.fd);
     if(gbm.library) dlclose(gbm.library);
     memset(&gbm,0,sizeof(gbm)); gbm.fd=-1;
-    /* Disconnect drops every proxy; failure never leaves an initialized backend. */
+    if(keyboard) zwp_virtual_keyboard_v1_destroy(keyboard);
+    if(pointer) zwlr_virtual_pointer_v1_destroy(pointer);
+    if(power) zwlr_output_power_v1_destroy(power);
+    if(keyboard_manager) zwp_virtual_keyboard_manager_v1_destroy(keyboard_manager);
+    if(pointer_manager) zwlr_virtual_pointer_manager_v1_destroy(pointer_manager);
+    if(power_manager) zwlr_output_power_manager_v1_destroy(power_manager);
+    if(copy_manager) zwlr_screencopy_manager_v1_destroy(copy_manager);
+    if(dmabuf) zwp_linux_dmabuf_v1_destroy(dmabuf);
+    for(unsigned i=0;i<output_count;i++) if(outputs[i].handle) wl_output_destroy(outputs[i].handle);
+    if(seat) wl_seat_destroy(seat);
+    if(shm) wl_shm_destroy(shm);
+    if(registry) wl_registry_destroy(registry);
     if (display) wl_display_disconnect(display);
-    display=NULL; shm=NULL; seat=NULL; copy_manager=NULL; pointer_manager=NULL; keyboard_manager=NULL;
+    display=NULL; registry=NULL; shm=NULL; seat=NULL; copy_manager=NULL; pointer_manager=NULL; keyboard_manager=NULL;
     pointer=NULL; keyboard=NULL; xkb=NULL; keymap=NULL; key_state=NULL;
     power_manager=NULL; power=NULL; power_failed=0;
     dmabuf=NULL; dmabuf_requested=dmabuf_disabled=dmabuf_reported=0; dmabuf_linear_formats=0;
@@ -331,7 +364,7 @@ int uu_wl_init(int32_t *w,int32_t *h) {
     int result=-1;
     const char *dma=getenv("UU_WAYLAND_DMABUF"); dmabuf_requested=dma && !strcmp(dma,"1");
     display=wl_display_connect(NULL); if (!display) goto end;
-    struct wl_registry *registry=wl_display_get_registry(display);
+    registry=wl_display_get_registry(display);
     wl_registry_add_listener(registry,&registry_listener,NULL);
     if(sync_display()!=0 || sync_display()!=0) goto end;
     dma_init();
@@ -417,7 +450,7 @@ retry:;
     }
     frame_clear(frame); pending=1-pending;
 end:
-    if(result!=0) for(unsigned i=0;i<2;i++) frame_clear(&frames[i]);
+    if(result!=0) for(unsigned i=0;i<2;i++) { frame_clear(&frames[i]); dma_clear(&frames[i]); }
     pthread_mutex_unlock(&lock); return result;
 }
 int uu_wl_move(int32_t x,int32_t y,int relative) {
