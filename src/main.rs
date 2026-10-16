@@ -656,8 +656,11 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                             let stale: Vec<String> = sessions.iter().filter(|(_, s)| s.desktop).map(|(k, _)| k.clone()).collect();
                             for k in stale { if let Some(old) = sessions.remove(&k) { let _ = old.pc.close().await; } }
                         }
-                        let stale_portal=capture.portal.as_ref().is_some_and(|session|!session.is_alive())
-                            && crate::session_lock::locked_now() == Some(false);
+                        let stale_portal=if desktop {
+                            if let Some(session)=capture.portal.clone() {
+                                tokio::task::spawn_blocking(move || session.retire_if_closed()).await??
+                            } else { false }
+                        } else { false };
                         if desktop && desktop_backend::headless() {
                             log::info!("Desktop connection ignored: headless mode (terminal, file transfer and port mapping remain available)");
                             continue;
