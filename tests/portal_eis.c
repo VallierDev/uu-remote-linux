@@ -380,6 +380,24 @@ static void run_geometry(const struct geometry *geometry) {
     assert(h.events[0].type == EIS_EVENT_SCROLL_DISCRETE);
     assert(h.events[0].dx == 0 && h.events[0].dy == -120);
 
+    uint8_t storage[256];
+    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
+    const struct spa_pod *format = spa_format_video_raw_build(&builder, SPA_PARAM_Format,
+        &SPA_VIDEO_INFO_RAW_INIT(.format=SPA_VIDEO_FORMAT_BGRA,
+            .size=SPA_RECTANGLE(geometry->width, geometry->height), .framerate=SPA_FRACTION(60,1)));
+    assert(format);
+    stream_format(h.portal, SPA_PARAM_Format, format);
+    stream_state(h.portal, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
+    stream_state(h.portal, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    stream_format(h.portal, SPA_PARAM_Format, NULL);
+    /* Expire only video recovery; keep EIS and the harness wall clock live. */
+    pthread_mutex_lock(&h.portal->lock);
+    h.portal->interrupted_at = g_get_monotonic_time() - PORTAL_RENEGOTIATION_TIMEOUT - 1;
+    pthread_mutex_unlock(&h.portal->lock);
+    assert(!uu_portal_capture_alive(h.portal));
+    uint8_t pixel = 99;
+    assert(uu_portal_capture_since(h.portal, &pixel, sizeof(pixel), NULL) == 9 && pixel == 99);
+
     clear_events(&h);
     assert(uu_portal_key(h.portal, 'a', 30, 0) == 0);
     wait_for_input(&h);
@@ -391,6 +409,24 @@ static void run_geometry(const struct geometry *geometry) {
     wait_for_input(&h);
     assert(h.events[0].type == EIS_EVENT_BUTTON_BUTTON);
     assert(h.events[0].code == 0x110 && !h.events[0].pressed);
+
+    stream_format(h.portal, SPA_PARAM_Format, format);
+    stream_state(h.portal, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
+    assert(uu_portal_capture_alive(h.portal) && !h.portal->interrupted_at);
+    /* Natural video recovery keeps this EIS device, with neither input held. */
+    assert(h.portal->ei_devices->data == device && h.connect_calls == 1 && h.starts == 1);
+    for (int pressed = 1; pressed >= 0; pressed--) {
+        clear_events(&h);
+        assert(uu_portal_key(h.portal, 'a', 30, pressed) == 0);
+        wait_for_input(&h);
+        assert(h.events[0].type == EIS_EVENT_KEYBOARD_KEY);
+        assert(h.events[0].code == 30 && h.events[0].pressed == pressed);
+        clear_events(&h);
+        assert(uu_portal_button(h.portal, 1, pressed) == 0);
+        wait_for_input(&h);
+        assert(h.events[0].type == EIS_EVENT_BUTTON_BUTTON);
+        assert(h.events[0].code == 0x110 && h.events[0].pressed == pressed);
+    }
 
     pause_resume(&h);
 
@@ -436,6 +472,8 @@ int main(void) {
         {3840, 2160, 2560, 1440, 100, 200},   /* 150% */
         {3840, 2160, 2194, 1234, 0, 0},       /* 175%, rounded logical size */
         {3840, 2160, 1920, 1080, 320, 90},    /* 200% */
+        {3840, 2160, 2304, 1296, 320, 90},    /* replacement at 166.67% */
+        {3840, 2160, 1920, 1080, 320, 90},    /* replacement back at 200% */
         {5120, 2880, 2560, 1440, 0, 0},       /* 5K */
         {7680, 4320, 3840, 2160, 7680, 0},    /* 8K, nonzero origin */
         {3440, 1440, 2293, 960, 0, 1080},     /* ultrawide */
@@ -443,6 +481,6 @@ int main(void) {
         {2257, 1505, 1806, 1204, 0, 0},       /* odd frame dimensions */
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) run_geometry(&cases[i]);
-    puts("Portal EIS integration checks passed: 11 geometries");
+    printf("Portal EIS integration checks passed: %zu geometries\n", sizeof(cases) / sizeof(cases[0]));
     return 0;
 }

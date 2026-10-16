@@ -23,6 +23,7 @@
 #define SCREEN "org.freedesktop.portal.ScreenCast"
 #define REQUEST "org.freedesktop.portal.Request"
 #define SESSION "org.freedesktop.portal.Session"
+#define PORTAL_RENEGOTIATION_TIMEOUT (5 * G_TIME_SPAN_SECOND)
 
 struct uu_portal {
     GDBusConnection *bus;
@@ -46,6 +47,9 @@ struct uu_portal {
     pthread_cond_t changed;
     atomic_int closed;
     int error;
+    enum pw_stream_state state;
+    int format_valid, stream_started;
+    gint64 interrupted_at;
     uint32_t node, width, height;
     int logical_width, logical_height;
     int absolute_stream_pixels;
@@ -155,13 +159,33 @@ static int has_interface(struct uu_portal *p, const char *interface) {
     if (!r) return 0;
     g_variant_unref(r); return 1;
 }
+/* Called with the frame mutex held. Count only the continuous invalid pause,
+ * not a healthy pause before format removal, and never arm during startup. */
+static void update_interruption(struct uu_portal *p) {
+    if (p->stream_started && p->state == PW_STREAM_STATE_PAUSED && !p->format_valid) {
+        if (!p->interrupted_at) p->interrupted_at = g_get_monotonic_time();
+    } else p->interrupted_at = 0;
+}
 static void stream_state(void *data, enum pw_stream_state old, enum pw_stream_state state, const char *message) {
     (void)old; (void)message;
+    struct uu_portal *p = data;
+    pthread_mutex_lock(&p->lock);
+    p->state = state;
+    if (state == PW_STREAM_STATE_STREAMING) p->stream_started = 1;
+    update_interruption(p);
+    pthread_mutex_unlock(&p->lock);
     if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) fail(data, 9);
 }
 static void stream_format(void *data, uint32_t id, const struct spa_pod *param) {
     struct uu_portal *p = data;
-    if (id != SPA_PARAM_Format || !param) return;
+    if (id != SPA_PARAM_Format) return;
+    if (!param) {
+        pthread_mutex_lock(&p->lock);
+        p->format_valid = 0;
+        update_interruption(p);
+        pthread_mutex_unlock(&p->lock);
+        return;
+    }
     struct spa_video_info_raw info = {0};
     if (spa_format_video_raw_parse(param, &info) < 0 || !info.size.width || !info.size.height ||
         info.size.width > 8192 || info.size.height > 8192 ||
@@ -176,13 +200,15 @@ static void stream_format(void *data, uint32_t id, const struct spa_pod *param) 
     if (!p->frame) { p->error = 8; pthread_mutex_unlock(&p->lock); return; }
     p->width = info.size.width; p->height = info.size.height; p->format = info.format;
     p->frame_length = length;
+    p->format_valid = 1;
+    update_interruption(p);
     pthread_cond_broadcast(&p->changed);
     pthread_mutex_unlock(&p->lock);
 }
 /* Called with the frame mutex held. Invalid transient chunks are discarded;
  * allocation capacity is not evidence that valid pixels have been supplied. */
 static void copy_video_buffer(struct uu_portal *p, struct spa_buffer *spa) {
-    if (!p->error && p->frame && spa->n_datas >= 1) {
+    if (!p->error && p->format_valid && p->frame && spa->n_datas >= 1) {
         struct spa_data *d = &spa->datas[0];
         struct spa_meta_header *header = spa_buffer_find_meta_data(spa, SPA_META_Header, sizeof(*header));
         if (!d->chunk || (d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) ||
@@ -448,10 +474,18 @@ void uu_portal_reset_frame(struct uu_portal *p) {
 int uu_portal_capture(struct uu_portal *p, uint8_t *frame, size_t length) {
     return uu_portal_capture_since(p, frame, length, NULL);
 }
+/* A static desktop can stop producing frames indefinitely. Only time out the
+ * paused, format-less renegotiation observed after a live scaling change (#25).
+ * Called with the frame mutex held; recovery runs on the Rust capture worker. */
+static int stream_stalled(struct uu_portal *p) {
+    return p->state == PW_STREAM_STATE_PAUSED && !p->format_valid && p->interrupted_at &&
+        g_get_monotonic_time() - p->interrupted_at >= PORTAL_RENEGOTIATION_TIMEOUT;
+}
 int uu_portal_capture_since(struct uu_portal *p, uint8_t *frame, size_t length, uint64_t *revision) {
     if (!p || !frame) return 11;
     pthread_mutex_lock(&p->lock);
-    int result = atomic_load(&p->closed) ? 9 : p->error ? p->error : !p->sequence ? 10 : length != p->frame_length ? 11 : 0;
+    int result = atomic_load(&p->closed) ? 9 : p->error ? p->error : stream_stalled(p) ? 9 :
+        !p->sequence ? 10 : length != p->frame_length ? 11 : 0;
     if (!result) {
         if (revision && *revision == p->revision) result = 12;
         else memcpy(frame, p->frame, length);
@@ -463,6 +497,14 @@ int uu_portal_alive(struct uu_portal *p) {
     if (!p || atomic_load(&p->closed) || atomic_load(&p->ei_failed)) return 0;
     pthread_mutex_lock(&p->lock);
     int alive = !p->error;
+    pthread_mutex_unlock(&p->lock);
+    return alive;
+}
+/* Video renegotiation must not block input releases or clipboard traffic. */
+int uu_portal_capture_alive(struct uu_portal *p) {
+    if (!uu_portal_alive(p)) return 0;
+    pthread_mutex_lock(&p->lock);
+    int alive = !stream_stalled(p);
     pthread_mutex_unlock(&p->lock);
     return alive;
 }

@@ -1,7 +1,190 @@
 #define _GNU_SOURCE
 /* Protocol-independent C bounds/lifecycle checks; never requests consent. */
+#include <gio/gio.h>
 #include <assert.h>
+static gint64 test_monotonic_time = 1000000;
+static gint64 portal_test_monotonic_time(void) { return test_monotonic_time; }
+#define g_get_monotonic_time portal_test_monotonic_time
 #include "../c_engine/portal_engine.c"
+#undef g_get_monotonic_time
+
+static struct uu_portal *test_portal(void) {
+    struct uu_portal *p = calloc(1, sizeof(*p));
+    assert(p);
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_cond_init(&p->changed, NULL);
+    return p;
+}
+static void test_format(struct uu_portal *p, uint32_t width, uint32_t height) {
+    uint8_t storage[256];
+    struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
+    const struct spa_pod *format = spa_format_video_raw_build(&builder, SPA_PARAM_Format,
+        &SPA_VIDEO_INFO_RAW_INIT(.format=SPA_VIDEO_FORMAT_BGRA, .size=SPA_RECTANGLE(width,height),
+            .framerate=SPA_FRACTION(60,1)));
+    assert(format);
+    stream_format(p, SPA_PARAM_Format, format);
+}
+static void test_frame(struct uu_portal *p) {
+    uint8_t pixels[16] = {1,2,3,255, 4,5,6,255, 7,8,9,255, 10,11,12,255};
+    struct spa_chunk chunk = {.offset=0, .size=sizeof(pixels), .stride=8};
+    struct spa_data data = {.type=SPA_DATA_MemPtr, .data=pixels, .maxsize=sizeof(pixels), .chunk=&chunk};
+    struct spa_buffer buffer = {.n_datas=1, .datas=&data};
+    copy_video_buffer(p, &buffer);
+}
+static void assert_capture_ok(struct uu_portal *p, uint8_t *pixels) {
+    uint64_t revision = p->revision + 1;
+    assert(uu_portal_capture_since(p, pixels, p->frame_length, &revision) == 0);
+}
+static void portal_renegotiation_timeout(void) {
+    uint8_t pixels[16];
+    struct uu_portal *p = test_portal();
+    test_monotonic_time = 1000000;
+    test_format(p, 2, 2);
+    assert(p->format_valid);
+    stream_state(p, PW_STREAM_STATE_UNCONNECTED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    assert(p->sequence == 1 && uu_portal_capture_alive(p));
+    assert_capture_ok(p, pixels);
+
+    gint64 paused_at = test_monotonic_time;
+    stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    assert(!p->interrupted_at);
+    stream_format(p, SPA_PARAM_Format, NULL);
+    assert(!p->format_valid && p->interrupted_at == paused_at && uu_portal_capture_alive(p));
+    uint64_t sequence = p->sequence;
+    test_frame(p);
+    assert(p->sequence == sequence); /* Buffers without a negotiated format are ignored. */
+
+    test_monotonic_time = paused_at + 3 * G_TIME_SPAN_SECOND;
+    stream_state(p, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_PAUSED, NULL);
+    stream_format(p, SPA_PARAM_Format, NULL);
+    test_monotonic_time = paused_at + 4 * G_TIME_SPAN_SECOND;
+    stream_format(p, SPA_PARAM_Format, NULL);
+    assert(p->interrupted_at == paused_at); /* Repeated NULL formats do not restart the deadline. */
+    assert(uu_portal_capture_alive(p));
+    assert_capture_ok(p, pixels);
+
+    test_monotonic_time = paused_at + 5 * G_TIME_SPAN_SECOND - 1;
+    assert(uu_portal_capture_alive(p));
+    assert_capture_ok(p, pixels);
+    test_monotonic_time = paused_at + 5 * G_TIME_SPAN_SECOND;
+    assert(!uu_portal_capture_alive(p) && uu_portal_alive(p));
+    uint64_t revision = 0;
+    memset(pixels, 99, sizeof(pixels));
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &revision) == 9);
+    assert(!revision && pixels[0] == 99 && pixels[15] == 99);
+    /* Late renegotiation can recover naturally before the worker replaces it. */
+    test_format(p, 2, 2);
+    stream_state(p, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    assert(uu_portal_capture_alive(p) && p->revision == 2);
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &revision) == 0);
+    assert(revision == 2 && pixels[0] == 1);
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &revision) == 12);
+    uu_portal_close(p);
+}
+static void portal_renegotiation_recovery(void) {
+    uint8_t pixels[16];
+    struct uu_portal *p = test_portal();
+    test_monotonic_time = 2000000;
+    test_format(p, 2, 2);
+    stream_state(p, PW_STREAM_STATE_UNCONNECTED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    gint64 paused_at = test_monotonic_time;
+    stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    stream_format(p, SPA_PARAM_Format, NULL);
+
+    test_monotonic_time = paused_at + 2 * G_TIME_SPAN_SECOND;
+    test_format(p, 2, 2);
+    assert(p->format_valid && !p->interrupted_at);
+    stream_state(p, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
+    assert(p->interrupted_at == 0 && uu_portal_capture_alive(p));
+    test_monotonic_time = paused_at + 6 * G_TIME_SPAN_SECOND;
+    assert(uu_portal_capture_alive(p));
+    assert_capture_ok(p, pixels);
+    uu_portal_close(p);
+}
+static void portal_renegotiation_event_order_and_healthy_states(void) {
+    uint8_t pixels[16];
+    struct uu_portal *p = test_portal();
+    test_monotonic_time = 3000000;
+    test_format(p, 2, 2);
+    stream_state(p, PW_STREAM_STATE_UNCONNECTED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    stream_format(p, SPA_PARAM_Format, NULL); /* Format can disappear before the state callback. */
+    assert(!p->format_valid && !p->interrupted_at && uu_portal_capture_alive(p));
+    test_monotonic_time += 20 * G_TIME_SPAN_SECOND;
+    assert(uu_portal_capture_alive(p));
+    stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    gint64 paused_at = test_monotonic_time;
+    assert(p->interrupted_at == paused_at);
+    test_monotonic_time = paused_at + 5 * G_TIME_SPAN_SECOND;
+    assert(!uu_portal_capture_alive(p) && uu_portal_alive(p));
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), NULL) == 9);
+    uu_portal_close(p);
+
+    p = test_portal();
+    test_monotonic_time = 4000000;
+    stream_state(p, PW_STREAM_STATE_UNCONNECTED, PW_STREAM_STATE_PAUSED, NULL);
+    assert(!p->interrupted_at);
+    test_monotonic_time += 60 * G_TIME_SPAN_SECOND;
+    assert(uu_portal_capture_alive(p)); /* A stream that never reached STREAMING has no recovery deadline. */
+    assert(uu_portal_capture(p, pixels, sizeof(pixels)) == 10);
+    uu_portal_close(p);
+
+    p = test_portal();
+    test_monotonic_time = 5000000;
+    test_format(p, 2, 2);
+    stream_state(p, PW_STREAM_STATE_UNCONNECTED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    uint64_t revision = 0;
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &revision) == 0);
+    test_monotonic_time += 60 * G_TIME_SPAN_SECOND;
+    assert(uu_portal_capture_alive(p)); /* A static screen can stream without producing a new frame. */
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &revision) == 12);
+    uu_portal_close(p);
+
+    p = test_portal();
+    test_monotonic_time = 6000000;
+    test_format(p, 2, 2);
+    stream_state(p, PW_STREAM_STATE_UNCONNECTED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    test_monotonic_time += 6 * G_TIME_SPAN_SECOND;
+    assert(p->format_valid && uu_portal_capture_alive(p)); /* PAUSED alone is not a format failure. */
+    assert_capture_ok(p, pixels);
+    assert(!p->interrupted_at);
+    /* Healthy paused time must not consume a later negotiation's allowance. */
+    stream_format(p, SPA_PARAM_Format, NULL);
+    paused_at = test_monotonic_time;
+    assert(p->interrupted_at == paused_at && uu_portal_capture_alive(p));
+    test_monotonic_time += 4 * G_TIME_SPAN_SECOND;
+    assert(uu_portal_capture_alive(p));
+    test_format(p, 2, 2);
+    assert(!p->interrupted_at && uu_portal_capture_alive(p));
+    /* A second format removal while still paused gets a new full deadline. */
+    test_monotonic_time += 20 * G_TIME_SPAN_SECOND;
+    stream_format(p, SPA_PARAM_Format, NULL);
+    paused_at = test_monotonic_time;
+    assert(p->interrupted_at == paused_at && uu_portal_capture_alive(p));
+    test_monotonic_time += 5 * G_TIME_SPAN_SECOND - 1;
+    assert(uu_portal_capture_alive(p));
+    test_monotonic_time++;
+    assert(!uu_portal_capture_alive(p) && uu_portal_alive(p));
+    uu_portal_close(p);
+}
+static void portal_changed_physical_format_still_fails(void) {
+    struct uu_portal *p = test_portal();
+    uint8_t pixels[24];
+    test_monotonic_time = 7000000;
+    test_format(p, 2, 2);
+    assert(p->format_valid && !p->error);
+    test_format(p, 3, 2);
+    assert(p->error == 8 && !uu_portal_capture_alive(p));
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), NULL) == 8);
+    uu_portal_close(p);
+}
+
 static void clipboard_bounds(void) {
     int fds[2]; uint8_t bytes[8]={0};
     assert(pipe2(fds,O_NONBLOCK)==0);
@@ -65,6 +248,10 @@ static void authorization_still_required(void) {
     }
 }
 int main(void) {
+    portal_renegotiation_timeout();
+    portal_renegotiation_recovery();
+    portal_renegotiation_event_order_and_healthy_states();
+    portal_changed_physical_format_still_fails();
     clipboard_bounds();
     capture_with_optional_geometry(0);
     capture_with_optional_geometry(1);
