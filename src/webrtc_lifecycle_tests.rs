@@ -163,18 +163,35 @@ async fn pending_portal_answers_echo_immediately_and_defers_capture_settings() {
         let mut setting = Vec::new();
         field_varint(2, 2, &mut setting);  // quality = General (高清 2M)
         field_varint(18, 30, &mut setting); // fpsCount = 30
+        field_varint(5, 1920, &mut setting);
+        field_varint(6, 1080, &mut setting);
         viewer.channels["CONTROL_DATA_CHANNEL"].send(&capture_rpc(77, 2, &setting).into()).await.unwrap();
         assert!(receive(&mut viewer.messages, 22, Duration::from_millis(700)).await.is_none(),
             "capture setting answered before the desktop was ready");
 
         // Readiness publishes the real geometry; the queued request is applied and answered.
-        portal.publish_test_screen(ready_screen());
+        let mut screen = ready_screen();
+        let native = Arc::get_mut(&mut screen).unwrap();
+        native.width = 3840;
+        native.height = 2160;
+        portal.publish_test_screen(screen);
         let response = receive(&mut viewer.messages, 22, Duration::from_secs(5)).await.expect("deferred capture setting was never answered");
         let header = body(&response, 22).and_then(|r| body(r, 1)).expect("RpcResponse header");
         assert_eq!(varint_of(header, 1), Some(77), "deferred reply lost the request id");
+        let inventory = receive(&mut viewer.messages, 7, Duration::from_secs(5)).await.expect("updated ScreenSources");
+        let display = body(&inventory, 7).and_then(|sources| body(sources, 1)).expect("display");
+        // v4 advertises pixels even when the recovered desktop's native size differs.
+        for (field, size) in [(4, (1920, 1080)), (6, (3840, 2160))] {
+            let rect = body(display, field).expect("display rectangle");
+            assert_eq!((varint_of(rect, 3), varint_of(rect, 4)), (Some(size.0), Some(size.1)));
+            assert_eq!((varint_of(rect, 5), varint_of(rect, 6)), (Some(size.0), Some(size.1)));
+        }
+        assert!(decode_wire(display).unwrap().iter().any(|field|
+            field.number == 8 && field.value == WireValue::Fixed64(1.0f64.to_le_bytes())));
         let sync = receive(&mut viewer.messages, 25, Duration::from_secs(5)).await.expect("CaptureSettingSync");
         let sync = body(&sync, 25).expect("CaptureSettingSync payload");
         assert_eq!(varint_of(sync, 1), Some(30));
+        assert_eq!((varint_of(sync, 5), varint_of(sync, 6)), (Some(1920), Some(1080)));
 
         // CONTROL still serves Echo after readiness, and no timer-driven flood appears.
         viewer.channels["CONTROL_DATA_CHANNEL"].send(&echo_request(9).into()).await.unwrap();
