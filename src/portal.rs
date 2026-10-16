@@ -9,7 +9,7 @@ mod permissions;
 
 #[cfg(all(target_os = "linux", feature = "portal"))]
 mod native {
-    use std::{ffi::c_void, ptr::NonNull, sync::Mutex};
+    use std::{ffi::c_void, ptr::NonNull, sync::{Mutex, MutexGuard, TryLockError}};
     extern "C" {
         fn uu_portal_open_persist(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_clipboard_supported(portal: *mut c_void) -> i32;
@@ -34,8 +34,30 @@ mod native {
         if *version == Some(super::FrameVersion(0, 0)) { return false; }
         super::blank(frame); *version = Some(super::FrameVersion(0, 0)); true
     }
+    // Portal preparation and native teardown can wait for consent or D-Bus.
+    // Only the swap may hold the mutex shared with input and clipboard.
+    fn replace_handle<T>(current: &Mutex<T>, locked: MutexGuard<'_, T>, prepare: impl FnOnce() -> Result<Option<T>, String>) -> Result<bool, String> {
+        drop(locked);
+        let Some(replacement) = prepare()? else { return Ok(false); };
+        let old = {
+            let mut handle = current.lock().map_err(|_| "Portal session lock poisoned")?;
+            std::mem::replace(&mut *handle, replacement)
+        };
+        drop(old);
+        Ok(true)
+    }
     pub struct Session { handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, retry_at: Mutex<Option<std::time::Instant>>, pub width: u32, pub height: u32 }
     impl Session {
+        fn take_lock_observation(&self) -> Result<bool, String> {
+            // A recovery in progress must see the lock even if another capture
+            // observes unlock and would otherwise reset only the old handle.
+            let _recovery = match self.retry_at.try_lock() {
+                Ok(recovery) => recovery,
+                Err(TryLockError::WouldBlock) => return Ok(false),
+                Err(TryLockError::Poisoned(_)) => return Err("Portal recovery lock poisoned".into()),
+            };
+            Ok(self.was_locked.swap(false, std::sync::atomic::Ordering::AcqRel))
+        }
         fn check_geometry(&self, replacement: &Self) -> Result<(), String> {
             // Encoder buffers use frame pixels. Logical geometry and EIS regions
             // belong to the replacement handle and may change with scaling (#25).
@@ -77,7 +99,7 @@ mod native {
         }
         pub fn capture_changed(&self, frame: &mut [u8], version: &mut Option<super::FrameVersion>) -> Result<bool, String> {
             if frame.len() != self.width as usize * self.height as usize * 4 { return Err(super::error(11)); }
-            let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+            let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
             // Drain EIS even on a static desktop so pause/disconnect and sync
             // events are processed without waiting for remote input.
             unsafe { uu_portal_input_dispatch(handle.0.as_ptr()) };
@@ -90,37 +112,62 @@ mod native {
                 }
                 return Ok(blank_changed(frame, version));
             }
-            if self.was_locked.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            if self.was_locked.load(std::sync::atomic::Ordering::Acquire) {
                 // First unlocked capture after a real lock: drop frames captured while locked.
-                unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
+                if self.take_lock_observation()? { unsafe { uu_portal_reset_frame(handle.0.as_ptr()) }; }
                 return Ok(blank_changed(frame, version));
             }
             if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } == 0 {
-                // GNOME can close the stream before the periodic lock watcher updates.
-                if crate::session_lock::locked_now() != Some(false) {
-                    self.was_locked.store(true, std::sync::atomic::Ordering::Release);
-                    return Ok(blank_changed(frame, version));
-                }
-                // logind's LockedHint can lag compositor stream closure. Give it a
-                // full watcher interval before attempting another permission session.
-                let mut retry = self.retry_at.lock().map_err(|_| "Portal recovery lock poisoned")?;
-                let deadline = retry.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(1));
-                if std::time::Instant::now() < *deadline { return Ok(blank_changed(frame, version)); }
-                let replacement = match Self::open() {
-                    Ok(value) => value,
-                    Err(error) => {
-                        log::warn!("Portal capture recovery deferred: {error}");
-                        *retry = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-                        return Ok(blank_changed(frame, version));
-                    }
+                // Serialize recovery without making another capture worker hold
+                // the input mutex while waiting for this worker's Portal calls.
+                let mut retry = match self.retry_at.try_lock() {
+                    Ok(retry) => retry,
+                    Err(TryLockError::WouldBlock) => return Ok(blank_changed(frame, version)),
+                    Err(TryLockError::Poisoned(_)) => return Err("Portal recovery lock poisoned".into()),
                 };
-                *retry = None;
-                self.check_geometry(&replacement)?;
-                *handle = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?;
-                *version = None;
-                log::info!("Portal capture session restored after stream loss");
+                if replace_handle(&self.handle, handle, || {
+                    // GNOME can close the stream before the periodic lock watcher updates.
+                    if crate::session_lock::locked_now() != Some(false) {
+                        self.was_locked.store(true, std::sync::atomic::Ordering::Release);
+                        return Ok(None);
+                    }
+                    {
+                        let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+                        if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } != 0 {
+                            *retry = None;
+                            return Ok(None);
+                        }
+                    }
+                    // logind's LockedHint can lag compositor stream closure.
+                    let deadline = retry.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(1));
+                    if std::time::Instant::now() < *deadline { return Ok(None); }
+                    let replacement = match Self::open() {
+                        Ok(value) => value,
+                        Err(error) => {
+                            log::warn!("Portal capture recovery deferred: {error}");
+                            *retry = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                            return Ok(None);
+                        }
+                    };
+                    *retry = None;
+                    self.check_geometry(&replacement)?;
+                    // Consent can outlive the unlocked state checked above.
+                    if *self.locked.borrow() != Some(false) || self.was_locked.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    replacement.handle.into_inner().map(Some).map_err(|_| "Portal session lock poisoned".into())
+                })? {
+                    *version = None;
+                    log::info!("Portal capture session restored after stream loss");
+                }
+                // Recheck lock state on the next capture before showing the new session.
+                return Ok(blank_changed(frame, version));
             } else {
-                *self.retry_at.lock().map_err(|_| "Portal recovery lock poisoned")? = None;
+                match self.retry_at.try_lock() {
+                    Ok(mut retry) => *retry = None,
+                    Err(TryLockError::WouldBlock) => (),
+                    Err(TryLockError::Poisoned(_)) => return Err("Portal recovery lock poisoned".into()),
+                }
             }
             let identity = handle.0.as_ptr() as usize;
             let mut revision = version.filter(|v| v.0 == identity).map_or(0, |v| v.1);
@@ -173,7 +220,7 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::mem::ManuallyDrop;
+        use std::{mem::ManuallyDrop, sync::Arc};
 
         struct Fixture(ManuallyDrop<Session>);
         impl Fixture {
@@ -211,6 +258,142 @@ mod native {
             assert!(original.session().check_geometry(same.session()).is_ok());
             assert!(original.session().check_geometry(width_changed.session()).is_err());
             assert!(original.session().check_geometry(height_changed.session()).is_err());
+        }
+
+        struct TestHandle {
+            generation: u8,
+            key_held: bool,
+            button_held: bool,
+            retirement: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        }
+        impl Drop for TestHandle {
+            fn drop(&mut self) {
+                if let Some((entered, resume)) = self.retirement.take() {
+                    let _ = entered.send(());
+                    let _ = resume.recv_timeout(std::time::Duration::from_secs(10));
+                }
+            }
+        }
+        fn release_input(current: Arc<Mutex<TestHandle>>) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<(u8, bool, bool)>) {
+            let (released, received) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut handle = current.lock().unwrap();
+                handle.key_held = false;
+                handle.button_held = false;
+                released.send((handle.generation, handle.key_held, handle.button_held)).unwrap();
+            });
+            (worker, received)
+        }
+
+        #[test]
+        fn recovery_does_not_block_input_releases_during_open_or_close() {
+            use std::{sync::mpsc::channel, time::Duration};
+            let timeout = Duration::from_secs(3);
+            let (opening, opened) = channel();
+            let (resume_open, wait_open) = channel();
+            let (closing, closed) = channel();
+            let (resume_close, wait_close) = channel();
+            let current = Arc::new(Mutex::new(TestHandle {
+                generation: 1, key_held: true, button_held: true, retirement: Some((closing, wait_close)),
+            }));
+            let retry = Arc::new(Mutex::new(None::<std::time::Instant>));
+            let recovery = {
+                let current = current.clone();
+                let retry = retry.clone();
+                std::thread::spawn(move || {
+                    let handle = current.lock().unwrap();
+                    let _owner = retry.try_lock().unwrap();
+                    replace_handle(&current, handle, || {
+                        opening.send(()).unwrap();
+                        wait_open.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Ok(Some(TestHandle {
+                            generation: 2, key_held: true, button_held: true, retirement: None,
+                        }))
+                    })
+                })
+            };
+            let opening_result = opened.recv_timeout(timeout);
+            let (first_worker, first_release) = release_input(current.clone());
+            let first_result = first_release.recv_timeout(timeout);
+            // A concurrent capture must not wait on recovery while retaining input's mutex.
+            let (contended, contention) = channel();
+            let contender = {
+                let current = current.clone();
+                let retry = retry.clone();
+                std::thread::spawn(move || {
+                    let _handle = current.lock().unwrap();
+                    contended.send(matches!(retry.try_lock(), Err(TryLockError::WouldBlock))).unwrap();
+                })
+            };
+            let contention_result = contention.recv_timeout(timeout);
+            let _ = resume_open.send(());
+            let closing_result = closed.recv_timeout(timeout);
+            let (second_worker, second_release) = release_input(current.clone());
+            let second_result = second_release.recv_timeout(timeout);
+            // Always release blocked work before asserting, including on regression.
+            let _ = resume_close.send(());
+            let recovered = recovery.join().unwrap();
+            first_worker.join().unwrap();
+            second_worker.join().unwrap();
+            contender.join().unwrap();
+            assert!(opening_result.is_ok() && closing_result.is_ok());
+            assert_eq!(first_result.unwrap(), (1, false, false));
+            assert_eq!(second_result.unwrap(), (2, false, false));
+            assert!(contention_result.unwrap());
+            assert!(recovered.unwrap());
+        }
+
+        #[test]
+        fn failed_or_deferred_recovery_keeps_the_current_handle_unlocked() {
+            let current = Mutex::new(1);
+            for failure in [false, true] {
+                let handle = current.lock().unwrap();
+                let result = replace_handle(&current, handle, || {
+                    assert_eq!(*current.try_lock().unwrap(), 1);
+                    if failure { Err("open failed".into()) } else { Ok(None) }
+                });
+                if failure { assert_eq!(result.unwrap_err(), "open failed"); }
+                else { assert!(!result.unwrap()); }
+                assert_eq!(*current.try_lock().unwrap(), 1);
+            }
+        }
+
+        #[test]
+        fn lock_observation_survives_unlock_while_recovery_is_opening() {
+            use std::{sync::{atomic::Ordering, mpsc::channel}, time::Duration};
+            let mut fixture = Fixture::new((2, 2));
+            let (locked, watch) = tokio::sync::watch::channel(Some(false));
+            fixture.0.locked = watch;
+            let session = fixture.session();
+            std::thread::scope(|threads| {
+                let (opening, opened) = channel();
+                let (resume, wait) = channel();
+                let recovery = threads.spawn(move || {
+                    let _owner = session.retry_at.lock().unwrap();
+                    opening.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                });
+                let ready = opened.recv_timeout(Duration::from_secs(3));
+                locked.send_replace(Some(true));
+                session.was_locked.store(true, Ordering::Release);
+                locked.send_replace(Some(false));
+                let (reset, result) = channel();
+                let capture = threads.spawn(move || {
+                    let _handle = session.handle.lock().unwrap();
+                    assert_eq!(*session.locked.borrow(), Some(false));
+                    reset.send(session.take_lock_observation()).unwrap();
+                });
+                let consumed = result.recv_timeout(Duration::from_secs(3));
+                let still_pending = session.was_locked.load(Ordering::Acquire);
+                let _ = resume.send(());
+                recovery.join().unwrap();
+                capture.join().unwrap();
+                assert!(ready.is_ok());
+                assert!(!consumed.unwrap().unwrap());
+                assert!(still_pending);
+            });
+            assert!(session.take_lock_observation().unwrap());
+            assert!(!session.was_locked.load(std::sync::atomic::Ordering::Acquire));
         }
     }
 }
