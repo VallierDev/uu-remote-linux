@@ -54,6 +54,13 @@ pub struct SignalingClient {
     _reconnect_key: Arc<std::sync::Mutex<Option<String>>>,
 }
 
+#[cfg(test)]
+impl SignalingClient {
+    pub fn disconnected() -> Arc<Self> {
+        Arc::new(Self { tx_outgoing: mpsc::channel(1).0, _reconnect_key: Arc::new(std::sync::Mutex::new(None)) })
+    }
+}
+
 fn refreshed_key(ack:&Value)->Option<String> {
     let values=ack.as_array()?;
     if values.first()?.as_str()? != "success" { return None; }

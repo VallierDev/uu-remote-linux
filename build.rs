@@ -52,6 +52,7 @@ fn main() {
             println!("cargo:rerun-if-changed=c_engine/portal_engine.c");
             println!("cargo:rerun-if-changed=c_engine/portal_engine.h");
             println!("cargo:rerun-if-changed=c_engine/portal_eis.inc");
+            println!("cargo:rerun-if-changed=c_engine/desktop_power.c");
             let flags=|kind:&str| {
                 let output=std::process::Command::new("pkg-config").args([kind,"gio-2.0","gio-unix-2.0","libpipewire-0.3","libei-1.0 >= 1.1"]).output()
                     .expect("Install pkg-config and GIO/PipeWire/libei development libraries");
@@ -59,7 +60,7 @@ fn main() {
                 String::from_utf8(output.stdout).expect("pkg-config flags must be UTF-8")
             };
             let mut build=cc::Build::new();
-            build.file("c_engine/portal_engine.c").flag_if_supported("-Wno-unused-parameter");
+            build.file("c_engine/portal_engine.c").file("c_engine/desktop_power.c").flag_if_supported("-Wno-unused-parameter");
             for flag in flags("--cflags").split_whitespace() { build.flag(flag); }
             build.compile("uu_portal_engine");
             for flag in flags("--libs").split_whitespace() {

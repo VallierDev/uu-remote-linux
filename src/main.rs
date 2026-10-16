@@ -2,6 +2,8 @@
 //! Zero-Wine, Zero-Python, Single-Binary, 5 Native Tools Integrated
 
 mod desktop_backend;
+mod desktop_session;
+mod desktop_power;
 mod portal;
 mod network_diagnostics;
 mod session_ice;
@@ -60,6 +62,52 @@ use webrtc::WebRtcSession;
 
 /// Set before a normal return when the host must come back in the other mode (signed in / out).
 static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn superseded_peer_ids(sessions: &HashMap<String, WebRtcSession>, ice: &str, desktop: bool) -> Vec<String> {
+    sessions.iter().filter(|(id, peer)| id.as_str() == ice || (desktop && peer.desktop))
+        .map(|(id, _)| id.clone()).collect()
+}
+fn released_peer_ids<T>(sessions: &HashMap<String, T>, ice: Option<&serde_json::Value>) -> Vec<String> {
+    let ice = ice.map(|id| id.as_str().map(str::to_owned).unwrap_or_else(|| id.to_string()));
+    sessions.keys().filter(|id| ice.as_deref().map_or(true, |ice| id.as_str() == ice)).cloned().collect()
+}
+
+#[cfg(test)]
+mod peer_release_tests {
+    use super::*;
+    #[test]
+    fn explicit_releases_leave_independent_and_replacement_peers_alive() {
+        let mut peers = HashMap::from([
+            ("old-desktop".to_owned(), ()), ("files".to_owned(), ()),
+            ("terminal".to_owned(), ()), ("port-mapping".to_owned(), ()),
+        ]);
+        let targets = released_peer_ids(&peers, Some(&serde_json::json!("old-desktop")));
+        assert_eq!(targets, ["old-desktop"]);
+        for id in targets { peers.remove(&id); }
+        peers.insert("new-desktop".to_owned(), ());
+        assert!(released_peer_ids(&peers, Some(&serde_json::json!("old-desktop"))).is_empty());
+        assert!(released_peer_ids(&peers, Some(&serde_json::json!("unknown"))).is_empty());
+        for id in ["files", "terminal", "port-mapping", "new-desktop"] {
+            assert_eq!(released_peer_ids(&peers, Some(&serde_json::json!(id))), [id]);
+        }
+        assert_eq!(peers.len(), 4);
+    }
+    #[test]
+    fn release_without_an_ice_id_retains_room_wide_cleanup() {
+        let peers = HashMap::from([("desktop".to_owned(), ()), ("files".to_owned(), ())]);
+        let mut targets = released_peer_ids(&peers, None);
+        targets.sort();
+        assert_eq!(targets, ["desktop", "files"]);
+    }
+    #[test]
+    fn explicit_non_string_ice_ids_never_become_room_wide_releases() {
+        let peers = HashMap::from([("123".to_owned(), ()), ("files".to_owned(), ())]);
+        for id in [serde_json::json!(999), serde_json::Value::Null, serde_json::json!(false), serde_json::json!({})] {
+            assert!(released_peer_ids(&peers, Some(&id)).is_empty());
+        }
+        assert_eq!(released_peer_ids(&peers, Some(&serde_json::json!(123))), ["123"]);
+    }
+}
 /// Re-executes this host; the new instance opens its window so the user sees the result.
 fn restart_host() -> ! {
     use std::os::unix::process::CommandExt;
@@ -234,6 +282,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut frame = vec![0; screen.width as usize * screen.height as usize * 4];
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
+                if *locked.borrow() == Some(false) {
+                    session.recover(&std::sync::atomic::AtomicBool::new(false)).map_err(|error| error.to_string())?;
+                }
                 session.capture(&mut frame)?;
                 if *locked.borrow() == Some(false) && session.is_alive() { break; }
                 if std::time::Instant::now() >= deadline { return Err("Test VM portal did not recover".into()); }
@@ -356,9 +407,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let capture = Arc::new((if desktop_backend::headless() {
         Err("headless mode (UU_DESKTOP_BACKEND=none)".to_owned())
-    } else if desktop_backend::detect()?==desktop_backend::DesktopBackend::Portal
-        && std::env::var("UU_PORTAL_PREAUTHORIZE").ok().as_deref()!=Some("1") {
-        Err("Portal screen access requires a desktop connection and local consent".to_owned())
+    } else if desktop_backend::detect()?==desktop_backend::DesktopBackend::Portal {
+        Err("Portal capture waits for a desktop CONTROL connection".to_owned())
     } else { ScreenCapture::new() }).unwrap_or_else(|error| {
         log::warn!("Desktop unavailable; terminal and file tools remain available: {error}");
         ScreenCapture::unavailable(error)
@@ -424,6 +474,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutdown: &mut tokio::sync::watch::Receiver<bool>,
     assist: &mut Option<assist::Assist>, commands: &mut mpsc::Receiver<assist::Command>, webrtc_sessions: Arc<Mutex<HashMap<String, WebRtcSession>>>) -> Result<(), Box<dyn std::error::Error>> {
+    let portal_desktop = (capture.backend == desktop_backend::DesktopBackend::Portal && !desktop_backend::headless())
+        .then(|| Arc::new(desktop_session::PortalDesktop::new(capture.clone())));
     let mut auth = if let Some(session) = assist.as_ref() { session.client.clone() } else {
         let creds = match config::file().and_then(Credentials::load) {
             Ok(creds) => creds,
@@ -655,22 +707,10 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         let controller_mac = mac_by_ice.remove(&ice).unwrap_or(next_mac);
                         if desktop { input.set_mac_controller(controller_mac); }
                         log::info!("Offer for connection: capture_type={} desktop={} active_peers={}", capture_type, desktop, sessions.len());
-                        if let Some(old) = sessions.remove(&ice) { let _ = old.pc.close().await; }
-                        if desktop {
-                            // One desktop stream at a time: a new desktop offer replaces stale ones.
-                            let stale: Vec<String> = sessions.iter().filter(|(_, s)| s.desktop).map(|(k, _)| k.clone()).collect();
-                            for k in stale { if let Some(old) = sessions.remove(&k) { let _ = old.pc.close().await; } }
+                        // Replace only this ICE id or a previous desktop, never tool peers.
+                        for id in superseded_peer_ids(&sessions, &ice, desktop) {
+                            if let Some(old) = sessions.remove(&id) { let _ = old.pc.close().await; }
                         }
-                        let stale_portal=if desktop {
-                            if let Some(session)=capture.portal.clone() {
-                                // A failed check must not end the host loop; treat it as not stale.
-                                match tokio::task::spawn_blocking(move || session.retire_if_closed()).await {
-                                    Ok(Ok(stale)) => stale,
-                                    Ok(Err(error)) => { log::warn!("Portal staleness check failed: {error}"); false }
-                                    Err(_) => { log::warn!("Portal staleness check panicked"); false }
-                                }
-                            } else { false }
-                        } else { false };
                         if desktop && desktop_backend::headless() {
                             log::info!("Desktop connection ignored: headless mode (terminal, file transfer and port mapping remain available)");
                             continue;
@@ -678,11 +718,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         let resized=desktop && capture.init_error.is_none() && capture.backend==desktop_backend::DesktopBackend::X11
                             && tokio::task::spawn_blocking(crate::capture::x11_resized).await.unwrap_or(false);
                         if resized { log::info!("Desktop geometry changed since startup; reinitializing capture"); }
-                        let session_capture=if desktop && (capture.init_error.is_some() || stale_portal || resized) {
-                            if stale_portal {
-                                input.release_held();input.bind_portal(None);
-                                capture=Arc::new(ScreenCapture::unavailable("Portal authorization expired".into()));
-                            }
+                        let session_capture=if desktop && portal_desktop.is_none() && (capture.init_error.is_some() || resized) {
                             match tokio::task::spawn_blocking(ScreenCapture::new).await {
                                 Ok(Ok(screen))=>{ capture=Arc::new(screen);capture.clone() },
                                 Ok(Err(error))=>{ log::warn!("Desktop connection unavailable: {error}"); continue; },
@@ -691,8 +727,10 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         } else { capture.clone() };
                         // Independent file/terminal peers must not detach the
                         // current desktop's authorized Portal input session.
-                        if desktop { input.bind_portal(session_capture.portal.clone()); }
-                        match WebRtcSession::new(session_capture, input.clone(), signaling_client.clone(), desktop, transport).await {
+                        if desktop && portal_desktop.is_none() { input.bind_portal(session_capture.portal.clone()); }
+                        if desktop { if let Some(portal) = &portal_desktop { portal.begin(); } }
+                        match WebRtcSession::new(session_capture, input.clone(), signaling_client.clone(), desktop, transport,
+                            if desktop { portal_desktop.clone() } else { None }).await {
                             Ok(sess) => {
                                 // Register before awaiting SDP: shutdown can always close
                                 // a peer whose answer may already be queued to the viewer.
@@ -730,15 +768,11 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                     }
                 }
                 SignalingEvent::Released(val) | SignalingEvent::Left(val) => {
-                    let ice = ["ice_id", "iceId"].iter().find_map(|k| val.get(*k).or_else(|| val.get("data").and_then(|d| d.get(*k))))
-                        .and_then(|v| v.as_str()).map(str::to_owned);
+                    let ice = ["ice_id", "iceId"].iter().find_map(|k| val.get(*k).or_else(|| val.get("data").and_then(|d| d.get(*k))));
                     let keys: Vec<String> = val.as_object().map(|o| o.keys().take(16).cloned().collect()).unwrap_or_default();
                     let mut sessions = webrtc_sessions.lock().await;
-                    let targets: Vec<String> = match &ice {
-                        Some(id) if sessions.contains_key(id) => vec![id.clone()],
-                        _ => sessions.keys().cloned().collect(),
-                    };
-                    log::info!("Remote controller disconnected: keys={:?} ice_matched={} closing={}", keys, ice.as_ref().is_some_and(|i| sessions.contains_key(i)), targets.len());
+                    let targets = released_peer_ids(&sessions, ice);
+                    log::info!("Remote controller disconnected: keys={:?} ice_matched={} closing={}", keys, ice.is_some() && !targets.is_empty(), targets.len());
                     let mut desktop_ended = false;
                     for k in targets {
                         if let Some(old) = sessions.remove(&k) {

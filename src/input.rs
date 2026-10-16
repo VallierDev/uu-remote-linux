@@ -445,6 +445,15 @@ impl InputInjector {
     }
 }
 impl DesktopInputSession {
+    pub fn is_current(&self) -> bool {
+        let owner = self.input.owner.lock().unwrap();
+        owner.owns(self.id)
+    }
+    /// Call only inside with_current or with_input, so a superseded peer cannot change bindings.
+    pub fn bind_portal(&self, portal: Option<std::sync::Arc<crate::portal::PortalSession>>) {
+        self.input.bind_portal(portal);
+    }
+    pub fn release_input(&self) { self.input.release_held(); }
     pub fn connected(&self) {
         let mut owner=self.input.owner.lock().unwrap();
         if owner.owns(self.id) && !owner.active {self.input.release_held();owner.active=true;}
@@ -452,6 +461,11 @@ impl DesktopInputSession {
     pub fn disconnected(&self) {
         let mut owner=self.input.owner.lock().unwrap();
         if owner.owns(self.id) && owner.active {owner.active=false;self.input.release_held();}
+    }
+    /// Lifecycle updates survive a transient disconnect, but serialize with replacement and shutdown.
+    pub fn with_current(&self, action:impl FnOnce()) {
+        let owner=self.input.owner.lock().unwrap();
+        if owner.owns(self.id) {action();}
     }
     pub fn with_input(&self, action:impl FnOnce()) {
         let owner=self.input.owner.lock().unwrap();
@@ -461,9 +475,60 @@ impl DesktopInputSession {
 impl Drop for DesktopInputSession {fn drop(&mut self) {self.disconnected();}}
 
 #[cfg(test)]
+impl InputInjector {
+    pub fn without_desktop() -> Self {
+        Self { mac_controller:std::sync::atomic::AtomicBool::new(false),
+            cmd:std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()),
+            owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts:std::sync::Mutex::new(Shortcuts::default()),
+            uinput:None, screen:std::sync::Mutex::new((0,0)), portal_failures:std::sync::atomic::AtomicUsize::new(0),
+            portal_outcomes:std::array::from_fn(|_|std::sync::atomic::AtomicUsize::new(0)),
+            portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::DesktopBackend::Portal,
+            pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()) }
+    }
+}
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+    #[test]
+    fn current_owner_can_publish_while_disconnected_but_cannot_inject() {
+        let input=Arc::new(InputInjector::without_desktop());
+        let session=input.desktop_session();
+        session.connected();session.disconnected();
+        let publications=AtomicUsize::new(0);
+        session.with_current(||{publications.fetch_add(1,Ordering::Relaxed);});
+        session.with_input(||panic!("disconnected owner must not inject"));
+        assert_eq!(publications.load(Ordering::Relaxed),1);
+        session.connected();
+        session.with_input(||{publications.fetch_add(1,Ordering::Relaxed);});
+        let next=input.desktop_session();
+        session.with_current(||panic!("replaced owner must not publish"));
+        next.with_current(||{publications.fetch_add(1,Ordering::Relaxed);});
+        input.shutdown();
+        next.with_current(||panic!("shutdown must reject lifecycle updates"));
+        assert_eq!(publications.load(Ordering::Relaxed),3);
+    }
+    #[test]
+    fn current_owner_gate_holds_ownership_through_publication() {
+        let input=Arc::new(InputInjector::without_desktop());
+        let session=input.desktop_session();
+        let (started,ready)=std::sync::mpsc::channel();
+        let (finish,resume)=std::sync::mpsc::channel();
+        let worker=session.clone();
+        let publication=std::thread::spawn(move ||worker.with_current(|| {
+            started.send(()).unwrap();resume.recv().unwrap();
+        }));
+        ready.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(input.owner.try_lock().is_err());
+        let replacing=input.clone();
+        let replacement=std::thread::spawn(move ||replacing.desktop_session());
+        finish.send(()).unwrap();
+        publication.join().unwrap();
+        let next=replacement.join().unwrap();
+        assert!(next.is_current());
+        session.with_current(||panic!("late publication after replacement"));
+    }
     #[test]
     fn cleanup_discards_motion_shortcuts_and_untracked_input_ledger() {
         let input=Arc::new(InputInjector::new());

@@ -805,7 +805,10 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
             && pc.sctp().state() == webrtc::sctp_transport::sctp_transport_state::RTCSctpTransportState::Connected { break; }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    crate::capture::keep_display_awake()?;
+    // Portal power/idle policy belongs to its CONTROL-scoped supervisor,
+    // including when video has no frames or the user locks manually.
+    if portal.is_none() { crate::capture::keep_display_awake()?; }
+    let portal_stream = portal.is_some();
     let (latest, mut receiver) = mpsc::channel(4);
     let budget=Arc::new(Semaphore::new(4));
     let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -892,7 +895,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                 max_send_ms=max_send_ms.max(send_started.elapsed().as_millis());
                 frames += 1;
                 if stats.elapsed() >= Duration::from_secs(30) {
-                    crate::capture::keep_display_awake()?;
+                    if !portal_stream { crate::capture::keep_display_awake()?; }
                     log::info!("Desktop latest-frame stats: sent={} skipped={} latest_seq={} window_s={} window_sent={} window_skipped={} max_slot_age_ms={} max_send_ms={}",
                         frames, skipped, frame.sequence, stats.elapsed().as_secs(), frames - window_frames, skipped - window_skipped, max_age_ms, max_send_ms);
                     (window_frames, window_skipped) = (frames, skipped);

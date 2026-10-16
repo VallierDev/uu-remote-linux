@@ -10,6 +10,12 @@ pub struct SessionIce {
 }
 
 impl SessionIce {
+    #[cfg(test)]
+    pub fn local() -> Self {
+        // A supplied empty URL list disables the public STUN defaults in local peer tests.
+        Self { servers: vec![RTCIceServer::default()], relay_only: false }
+    }
+
     pub fn from_header(header:&Value)->Self {
         let data=header.get("data").unwrap_or(header);
         let field=|name:&str|header.get(name).or_else(||data.get(name));

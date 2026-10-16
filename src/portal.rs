@@ -1,6 +1,18 @@
 //! GNOME/KDE portal session. Capture and input must share this Arc; do not
 //! recreate it in an encoder subprocess (that would request consent again).
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortalError { pub code: i32 }
+
+impl std::fmt::Display for PortalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", error(self.code))
+    }
+}
+
+impl std::error::Error for PortalError {}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FrameVersion(usize, u64);
 #[cfg(unix)]
@@ -12,6 +24,7 @@ mod native {
     use std::{ffi::c_void, ptr::NonNull, sync::{Mutex, MutexGuard, TryLockError}};
     extern "C" {
         fn uu_portal_open_persist(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
+        fn uu_portal_open_persist_cancellable(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), save_data: *mut c_void, cancelled: extern "C" fn(*mut c_void) -> i32, cancel_data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_clipboard_supported(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_ready(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_set(portal: *mut c_void, text: *const u8, length: usize) -> i32;
@@ -47,27 +60,19 @@ mod native {
         Ok(true)
     }
     #[derive(Default)]
-    struct Recovery { retry_at: Option<std::time::Instant>, retired: bool }
+    struct Recovery { retry_at: Option<std::time::Instant> }
     impl Recovery {
         fn ready(&mut self, now: std::time::Instant, unlocked: impl FnOnce() -> bool) -> bool {
-            if self.retired { return false; }
             let deadline = self.retry_at.get_or_insert(now + std::time::Duration::from_secs(1));
             if now < *deadline { return false; }
             *deadline = now + std::time::Duration::from_secs(1);
             unlocked()
         }
     }
-    fn retire_if_closed<T>(current: &Mutex<T>, recovery: &Mutex<Recovery>, alive: impl FnOnce(&T) -> bool, unlocked: impl FnOnce() -> bool) -> Result<bool, String> {
-        // Wait outside the input mutex. Inspect the published replacement if recovery
-        // won; otherwise prevent the old encoder from opening after reconnect takes over.
-        let mut recovery = recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
-        let alive = {
-            let handle = current.lock().map_err(|_| "Portal session lock poisoned")?;
-            alive(&handle)
-        };
-        if alive || !unlocked() { return Ok(false); }
-        recovery.retired = true;
-        Ok(true)
+    fn clear_pause_for_unlocked_replacement(was_locked: &std::sync::atomic::AtomicBool, state: Option<bool>) {
+        if state == Some(false) {
+            was_locked.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
     pub struct Session { handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, pub width: u32, pub height: u32 }
     impl Session {
@@ -81,11 +86,11 @@ mod native {
             };
             Ok(self.was_locked.swap(false, std::sync::atomic::Ordering::AcqRel))
         }
-        fn check_geometry(&self, replacement: &Self) -> Result<(), String> {
+        fn check_geometry(&self, replacement: &Self) -> Result<(), super::PortalError> {
             // Encoder buffers use frame pixels. Logical geometry and EIS regions
             // belong to the replacement handle and may change with scaling (#25).
             if (self.width, self.height) != (replacement.width, replacement.height) {
-                Err("Portal dimensions changed; reconnect required".into())
+                Err(super::PortalError { code: 14 })
             } else {
                 Ok(())
             }
@@ -93,11 +98,14 @@ mod native {
         pub fn is_alive(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 })
         }
-        pub fn retire_if_closed(&self) -> Result<bool, String> {
-            retire_if_closed(&self.handle, &self.recovery, |handle| unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 },
-                || crate::session_lock::locked_now() == Some(false))
-        }
-        pub fn open() -> Result<Self, String> {
+        fn open_inner(cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<Self, super::PortalError> {
+            extern "C" fn is_cancelled(data: *mut c_void) -> i32 {
+                let cancelled = unsafe { &*(data as *const std::sync::atomic::AtomicBool) };
+                i32::from(cancelled.load(std::sync::atomic::Ordering::Acquire))
+            }
+            if cancelled.is_some_and(|value| value.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(super::PortalError { code: 13 });
+            }
             let (mut error, mut width, mut height) = (0, 0, 0);
             let directory = super::permissions::directory();
             let key = super::permissions::desktop_key();
@@ -114,12 +122,70 @@ mod native {
                 });
                 if result.is_err() { log::warn!("Portal permission cache callback failed"); }
             }
-            let pointer = unsafe { uu_portal_open_persist(token.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()), save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height) };
-            let handle = NonNull::new(pointer).ok_or_else(|| super::error(error))?;
+            let restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
+            let pointer = unsafe {
+                if let Some(cancelled) = cancelled {
+                    uu_portal_open_persist_cancellable(
+                        restore, save_token, &mut cache as *mut _ as *mut c_void,
+                        is_cancelled, cancelled as *const _ as *mut c_void,
+                        &mut error, &mut width, &mut height,
+                    )
+                } else {
+                    uu_portal_open_persist(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
+                }
+            };
+            let handle = NonNull::new(pointer).ok_or(super::PortalError { code: error })?;
             // A freshly opened session holds no lock-screen frame: only an observed lock (or a
             // closed stream) must discard the cached frame. Starting "locked" cleared the first
             // valid frame, and a static desktop sends no new one, so the viewer stayed black (#2).
             Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), width, height })
+        }
+        pub fn open() -> Result<Self, String> {
+            Self::open_inner(None).map_err(|error| error.to_string())
+        }
+        pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, super::PortalError> {
+            Self::open_inner(Some(cancelled))
+        }
+        pub fn recover(&self, cancelled: &std::sync::atomic::AtomicBool) -> Result<bool, super::PortalError> {
+            use std::sync::atomic::Ordering;
+            if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+            // Serialize with the encoder's stream-loss recovery: two openers would ask for consent twice.
+            let mut recovery = loop {
+                match self.recovery.try_lock() {
+                    Ok(recovery) => break recovery,
+                    Err(TryLockError::WouldBlock) => {
+                        if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(TryLockError::Poisoned(_)) => return Err(super::PortalError { code: 3 }),
+                }
+            };
+            let alive = {
+                let handle = self.handle.lock().map_err(|_| super::PortalError { code: 3 })?;
+                unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 && uu_portal_capture_alive(handle.0.as_ptr()) != 0 }
+            };
+            if alive { return Ok(false); }
+
+            super::open_then_install(cancelled, || Self::open_cancellable(cancelled), |replacement| {
+                self.check_geometry(&replacement)?;
+                let replacement_handle = replacement.handle.into_inner().map_err(|_| super::PortalError { code: 3 })?;
+                let mut handle = self.handle.lock().map_err(|_| super::PortalError { code: 3 })?;
+                if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+                *handle = replacement_handle;
+                clear_pause_for_unlocked_replacement(&self.was_locked, *self.locked.borrow());
+                log::info!("Portal capture session restored after closure");
+                Ok(())
+            })?;
+            recovery.retry_at = None;
+            Ok(true)
+        }
+        pub fn pause(&self) {
+            if let Ok(handle) = self.handle.lock() {
+                unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
+                self.was_locked.store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                self.was_locked.store(true, std::sync::atomic::Ordering::Release);
+            }
         }
         pub fn capture(&self, frame: &mut [u8]) -> Result<(), String> {
             self.capture_changed(frame, &mut None).map(|_| ())
@@ -134,8 +200,8 @@ mod native {
             if state != Some(false) {
                 // Unknown state (watcher not reported yet): show nothing but keep the cached frame.
                 if state == Some(true) {
-                    self.was_locked.store(true, std::sync::atomic::Ordering::Release);
                     unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
+                    self.was_locked.store(true, std::sync::atomic::Ordering::Release);
                 }
                 return Ok(blank_changed(frame, version));
             }
@@ -175,7 +241,7 @@ mod native {
                         }
                     };
                     recovery.retry_at = None;
-                    self.check_geometry(&replacement)?;
+                    self.check_geometry(&replacement).map_err(|error| error.to_string())?;
                     // Consent can outlive the unlocked state checked above.
                     if *self.locked.borrow() != Some(false) || self.was_locked.load(std::sync::atomic::Ordering::Acquire) {
                         return Ok(None);
@@ -384,73 +450,6 @@ mod native {
         }
 
         #[test]
-        fn reconnect_waits_for_recovery_and_rechecks_the_published_handle() {
-            use std::{sync::mpsc::channel, time::Duration};
-            for succeeds in [false, true] {
-                let current = Arc::new(Mutex::new(false));
-                let recovery = Arc::new(Mutex::new(Recovery::default()));
-                let (opening, opened) = channel();
-                let (resume, wait) = channel();
-                let (checked, observed) = channel();
-                let (starting, started) = channel();
-                let worker = {
-                    let current = current.clone();
-                    let recovery = recovery.clone();
-                    std::thread::spawn(move || {
-                        let handle = current.lock().unwrap();
-                        let _owner = recovery.lock().unwrap();
-                        replace_handle(&current, handle, || {
-                            opening.send(()).unwrap();
-                            wait.recv_timeout(Duration::from_secs(10)).unwrap();
-                            if succeeds { Ok(Some(true)) } else { Ok(None) }
-                        }).unwrap()
-                    })
-                };
-                let ready = opened.recv_timeout(Duration::from_secs(3));
-                let reconnect = {
-                    let current = current.clone();
-                    let recovery = recovery.clone();
-                    std::thread::spawn(move || {
-                        starting.send(()).unwrap();
-                        retire_if_closed(&current, &recovery, |alive| {
-                            checked.send(*alive).unwrap();
-                            *alive
-                        }, || {
-                            assert!(current.try_lock().is_ok());
-                            true
-                        }).unwrap()
-                    })
-                };
-                let started = started.recv_timeout(Duration::from_secs(3));
-                // A reconnect waiting on recovery must leave input's mutex available.
-                let input_available = current.try_lock().is_ok();
-                let premature_check = observed.recv_timeout(Duration::from_millis(100));
-                let _ = resume.send(());
-                let recovered = worker.join().unwrap();
-                let stale = reconnect.join().unwrap();
-                assert!(ready.is_ok() && started.is_ok() && input_available);
-                assert!(matches!(premature_check, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
-                assert_eq!(observed.recv_timeout(Duration::from_secs(3)).unwrap(), succeeds);
-                assert_eq!(recovered, succeeds);
-                assert_eq!(stale, !succeeds);
-                assert_eq!(recovery.lock().unwrap().retired, !succeeds);
-            }
-        }
-
-        #[test]
-        fn reconnect_retirement_prevents_a_late_encoder_recovery() {
-            let current = Mutex::new(false);
-            let recovery = Mutex::new(Recovery::default());
-            // Locked or unknown sessions must not be retired by a reconnect.
-            assert!(!retire_if_closed(&current, &recovery, |alive| *alive, || false).unwrap());
-            assert!(!recovery.lock().unwrap().retired);
-            assert!(retire_if_closed(&current, &recovery, |alive| *alive, || true).unwrap());
-            let mut recovery = recovery.lock().unwrap();
-            recovery.retry_at = Some(std::time::Instant::now());
-            assert!(!recovery.ready(std::time::Instant::now(), || panic!("retired encoder probed logind")));
-        }
-
-        #[test]
         fn recovery_backoff_skips_lock_probes_until_the_deadline() {
             use std::{cell::Cell, time::{Duration, Instant}};
             let now = Instant::now();
@@ -514,10 +513,36 @@ mod native {
             assert!(session.take_lock_observation().unwrap());
             assert!(!session.was_locked.load(std::sync::atomic::Ordering::Acquire));
         }
+
+        #[test]
+        fn cancelled_recovery_does_not_touch_the_handle() {
+            let session = Fixture::new((1920, 1080));
+            let cancelled = std::sync::atomic::AtomicBool::new(true);
+            assert_eq!(session.session().recover(&cancelled).unwrap_err().code, 13);
+        }
+
+        #[test]
+        fn unlocked_replacement_keeps_its_first_static_frame() {
+            let was_locked = std::sync::atomic::AtomicBool::new(true);
+            clear_pause_for_unlocked_replacement(&was_locked, Some(false));
+            assert!(!was_locked.load(std::sync::atomic::Ordering::Acquire));
+        }
     }
 }
 
 fn blank(frame: &mut [u8]) { for pixel in frame.chunks_exact_mut(4) { pixel.copy_from_slice(&[0, 0, 0, 255]); } }
+
+fn open_then_install<T>(
+    cancelled: &std::sync::atomic::AtomicBool,
+    open: impl FnOnce() -> Result<T, PortalError>,
+    install: impl FnOnce(T) -> Result<(), PortalError>,
+) -> Result<(), PortalError> {
+    use std::sync::atomic::Ordering;
+    if cancelled.load(Ordering::Acquire) { return Err(PortalError { code: 13 }); }
+    let replacement = open()?;
+    if cancelled.load(Ordering::Acquire) { return Err(PortalError { code: 13 }); }
+    install(replacement)
+}
 
 fn error(code: i32) -> String {
     let reason = match code {
@@ -525,7 +550,9 @@ fn error(code: i32) -> String {
         3 => "request failed", 4 => "permission cancelled or denied", 5 => "permission request timed out",
         6 => "single monitor and keyboard/pointer permission required", 7 => "PipeWire connection failed",
         8 => "unsupported frame format or size", 9 => "session closed or stream lost",
-        10 => "frame unavailable", 11 => "invalid input or frame buffer", _ => "operation failed",
+        10 => "frame unavailable", 11 => "invalid input or frame buffer",
+        13 => "operation cancelled", 14 => "dimensions changed; reconnect required",
+        _ => "operation failed",
     };
     format!("Portal {reason} (code {code})")
 }
@@ -542,8 +569,16 @@ impl PortalSession {
     pub fn clipboard_set(&self, _: &str) -> Result<(), String> { Err(error(2)) }
     pub fn clipboard_poll(&self) -> Option<String> { None }
     pub fn is_alive(&self) -> bool { false }
-    pub fn retire_if_closed(&self) -> Result<bool, String> { Ok(false) }
     pub fn open() -> Result<Self, String> { Err("Portal backend requires Linux and --features portal".into()) }
+    pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, PortalError> {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) { Err(PortalError { code: 13 }) }
+        else { Err(PortalError { code: 2 }) }
+    }
+    pub fn recover(&self, cancelled: &std::sync::atomic::AtomicBool) -> Result<bool, PortalError> {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) { Err(PortalError { code: 13 }) }
+        else { Err(PortalError { code: 2 }) }
+    }
+    pub fn pause(&self) {}
     pub fn capture(&self, _: &mut [u8]) -> Result<(), String> { Err(error(2)) }
     pub fn capture_changed(&self, _: &mut [u8], _: &mut Option<FrameVersion>) -> Result<bool, String> { Err(error(2)) }
     pub fn move_pointer(&self, _: f64, _: f64, _: bool) -> Result<(), String> { Err(error(2)) }
@@ -574,5 +609,33 @@ mod tests {
     fn errors_never_include_remote_messages_or_identifiers() {
         assert!(super::check(4).unwrap_err().contains("cancelled or denied"));
         assert!(super::check(9).unwrap_err().contains("closed or stream lost"));
+    }
+    #[test]
+    fn portal_error_display_is_fixed_and_sanitized() {
+        assert_eq!(super::PortalError { code: 13 }.to_string(), "Portal operation cancelled (code 13)");
+        assert_eq!(super::PortalError { code: 14 }.to_string(), "Portal dimensions changed; reconnect required (code 14)");
+        assert_eq!(super::PortalError { code: 123 }.to_string(), "Portal operation failed (code 123)");
+    }
+    #[test]
+    fn opening_with_pre_cancelled_flag_returns_cancellation_code() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let code = match super::PortalSession::open_cancellable(&cancelled) {
+            Err(error) => error.code,
+            Ok(_) => panic!("pre-cancelled portal open unexpectedly succeeded"),
+        };
+        assert_eq!(code, 13);
+    }
+    #[test]
+    fn replacement_opens_before_installing_under_the_handle_lock() {
+        let handle = std::sync::Mutex::new(7);
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        super::open_then_install(&cancelled, || {
+            assert_eq!(*handle.try_lock().unwrap(), 7);
+            Ok(11)
+        }, |replacement| {
+            *handle.lock().unwrap() = replacement;
+            Ok(())
+        }).unwrap();
+        assert_eq!(*handle.lock().unwrap(), 11);
     }
 }

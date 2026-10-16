@@ -46,6 +46,8 @@ struct uu_portal {
     pthread_mutex_t lock;
     pthread_cond_t changed;
     atomic_int closed;
+    uu_portal_cancelled_fn cancelled;
+    void *cancel_data;
     int error;
     enum pw_stream_state state;
     int format_valid, stream_started;
@@ -71,6 +73,10 @@ static pthread_once_t pw_once = PTHREAD_ONCE_INIT;
 static atomic_uint token_sequence = 1;
 static void initialize_pipewire(void) { pw_init(NULL, NULL); }
 static GVariant *empty_options(void) { return g_variant_new_array(G_VARIANT_TYPE("{sv}"), NULL, 0); }
+static int open_cancelled(struct uu_portal *p) {
+    return p->cancelled && p->cancelled(p->cancel_data);
+}
+static int wait_for_first_frame(struct uu_portal *p);
 #include "portal_eis.inc"
 static void fail(struct uu_portal *p, int error) {
     pthread_mutex_lock(&p->lock);
@@ -87,6 +93,16 @@ static void response_received(GDBusConnection *bus, const gchar *sender, const g
     g_variant_get(parameters, "(u@a{sv})", &r->code, &r->results);
     r->done = 1;
 }
+/* Bounded consent wait; cancellation must break it within one poll interval. */
+static int wait_for_response(struct uu_portal *p, struct response *response, unsigned consent_seconds) {
+    gint64 deadline = g_get_monotonic_time() + consent_seconds * G_TIME_SPAN_SECOND;
+    while (!response->done && !atomic_load(&p->closed) && !open_cancelled(p) &&
+        g_get_monotonic_time() < deadline) {
+        while (g_main_context_iteration(p->context, FALSE)) {}
+        if (!response->done) g_usleep(5000);
+    }
+    return response->done ? 0 : open_cancelled(p) ? 13 : atomic_load(&p->closed) ? 9 : 5;
+}
 static void close_request(struct uu_portal *p, const char *path) {
     if (!path) return;
     GVariant *r = g_dbus_connection_call_sync(p->bus, DEST, path, REQUEST, "Close",
@@ -96,6 +112,7 @@ static void close_request(struct uu_portal *p, const char *path) {
 /* Subscribe before invocation, using the documented handle_token path. */
 static GVariant *request(struct uu_portal *p, const char *interface, const char *method,
     GVariantBuilder *options, int mode, int *error) {
+    if (open_cancelled(p)) { *error = 13; return NULL; }
     char token[64];
     snprintf(token, sizeof(token), "uu_%u_%u", (unsigned)getpid(), atomic_fetch_add(&token_sequence, 1));
     g_variant_builder_add(options, "{sv}", "handle_token", g_variant_new_string(token));
@@ -112,7 +129,7 @@ static GVariant *request(struct uu_portal *p, const char *interface, const char 
     GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH, interface, method, args,
         G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 10000, NULL, NULL);
     char *actual = NULL;
-    if (!reply) { *error = 3; goto finish; }
+    if (!reply) { *error = open_cancelled(p) ? 13 : 3; goto finish; }
     const char *handle;
     g_variant_get(reply, "(&o)", &handle);
     actual = g_strdup(handle);
@@ -125,13 +142,8 @@ static GVariant *request(struct uu_portal *p, const char *interface, const char 
         unsigned long parsed=strtoul(configured_timeout,&end,10);
         if(end && !*end && parsed>=30 && parsed<=900) consent_seconds=(unsigned)parsed;
     }
-    gint64 deadline = g_get_monotonic_time() + consent_seconds * G_TIME_SPAN_SECOND;
-    while (!response.done && !atomic_load(&p->closed) && g_get_monotonic_time() < deadline) {
-        while (g_main_context_iteration(p->context, FALSE)) {}
-        if (!response.done) g_usleep(5000);
-    }
-    if (!response.done) *error = atomic_load(&p->closed) ? 9 : 5;
-    else if (response.code != 0) *error = 4;
+    *error = wait_for_response(p, &response, consent_seconds);
+    if (!*error && response.code != 0) *error = 4;
 finish:
     if (*error) close_request(p, actual ? actual : expected);
     g_dbus_connection_signal_unsubscribe(p->bus, subscription);
@@ -262,10 +274,16 @@ static const struct pw_stream_events stream_events = {
     PW_VERSION_STREAM_EVENTS, .state_changed = stream_state, .param_changed = stream_format, .process = stream_process
 };
 static int connect_pipewire(struct uu_portal *p) {
+    if (open_cancelled(p)) return 13;
     GUnixFDList *fds = NULL;
     GVariant *reply = g_dbus_connection_call_with_unix_fd_list_sync(p->bus, DEST, PATH, SCREEN,
         "OpenPipeWireRemote", g_variant_new("(o@a{sv})", p->session, empty_options()),
         G_VARIANT_TYPE("(h)"), G_DBUS_CALL_FLAGS_NONE, 10000, NULL, &fds, NULL, NULL);
+    if (open_cancelled(p)) {
+        if (reply) g_variant_unref(reply);
+        if (fds) g_object_unref(fds);
+        return 13;
+    }
     if (!reply) return 7;
     gint32 index; g_variant_get(reply, "(h)", &index);
     int fd = g_unix_fd_list_get(fds, index, NULL);
@@ -297,12 +315,22 @@ static int connect_pipewire(struct uu_portal *p) {
     if (pw_stream_connect(p->stream, PW_DIRECTION_INPUT, p->node,
         PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 2) < 0) return 7;
     if (pw_thread_loop_start(p->pw_loop) < 0) return 7;
-    struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec += 10;
+    return wait_for_first_frame(p);
+}
+static int wait_for_first_frame(struct uu_portal *p) {
+    struct timespec until;
+    gint64 deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
     pthread_mutex_lock(&p->lock);
-    while (!p->sequence && !p->error) {
-        if (pthread_cond_timedwait(&p->changed, &p->lock, &until)) break;
+    while (!p->sequence && !p->error && !open_cancelled(p)) {
+        gint64 remaining = deadline - g_get_monotonic_time();
+        if (remaining <= 0) break;
+        clock_gettime(CLOCK_REALTIME, &until);
+        gint64 wait_us = MIN(100000, remaining);
+        until.tv_nsec += wait_us * 1000;
+        if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&p->changed, &p->lock, &until);
     }
-    int result = p->error ? p->error : p->sequence ? 0 : 10;
+    int result = p->error ? p->error : open_cancelled(p) ? 13 : p->sequence ? 0 : 10;
     pthread_mutex_unlock(&p->lock);
     return result;
 }
@@ -327,10 +355,14 @@ static int read_stream_result(struct uu_portal *p, GVariant *results) {
     if (streams) g_variant_unref(streams);
     return error;
 }
-struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *), void *data, int *error, uint32_t *width, uint32_t *height) {
+static struct uu_portal *open_persist(const char *restore, void (*save_token)(const char *, void *),
+    void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
+    int *error, uint32_t *width, uint32_t *height) {
     *error = 0; *width = *height = 0;
     struct uu_portal *p = calloc(1, sizeof(*p));
     if (!p) { *error = 8; return NULL; }
+    p->cancelled = cancelled;
+    p->cancel_data = cancel_data;
     /* GNOME forwards NotifyPointerMotionAbsolute into Mutter's stream-to-stage
      * transform. It expects stream pixels, unlike the compositor-sized KDE path.
      * Do not apply the compositor scale twice on fractional-scale displays. */
@@ -342,7 +374,10 @@ struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)
     p->context = g_main_context_new(); g_main_context_push_thread_default(p->context);
     p->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
     if (!p->bus) { *error = 1; goto done; }
-    if (!has_interface(p, REMOTE) || !has_interface(p, SCREEN)) { *error = 2; goto done; }
+    if (open_cancelled(p)) { *error = 13; goto done; }
+    int interfaces_available = has_interface(p, REMOTE) && has_interface(p, SCREEN);
+    if (open_cancelled(p)) { *error = 13; goto done; }
+    if (!interfaces_available) { *error = 2; goto done; }
     GVariantBuilder options; GVariant *results;
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
     char token[64]; snprintf(token, sizeof(token), "uu_session_%u_%u", (unsigned)getpid(), atomic_fetch_add(&token_sequence, 1));
@@ -405,23 +440,41 @@ struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)
         fprintf(stderr, "Portal persistence: requested=%d restore_attempted=%d token_returned=%d\n",
             version >= 2, restore && *restore, p->restore_token && *p->restore_token);
     }
-    if (!*error && p->restore_token && save_token) save_token(p->restore_token, data);
+    if (!*error && p->restore_token && save_token) save_token(p->restore_token, save_data);
     g_variant_unref(results);
     if (*error) goto done;
     p->main_loop = g_main_loop_new(p->context, FALSE);
     g_main_context_pop_thread_default(p->context);
-    if (pthread_create(&p->dbus_thread, NULL, run_dbus, p)) { *error = 3; uu_portal_close(p); return NULL; }
+    if (pthread_create(&p->dbus_thread, NULL, run_dbus, p)) {
+        *error = 3; p->cancelled = NULL; p->cancel_data = NULL;
+        uu_portal_close(p); return NULL;
+    }
     p->dbus_started = 1;
     *error = connect_pipewire(p);
-    if (*error) { uu_portal_close(p); return NULL; }
+    if (*error) {
+        p->cancelled = NULL; p->cancel_data = NULL;
+        uu_portal_close(p); return NULL;
+    }
     fprintf(stderr, "Portal pointer geometry: frame=%ux%u compositor=%dx%d absolute=%s\n",
         p->width, p->height, p->logical_width, p->logical_height,
         p->absolute_stream_pixels ? "stream-pixels-or-eis" : "compositor-logical");
     *width = p->width; *height = p->height;
+    p->cancelled = NULL; p->cancel_data = NULL;
     return p;
 done:
     g_main_context_pop_thread_default(p->context);
+    p->cancelled = NULL; p->cancel_data = NULL;
     uu_portal_close(p); return NULL;
+}
+struct uu_portal *uu_portal_open_persist_cancellable(const char *restore,
+    void (*save_token)(const char *, void *), void *save_data,
+    uu_portal_cancelled_fn cancelled, void *cancel_data,
+    int *error, uint32_t *width, uint32_t *height) {
+    return open_persist(restore, save_token, save_data, cancelled, cancel_data, error, width, height);
+}
+struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *),
+    void *data, int *error, uint32_t *width, uint32_t *height) {
+    return open_persist(restore, save_token, data, NULL, NULL, error, width, height);
 }
 struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32_t *width, uint32_t *height) {
     return uu_portal_open_persist(restore, NULL, NULL, error, width, height);

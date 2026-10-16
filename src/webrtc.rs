@@ -25,6 +25,15 @@ use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocalWriter;
 
+fn is_capture_setting_message(data: &[u8]) -> bool {
+    use crate::protocol::WireValue;
+    let Ok(fields) = crate::protocol::decode_wire(data) else { return false; };
+    fields.iter().find_map(|field| match (field.number, &field.value) {
+        (21, WireValue::Bytes(rpc)) => crate::protocol::decode_wire(rpc).ok(),
+        _ => None,
+    }).is_some_and(|rpc| rpc.iter().any(|field| matches!(field.number, 2 | 3 | 4 | 6)))
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SessionContext {
     pub client_id: Option<String>,
@@ -48,6 +57,7 @@ impl WebRtcSession {
         signaling_client: Arc<crate::signaling::SignalingClient>,
         desktop: bool,
         transport:crate::session_ice::SessionIce,
+        portal_desktop: Option<Arc<crate::desktop_session::PortalDesktop>>,
     ) -> Result<Self, String> {
         let mut m = MediaEngine::default();
         m.register_default_codecs()
@@ -222,7 +232,7 @@ impl WebRtcSession {
         });
 
         // Desktop sound on the viewer's audio m-line (it always offers Opus).
-        if desktop && crate::audio::enabled() {
+        if desktop && crate::audio::enabled() && !cfg!(test) {
             let audio_track = Arc::new(TrackLocalStaticSample::new(
                 RTCRtpCodecCapability { mime_type: "audio/opus".to_owned(), clock_rate: 48000, channels: 2, ..Default::default() },
                 "audio_0".to_owned(), "audio_0".to_owned(),
@@ -247,7 +257,7 @@ impl WebRtcSession {
         // Per-connection mute / lock-after-session settings (安全 menu).
         let peer_actions = Arc::new(crate::system_actions::PeerActions::default());
         let desktop_sound = desktop && crate::audio::enabled();
-        if desktop {
+        if desktop && !cfg!(test) {
             let (end_pc, actions) = (pc.clone(), peer_actions.clone());
             tokio::spawn(async move {
                 {
@@ -269,12 +279,29 @@ impl WebRtcSession {
             });
         }
         let portal=capture.portal.clone();
+        let stream_desktop = portal_desktop.clone();
         // File/terminal/port-mapping connections carry no desktop video.
         let control_video_track = video_track.clone();
         let stream_settings = video_settings.clone();
-        if desktop {
+        if desktop && !cfg!(test) {
             let state_pc = streaming_pc.clone();
             tokio::spawn(async move {
+                let screen = if let Some(desktop) = stream_desktop {
+                    let mut updates = desktop.subscribe();
+                    loop {
+                        let state = updates.borrow_and_update().clone();
+                        if state.screen.init_error.is_none() { break Some(state.screen); }
+                        if !state.waiting { return; }
+                        if matches!(streaming_pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed) { return; }
+                        tokio::select! {
+                            changed = updates.changed() => if changed.is_err() { return; },
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                        }
+                    }
+                } else { None };
+                let (capture_size, capture_display, portal) = screen.as_ref().map_or(
+                    (capture_size, capture_display, portal),
+                    |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
                 if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request).await {
                     // A send racing the viewer's close fails with a misleading track error.
                     if matches!(state_pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed) {
@@ -289,12 +316,25 @@ impl WebRtcSession {
         }
         let input_clone = input.clone();
         let control_capture = capture.clone();
+        let desktop_pc = Arc::downgrade(&pc);
         let control_sequence = Arc::new(std::sync::atomic::AtomicU64::new(1));
         // Capability belongs to the granted session, including while GNOME is
         // locked. Echo can precede TEXT readiness and CONTROL auto-unlock;
         // advertising false here would disable clipboard for the entire peer.
-        let portal_clipboard_supported = desktop && capture.portal.as_ref().is_some_and(|session| session.clipboard_supported());
+        let portal_clipboard_supported = desktop && portal_desktop.as_ref().map_or_else(
+            || capture.portal.as_ref().is_some_and(|session| session.clipboard_supported()),
+            |manager| {
+                let state = manager.snapshot();
+                state.screen.init_error.is_none()
+                    && state.screen.portal.as_ref().is_some_and(|session| session.clipboard_supported())
+            });
         let text_clipboard_ready = Arc::new(std::sync::atomic::AtomicBool::new(portal_clipboard_supported));
+        let last_echo_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let echo_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Same watcher the desktop session uses: the manager's when Portal owns the
+        // session, otherwise the global lock watcher. Unknown state fails closed below.
+        let channel_lock_state = portal_desktop.as_ref().map_or_else(
+            crate::session_lock::watch_locked, |manager| manager.lock_state());
         // One file-transfer session per peer. The viewer may send FileTransferFtp RPCs on CONTROL,
         // but it receives file traffic only through streamerDidReceiveFileData, so every reply and
         // host-initiated request goes out on FILE_DATA_CHANNEL.
@@ -337,8 +377,13 @@ impl WebRtcSession {
             let input_inst = input_clone.clone();
             let channel_input_session=input_session.clone();
             let screen = control_capture.clone();
+            let portal_desktop = portal_desktop.clone();
+            let desktop_pc = desktop_pc.clone();
             let out_sequence = control_sequence.clone();
             let shared_clipboard_ready = text_clipboard_ready.clone();
+            let last_echo_request = last_echo_request.clone();
+            let echo_seen = echo_seen.clone();
+            let channel_lock_state = channel_lock_state.clone();
             let peer_files = peer_files.clone();
             let peer_port_mapping = port_mapping.clone();
             let peer_video_settings = video_settings.clone();
@@ -350,7 +395,6 @@ impl WebRtcSession {
                 let lbl = label.clone();
                 let inp = input_inst.clone();
                 let d_reply = d.clone();
-                let input_size = (screen.width, screen.height);
                 let reply_sequence = out_sequence.clone();
                 let channel_video_settings = peer_video_settings.clone();
                 let channel_actions = peer_actions.clone();
@@ -378,6 +422,88 @@ impl WebRtcSession {
                         }
                     });
                 }
+                let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+                if label == "CONTROL_DATA_CHANNEL" {
+                    let settings = channel_video_settings.clone();
+                    let track = peer_video_track.clone();
+                    let response_tx = outbound.clone();
+                    let sequence = reply_sequence.clone();
+                    let manager = portal_desktop.clone();
+                    let channel = Arc::downgrade(&d);
+                    let initial_screen = screen.clone();
+                    tokio::spawn(async move {
+                        let mut health = tokio::time::interval(std::time::Duration::from_millis(100));
+                        loop {
+                            let request = tokio::select! {
+                                request = capture_rx.recv() => match request { Some(request) => request, None => break },
+                                _ = health.tick() => {
+                                    if channel.upgrade().is_none_or(|channel| matches!(
+                                        channel.ready_state(),
+                                        webrtc::data_channel::data_channel_state::RTCDataChannelState::Closing
+                                            | webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed
+                                    )) { break; }
+                                    continue;
+                                }
+                            };
+                            let active_screen = if desktop {
+                                if let Some(manager) = &manager {
+                                    loop {
+                                        let state = manager.snapshot();
+                                        if !state.waiting && state.screen.init_error.is_some() {
+                                            log::warn!("Capture setting request dropped: Portal desktop unavailable");
+                                            break None;
+                                        }
+                                        let live = state.screen.init_error.is_none()
+                                            && (cfg!(test) || state.screen.portal.as_ref().is_some_and(|portal| portal.is_alive()))
+                                            && *manager.lock_state().borrow() == Some(false);
+                                        if live { break Some(state.screen); }
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                        if channel.upgrade().is_none_or(|channel| channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open) { return; }
+                                    }
+                                } else {
+                                    Some(initial_screen.clone())
+                                }
+                            } else {
+                                Some(initial_screen.clone())
+                            };
+                            let Some(active_screen) = active_screen else { continue; };
+                            let input_size = if active_screen.init_error.is_none() {
+                                (active_screen.width, active_screen.height)
+                            } else { (1920, 1080) };
+                            let Ok(fields) = crate::protocol::decode_wire(&request) else { continue; };
+                            use crate::protocol::WireValue;
+                            let Some(rpc) = fields.iter().find_map(|f| match (f.number, &f.value) {
+                                (21, WireValue::Bytes(rpc)) => Some(*rpc), _ => None,
+                            }) else { continue; };
+                            let Ok(rpc_fields) = crate::protocol::decode_wire(rpc) else { continue; };
+                            let before = *settings.borrow();
+                            let output_before = before.output;
+                            let revision = track.revision();
+                            let Some(response) = crate::capture_setting::handle_rpc_with_codecs(
+                                &rpc_fields, &settings, input_size,
+                                track.supports(crate::capture_setting::VideoCodec::H264),
+                                track.supports(crate::capture_setting::VideoCodec::H265)) else { continue; };
+                            let codec_changed = settings.borrow().codec != before.codec;
+                            if desktop && codec_changed && !track.wait_for_applied(revision, &settings).await {
+                                log::warn!("Codec switch did not produce a transmitted frame; success reply withheld");
+                                continue;
+                            }
+                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default().as_secs();
+                            let next = || sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = response_tx.send(crate::initialization::envelope(next(), timestamp, 22, &response));
+                            let current = *settings.borrow();
+                            if current.output != output_before {
+                                match crate::capture_setting::screen_sources(next(), timestamp, input_size, current.output, "Linux desktop") {
+                                    Ok(screens) => { let _ = response_tx.send(screens); }
+                                    Err(error) => log::warn!("Screen sources update failed: {}", error),
+                                }
+                            }
+                            let sync = crate::capture_setting::sync_payload(&current, input_size);
+                            let _ = response_tx.send(crate::initialization::envelope(next(), timestamp, 25, &sync));
+                        }
+                    });
+                }
                 // The viewer sends FileTransferFtp RPCs (Message 21/22) on CONTROL; accept them on TEXT/FILE too.
                 let file_session = if matches!(label.as_str(), "CONTROL_DATA_CHANNEL" | "TEXT_DATA_CHANNEL" | "FILE_DATA_CHANNEL") {
                     Some(peer_files.clone())
@@ -391,23 +517,58 @@ impl WebRtcSession {
                     let initial_sequence = out_sequence.clone();
                     let clipboard_sink = clipboard_input.clone();
                     let clipboard_ready = clipboard_enabled.clone();
+                    let last_echo_request = last_echo_request.clone();
+                    let echo_seen = echo_seen.clone();
                     let rich_outgoing=rich_state.clone();
                     let open_actions = channel_actions.clone();
                     let open_video = channel_video_settings.clone();
                     let open_track = peer_video_track.clone();
+                    let open_desktop = portal_desktop.clone();
+                    let open_owner = channel_input_session.clone();
+                    let open_screen = screen.clone();
                     d.on_open(Box::new(move || {
                         let init_actions = open_actions.clone();
                         let init_video = open_video.clone();
                         let init_track = open_track.clone();
                         let channel = channel.clone();
                         let sequence = initial_sequence.clone();
-                        let screen = screen.clone();
+                        let screen = open_screen.clone();
                         let clipboard_sink = clipboard_sink.clone();
                         let clipboard_ready = clipboard_ready.clone();
                         let rich_outgoing=rich_outgoing.clone();
+                        let portal_desktop = open_desktop.clone();
+                        let owner = open_owner.clone();
+                        let pc = desktop_pc.upgrade();
                         Box::pin(async move {
+                          // Permission dialogs and first-frame waits must not occupy the
+                          // channel-open callback or delay CONTROL message dispatch.
+                          tokio::spawn(async move {
                           if channel.label() == "TEXT_DATA_CHANNEL" {
                             if !desktop { return; }
+                            let screen = if let Some(desktop) = &portal_desktop {
+                                let mut updates = desktop.subscribe();
+                                let Some(_) = crate::desktop_session::wait_ready(&mut updates, &channel).await else { return; };
+                                let mut locked = desktop.lock_state();
+                                loop {
+                                    let state = desktop.snapshot();
+                                    if !state.waiting && state.screen.init_error.is_some() { return; }
+                                    if let Some(session) = state.screen.portal.as_ref() {
+                                        if session.is_alive() && *locked.borrow() == Some(false) {
+                                            break state.screen;
+                                        }
+                                    }
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                                        changed = locked.changed() => if changed.is_err() { return; },
+                                        _ = async {
+                                            loop {
+                                                if channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed { return; }
+                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                            }
+                                        } => return,
+                                    }
+                                }
+                            } else { screen };
                             let bridge = if let Some(session)=screen.portal.clone() { crate::clipboard::start_portal(session) } else { crate::clipboard::start(screen.display.clone()) };
                             *clipboard_sink.lock().unwrap() = Some(bridge.incoming);
                             let clipboard_channel = channel.clone();
@@ -452,6 +613,76 @@ impl WebRtcSession {
                             });
                             return;
                           }
+                            if desktop {
+                                // Report secure-desktop state before waiting for capture,
+                                // so AUTO_UNLOCK_SYSTEM can arrive on this same CONTROL.
+                                let state = portal_desktop.as_ref().map_or_else(
+                                    crate::session_lock::watch_locked, |desktop| desktop.lock_state());
+                                tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), state));
+                            }
+                            if let Some(manager) = &portal_desktop {
+                                let mut updates = manager.subscribe();
+                                let channel = channel.clone();
+                                let sequence = sequence.clone();
+                                let echo_request = last_echo_request.clone();
+                                let clipboard_ready = clipboard_ready.clone();
+                                tokio::spawn(async move {
+                                    let mut health = tokio::time::interval(std::time::Duration::from_millis(100));
+                                    loop {
+                                        tokio::select! {
+                                            changed = updates.changed() => if changed.is_err() { break; },
+                                            _ = health.tick() => {
+                                                if channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { break; }
+                                                continue;
+                                            }
+                                        }
+                                        let state = updates.borrow_and_update().clone();
+                                        let supported = state.screen.init_error.is_none()
+                                            && state.screen.portal.as_ref().is_some_and(|portal| portal.clipboard_supported());
+                                        clipboard_ready.store(supported, std::sync::atomic::Ordering::Release);
+                                        // echo_seen is published after the request seq, so reading it
+                                        // first guarantees a non-stale sequence for the replay.
+                                        if supported && echo_seen.load(std::sync::atomic::Ordering::Acquire) {
+                                            let request_seq = echo_request.load(std::sync::atomic::Ordering::Acquire);
+                                            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                            let response = crate::control_protocol::encode_echo_response_with_clipboard(
+                                                sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                                                timestamp, request_seq, true);
+                                            let _ = channel.send(&bytes::Bytes::from(response)).await;
+                                        }
+                                        if !state.waiting && state.screen.init_error.is_some() { break; }
+                                    }
+                                });
+                            }
+                            let screen = if let Some(portal) = &portal_desktop {
+                                if !cfg!(test) {
+                                    if let (Some(owner), Some(pc)) = (owner, pc) {
+                                        tokio::spawn(portal.clone().run(pc, channel.clone(), owner));
+                                    }
+                                }
+                                let snapshot = portal.snapshot();
+                                if snapshot.screen.init_error.is_some() {
+                                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    let message = crate::initialization::envelope(
+                                        sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
+                                        &init_actions.metrics_payload(desktop_sound, snapshot.permission(true)));
+                                    if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
+                                    let mut updates = portal.subscribe();
+                                    match crate::desktop_session::wait_ready(&mut updates, &channel).await {
+                                        Some(screen) => screen,
+                                        None => {
+                                            if channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {
+                                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                let message = crate::initialization::envelope(
+                                                    sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
+                                                    &init_actions.metrics_payload(desktop_sound, crate::system_metrics::Permission::Reject));
+                                                let _ = channel.send(&bytes::Bytes::from(message)).await;
+                                            }
+                                            return;
+                                        }
+                                    }
+                                } else { snapshot.screen }
+                            } else { screen };
                             let timestamp = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                             let next_seq = || sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -494,7 +725,6 @@ impl WebRtcSession {
                             }
                             // Mirror the Linux pointer shape; the video itself carries no pointer.
                             if !desktop { return; }
-                            tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone()));
                             let mut shapes = crate::cursor::monitor(&screen.display);
                             let mut health = tokio::time::interval(std::time::Duration::from_millis(200));
                             let mut sent = 0usize;
@@ -518,12 +748,14 @@ impl WebRtcSession {
                                     }
                                 }
                             }
+                          });
                         })
                     }));
                 }
 
 
                 d.on_message(Box::new(move |msg: DataChannelMessage| {
+                    let screen = portal_desktop.as_ref().map_or_else(|| screen.clone(), |desktop| desktop.snapshot().screen);
                     let channel_name = lbl.clone();
                     let input_worker = inp.clone();
                     let message_input_session=channel_input_session.clone();
@@ -537,43 +769,28 @@ impl WebRtcSession {
                     let rich_incoming=rich_state.clone();
                     let file_worker = file_session.clone();
                     let mapping = peer_port_mapping.clone();
-                    let video_settings = channel_video_settings.clone();
-                    let negotiated_track = peer_video_track.clone();
                     let actions = channel_actions.clone();
+                    let portal_for_message = portal_desktop.clone();
+                    let lock_for_message = channel_lock_state.clone();
+                    let echo_for_message = last_echo_request.clone();
+                    let echo_seen_for_message = echo_seen.clone();
+                    let capture_requests = capture_tx.clone();
 
                     Box::pin(async move {
+                        let input_size = (screen.width, screen.height);
                         if let Some(term) = &terminal_worker {
                             if crate::terminal::is_frame(&msg.data) { term.handle(&msg.data); return; }
+                        }
+                        if channel_name == "CONTROL_DATA_CHANNEL" && is_capture_setting_message(&msg.data) {
+                            if capture_requests.try_send(msg.data.to_vec()).is_err() {
+                                log::warn!("Capture setting queue full or closed; request dropped");
+                            }
+                            return;
                         }
                         if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
                             use crate::protocol::WireValue;
                             let rpc = fields.iter().find_map(|f| match (f.number, &f.value) { (21, WireValue::Bytes(b)) => Some(*b), _ => None });
                             let rpc_fields = rpc.and_then(|r| crate::protocol::decode_wire(r).ok());
-                            let before = *video_settings.borrow();
-                            let output_before = before.output;
-                            let revision = negotiated_track.revision();
-                            if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::capture_setting::handle_rpc_with_codecs(r, &video_settings, input_size, negotiated_track.supports(crate::capture_setting::VideoCodec::H264), negotiated_track.supports(crate::capture_setting::VideoCodec::H265))) {
-                                let codec_changed = video_settings.borrow().codec != before.codec;
-                                if codec_changed && !negotiated_track.wait_for_applied(revision, &video_settings).await {
-                                    // Official host replies after startVideoCaptureAndSendRpcResponse.
-                                    // Do not fabricate a codec error number or acknowledge an encoder that never started.
-                                    log::warn!("Codec switch did not produce a transmitted frame; success reply withheld");
-                                    return;
-                                }
-                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                let next = || out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let _ = rpc_out.send(crate::initialization::envelope(next(), ts, 22, &response));
-                                let current = *video_settings.borrow();
-                                if current.output != output_before {
-                                    match crate::capture_setting::screen_sources(next(), ts, input_size, current.output, "Linux desktop") {
-                                        Ok(screens) => { let _ = rpc_out.send(screens); },
-                                        Err(e) => log::warn!("Screen sources update failed: {}", e),
-                                    }
-                                }
-                                let sync = crate::capture_setting::sync_payload(&current, input_size);
-                                let _ = rpc_out.send(crate::initialization::envelope(next(), ts, 25, &sync));
-                                return;
-                            }
                             if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
@@ -724,8 +941,8 @@ impl WebRtcSession {
                                 if let Some(query) = query {
                                     let id = crate::protocol::decode_wire(query).ok().and_then(|q| q.iter().find_map(|f| match (&f.value, f.number) { (WireValue::Varint(v), 1) => Some(*v), _ => None }));
                                     if id == Some(1) {
-                                        let locked = *crate::session_lock::watch_locked().borrow();
-                                        crate::session_lock::send_state(&reply_chan, &out_sequence, locked.unwrap_or(false)).await;
+                                        let locked = *lock_for_message.borrow();
+                                        crate::session_lock::send_state(&reply_chan, &out_sequence, locked != Some(false)).await;
                                     }
                                 }
                                 if let Some(simple) = simple {
@@ -747,6 +964,7 @@ impl WebRtcSession {
                                             log::info!("SimpleAction {} ({}) received: value={:?} args={}", action,
                                                 crate::control_protocol::simple_action_name(action).unwrap_or("?"), value, sa::args_shape(&args));
                                             let (actions, input, chan, seq_out) = (actions.clone(), input_worker.clone(), reply_chan.clone(), out_sequence.clone());
+                                            let settings_portal = portal_for_message.clone();
                                             tokio::spawn(async move {
                                                 let worker = actions.clone();
                                                 let report = tokio::task::spawn_blocking(move || worker.handle(action, value, &args, || {
@@ -756,7 +974,10 @@ impl WebRtcSession {
                                                 })).await.unwrap_or(false);
                                                 if report {
                                                     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                                    let message = crate::initialization::envelope(seq_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &actions.metrics_payload(desktop_sound, crate::system_metrics::Permission::Allow));
+                                                    let permission = settings_portal.as_ref().map_or(
+                                                        crate::system_metrics::Permission::Allow,
+                                                        |manager| manager.snapshot().permission(desktop));
+                                                    let message = crate::initialization::envelope(seq_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &actions.metrics_payload(desktop_sound, permission));
                                                     if let Err(e) = chan.send(&bytes::Bytes::from(message)).await { log::warn!("Settings report failed: {}", e); }
                                                 }
                                             });
@@ -765,6 +986,8 @@ impl WebRtcSession {
                                             log::info!("SimpleAction {} ({}) not handled: args={}", action, crate::control_protocol::simple_action_name(action).unwrap_or("?"), sa::args_shape(args));
                                         }
                                         if action == 0 {
+                                            echo_for_message.store(seq, std::sync::atomic::Ordering::Release);
+                                            echo_seen_for_message.store(true, std::sync::atomic::Ordering::Release);
                                             let response = crate::control_protocol::encode_echo_response_with_clipboard(
                                                 out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                                                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(), seq,
@@ -788,6 +1011,8 @@ impl WebRtcSession {
                                 if channel_name.contains("CONTROL") {
                                     match crate::control_protocol::decode_control(&msg.data) {
                                         Ok(crate::control_protocol::ControlMessage::Input(event)) => {
+                                            if screen.backend == crate::desktop_backend::DesktopBackend::Portal
+                                                && (screen.init_error.is_some() || *lock_for_message.borrow() != Some(false)) { return; }
                                             use crate::control_protocol::ControlInput;
                                             // Separate receipt budgets keep motion floods from hiding clicks.
                                             static RECEIPTS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
@@ -1048,6 +1273,14 @@ mod tests {
         assert_eq!(negotiated_bundle_media(sdp), Some(("data".into(), 1)));
     }
 }
+
+#[cfg(test)]
+#[path = "desktop_control_tests.rs"]
+mod desktop_control_tests;
+
+#[cfg(test)]
+#[path = "webrtc_lifecycle_tests.rs"]
+mod webrtc_lifecycle_tests;
 
 /// Virtual/overlay interfaces never carry the UU video path (ZeroTier, containers).
 fn ice_interface_allowed(name: &str) -> bool {

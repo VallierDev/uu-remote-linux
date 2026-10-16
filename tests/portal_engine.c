@@ -185,6 +185,36 @@ static void portal_changed_physical_format_still_fails(void) {
     uu_portal_close(p);
 }
 
+static int cancel_immediately(void *data) { return *(const int *)data; }
+struct cancel_later { int *cancelled; int polls; };
+static int cancel_after_polls(void *data) {
+    struct cancel_later *state = data;
+    if (state->polls++ >= 2) *state->cancelled = 1;
+    return *state->cancelled;
+}
+static void cancellable_waits(void) {
+    int cancelled = 1, error = 0;
+    struct uu_portal p = {.cancelled=cancel_immediately, .cancel_data=&cancelled};
+    pthread_mutex_init(&p.lock, NULL);
+    pthread_cond_init(&p.changed, NULL);
+    assert(wait_for_first_frame(&p) == 13);
+    pthread_cond_destroy(&p.changed);
+    pthread_mutex_destroy(&p.lock);
+
+    GVariantBuilder options;
+    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    assert(!request(&p, REMOTE, "Start", &options, 2, &error));
+    assert(error == 13);
+    g_variant_builder_clear(&options);
+
+    /* A cancel arriving during the consent wait must stop it without the full timeout. */
+    int waiting_cancelled = 0;
+    struct cancel_later state = {.cancelled=&waiting_cancelled};
+    struct response response = {0};
+    struct uu_portal waiting = {.cancelled=cancel_after_polls, .cancel_data=&state};
+    assert(wait_for_response(&waiting, &response, 120) == 13);
+    assert(waiting_cancelled);
+}
 static void clipboard_bounds(void) {
     int fds[2]; uint8_t bytes[8]={0};
     assert(pipe2(fds,O_NONBLOCK)==0);
@@ -252,6 +282,7 @@ int main(void) {
     portal_renegotiation_recovery();
     portal_renegotiation_event_order_and_healthy_states();
     portal_changed_physical_format_still_fails();
+    cancellable_waits();
     clipboard_bounds();
     capture_with_optional_geometry(0);
     capture_with_optional_geometry(1);

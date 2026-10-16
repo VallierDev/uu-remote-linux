@@ -66,6 +66,12 @@ pub struct ScreenCapture {
 }
 
 impl ScreenCapture {
+    pub fn open_portal(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, crate::portal::PortalError> {
+        let session = std::sync::Arc::new(crate::portal::PortalSession::open_cancellable(cancelled)?);
+        Ok(Self { backend: crate::desktop_backend::DesktopBackend::Portal, init_error: None,
+            display: "wayland:portal".into(), width: session.width, height: session.height,
+            portal: Some(session), kms: None, buffer: Mutex::new(Vec::new()) })
+    }
     pub fn new() -> Result<Self, String> {
         let backend=crate::desktop_backend::detect()?;
         if backend == crate::desktop_backend::DesktopBackend::Kms {
@@ -75,10 +81,7 @@ impl ScreenCapture {
                 buffer:Mutex::new(Vec::new()),kms:Some(kms) });
         }
         if backend == crate::desktop_backend::DesktopBackend::Portal {
-            let session=std::sync::Arc::new(crate::portal::PortalSession::open()?);
-            let (width,height)=(session.width,session.height);
-            return Ok(Self { backend,init_error:None,portal:Some(session),kms:None,display:"wayland:portal".into(),width,height,
-                buffer:Mutex::new(Vec::new()) });
+            return Self::open_portal(&std::sync::atomic::AtomicBool::new(false)).map_err(|error| error.to_string());
         }
         if backend == crate::desktop_backend::DesktopBackend::Wayland {
             let (width,height)=crate::wayland::init()?;
@@ -156,7 +159,9 @@ impl Drop for ScreenCapture {
 /// Keep the display visible only while a peer is streaming; never unlock it.
 pub fn keep_display_awake() -> Result<(), String> {
     if crate::desktop_backend::detect()? == crate::desktop_backend::DesktopBackend::Kms { return Ok(()); }
-    if crate::desktop_backend::detect()? == crate::desktop_backend::DesktopBackend::Portal { return Ok(()); }
+    if crate::desktop_backend::detect()? == crate::desktop_backend::DesktopBackend::Portal {
+        return crate::desktop_power::wake();
+    }
     if crate::desktop_backend::detect()? == crate::desktop_backend::DesktopBackend::Wayland {
         return crate::wayland::wake();
     }
