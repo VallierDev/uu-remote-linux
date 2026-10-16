@@ -62,7 +62,7 @@ pub struct Screen<'a> {
     pub fps: i32,
     pub resolution: WinRect,
     pub primary: bool,
-    /// Measured pixel/logical scale; never zero or guessed from a display name.
+    /// Pixel/logical scale of the advertised coordinate space (1.0 for capture-setting v4).
     pub dpr: f64,
     pub display_name: &'a str,
     pub video_track_index: i32,
@@ -91,11 +91,7 @@ impl Screen<'_> {
         integer(1, self.id, &mut out);
         integer(2, self.fps, &mut out);
         bytes(3, &rect, &mut out); // the measured native resolution first
-        let sized = |(pixel_width, pixel_height): (i32, i32)| WinRect {
-            width: (f64::from(pixel_width) * f64::from(self.resolution.width) / f64::from(self.resolution.pixel_width)).round() as i32,
-            height: (f64::from(pixel_height) * f64::from(self.resolution.height) / f64::from(self.resolution.pixel_height)).round() as i32,
-            pixel_width, pixel_height, ..self.resolution
-        }.encode();
+        let sized = |(width, height): (i32, i32)| WinRect { width, height, pixel_width: width, pixel_height: height, ..self.resolution }.encode();
         for size in self.scaled { bytes(3, &sized(*size)?, &mut out); }
         let current = match self.current { Some(size) => sized(size)?, None => rect.clone() };
         bytes(4, &current, &mut out); // current_resolution
@@ -244,41 +240,6 @@ mod tests {
         assert!(decode_wire(&display).unwrap().iter().any(|f| f.number == 8 && f.value == WireValue::Fixed64(1.0f64.to_le_bytes())));
         assert_eq!(nested(&display, 3), rect);
         assert_eq!(nested(&display, 6), rect);
-    }
-    #[test]
-    fn scaled_portal_inventory_preserves_logical_and_pixel_geometry() {
-        let cases = [
-            ((1920, 1080), (1920, 1080), (1280, 720), (1280, 720)),
-            ((2560, 1440), (2048, 1152), (1920, 1080), (1536, 864)),
-            ((2560, 1440), (1707, 960), (1280, 720), (854, 480)),
-            ((3840, 2160), (2560, 1440), (1920, 1080), (1280, 720)),
-            ((3840, 2160), (2194, 1234), (1920, 1080), (1097, 617)),
-            ((3840, 2160), (1920, 1080), (1920, 1080), (960, 540)),
-            ((5120, 2880), (2560, 1440), (2560, 1440), (1280, 720)),
-            ((7680, 4320), (3840, 2160), (3840, 2160), (1920, 1080)),
-            ((3440, 1440), (2293, 960), (1720, 720), (1147, 480)),
-            ((2160, 3840), (1080, 1920), (1080, 1920), (540, 960)),
-            ((2257, 1505), (1806, 1204), (1128, 752), (903, 602)),
-        ];
-        for (physical, logical, output, current_logical) in cases {
-            let msg = crate::capture_setting::screen_sources(
-                1, 2, physical, logical, Some(output), "test",
-            ).unwrap();
-            let display = nested(&nested(&msg, 7), 1);
-            let native = nested(&display, 3);
-            let current = nested(&display, 4);
-            assert_eq!(number(&native, 3), Some(u64::from(logical.0)));
-            assert_eq!(number(&native, 4), Some(u64::from(logical.1)));
-            assert_eq!(number(&native, 5), Some(u64::from(physical.0)));
-            assert_eq!(number(&native, 6), Some(u64::from(physical.1)));
-            assert_eq!(number(&current, 3), Some(current_logical.0));
-            assert_eq!(number(&current, 4), Some(current_logical.1));
-            assert_eq!(number(&current, 5), Some(u64::from(output.0)));
-            assert_eq!(number(&current, 6), Some(u64::from(output.1)));
-            let dpr = f64::from(physical.0) / f64::from(logical.0);
-            assert!(decode_wire(&display).unwrap().iter().any(
-                |f| f.number == 8 && f.value == WireValue::Fixed64(dpr.to_le_bytes())));
-        }
     }
     #[test]
     fn minimal_messages_preserve_actual_source_size_and_binding_zero() {

@@ -148,7 +148,7 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
             Some(CHROMA_420) => next.chroma = CHROMA_420,
             _ => {}
         }
-        // ChooseResolutionType 3 = follow remote (native); otherwise pixel size, else logical size.
+        // ChooseResolutionType 3 = follow remote (native); v4 uses pixels in both size pairs.
         if number(&fields, 10) == Some(3) { next.output = None; }
         else if let Some((w, h)) = number(&fields, 16).zip(number(&fields, 17)).or_else(|| number(&fields, 5).zip(number(&fields, 6))) {
             next.output = clamp_output(native, w, h);
@@ -180,14 +180,15 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
     Some(out)
 }
 
-/// Message 7 ScreenSources for the single desktop: native size, scaled choices, current size.
-pub fn screen_sources(seq: u64, timestamp: u64, native: (u32, u32), logical: (u32, u32), output: Option<(u32, u32)>, name: &str) -> Result<Vec<u8>, String> {
+/// Message 7 ScreenSources in pixels for capture-setting v4: native, choices, current size.
+pub fn screen_sources(seq: u64, timestamp: u64, native: (u32, u32), output: Option<(u32, u32)>, name: &str) -> Result<Vec<u8>, String> {
     use crate::initialization::{Screen, WinRect};
     let (w, h) = (native.0 as i32, native.1 as i32);
     let scaled: Vec<(i32, i32)> = scaled_sizes(native).into_iter().map(|(w, h)| (w as i32, h as i32)).collect();
-    // Screen field 8 is the existing DPR double; WinRect keeps logical and pixel sizes separate.
-    let resolution = WinRect { left: 0, top: 0, width: logical.0 as i32, height: logical.1 as i32, pixel_width: w, pixel_height: h };
-    let screens = [Screen { id: 0, fps: crate::video::FPS as i32, resolution, primary: true, dpr: f64::from(native.0) / f64::from(logical.0),
+    // DPI_SCALE starts at version 5; the observed v4 request uses fields 5/6 as pixels.
+    // Keep every advertised rectangle in that space; Portal/EIS maps input independently.
+    let resolution = WinRect { left: 0, top: 0, width: w, height: h, pixel_width: w, pixel_height: h };
+    let screens = [Screen { id: 0, fps: crate::video::FPS as i32, resolution, primary: true, dpr: 1.0,
         display_name: name, video_track_index: 0, screen_type: 0, builtin_screen_type: 0,
         scaled: &scaled, current: output.map(|(w, h)| (w as i32, h as i32)) }];
     crate::initialization::encode_screen_sources(seq, timestamp, &screens, 0)
@@ -299,6 +300,133 @@ mod tests {
         handle_rpc(&decode_wire(&rpc(2, 6, &[8, 160, 32, 16, 160, 20])).unwrap(), &tx, (1920, 1080)).unwrap();
         assert_eq!(rx.borrow().output, None);
         assert_eq!(scaled_sizes((1920, 1080)), vec![(1600, 900), (1280, 720), (960, 540), (640, 360)]);
+    }
+
+    #[test]
+    fn version_four_native_inventory_roundtrips_without_downscaling() {
+        assert_eq!(FEATURE_VERSION, 4);
+        let native = (3840, 2160);
+        let inventory = screen_sources(1, 2, native, None, "test").unwrap();
+        let envelope = decode_wire(&inventory).unwrap();
+        let sources = decode_wire(message(&envelope, 7).unwrap()).unwrap();
+        let display = decode_wire(message(&sources, 1).unwrap()).unwrap();
+        let rect = decode_wire(message(&display, 4).unwrap()).unwrap();
+        let mut body = Vec::new();
+        put_varint(5, number(&rect, 3).unwrap(), &mut body);
+        put_varint(6, number(&rect, 4).unwrap(), &mut body);
+        put_varint(2, QUALITY_BLURAY, &mut body);
+        let (tx, rx) = watch::channel(VideoSettings::default());
+        handle_rpc(&decode_wire(&rpc(77, 2, &body)).unwrap(), &tx, native).unwrap();
+        assert_eq!(rx.borrow().output, None, "native selection must preserve the full frame");
+        let sync = sync_payload(&rx.borrow(), native);
+        let fields = decode_wire(&sync).unwrap();
+        assert_eq!(number(&fields, 5), Some(3840));
+        assert_eq!(number(&fields, 6), Some(2160));
+    }
+
+    fn advertised_display(native: (u32, u32), output: Option<(u32, u32)>) -> Vec<u8> {
+        let inventory = screen_sources(1, 2, native, output, "test").unwrap();
+        let envelope = decode_wire(&inventory).unwrap();
+        let sources = decode_wire(message(&envelope, 7).unwrap()).unwrap();
+        message(&sources, 1).unwrap().to_vec()
+    }
+
+    #[test]
+    fn version_four_resolution_choices_and_settings_roundtrip_in_pixels() {
+        assert_eq!(FEATURE_VERSION, 4);
+        for native in [(1920, 1080), (2560, 1440), (3840, 2160), (5120, 2880),
+            (7680, 4320), (3440, 1440), (2160, 3840), (2257, 1505)] {
+            let display = advertised_display(native, None);
+            let fields = decode_wire(&display).unwrap();
+            assert!(fields.iter().any(|f| f.number == 8 && f.value == WireValue::Fixed64(1.0f64.to_le_bytes())));
+            assert_eq!(message(&fields, 6), message(&fields, 4));
+            let choices: Vec<_> = fields.iter().filter_map(|f| match f.value {
+                WireValue::Bytes(rect) if f.number == 3 => Some(rect), _ => None,
+            }).collect();
+            assert_eq!(choices.len(), 1 + scaled_sizes(native).len());
+            assert_eq!(choices[0], message(&fields, 6).unwrap());
+            for rect in choices {
+                let rect = decode_wire(rect).unwrap();
+                let (w, h) = (number(&rect, 3).unwrap(), number(&rect, 4).unwrap());
+                assert_eq!(number(&rect, 5), Some(w));
+                assert_eq!(number(&rect, 6), Some(h));
+                let selected = (w as u32, h as u32);
+                let expected = (selected != native).then_some(selected);
+                // Exercise both the observed legacy capture request and the resolution-only RPC.
+                for case in [2, 6] {
+                    let (tx, rx) = watch::channel(VideoSettings::default());
+                    let mut body = Vec::new();
+                    let (wf, hf) = if case == 2 { (5, 6) } else { (1, 2) };
+                    put_varint(wf, w, &mut body); put_varint(hf, h, &mut body);
+                    if case == 2 {
+                        put_varint(2, QUALITY_GENERAL, &mut body);
+                        put_varint(18, 30, &mut body);
+                    }
+                    let response = handle_rpc(&decode_wire(&rpc(77, case, &body)).unwrap(), &tx, native).unwrap();
+                    let response = decode_wire(&response).unwrap();
+                    assert_eq!(message(&response, 1), Some(&[8u8, 77][..]));
+                    assert_eq!(message(&response, 2), Some(&[][..]));
+                    assert_eq!(rx.borrow().output, expected);
+                    if case == 2 {
+                        assert_eq!(rx.borrow().quality, QUALITY_GENERAL);
+                        assert_eq!(rx.borrow().fps, 30);
+                    }
+                    let sync = sync_payload(&rx.borrow(), native);
+                    let sync = decode_wire(&sync).unwrap();
+                    for (wf, hf) in [(5, 6), (9, 10)] {
+                        assert_eq!(number(&sync, wf), Some(w));
+                        assert_eq!(number(&sync, hf), Some(h));
+                    }
+                    let updated = advertised_display(native, rx.borrow().output);
+                    let updated = decode_wire(&updated).unwrap();
+                    assert_eq!(message(&updated, 6), message(&fields, 6));
+                    assert_eq!(message(&updated, 3), message(&fields, 3));
+                    let current = decode_wire(message(&updated, 4).unwrap()).unwrap();
+                    for (wf, hf) in [(3, 4), (5, 6)] {
+                        assert_eq!(number(&current, wf), Some(w));
+                        assert_eq!(number(&current, hf), Some(h));
+                    }
+                    // Echo synchronized dimensions with a quality/fps change, then restore native.
+                    let mut body = Vec::new();
+                    put_varint(5, number(&sync, 5).unwrap(), &mut body);
+                    put_varint(6, number(&sync, 6).unwrap(), &mut body);
+                    put_varint(2, QUALITY_BLURAY, &mut body);
+                    put_varint(18, 60, &mut body);
+                    handle_rpc(&decode_wire(&rpc(78, 2, &body)).unwrap(), &tx, native).unwrap();
+                    assert_eq!(rx.borrow().output, expected);
+                    assert_eq!(rx.borrow().quality, QUALITY_BLURAY);
+                    assert_eq!(rx.borrow().fps, 60);
+                    let mut native_request = Vec::new();
+                    put_varint(5, u64::from(native.0), &mut native_request);
+                    put_varint(6, u64::from(native.1), &mut native_request);
+                    handle_rpc(&decode_wire(&rpc(79, 2, &native_request)).unwrap(), &tx, native).unwrap();
+                    assert_eq!(rx.borrow().output, None);
+                    handle_rpc(&decode_wire(&rpc(80, 2, &body)).unwrap(), &tx, native).unwrap();
+                    assert_eq!(rx.borrow().output, expected);
+                    handle_rpc(&decode_wire(&rpc(81, 2, &[80, 3])).unwrap(), &tx, native).unwrap();
+                    assert_eq!(rx.borrow().output, None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_pixel_size_takes_precedence_and_follow_remote_restores_native() {
+        let native = (3840, 2160);
+        let (tx, rx) = watch::channel(VideoSettings { output: Some((1280, 720)), ..Default::default() });
+        let mut body = Vec::new();
+        for (field, value) in [(5, 1920), (6, 1080), (16, 2560), (17, 1440)] {
+            put_varint(field, value, &mut body);
+        }
+        handle_rpc(&decode_wire(&rpc(1, 2, &body)).unwrap(), &tx, native).unwrap();
+        assert_eq!(rx.borrow().output, Some((2560, 1440)));
+        put_varint(10, 3, &mut body);
+        handle_rpc(&decode_wire(&rpc(2, 2, &body)).unwrap(), &tx, native).unwrap();
+        assert_eq!(rx.borrow().output, None);
+        let sync = sync_payload(&rx.borrow(), native);
+        let fields = decode_wire(&sync).unwrap();
+        assert_eq!(number(&fields, 5), Some(3840));
+        assert_eq!(number(&fields, 6), Some(2160));
     }
 
     #[test]
