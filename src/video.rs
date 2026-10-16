@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore, OwnedSemaphorePermit};
 use webrtc::media::Sample;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -66,6 +66,7 @@ struct CompleteFrame {
     sequence: u64,
     completed_at: Instant,
     data: Vec<u8>,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 const RTP_CLOCK: u64 = 90_000;
@@ -269,16 +270,16 @@ impl Drop for StopOnDrop { fn drop(&mut self) { self.0.store(true, std::sync::at
 async fn read_encoder(
     size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     latest: mpsc::Sender<Arc<CompleteFrame>>,
-    settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>,
+    settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
 ) -> Result<(), String> {
     // The sequence is shared so a CPU fallback or settings restart continues it (skip statistics stay correct).
     let encoder = Encoder::requested();
-    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,sequence,settings,idr).await; }
-    match read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,sequence.clone(),settings,idr.clone()).await {
+    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,sequence,settings,idr,budget).await; }
+    match read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,sequence.clone(),settings,idr.clone(),budget.clone()).await {
         Ok(())=>Ok(()),
         Err(error) if !latest.is_closed()=>{
             log::warn!("{} stream unavailable; switching scoped encoder to CPU: {}",encoder.name_for(settings.codec),error);
-            read_encoder_with(size,display,portal,latest,Encoder::Cpu,sequence,settings,idr).await
+            read_encoder_with(size,display,portal,latest,Encoder::Cpu,sequence,settings,idr,budget).await
         },
         Err(error)=>Err(error),
     }
@@ -288,21 +289,21 @@ async fn read_encoder(
 #[cfg(feature = "inproc-av")]
 async fn read_inprocess(
     config: crate::inproc_encoder::Config, latest: mpsc::Sender<Arc<CompleteFrame>>,
-    sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>,
+    sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
 ) -> Result<(), String> {
     let codec = config.codec;
-    let (units_tx, mut units) = mpsc::channel::<Vec<u8>>(4);
+    let (units_tx, mut units) = mpsc::channel::<crate::inproc_encoder::EncodedUnit>(4);
     let stop = Arc::new(AtomicBool::new(false));
     // If this future is dropped (reader task aborted), the blocking encoder stops at its next packet.
     let _stop_on_drop = StopOnDrop(stop.clone());
     let job = tokio::task::spawn_blocking({
         let stop = stop.clone();
-        move || crate::inproc_encoder::run(config, units_tx, stop, idr)
+        move || crate::inproc_encoder::run(config, units_tx, stop, idr, budget)
     });
     let mut gate = DependencyGate::default();
-    while let Some(data) = units.recv().await {
+    while let Some(unit) = units.recv().await {
         let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        gate.submit(&latest, Arc::new(CompleteFrame { codec, sequence, completed_at: Instant::now(), data }));
+        gate.submit(&latest, Arc::new(CompleteFrame { codec, sequence, completed_at: unit.completed_at, data: unit.data, _permit: Some(unit.permit) }));
         if latest.is_closed() { break; }
     }
     // Dropping the receiver also unblocks the encoder if it is waiting to send.
@@ -333,10 +334,11 @@ fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
 
 async fn read_encoder_with(
     size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,encoder:Encoder,sequence:Arc<std::sync::atomic::AtomicU64>,
-    settings: VideoSettings, #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] idr: Arc<AtomicBool>,
+    settings: VideoSettings, #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
 )->Result<(),String>{
     let kms=display.starts_with("kms:");
     let wayland=kms || display.starts_with("wayland:");
+    let (permits_tx,mut permits_rx)=mpsc::channel::<OwnedSemaphorePermit>(4);
     let kms_capture=if kms {
         let capture=tokio::task::spawn_blocking(crate::kms::Capture::open).await.map_err(|_|"KMS worker failed")??;
         if (capture.width,capture.height)!=size { return Err("KMS mode changed; restart host to refresh desktop geometry".into()); }
@@ -354,7 +356,7 @@ async fn read_encoder_with(
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} pipeline=in-process",
             display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec));
-        return read_inprocess(config, latest, sequence, idr).await;
+        return read_inprocess(config, latest, sequence, idr, budget).await;
     }
     let size = format!("{}x{}", size.0, size.1);
     let fps = settings.fps.to_string();
@@ -397,7 +399,8 @@ async fn read_encoder_with(
         #[cfg(not(target_os="linux"))]
         let executable=std::env::current_exe().map_err(|e|format!("Capture executable: {e}"))?;
         let mut capture=wayland_capture_command(&executable,settings.fps)
-            .kill_on_drop(true).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit())
+            .env("UU_WAYLAND_DEMAND","1")
+            .kill_on_drop(true).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit())
             .spawn().map_err(|e|format!("Start Wayland capture: {e}"))?;
         let source:std::process::Stdio=capture.stdout.take().ok_or("Capture stdout missing")?
             .try_into().map_err(|e|format!("Capture pipe: {e}"))?;
@@ -416,11 +419,13 @@ async fn read_encoder_with(
             use tokio::io::AsyncWriteExt;
             let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.fps)));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut bytes=vec![0;capture.width as usize*capture.height as usize*4];
             loop {
                 tick.tick().await;
+                let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
+                permits_tx.send(permit).await.map_err(|_|"Encoder stopped")?;
                 let capture=capture.clone();
-                let bytes=tokio::task::spawn_blocking(move || {
-                    let mut bytes=vec![0;capture.width as usize*capture.height as usize*4];
+                bytes=tokio::task::spawn_blocking(move || {
                     capture.capture(&mut bytes)?; Ok::<_,String>(bytes)
                 }).await.map_err(|_|"KMS worker failed")??;
                 sink.write_all(&bytes).await.map_err(|_|"KMS encoder pipe failed")?;
@@ -433,23 +438,42 @@ async fn read_encoder_with(
             let interval=Duration::from_nanos(1_000_000_000/u64::from(settings.fps));
             let mut tick=tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut frame=vec![0;(session.width as usize)*(session.height as usize)*4];
+            let mut version=None;
             loop {
                 tick.tick().await;
+                let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
+                permits_tx.send(permit).await.map_err(|_|"Encoder stopped")?;
                 let session=session.clone();
-                let frame=tokio::task::spawn_blocking(move || {
-                    let mut frame=vec![0;(session.width as usize)*(session.height as usize)*4];
-                    session.capture(&mut frame)?;
-                    Ok::<_,String>(frame)
+                (frame,version)=tokio::task::spawn_blocking(move || {
+                    session.capture_changed(&mut frame,&mut version)?;
+                    Ok::<_,String>((frame,version))
                 }).await.map_err(|e|format!("Portal capture worker: {e}"))??;
                 sink.write_all(&frame).await.map_err(|e|format!("Portal encoder pipe: {e}"))?;
             }
         })))
     } else if let Some(mut capture)=native_capture {
+        let mut demand=capture.stdin.take().ok_or("Capture stdin missing")?;
         Some(EncoderTask(tokio::spawn(async move {
-            let status=capture.wait().await.map_err(|e|format!("Wayland capture: {e}"))?;
-            // Nothing awaits this task; log so the cause survives the generic encoder EOF.
-            log::warn!("Wayland capture exited: {status}");
-            Err(format!("Wayland capture exited: {status}"))
+            use tokio::io::AsyncWriteExt;
+            tokio::select! {
+                result=async {
+                    let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.fps)));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
+                        tick.tick().await;
+                        permits_tx.send(permit).await.map_err(|_|"Encoder stopped")?;
+                        demand.write_all(&[1]).await.map_err(|_|"Capture demand pipe closed")?;
+                    }
+                } => result,
+                status=capture.wait() => {
+                    let status=status.map_err(|e|format!("Wayland capture: {e}"))?;
+                    // Nothing awaits this task; log so the cause survives the generic encoder EOF.
+                    log::warn!("Wayland capture exited: {status}");
+                    Err(format!("Wayland capture exited: {status}"))
+                },
+            }
         })))
     } else { None };
     let mut stdout = child.stdout.take().ok_or("Encoder stdout missing")?;
@@ -468,8 +492,9 @@ async fn read_encoder_with(
             if next > MAX_ACCESS_UNIT { return Err("Encoder access unit exceeds limit".into()); }
             let frame: Vec<u8> = pending.drain(..next).collect();
             let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let permit=if wayland {Some(permits_rx.recv().await.ok_or("Capture producer stopped")?)} else {None};
             gate.submit(&latest, Arc::new(CompleteFrame {
-                codec: settings.codec, sequence, completed_at: Instant::now(), data: frame,
+                codec: settings.codec, sequence, completed_at: Instant::now(), data: frame, _permit: permit,
             }));
             if latest.is_closed() { return Ok(()); }
         }
@@ -499,7 +524,7 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
     let sequence=Arc::new(std::sync::atomic::AtomicU64::new(0));
     let fps=crate::wayland::capture_fps(std::env::var("UU_PROBE_FPS").ok().as_deref())?;
     let settings=VideoSettings {fps,..VideoSettings::default()};
-    let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,settings,sequence,Arc::new(AtomicBool::new(false)))));
+    let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,settings,sequence,Arc::new(AtomicBool::new(false)),Arc::new(Semaphore::new(4)))));
     let mut count=0;
     let mut bytes=0;
     // UU_PROBE_FRAMES lengthens the sample for baseline measurements; default is 5 frames.
@@ -527,6 +552,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
     }
     crate::capture::keep_display_awake()?;
     let (latest, mut receiver) = mpsc::channel(4);
+    let budget=Arc::new(Semaphore::new(4));
     let sequence = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut current = *settings.borrow_and_update();
     if !track.supports(current.codec) && track.supports(VideoCodec::H265) {
@@ -534,7 +560,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
         applied.send_replace(current);
         settings.borrow_and_update();
     }
-    let mut reader = EncoderTask(tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone())));
+    let mut reader = EncoderTask(tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone(), budget.clone())));
     let mut previous = None;
     let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
     let mut settings_open = true;
@@ -547,39 +573,40 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
     let mut stats = Instant::now();
     // sent/skipped are cumulative; window_* and max_* cover the interval since the last stats line.
     let (mut window_frames, mut window_skipped) = (0u64, 0u64);
-    loop {
+    let mut send_interrupted=false;
+    'stream: loop {
+        let next = *settings.borrow_and_update();
+        if next != current || send_interrupted {
+            let discard = next.codec != current.codec || send_interrupted;
+            current = next;
+            timeline.fps = u64::from(next.fps);
+            if discard {
+                reader.0.abort();
+                let _ = (&mut reader.0).await;
+                while receiver.try_recv().is_ok() {}
+                reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone(), budget.clone()));
+            } else {
+                reader.restart(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone(), budget.clone())).await;
+            }
+            send_interrupted=false;
+        }
         tokio::select! {
             result = &mut reader.0 => {
                 let result = result.map_err(|e| format!("Encoder reader task: {e}"))?;
                 if let (Err(error), VideoCodec::H265, true) = (&result, current.codec, track.supports(VideoCodec::H264)) {
                     log::warn!("HEVC stream failed ({error}); falling back to negotiated H264");
-                    current.codec = VideoCodec::H264;
                     applied.send_modify(|value| value.codec = VideoCodec::H264);
                     current = *settings.borrow_and_update();
                     while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone()));
+                    reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone(), budget.clone()));
                     continue;
                 }
                 return result;
             },
             _ = health.tick() => { if transport_closed(&pc) { return Ok(()); } },
             changed = settings.changed(), if settings_open => {
-                if changed.is_err() { settings_open = false; continue; }
-                // Restart the encoder with the viewer's new 帧率/画质; it begins with an IDR, and frames
-                // still queued from the old encoder remain a valid chain before it.
-                let next = *settings.borrow_and_update();
-                let codec_changed = next.codec != current.codec;
-                current = next;
-                timeline.fps = u64::from(next.fps);
-                if codec_changed {
-                    reader.0.abort();
-                    let _ = (&mut reader.0).await;
-                    // Drain only after the old producer is gone, before the new IDR can enter.
-                    while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone()));
-                } else {
-                    reader.restart(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone())).await;
-                }
+                if changed.is_err() { settings_open = false; }
+                continue;
             },
             frame = receiver.recv() => {
                 // A closed queue means the reader ended; its JoinHandle carries the reason.
@@ -600,6 +627,10 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                     tokio::select! {
                         result = &mut send => { result.map_err(|e| format!("Video send: {e}"))?; break; },
                         _ = health.tick() => { if transport_closed(&pc) { return Ok(()); } },
+                        changed = settings.changed(), if settings_open => {
+                            if changed.is_err() { settings_open=false; }
+                            else if *settings.borrow()!=current { send_interrupted=true; continue 'stream; }
+                        },
                     }
                 }
                 previous = Some(frame.sequence);
@@ -630,6 +661,29 @@ mod tests {
         }
     }
     use super::*;
+    #[tokio::test]
+    async fn frame_budget_spans_queued_sending_and_restarted_encoders() {
+        let budget=Arc::new(Semaphore::new(2));
+        let (tx,mut rx)=mpsc::channel(4);
+        let mut gate=DependencyGate::default();
+        for sequence in 1..=2 {
+            let permit=budget.clone().acquire_owned().await.unwrap();
+            gate.submit(&tx,Arc::new(CompleteFrame {codec:VideoCodec::H264,sequence,completed_at:Instant::now(),
+                data:vec![0,0,1,5,42],_permit:Some(permit)}));
+        }
+        let sending=rx.recv().await.unwrap();
+        assert_eq!(budget.available_permits(),0);
+        let restarted=tokio::spawn(budget.clone().acquire_owned());
+        tokio::task::yield_now().await;
+        assert!(!restarted.is_finished());
+        drop(sending);
+        let permit=tokio::time::timeout(Duration::from_secs(1),restarted).await.unwrap().unwrap().unwrap();
+        assert_eq!(budget.available_permits(),0);
+        drop(rx);
+        assert_eq!(budget.available_permits(),1);
+        drop(permit);
+        assert_eq!(budget.available_permits(),2);
+    }
     #[test]
     fn x264_buffer_fits_keyframes() {
         assert_eq!(buffer_kbits(2000, Encoder::Nvenc), 250);
@@ -667,7 +721,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let old_tx = tx.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let frame = |sequence, idr| Arc::new(CompleteFrame {
+        let frame = |sequence, idr| Arc::new(CompleteFrame { _permit: None,
             sequence, codec: VideoCodec::H264, completed_at: Instant::now(),
             data: vec![0, 0, 1, 9, 240, 0, 0, 1, if idr { 5 } else { 1 }, 42],
         });
@@ -762,7 +816,7 @@ mod tests {
     async fn bounded_queue_never_sends_broken_prediction_chain_after_overload(){
         let(tx,mut rx)=mpsc::channel(1);
         let mut gate=DependencyGate::default();
-        let frame=|sequence,idr|Arc::new(CompleteFrame{sequence,codec:VideoCodec::H264,completed_at:Instant::now(),data:vec![0,0,1,9,240,0,0,1,if idr{5}else{1},42]});
+        let frame=|sequence,idr|Arc::new(CompleteFrame{_permit:None,sequence,codec:VideoCodec::H264,completed_at:Instant::now(),data:vec![0,0,1,9,240,0,0,1,if idr{5}else{1},42]});
         gate.submit(&tx,frame(1,false));assert!(rx.try_recv().is_err()); // no IDR yet
         gate.submit(&tx,frame(2,true));
         gate.submit(&tx,frame(3,false)); // queue full: P3 lost
@@ -795,7 +849,7 @@ mod tests {
     async fn hevc_dependency_gate_recovers_only_at_irap_after_overflow() {
         let (tx, mut rx) = mpsc::channel(1);
         let mut gate = DependencyGate::default();
-        let frame = |sequence, irap| Arc::new(CompleteFrame { codec: VideoCodec::H265,
+        let frame = |sequence, irap| Arc::new(CompleteFrame { _permit: None, codec: VideoCodec::H265,
             sequence, completed_at: Instant::now(), data: vec![0,0,1,if irap { 38 } else { 2 },1,42] });
         gate.submit(&tx, frame(1, false));
         assert!(rx.try_recv().is_err());

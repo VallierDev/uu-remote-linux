@@ -61,14 +61,15 @@ impl VideoTrack {
         };
         let count = payloads.len();
         let mut complete = count > 0;
+        let timestamp = state.timestamp;
+        state.timestamp = state.timestamp.wrapping_add((sample.duration.as_secs_f64() * 90_000.0) as u32);
         for (index, payload) in payloads.into_iter().enumerate() {
-            let packet = Packet { header: Header { version: 2, sequence_number: state.sequence, timestamp: state.timestamp,
+            let packet = Packet { header: Header { version: 2, sequence_number: state.sequence, timestamp,
                 marker: index + 1 == count, ..Default::default() }, payload };
             state.sequence = state.sequence.wrapping_add(1);
             complete &= track.write_rtp_with_extensions(&packet, extensions).await? > 0;
         }
         if complete { self.progress.send_modify(|value| { value.0 += 1; value.1 = codec; }); }
-        state.timestamp = state.timestamp.wrapping_add((sample.duration.as_secs_f64() * 90_000.0) as u32);
         Ok(())
     }
 }

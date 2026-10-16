@@ -51,6 +51,7 @@ struct uu_portal {
     uint8_t *frame;
     size_t frame_length;
     uint64_t sequence;
+    uint64_t revision;
 };
 #include "portal_clipboard.inc"
 
@@ -182,6 +183,7 @@ static void copy_video_buffer(struct uu_portal *p, struct spa_buffer *spa) {
             memset(p->frame, 0, p->frame_length);
             for (size_t pixel = 0; pixel < p->frame_length / 4; pixel++) p->frame[pixel * 4 + 3] = 255;
             p->sequence++;
+            p->revision++;
             return;
         }
         struct spa_meta_region *crop = spa_buffer_find_meta_data(spa, SPA_META_VideoCrop, sizeof(*crop));
@@ -203,6 +205,7 @@ static void copy_video_buffer(struct uu_portal *p, struct spa_buffer *spa) {
                 }
             }
             p->sequence++;
+            p->revision++;
         }
     }
 }
@@ -418,14 +421,22 @@ void uu_portal_reset_frame(struct uu_portal *p) {
     if (!p) return;
     pthread_mutex_lock(&p->lock);
     p->sequence = 0;
+    p->revision++;
     if (p->frame) memset(p->frame, 0, p->frame_length);
     pthread_mutex_unlock(&p->lock);
 }
 int uu_portal_capture(struct uu_portal *p, uint8_t *frame, size_t length) {
+    return uu_portal_capture_since(p, frame, length, NULL);
+}
+int uu_portal_capture_since(struct uu_portal *p, uint8_t *frame, size_t length, uint64_t *revision) {
     if (!p || !frame) return 11;
     pthread_mutex_lock(&p->lock);
     int result = atomic_load(&p->closed) ? 9 : p->error ? p->error : !p->sequence ? 10 : length != p->frame_length ? 11 : 0;
-    if (!result) memcpy(frame, p->frame, length);
+    if (!result) {
+        if (revision && *revision == p->revision) result = 12;
+        else memcpy(frame, p->frame, length);
+        if (revision) *revision = p->revision;
+    }
     pthread_mutex_unlock(&p->lock); return result;
 }
 int uu_portal_alive(struct uu_portal *p) {

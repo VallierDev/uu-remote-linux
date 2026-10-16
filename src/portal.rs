@@ -1,6 +1,8 @@
 //! GNOME/KDE portal session. Capture and input must share this Arc; do not
 //! recreate it in an encoder subprocess (that would request consent again).
 use std::sync::Arc;
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FrameVersion(usize, u64);
 #[cfg(unix)]
 #[path = "portal_permissions.rs"]
 mod permissions;
@@ -17,7 +19,7 @@ mod native {
         fn uu_portal_close(portal: *mut c_void);
         fn uu_portal_alive(portal: *mut c_void) -> i32;
         fn uu_portal_reset_frame(portal: *mut c_void);
-        fn uu_portal_capture(portal: *mut c_void, bgra: *mut u8, length: usize) -> i32;
+        fn uu_portal_capture_since(portal: *mut c_void, bgra: *mut u8, length: usize, revision: *mut u64) -> i32;
         fn uu_portal_move(portal: *mut c_void, x: f64, y: f64, relative: i32) -> i32;
         fn uu_portal_button(portal: *mut c_void, button: i32, pressed: i32) -> i32;
         fn uu_portal_key(portal: *mut c_void, keysym: u32, pressed: i32) -> i32;
@@ -26,6 +28,10 @@ mod native {
     // The engine owns callback threads; public calls are serialized by Mutex.
     unsafe impl Send for Handle {}
     impl Drop for Handle { fn drop(&mut self) { unsafe { uu_portal_close(self.0.as_ptr()) } } }
+    fn blank_changed(frame: &mut [u8], version: &mut Option<super::FrameVersion>) -> bool {
+        if *version == Some(super::FrameVersion(0, 0)) { return false; }
+        super::blank(frame); *version = Some(super::FrameVersion(0, 0)); true
+    }
     pub struct Session { handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, retry_at: Mutex<Option<std::time::Instant>>, pub width: u32, pub height: u32 }
     impl Session {
         pub fn is_alive(&self) -> bool {
@@ -56,6 +62,10 @@ mod native {
             Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), retry_at: Mutex::new(None), width, height })
         }
         pub fn capture(&self, frame: &mut [u8]) -> Result<(), String> {
+            self.capture_changed(frame, &mut None).map(|_| ())
+        }
+        pub fn capture_changed(&self, frame: &mut [u8], version: &mut Option<super::FrameVersion>) -> Result<bool, String> {
+            if frame.len() != self.width as usize * self.height as usize * 4 { return Err(super::error(11)); }
             let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
             let state = *self.locked.borrow();
             if state != Some(false) {
@@ -64,30 +74,30 @@ mod native {
                     self.was_locked.store(true, std::sync::atomic::Ordering::Release);
                     unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
                 }
-                super::blank(frame); return Ok(());
+                return Ok(blank_changed(frame, version));
             }
             if self.was_locked.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 // First unlocked capture after a real lock: drop frames captured while locked.
                 unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
-                super::blank(frame); return Ok(());
+                return Ok(blank_changed(frame, version));
             }
             if unsafe { uu_portal_alive(handle.0.as_ptr()) } == 0 {
                 // GNOME can close the stream before the periodic lock watcher updates.
                 if crate::session_lock::locked_now() != Some(false) {
                     self.was_locked.store(true, std::sync::atomic::Ordering::Release);
-                    super::blank(frame); return Ok(());
+                    return Ok(blank_changed(frame, version));
                 }
                 // logind's LockedHint can lag compositor stream closure. Give it a
                 // full watcher interval before attempting another permission session.
                 let mut retry = self.retry_at.lock().map_err(|_| "Portal recovery lock poisoned")?;
                 let deadline = retry.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(1));
-                if std::time::Instant::now() < *deadline { super::blank(frame); return Ok(()); }
+                if std::time::Instant::now() < *deadline { return Ok(blank_changed(frame, version)); }
                 let replacement = match Self::open() {
                     Ok(value) => value,
                     Err(error) => {
                         log::warn!("Portal capture recovery deferred: {error}");
                         *retry = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-                        super::blank(frame); return Ok(());
+                        return Ok(blank_changed(frame, version));
                     }
                 };
                 *retry = None;
@@ -97,8 +107,14 @@ mod native {
                 *handle = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?;
                 log::info!("Portal capture session restored after closure");
             }
-            let code = unsafe { uu_portal_capture(handle.0.as_ptr(), frame.as_mut_ptr(), frame.len()) };
-            if code == 10 || code == 9 { super::blank(frame); Ok(()) } else { super::check(code) }
+            let identity = handle.0.as_ptr() as usize;
+            let mut revision = version.filter(|v| v.0 == identity).map_or(0, |v| v.1);
+            let code = unsafe { uu_portal_capture_since(handle.0.as_ptr(), frame.as_mut_ptr(), frame.len(), &mut revision) };
+            match code {
+                0 | 12 => { *version = Some(super::FrameVersion(identity, revision)); Ok(code == 0) }
+                9 | 10 => Ok(blank_changed(frame, version)),
+                _ => Err(super::error(code)),
+            }
         }
 
         pub fn clipboard_supported(&self) -> bool {
@@ -166,6 +182,7 @@ impl PortalSession {
     pub fn is_alive(&self) -> bool { false }
     pub fn open() -> Result<Self, String> { Err("Portal backend requires Linux and --features portal".into()) }
     pub fn capture(&self, _: &mut [u8]) -> Result<(), String> { Err(error(2)) }
+    pub fn capture_changed(&self, _: &mut [u8], _: &mut Option<FrameVersion>) -> Result<bool, String> { Err(error(2)) }
     pub fn move_pointer(&self, _: f64, _: f64, _: bool) -> Result<(), String> { Err(error(2)) }
     pub fn button(&self, _: i32, _: bool) -> Result<(), String> { Err(error(2)) }
     pub fn key(&self, _: u64, _: bool) -> Result<(), String> { Err(error(2)) }

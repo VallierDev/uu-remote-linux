@@ -11,6 +11,8 @@ use ff::ChannelLayout;
 use ff::util::picture;
 use ff::{codec, encoder, frame, software::scaling, Dictionary, Packet, Rational};
 use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use std::collections::VecDeque;
 
 use crate::damage_capture::DamageCapture;
 
@@ -58,13 +60,38 @@ fn ensure_init() -> Result<(), String> {
     result
 }
 
-/// Sends one access unit per encoder packet. Returns `Ok(false)` when the receiver is gone.
-fn drain(encoder: &mut encoder::Video, packet: &mut Packet, units: &mpsc::Sender<Vec<u8>>) -> Result<bool, String> {
+pub struct EncodedUnit { pub data: Vec<u8>, pub permit: OwnedSemaphorePermit, pub completed_at: Instant }
+
+fn acquire(budget: &Arc<Semaphore>, units: &mpsc::Sender<EncodedUnit>) -> Option<OwnedSemaphorePermit> {
+    tokio::runtime::Handle::current().block_on(async {
+        tokio::select! {
+            permit = budget.clone().acquire_owned() => permit.ok(),
+            _ = units.closed() => None,
+        }
+    })
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[tokio::test]
+    async fn closing_encoder_output_wakes_a_blocked_capture() {
+        let budget=Arc::new(Semaphore::new(0));
+        let (tx,rx)=mpsc::channel(1);
+        let worker=tokio::task::spawn_blocking(move || acquire(&budget,&tx));
+        tokio::task::yield_now().await;
+        drop(rx);
+        assert!(tokio::time::timeout(Duration::from_secs(1),worker).await.unwrap().unwrap().is_none());
+    }
+}
+
+fn drain(encoder: &mut encoder::Video, packet: &mut Packet, units: &mpsc::Sender<EncodedUnit>, permits: &mut VecDeque<OwnedSemaphorePermit>) -> Result<bool, String> {
     loop {
         match encoder.receive_packet(packet) {
             Ok(()) => {
                 let data = packet.data().unwrap_or_default().to_vec();
-                if units.blocking_send(data).is_err() { return Ok(false); }
+                let permit = permits.pop_front().ok_or("Encoder returned an unbudgeted access unit")?;
+                if units.blocking_send(EncodedUnit {data, permit, completed_at: Instant::now()}).is_err() { return Ok(false); }
             }
             Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(true),
             Err(error) => return Err(text(error)),
@@ -168,11 +195,11 @@ fn send_video_frame(encoder: &mut encoder::Video, frame: &frame::Video, kind: cr
 }
 
 /// Runs until `stop` is set or the receiver is dropped. A set `idr` flag forces the next frame to be an IDR.
-pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>) -> Result<(), String> {
+pub fn run(config: Config, units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>) -> Result<(), String> {
     ensure_init()?;
     if config.damage {
         match DamageCapture::open(&config.display) {
-            Ok(capture) => return run_damage(config, capture, units, stop, idr),
+            Ok(capture) => return run_damage(config, capture, units, stop, idr, budget),
             Err(error) => log::warn!("Damage-driven capture unavailable, using x11grab: {error}"),
         }
     }
@@ -195,14 +222,18 @@ pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, 
 
     let mut scaler: Option<(scaling::Context, (Pixel, u32, u32))> = None;
     let mut decoded = frame::Video::empty();
-    let mut converted = frame::Video::new(pixel, width, height);
+    let mut converted = frame::Video::empty();
     let mut packet = Packet::empty();
     let started = Instant::now();
     let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
     let mut last_at: Option<Duration> = None;
     let mut last_slot: i64 = -1;
-    for (stream, input_packet) in input.packets() {
+    let mut permits = VecDeque::with_capacity(4);
+    let mut packets = input.packets();
+    loop {
         if stop.load(Ordering::Relaxed) { return Ok(()); }
+        let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
+        let Some((stream, input_packet)) = packets.next() else { return Ok(()); };
         if stream.index() != index { continue; }
         decoder.send_packet(&input_packet).map_err(text)?;
         match decoder.receive_frame(&mut decoded) {
@@ -236,20 +267,19 @@ pub fn run(config: Config, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, 
         frame.set_pts(Some(slot));
         frame.set_kind(if idr.swap(false, Ordering::AcqRel) { picture::Type::I } else { picture::Type::None });
         send_video_frame(&mut encoder, frame, config.encoder)?;
-        if !drain(&mut encoder, &mut packet, &units)? { return Ok(()); }
+        permits.push_back(permit);
+        if !drain(&mut encoder, &mut packet, &units, &mut permits)? { return Ok(()); }
     }
-    Ok(())
 }
 
 /// Damage-driven loop. Damage only marks the picture dirty; a dirty picture is captured and encoded on
 /// the next fixed frame tick, so the stream keeps a steady cadence while the screen moves. The viewer's
 /// jitter buffer grows with irregular arrivals, and irregular sends were what raised its latency.
-/// An idle screen sends a keepalive about once a second so the viewer still sees traffic.
-fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<Vec<u8>>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>) -> Result<(), String> {
+fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>) -> Result<(), String> {
     let (mut encoder, pixel, width, height) = open_encoder(&config)?;
     let (cap_width, cap_height) = capture.size();
     let mut captured = frame::Video::new(Pixel::BGRZ, cap_width, cap_height);
-    let mut converted = frame::Video::new(pixel, width, height);
+    let mut converted = frame::Video::empty();
     let mut scaler = None;
     let mut packet = Packet::empty();
     let started = Instant::now();
@@ -261,6 +291,9 @@ fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<Ve
     let mut next_tick = Instant::now();
     let mut last_send = Instant::now();
     let mut last_slot: i64 = -1;
+    let mut permits = VecDeque::with_capacity(4);
+    let locked = crate::session_lock::watch_locked();
+    let mut last_locked = *locked.borrow();
     loop {
         if stop.load(Ordering::Relaxed) { return Ok(()); }
         let deadline = if dirty { next_tick } else { last_send + keepalive };
@@ -271,13 +304,20 @@ fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<Ve
         let now = Instant::now();
         if dirty && now < next_tick { continue; }
         if !dirty && now < last_send + keepalive { continue; }
+        let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
+        dirty |= capture.wait(Duration::ZERO)?;
+        let state = *locked.borrow();
+        if state != last_locked { dirty = true; last_locked = state; }
 
-        let source = capture.capture()?;
-        let bytes_per_line = cap_width as usize * 4;
-        let stride = captured.stride(0);
-        let row = bytes_per_line.min(stride);
-        for (y, src) in source.chunks_exact(bytes_per_line).enumerate() {
-            captured.data_mut(0)[y * stride..y * stride + row].copy_from_slice(&src[..row]);
+        if dirty {
+            let source = capture.capture()?;
+            let bytes_per_line = cap_width as usize * 4;
+            let stride = captured.stride(0);
+            let row = bytes_per_line.min(stride);
+            for (y, src) in source.chunks_exact(bytes_per_line).enumerate() {
+                captured.data_mut(0)[y * stride..y * stride + row].copy_from_slice(&src[..row]);
+            }
         }
 
         let slot = ((started.elapsed().as_micros() * u128::from(config.fps) + 500_000) / 1_000_000) as i64;
@@ -290,13 +330,16 @@ fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<Ve
             if scaler.is_none() {
                 scaler = Some(scaling::Context::get(Pixel::BGRZ, cap_width, cap_height, pixel, width, height, scaling::Flags::BILINEAR).map_err(text)?);
             }
-            if let Some(context) = scaler.as_mut() { context.run(&captured, &mut converted).map_err(text)?; }
+            if dirty {
+                if let Some(context) = scaler.as_mut() { context.run(&captured, &mut converted).map_err(text)?; }
+            }
             &mut converted
         };
         frame.set_pts(Some(slot));
         frame.set_kind(if idr.swap(false, Ordering::AcqRel) { picture::Type::I } else { picture::Type::None });
         send_video_frame(&mut encoder, frame, config.encoder)?;
-        if !drain(&mut encoder, &mut packet, &units)? { return Ok(()); }
+        permits.push_back(permit);
+        if !drain(&mut encoder, &mut packet, &units, &mut permits)? { return Ok(()); }
         let now = Instant::now();
         if dirty {
             // Keep the tick phase; after a long idle, restart the phase from now instead of bursting to catch up.

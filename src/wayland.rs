@@ -63,7 +63,7 @@ pub fn key(symbol:u64,pressed:bool)->i32 {
 /// Capture and the pipe write run on separate threads with two frame buffers, so a
 /// slow encoder read no longer delays the next screencopy request.
 pub fn capture_stdout() -> Result<(),String> {
-    use std::io::Write;
+    use std::io::{Read,Write};
     let (w,h)=init()?;
     let size=(w as usize)*(h as usize)*4;
     let fps=capture_fps(std::env::var("UU_WAYLAND_FPS").ok().as_deref())?;
@@ -78,17 +78,23 @@ pub fn capture_stdout() -> Result<(),String> {
         let mut stdout=std::io::stdout().lock();
         for frame in full_rx {
             stdout.write_all(&frame).map_err(|e|format!("Capture pipe: {e}"))?;
+            stdout.flush().map_err(|e|format!("Capture pipe: {e}"))?;
             if free_tx.send(frame).is_err() { break; }
         }
         Ok(())
     }).map_err(|e|format!("Capture writer: {e}"))?;
+    let demand=std::env::var("UU_WAYLAND_DEMAND").is_ok_and(|v|v=="1");
+    let mut stdin=std::io::stdin().lock();
     loop {
+        if demand { stdin.read_exact(&mut [0]).map_err(|_|"Capture demand pipe closed")?; }
         // Time from buffer availability: a slow encoder read must not shorten the next interval.
         let Ok(mut frame)=free_rx.recv() else { break };
         let start=std::time::Instant::now();
         capture(&mut frame)?;
         if full_tx.send(frame).is_err() { break; }
-        if let Some(left)=interval.checked_sub(start.elapsed()) { std::thread::sleep(left); }
+        if !demand {
+            if let Some(left)=interval.checked_sub(start.elapsed()) { std::thread::sleep(left); }
+        }
     }
     drop(full_tx);
     writer.join().map_err(|_|"Capture writer panicked")?

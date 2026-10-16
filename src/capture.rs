@@ -72,18 +72,18 @@ impl ScreenCapture {
             let kms=crate::kms::Capture::open()?;
             let (width,height)=(kms.width,kms.height);
             return Ok(Self { backend,init_error:None,portal:None,display:"kms:linear".into(),width,height,
-                buffer:Mutex::new(vec![0;width as usize*height as usize*4]),kms:Some(kms) });
+                buffer:Mutex::new(Vec::new()),kms:Some(kms) });
         }
         if backend == crate::desktop_backend::DesktopBackend::Portal {
             let session=std::sync::Arc::new(crate::portal::PortalSession::open()?);
             let (width,height)=(session.width,session.height);
             return Ok(Self { backend,init_error:None,portal:Some(session),kms:None,display:"wayland:portal".into(),width,height,
-                buffer:Mutex::new(vec![0;(width as usize)*(height as usize)*4]) });
+                buffer:Mutex::new(Vec::new()) });
         }
         if backend == crate::desktop_backend::DesktopBackend::Wayland {
             let (width,height)=crate::wayland::init()?;
             return Ok(Self { backend, init_error:None, portal:None, kms:None, display:"wayland:native".into(), width,height,
-                buffer:Mutex::new(vec![0;(width as usize)*(height as usize)*4]) });
+                buffer:Mutex::new(Vec::new()) });
         }
         let ret = unsafe { x11_init(std::ptr::null()) };
         if ret != 0 {
@@ -98,8 +98,7 @@ impl ScreenCapture {
             return Err(format!("Invalid screen dimensions: {}x{}", w, h));
         }
 
-        let buf_size = (w * h * 4) as usize;
-        let buffer = Mutex::new(vec![0u8; buf_size]);
+        let buffer = Mutex::new(Vec::new());
 
         log::info!("ScreenCapture initialized: {}x{}", w, h);
         let display_ptr = unsafe { x11_display_name() };
@@ -128,6 +127,7 @@ impl ScreenCapture {
     pub fn capture_frame(&self) -> Result<Vec<u8>, String> {
         if let Some(error)=&self.init_error { return Err(error.clone()); }
         let mut buf = self.buffer.lock().unwrap();
+        buf.resize(self.width as usize * self.height as usize * 4, 0);
         if let Some(kms)=&self.kms { kms.capture(&mut buf)?; return Ok(buf.clone()); }
         if let Some(session)=&self.portal { session.capture(&mut buf)?; return Ok(buf.clone()); }
         if self.backend == crate::desktop_backend::DesktopBackend::Wayland {
