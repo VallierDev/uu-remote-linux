@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Paste Finder files into an SSH terminal through an existing UU TCP mapping."""
+
+import argparse
+import collections
+import errno
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import queue
+import re
+import select
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+
+START, END = b"\x1b[200~", b"\x1b[201~"
+ENABLE, DISABLE = b"\x1b[?2004h", b"\x1b[?2004l"
+MAX_PASTE = 8 * 1024 * 1024
+
+
+class PasteError(Exception):
+    """Messages must not include clipboard contents, paths or subprocess output."""
+
+
+def prefix_tail(data, marker):
+    for length in range(min(len(data), len(marker) - 1), 0, -1):
+        if data.endswith(marker[:length]):
+            return length
+    return 0
+
+
+class InputFrames:
+    """Recognize bracketed pastes across arbitrary PTY read boundaries."""
+
+    def __init__(self):
+        self.buffer = b""
+        self.pasting = False
+        self.overflow = False
+
+    def feed(self, data):
+        self.buffer += data
+        events = []
+        while self.buffer:
+            if self.pasting:
+                end = self.buffer.find(END)
+                if end < 0:
+                    if len(self.buffer) > MAX_PASTE:
+                        self.overflow = True
+                        tail = prefix_tail(self.buffer, END)
+                        self.buffer = self.buffer[-tail:] if tail else b""
+                    break
+                payload, self.buffer = self.buffer[:end], self.buffer[end + len(END):]
+                events.append(("error" if self.overflow or len(payload) > MAX_PASTE else "paste", payload))
+                self.pasting = self.overflow = False
+            else:
+                start = self.buffer.find(START)
+                if start >= 0:
+                    if start:
+                        events.append(("data", self.buffer[:start]))
+                    self.buffer = self.buffer[start + len(START):]
+                    self.pasting = True
+                else:
+                    tail = prefix_tail(self.buffer, START)
+                    size = len(self.buffer) - tail
+                    if size:
+                        events.append(("data", self.buffer[:size]))
+                        self.buffer = self.buffer[size:]
+                    break
+        return events
+
+    def flush_key(self):
+        # A standalone Escape must not wait indefinitely for another key.
+        if not self.pasting:
+            result, self.buffer = self.buffer, b""
+            return result
+        return b""
+
+
+class OutputModes:
+    """Keep local paste framing on; retain the remote app's requested mode."""
+
+    def __init__(self):
+        self.buffer = b""
+        self.bracketed = False
+
+    def feed(self, data):
+        self.buffer += data
+        output = bytearray()
+        while self.buffer:
+            index = self.buffer.find(b"\x1b")
+            if index < 0:
+                output.extend(self.buffer)
+                self.buffer = b""
+                break
+            output.extend(self.buffer[:index])
+            self.buffer = self.buffer[index:]
+            if self.buffer.startswith(b"\x1bc"):
+                output.extend(b"\x1bc" + ENABLE)
+                self.bracketed = False
+                self.buffer = self.buffer[2:]
+                continue
+            match = re.match(rb"\x1b\[\?([0-9;]+)([hl])", self.buffer)
+            if match:
+                params = match[1].split(b";")
+                if b"2004" in params:
+                    self.bracketed = match[2] == b"h"
+                    others = [p for p in params if p != b"2004"]
+                    if others:
+                        output.extend(b"\x1b[?" + b";".join(others) + match[2])
+                    output.extend(ENABLE)
+                else:
+                    output.extend(match[0])
+                self.buffer = self.buffer[match.end():]
+            elif len(self.buffer) < 128 and re.fullmatch(rb"\x1b(?:\[(?:\?[0-9;]*)?)?", self.buffer):
+                break
+            else:
+                output.extend(self.buffer[:1])
+                self.buffer = self.buffer[1:]
+        return bytes(output)
+
+
+def paste_bytes(data, bracketed):
+    return START + data + END if bracketed else data
+
+
+def clipboard_paths(helper):
+    try:
+        result = subprocess.run([str(helper)], capture_output=True, timeout=3, check=True)
+        paths = json.loads(result.stdout)
+        if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+            raise ValueError()
+        return paths
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise PasteError("Cannot check copied files; paste was not sent.") from None
+
+
+def copied_files(data, read_clipboard):
+    try:
+        text = data.decode("utf-8")
+        paths = shlex.split(text)
+    except (UnicodeError, ValueError):
+        return None
+    if not paths or not all(p.startswith("/") for p in paths):
+        return None
+    # Ordinary text that happens to name a local file must never upload it.
+    # Ghostty 1.3.1 getOpinionatedStringContents escapes Finder file paths;
+    # require the entire pasted path list to match actual file-URL clipboard data.
+    if paths != read_clipboard():
+        return None
+    if len(paths) > 256:
+        raise PasteError("Too many copied files (maximum 256).")
+    for path in paths:
+        if any(ord(c) < 32 or ord(c) == 127 for c in path):
+            raise PasteError("A copied filename contains unsupported control characters.")
+        try:
+            if not stat.S_ISREG(os.stat(path).st_mode):
+                raise PasteError("Copy files individually; folder pasting is not supported.")
+        except OSError:
+            raise PasteError("A copied file is no longer readable.") from None
+    if len({Path(p).name for p in paths}) != len(paths):
+        raise PasteError("Copied files must have distinct filenames; paste them separately.")
+    return paths
+
+
+def run_private(args, cancel, timeout):
+    # Neither SSH errors nor SCP output may disclose paths, clipboard/file data,
+    # or credentials. Authentication never reads from the interactive terminal.
+    with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, start_new_session=True) as process:
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancel.is_set() or time.monotonic() > deadline:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+                raise PasteError("Upload cancelled." if cancel.is_set() else "Upload timed out; paste was not sent.")
+            try:
+                stdout, _ = process.communicate(timeout=0.1)
+                if process.returncode:
+                    raise PasteError("Upload failed; check the UU mapping and SSH access. Paste was not sent.")
+                return stdout
+            except subprocess.TimeoutExpired:
+                pass
+
+
+class Uploader:
+    def __init__(self, config, host):
+        common = ["-F", str(config)] if config else []
+        common += ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+        self.ssh = ["/usr/bin/ssh", *common, host]
+        self.scp = ["/usr/bin/scp", "-q", *common]
+        self.host = host
+
+    def upload(self, paths, cancel):
+        script = ('umask 077; d="$HOME/.local/share/uuremote/uploads"; '
+                  'mkdir -p "$d" && mktemp -d "$d/paste.XXXXXXXX"')
+        try:
+            directory = run_private([*self.ssh, script], cancel, 30).decode("utf-8").strip()
+        except UnicodeError:
+            raise PasteError("Invalid upload destination; paste was not sent.") from None
+        if (not directory.startswith("/") or len(directory) > 4096 or
+                any(ord(c) < 32 or ord(c) == 127 for c in directory) or
+                not re.fullmatch(r"paste\.[A-Za-z0-9]+", directory.rsplit("/", 1)[-1])):
+            raise PasteError("Invalid upload destination; paste was not sent.")
+        try:
+            # Use modern SCP's SFTP mode, never legacy SCP (-O). Unique batch
+            # directories prevent overwrites; all local paths are absolute.
+            run_private([*self.scp, *paths, f"{self.host}:{directory}/"], cancel, 300)
+        except (PasteError, OSError):
+            # Clean only this batch, with quoted remote shell syntax. Cancellation
+            # of one upload must not stop another SSH/UU session.
+            try:
+                run_private([*self.ssh, "rm -rf -- " + shlex.quote(directory)], threading.Event(), 10)
+            except (PasteError, OSError):
+                pass
+            raise
+        return " ".join(shlex.quote(directory + "/" + Path(p).name) for p in paths).encode("utf-8")
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def relay(command, read_clipboard, uploader):
+    original = termios.tcgetattr(0)
+    master, slave = pty.openpty()
+
+    def resize(*_):
+        try:
+            size = fcntl.ioctl(0, termios.TIOCGWINSZ, bytes(8))
+            fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+        except OSError:
+            pass
+
+    resize()
+
+    def child_tty():
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, preexec_fn=child_tty)
+    os.close(slave)
+    previous_resize = signal.signal(signal.SIGWINCH, resize)
+
+    def shutdown(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    previous_signals = {sig: signal.signal(sig, shutdown)
+                        for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+    frames, modes = InputFrames(), OutputModes()
+    events, completed = collections.deque(), queue.Queue()
+    cancel, uploading, interrupted = threading.Event(), False, False
+    worker = None
+    last_input = time.monotonic()
+
+    def upload_worker(paths):
+        try:
+            completed.put((uploader.upload(paths, cancel), None))
+        except (OSError, PasteError):
+            completed.put((None, "Upload failed or cancelled; paste was not sent."))
+
+    def notice(message):
+        write_all(2, ("\r\n[UU paste] " + message + "\r\n").encode())
+
+    def interrupt_upload():
+        nonlocal interrupted, frames
+        if not uploading:
+            return
+        pending = list(events)
+        positions = [(i, payload.rfind(b"\x03")) for i, (kind, payload) in enumerate(pending)
+                     if kind == "data" and b"\x03" in payload]
+        if positions:
+            index, offset = positions[-1]
+            cancel.set()
+            interrupted = True
+            frames = InputFrames()
+            events.clear()
+            events.extend(frames.feed(pending[index][1][offset + 1:]))
+            events.extend(pending[index + 1:])
+            write_all(master, b"\x03")
+
+    try:
+        tty.setraw(0)
+        write_all(1, ENABLE)
+        while True:
+            interrupt_upload()
+            if uploading:
+                try:
+                    data, error = completed.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    uploading = False
+                    if error:
+                        notice(error)
+                    elif not interrupted:
+                        write_all(master, paste_bytes(data, modes.bracketed))
+            while events and not uploading:
+                kind, data = events.popleft()
+                if kind == "error":
+                    notice("Paste exceeds 8 MiB; paste was not sent.")
+                    continue
+                if kind == "data":
+                    write_all(master, data)
+                    continue
+                try:
+                    files = copied_files(data, read_clipboard)
+                except PasteError as error:
+                    notice(str(error))
+                    continue
+                if files is None:
+                    write_all(master, paste_bytes(data, modes.bracketed))
+                else:
+                    cancel.clear()
+                    uploading, interrupted = True, False
+                    worker = threading.Thread(target=upload_worker, args=(files,), daemon=True)
+                    worker.start()
+            interrupt_upload()
+            readable, _, _ = select.select([0, master], [], [], 0.025)
+            if master in readable:
+                try:
+                    data = os.read(master, 65536)
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                    data = b""
+                if not data:
+                    break
+                write_all(1, modes.feed(data))
+            if 0 in readable:
+                data = os.read(0, 65536)
+                if not data:
+                    break
+                last_input = time.monotonic()
+                events.extend(frames.feed(data))
+                if sum(len(payload) for _, payload in events) > MAX_PASTE:
+                    events.clear()
+                    notice("Input queue is full; queued input was discarded.")
+            elif time.monotonic() - last_input > 0.025:
+                data = frames.flush_key()
+                if data:
+                    events.append(("data", data))
+        if modes.buffer:
+            write_all(1, modes.buffer)
+    finally:
+        cancel.set()
+        signal.signal(signal.SIGWINCH, previous_resize)
+        for sig, previous in previous_signals.items():
+            signal.signal(sig, previous)
+        termios.tcsetattr(0, termios.TCSADRAIN, original)
+        write_all(1, DISABLE)
+        os.close(master)
+        if child.poll() is None:
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGTERM)
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    os.killpg(child.pid, signal.SIGKILL)
+        status = child.wait()
+        if worker is not None:
+            worker.join(timeout=12)
+    return status if status >= 0 else 128 - status
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-F", "--ssh-config", type=Path)
+    parser.add_argument("host", help="SSH alias for an existing UU loopback port mapping")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", args.host):
+        parser.error("use an SSH host alias, without options or a port")
+    common = ["-F", str(args.ssh_config)] if args.ssh_config else []
+    command = ["/usr/bin/ssh", *common]
+    if not (os.isatty(0) and os.isatty(1)):
+        os.execv(command[0], [*command, args.host, *args.command])
+    helper = Path(__file__).resolve().with_name("clipboard-files")
+    if not helper.is_file():
+        parser.error("run contrib/macos-ssh/install.sh on your Mac first")
+    return relay([*command, "-tt", args.host, *args.command],
+                 lambda: clipboard_paths(helper), Uploader(args.ssh_config, args.host))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, PasteError):
+        print("UU SSH companion failed; check the UU mapping and SSH configuration.", file=sys.stderr)
+        sys.exit(1)

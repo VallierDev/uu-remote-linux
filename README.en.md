@@ -236,6 +236,12 @@ service and run `loginctl enable-linger $USER`, so the systemd user manager (wit
 starts at boot without a login. The viewer's remote desktop keeps showing "connecting" in this mode; that is expected.
 Log in once with `uuremote-server login --no-gui` (QR in the terminal).
 
+**Paste files from a Mac terminal**: when using Ghostty over UU's SSH port mapping,
+the optional [Mac SSH paste companion](contrib/macos-ssh/README.md) uploads files
+copied in Finder before inserting their remote paths. Text and mouse reports pass
+through. It does not change the official UU terminal; folders, drag-and-drop and
+raw screenshot clipboard data are not supported.
+
 **Virtual desktop**: for a full remote desktop, run a desktop session (Xfce recommended) on an Xvfb screen:
 
 ```sh

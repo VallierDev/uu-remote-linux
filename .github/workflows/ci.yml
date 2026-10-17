@@ -6,6 +6,16 @@ on:
   pull_request:
 
 jobs:
+  test-macos-ssh-paste:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s contrib/macos-ssh -p 'test_*.py' -v
+      - name: Test file-URL clipboard reader on a private pasteboard
+        run: |
+          swiftc -O contrib/macos-ssh/clipboard-files.swift -o "$RUNNER_TEMP/clipboard-files"
+          "$RUNNER_TEMP/clipboard-files" --self-test
+
   test:
     runs-on: ubuntu-22.04
     steps:
