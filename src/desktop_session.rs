@@ -16,10 +16,13 @@ pub struct State {
 impl State {
     pub fn permission(&self, desktop: bool) -> crate::system_metrics::Permission {
         use crate::system_metrics::Permission;
-        if !desktop || self.screen.init_error.is_none() { Permission::Allow }
+        if !desktop { Permission::Allow }
         else if self.waiting { Permission::Unknown }
+        else if self.screen.init_error.is_none() { Permission::Allow }
         else { Permission::Reject }
     }
+    /// Capture exists and is not waiting for a replacement of a closed Portal session.
+    pub fn ready(&self) -> bool { self.screen.init_error.is_none() && !self.waiting }
 }
 
 pub struct PortalDesktop {
@@ -114,7 +117,10 @@ impl PortalDesktop {
             opening: Arc::new(Mutex::new(())), locked: crate::session_lock::watch_locked() }
     }
     pub fn begin(&self) {
-        self.state.send_modify(|state| state.waiting = state.screen.init_error.is_some());
+        // GNOME closes the Portal session on lock; a cached screen with a dead session
+        // is not ready (no Allow, no stale video path) until maintain() rebuilds it.
+        self.state.send_modify(|state| state.waiting = state.screen.init_error.is_some()
+            || state.screen.portal.as_ref().is_some_and(|portal| !portal.is_alive()));
     }
     pub fn snapshot(&self) -> State { self.state.borrow().clone() }
     pub fn subscribe(&self) -> watch::Receiver<State> { self.state.subscribe() }
@@ -310,7 +316,7 @@ pub async fn closed(pc: &RTCPeerConnection, channel: &RTCDataChannel) {
 pub async fn wait_ready(state: &mut watch::Receiver<State>, channel: &RTCDataChannel) -> Option<Arc<ScreenCapture>> {
     loop {
         let current = state.borrow_and_update().clone();
-        if current.screen.init_error.is_none() { return Some(current.screen); }
+        if current.ready() { return Some(current.screen); }
         if !current.waiting || channel.ready_state() != RTCDataChannelState::Open { return None; }
         tokio::select! {
             changed = state.changed() => if changed.is_err() { return None; },
@@ -334,6 +340,16 @@ mod tests {
         screen.width = 1920;
         screen.height = 1080;
         Arc::new(screen)
+    }
+    #[test]
+    fn cached_screen_waiting_for_a_closed_portal_is_not_ready_or_allowed() {
+        use crate::system_metrics::Permission;
+        let live = State { screen: ready_screen(), waiting: false };
+        assert!(live.ready() && live.permission(true) == Permission::Allow);
+        let stale = State { screen: ready_screen(), waiting: true };
+        assert!(!stale.ready());
+        assert!(stale.permission(true) == Permission::Unknown);
+        assert!(stale.permission(false) == Permission::Allow);
     }
     #[test]
     fn recovered_screen_is_retained_across_transient_disconnect() {

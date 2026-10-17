@@ -290,7 +290,7 @@ impl WebRtcSession {
                     let mut updates = desktop.subscribe();
                     loop {
                         let state = updates.borrow_and_update().clone();
-                        if state.screen.init_error.is_none() { break Some(state.screen); }
+                        if state.ready() { break Some(state.screen); }
                         if !state.waiting { return; }
                         if matches!(streaming_pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed) { return; }
                         tokio::select! {
@@ -325,7 +325,7 @@ impl WebRtcSession {
             || capture.portal.as_ref().is_some_and(|session| session.clipboard_supported()),
             |manager| {
                 let state = manager.snapshot();
-                state.screen.init_error.is_none()
+                state.ready()
                     && state.screen.portal.as_ref().is_some_and(|session| session.clipboard_supported())
             });
         let text_clipboard_ready = Arc::new(std::sync::atomic::AtomicBool::new(portal_clipboard_supported));
@@ -653,7 +653,7 @@ impl WebRtcSession {
                                             }
                                         }
                                         let state = updates.borrow_and_update().clone();
-                                        let supported = state.screen.init_error.is_none()
+                                        let supported = state.ready()
                                             && state.screen.portal.as_ref().is_some_and(|portal| portal.clipboard_supported());
                                         clipboard_ready.store(supported, std::sync::atomic::Ordering::Release);
                                         // echo_seen is published after the request seq, so reading it
@@ -677,7 +677,7 @@ impl WebRtcSession {
                                     }
                                 }
                                 let snapshot = portal.snapshot();
-                                if snapshot.screen.init_error.is_some() {
+                                if !snapshot.ready() {
                                     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                     let message = crate::initialization::envelope(
                                         sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
