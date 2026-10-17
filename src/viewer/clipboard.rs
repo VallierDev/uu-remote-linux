@@ -22,7 +22,8 @@ enum Backend {
 #[cfg(feature="viewer-sdl")]
 pub enum ClipboardRequest {
     Read(tokio::sync::oneshot::Sender<Result<Option<String>,()>>),
-    Write(String,tokio::sync::oneshot::Sender<Result<(),()>>),
+    // false means the unfocused window skipped the write.
+    Write(String,tokio::sync::oneshot::Sender<Result<bool,()>>),
 }
 fn executable(name:&str)->Option<PathBuf>{
     use std::os::unix::fs::PermissionsExt;
@@ -43,20 +44,24 @@ impl Backend {
             #[cfg(feature="viewer-sdl")]
             Self::Sdl(tx)=>{
                 let(reply,rx)=tokio::sync::oneshot::channel();
-                tx.send(ClipboardRequest::Read(reply)).await.map_err(|_|())?;
-                tokio::time::timeout(Duration::from_secs(2),rx).await.map_err(|_|())?.map_err(|_|())?
+                tokio::time::timeout(Duration::from_secs(2),async {
+                    tx.send(ClipboardRequest::Read(reply)).await.map_err(|_|())?;
+                    rx.await.map_err(|_|())?
+                }).await.map_err(|_|())?
             }
         }
     }
-    async fn write(&self,value:&str)->Result<(),()>{
+    async fn write(&self,value:&str)->Result<bool,()>{
         if value.len()>MAX_TEXT || value.contains('\0'){return Err(())}
         match self {
-            Self::Command(backend)=>backend.write(value).await,
+            Self::Command(backend)=>backend.write(value).await.map(|()|true),
             #[cfg(feature="viewer-sdl")]
             Self::Sdl(tx)=>{
                 let(reply,rx)=tokio::sync::oneshot::channel();
-                tx.send(ClipboardRequest::Write(value.into(),reply)).await.map_err(|_|())?;
-                tokio::time::timeout(Duration::from_secs(2),rx).await.map_err(|_|())?.map_err(|_|())?
+                tokio::time::timeout(Duration::from_secs(2),async {
+                    tx.send(ClipboardRequest::Write(value.into(),reply)).await.map_err(|_|())?;
+                    rx.await.map_err(|_|())?
+                }).await.map_err(|_|())?
             }
         }
     }
@@ -93,9 +98,11 @@ impl CommandBackend {
 struct SyncState {last:Option<String>,assembly:text::Assembly,rich:rich::State,seq:u64}
 impl SyncState {
     async fn apply(&mut self,backend:&Backend,value:String)->Result<(),()>{
-        backend.write(&value).await?;
-        log::info!("Viewer remote clipboard applied: bytes={}",value.len());
-        self.last=Some(value);Ok(())
+        if backend.write(&value).await? {
+            log::info!("Viewer remote clipboard applied: bytes={}",value.len());
+            self.last=Some(value);
+        }
+        Ok(())
     }
     fn next(&mut self)->u64{self.seq=self.seq.wrapping_add(1).max(100);self.seq}
     /// Two requests per change: the rich format-list offer (this project's host asks for the data) and
@@ -218,7 +225,7 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         let(tx,mut rx)=mpsc::channel(8);let backend=Backend::Sdl(tx);
         let ui=tokio::spawn(async move{
             let Some(ClipboardRequest::Write(text,reply))=rx.recv().await else{panic!()};
-            assert_eq!(text,"text\n");reply.send(Ok(())).unwrap();
+            assert_eq!(text,"text\n");reply.send(Ok(true)).unwrap();
             let Some(ClipboardRequest::Read(reply))=rx.recv().await else{panic!()};
             reply.send(Ok(Some("text\n".into()))).unwrap();
         });
@@ -235,6 +242,17 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         assert_eq!(select(true,&["wl-copy","xclip","xsel"]).unwrap().write,PathBuf::from("xclip"));
         assert_eq!(select(true,&["xsel"]).unwrap().write,PathBuf::from("xsel"));
         assert!(select(true,&[]).is_none());
+    }
+    #[cfg(feature="viewer-sdl")]
+    #[tokio::test] async fn unfocused_write_does_not_mark_remote_text_as_applied(){
+        let(tx,mut rx)=mpsc::channel(8);let backend=Backend::Sdl(tx);
+        let ui=tokio::spawn(async move{
+            let Some(ClipboardRequest::Write(_,reply))=rx.recv().await else{panic!()};
+            reply.send(Ok(false)).unwrap();
+        });
+        let mut state=SyncState::default();state.last=Some("local".into());
+        state.apply(&backend,"remote".into()).await.unwrap();
+        assert_eq!(state.last.as_deref(),Some("local"));ui.await.unwrap();
     }
     #[test] fn limits_match_host_and_unchanged_or_remote_text_is_not_reoffered(){
         assert!(include_str!("../clipboard.rs").contains("pub const MAX_TEXT: usize = 30 * 1024;"));

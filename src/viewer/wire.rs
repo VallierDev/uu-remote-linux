@@ -226,7 +226,7 @@ pub fn media_control(data:&[u8])->(Option<u32>,Option<u32>){
         let original:Shape=serde_json::from_str(include_str!("../../tests/fixtures/viewer/session-shape.json")).unwrap();
         for force in [false,true] {
             let s=original.video_preferences(force);s.validate_session().unwrap();assert_eq!(s.chroma,1);
-            let options=s.connect_options("synthetic-device").unwrap();
+            let options=s.connect_options("synthetic-device",false).unwrap();
             let mut caps=Vec::new();
             for f in decode_wire(&options).unwrap(){if let (4,WireValue::Bytes(cap))=(f.number,f.value){
                 assert_eq!(super::super::tools::uint(cap,1),30);
@@ -234,7 +234,7 @@ pub fn media_control(data:&[u8])->(Option<u32>,Option<u32>){
                 caps.push((super::super::tools::uint(cap,2),super::super::tools::uint(cap,5)));
             }}
             assert_eq!(caps,if force{vec![(1,1),(1,3)]}else{vec![(2,1),(2,3),(1,1),(1,3)]});
-            assert!(s.video_preferences(force).connect_options("synthetic-device").unwrap()==options);
+            assert!(s.video_preferences(force).connect_options("synthetic-device",false).unwrap()==options);
         }
     }
     #[test] fn chroma_request_and_actual_sync_are_independent_of_encoder_list(){

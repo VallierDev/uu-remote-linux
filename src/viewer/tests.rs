@@ -316,7 +316,7 @@ async fn hevc_track_uses_negotiated_payload_type_in_memory(){
             }
         })));
         let(tx,_rx)=mpsc::channel(256);
-        let peer=Peer::new(RTCConfiguration::default(),&shape().video_preferences(false),"app","ice","host",tx,viewer_settings).await.unwrap();
+        let peer=Peer::new(RTCConfiguration::default(),&shape().video_preferences(false),"app","ice","host",tx,viewer_settings,super::clipboard::Bridge::new(false)).await.unwrap();
         let mut gathered=peer.pc.gathering_complete_promise().await;peer.offer().await.unwrap();gathered.recv().await;
         host.set_remote_description(peer.pc.local_description().await.unwrap()).await.unwrap();
         let answer=host.create_answer(None).await.unwrap();

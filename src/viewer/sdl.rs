@@ -20,12 +20,15 @@ impl Window {
             use super::clipboard::ClipboardRequest;
             match request {
                 ClipboardRequest::Read(reply)=>{
-                    let result=if std::mem::take(&mut self.clipboard_dirty){read_clipboard()}else{Ok(None)};
+                    let result=if self.focused && std::mem::take(&mut self.clipboard_dirty) && self.clipboard.has_clipboard_text(){read_clipboard()}else{Ok(None)};
                     let _=reply.send(result);
                 },
                 ClipboardRequest::Write(text,reply)=>{
-                    self.clipboard_dirty=true;
-                    let _=reply.send(self.clipboard.set_clipboard_text(&text).map_err(|_|()));
+                    let result=if self.focused {
+                        self.clipboard_dirty=true;
+                        self.clipboard.set_clipboard_text(&text).map(|()|true).map_err(|_|())
+                    }else{Ok(false)};
+                    let _=reply.send(result);
                 },
             }
         }
@@ -172,14 +175,28 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
         for text in ["clipboard text\n",""]{
             let(reply,rx)=tokio::sync::oneshot::channel();
             tx.send(ClipboardRequest::Write(text.into(),reply)).await.unwrap();
-            window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok(()));
+            window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok(true));
             let(reply,rx)=tokio::sync::oneshot::channel();
             tx.send(ClipboardRequest::Read(reply)).await.unwrap();
-            window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok(Some(text.to_owned())));
+            window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok((!text.is_empty()).then(||text.to_owned())));
             let(reply,rx)=tokio::sync::oneshot::channel();
             tx.send(ClipboardRequest::Read(reply)).await.unwrap();
             window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok(None));
         }
+        window.focused=false;window.clipboard_dirty=true;
+        let(reply,rx)=tokio::sync::oneshot::channel();
+        tx.send(ClipboardRequest::Read(reply)).await.unwrap();
+        window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok(None));assert!(window.clipboard_dirty);
+        let(reply,rx)=tokio::sync::oneshot::channel();
+        tx.send(ClipboardRequest::Write("background".into(),reply)).await.unwrap();
+        window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok(false));
+        window.focused=true;
+        let(reply,rx)=tokio::sync::oneshot::channel();
+        tx.send(ClipboardRequest::Read(reply)).await.unwrap();
+        window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok(None));
+        window.clipboard_dirty=false;
+        window._sdl.event().unwrap().push_event(Event::Window{timestamp:0,window_id:window.canvas.window().id(),win_event:WindowEvent::FocusGained}).unwrap();
+        window.poll(&mut Input::new(true));assert!(window.clipboard_dirty);
         let bridge=window.clipboard_bridge();assert!(bridge.enabled);
         drop(window);
         assert!(tx.is_closed());drop(bridge);
