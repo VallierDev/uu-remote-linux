@@ -1,13 +1,14 @@
 use super::{desktop::{Frame,FrameSink},input::{Input,Viewport},session::Session};
 use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum,rect::Rect};
-pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool }
+pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool }
 impl Window {
     pub fn new()->Result<Self,String>{
         let sdl=sdl2::init()?;let video=sdl.video()?;
         let window=video.window("Native viewer (experimental)",1280,720).position_centered().resizable().build().map_err(|_|"Window creation failed")?;
         let canvas=window.into_canvas().build().map_err(|_|"Renderer creation failed")?;
-        let events=sdl.event_pump()?;Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false})
+        let events=sdl.event_pump()?;Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false})
     }
+    pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
     fn viewport(&self)->Viewport {Viewport::fit(self.canvas.window().size(),self.frame)}
     pub fn poll(&mut self,input:&mut Input)->(bool,Vec<serde_json::Value>){
         let viewport=self.viewport();
@@ -67,7 +68,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let mut command_open=true;let mut requested=false;
     let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
     let mut audio=super::audio::Playback::new(&window._sdl,session.peer.audio.clone());
-    let mut input=Input::new(view_only);let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
+    let mut input=Input::new(view_only);input.set_mac(window.mac);let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
     let mut heartbeat=tokio::time::interval(std::time::Duration::from_secs(1));
     let deadline=tokio::time::sleep(std::time::Duration::from_secs(30));tokio::pin!(deadline);
     let result=async {

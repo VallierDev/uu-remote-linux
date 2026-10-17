@@ -429,6 +429,11 @@ terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsd
   The default request stays 4:2:0; `UU_VIEWER_CHROMA=444` requests true color (4:4:4) after CONTROL opens. The host may fall back to
   4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
 
+Mac targets use native macOS keycodes; Windows / Linux targets retain Windows VK. Keys follow physical positions, without
+automatically translating Ctrl to Command; on a Mac target the PC Super / Windows key acts as Command. Control sessions fail
+explicitly if the keyboard platform cannot be determined; view-only sessions do not need that lookup. Mac platform detection
+for remote assistance and ISO / JIS keyboards have not been tested live.
+
 **Tested live** (author's setup, not full acceptance):
 | Feature | Official Windows host | Official Mac host | This project's Linux host |
 |---|---|---|---|

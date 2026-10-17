@@ -16,6 +16,25 @@ pub fn windows_vk(scan: i32) -> Option<i32> {
         _=>return None,
     })
 }
+pub fn mac_keycode(scan:i32)->Option<i32>{
+    // Inverted SDL Darwin table (release-2.32.10/src/events/scancodes_darwin.h).
+    // Live Mac host evidence: Windows VK 49 becomes Space, and VK 8 becomes C.
+    Some(match scan{
+        4=>0,22=>1,7=>2,9=>3,11=>4,10=>5,29=>6,27=>7,6=>8,25=>9,100=>10,5=>11,
+        20=>12,26=>13,8=>14,21=>15,28=>16,23=>17,30=>18,31=>19,32=>20,33=>21,
+        35=>22,34=>23,46=>24,38=>25,36=>26,45=>27,37=>28,39=>29,48=>30,18=>31,
+        24=>32,47=>33,12=>34,19=>35,40=>36,15=>37,13=>38,52=>39,14=>40,51=>41,
+        49=>42,54=>43,56=>44,17=>45,16=>46,55=>47,43=>48,44=>49,53=>50,42=>51,
+        41=>53,231=>54,227=>55,225=>56,57=>57,226=>58,224=>59,229=>60,230=>61,228=>62,
+        108=>64,99=>65,85=>67,87=>69,83=>71,84=>75,88=>76,86=>78,109=>79,110=>80,
+        103=>81,98=>82,89=>83,90=>84,91=>85,92=>86,93=>87,94=>88,95=>89,96=>91,97=>92,
+        62=>96,63=>97,64=>98,60=>99,65=>100,66=>101,68=>103,104=>105,107=>106,105=>107,
+        70=>105,71=>107,72=>113,
+        67=>109,101=>110,69=>111,106=>113,73=>114,74=>115,75=>116,76=>117,61=>118,
+        77=>119,59=>120,78=>121,58=>122,80=>123,79=>124,81=>125,82=>126,
+        _=>return None,
+    })
+}
 #[derive(Clone,Copy,Debug,PartialEq)]
 pub struct Viewport { pub x:f64, pub y:f64, pub width:f64, pub height:f64 }
 impl Viewport {
@@ -30,16 +49,17 @@ impl Viewport {
     }
 }
 #[derive(Default)]
-pub struct Input { view_only:bool, keys:BTreeMap<i32,i32>, buttons:BTreeSet<i32> }
+pub struct Input { view_only:bool, mac:bool, keys:BTreeMap<i32,i32>, buttons:BTreeSet<i32> }
 pub fn view_only(argument:Option<&str>,environment:Option<&str>)->Result<bool,String> {
     match argument {None=>Ok(environment==Some("1")),Some("--view-only")=>Ok(true),_=>Err("Expected --view-only".into())}
 }
 impl Input {
     pub fn new(view_only:bool)->Self {Self{view_only,..Default::default()}}
+    pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
     pub fn enabled(&self)->bool {!self.view_only}
     pub fn key(&mut self,scan:i32,down:bool)->Option<Value> {
         if self.view_only {return None}
-        let vk=windows_vk(scan)?;
+        let vk=if self.mac{mac_keycode(scan)}else{windows_vk(scan)}?;
         let changed=if down {
             if self.keys.contains_key(&scan) {return None}
             let already=self.keys.values().any(|v|*v==vk);self.keys.insert(scan,vk);!already
@@ -65,6 +85,33 @@ impl Input {
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn mac_target_uses_native_codes_and_releases_same_keys(){
+        let mut input=Input::default();input.set_mac(true);
+        for (scan,code) in [(30,18),(39,29),(42,51),(44,49),(6,8),(4,0),(40,36),(43,48),
+            (80,123),(79,124),(81,125),(82,126),(224,59),(225,56),(226,58),(227,55)]{
+            assert_eq!(input.key(scan,true).unwrap()["key"],code);
+            assert_eq!(input.key(scan,false).unwrap()["key"],code);
+        }
+        input.set_mac(false);assert_eq!(input.key(30,true).unwrap()["key"],49);
+    }
+    #[test] fn mac_focus_release_keeps_zero_keycode_and_modifiers(){
+        let mut input=Input::default();input.set_mac(true);
+        assert!(input.key(4,true).is_some());assert!(input.key(4,true).is_none());
+        input.key(225,true);input.key(227,true);
+        let release=input.release_all();
+        assert_eq!(release,vec![json!({"action":"kbd_release","key":0}),
+            json!({"action":"kbd_release","key":55}),json!({"action":"kbd_release","key":56})]);
+        assert!(input.release_all().is_empty());assert!(input.key(4,false).is_none());
+        let mut watch=Input::new(true);watch.set_mac(true);assert!(watch.key(4,true).is_none());
+    }
+    #[test] fn mac_function_key_aliases_release_after_last_keyup(){
+        for (pc,function,code) in [(70,104,105),(71,105,107),(72,106,113)]{
+            let mut input=Input::default();input.set_mac(true);
+            assert_eq!(input.key(pc,true).unwrap()["key"],code);
+            assert!(input.key(function,true).is_none());assert!(input.key(pc,false).is_none());
+            assert_eq!(input.key(function,false).unwrap()["key"],code);
+        }
+    }
     #[test] fn watch_switch_is_explicit_and_validated(){
         assert!(!view_only(None,None).unwrap());assert!(!view_only(None,Some("0")).unwrap());
         assert!(view_only(None,Some("1")).unwrap());assert!(view_only(Some("--view-only"),Some("0")).unwrap());

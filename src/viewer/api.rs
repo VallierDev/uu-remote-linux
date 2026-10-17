@@ -14,6 +14,13 @@ pub struct JoinData {
     #[serde(default)] pub report_server_address: String,
     #[serde(default)] pub streamer_retry_delta_ms: i32,
     #[serde(default)] pub international_connect: bool,
+    #[serde(default)] pub publisher_platform: Option<i32>,
+}
+pub fn device_platform(data:&Value,device:&str)->Option<i64>{
+    ["my_binded_devices","others_shared_devices"].into_iter()
+        .filter_map(|key|data.get(key).and_then(Value::as_array)).flatten()
+        .find(|d|d.get("device_id").and_then(Value::as_str)==Some(device))
+        .and_then(|d|d.get("platform")).and_then(Value::as_i64)
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error { AuthenticationExpired, Api(i32, String), InvalidResponse, Transport, MissingRoom, InvalidDevice, InvalidAssist }
@@ -167,6 +174,16 @@ impl Api {
 mod tests {
     use super::*;
     #[test]
+    fn target_platform_matches_only_the_selected_device(){
+        let data=json!({"my_binded_devices":[{"device_id":"windows","platform":1},{"device_id":"mac","platform":4}],
+            "others_shared_devices":[{"device_id":"shared-mac","platform":4}]});
+        assert_eq!(device_platform(&data,"windows"),Some(1));
+        assert_eq!(device_platform(&data,"mac"),Some(4));
+        assert_eq!(device_platform(&data,"shared-mac"),Some(4));
+        assert_eq!(device_platform(&data,"missing"),None);
+        assert_eq!(device_platform(&json!({}),"mac"),None);
+    }
+    #[test]
     fn assistance_response_validation_and_safe_user_errors() {
         let mut fixture:Value=serde_json::from_str(include_str!("../../tests/fixtures/viewer/join.json")).unwrap();
         fixture["data"]["publisher_device_id"]=json!("synthetic-publisher");
@@ -188,6 +205,9 @@ mod tests {
         let fixture: Value = serde_json::from_str(include_str!("../../tests/fixtures/viewer/join.json")).unwrap();
         let data = parse_join(200, fixture.clone()).unwrap();
         assert_eq!(data.signaling_list.len(), 1);
+        assert_eq!(data.publisher_platform,None);
+        let mut mac=fixture.clone();mac["data"]["publisher_platform"]=json!(4);
+        assert_eq!(parse_join(200,mac).unwrap().publisher_platform,Some(4));
         for key in ["report_token", "report_url"] {
             let mut v = fixture.clone(); v["data"].as_object_mut().unwrap().remove(key);
             assert!(matches!(parse_join(200,v), Err(Error::InvalidResponse)));

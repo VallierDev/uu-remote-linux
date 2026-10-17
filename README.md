@@ -393,6 +393,10 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
 
+Mac 目标使用 macOS 原生键码，Windows / Linux 目标保留 Windows VK。键盘按物理键位置转发，不自动把 Ctrl 改成 Command；
+控制 Mac 时，PC 键盘的 Super / Win 键对应 Command。无法确定目标键盘平台时会报错，不猜测键码；只看模式不需要此识别。
+远程协助的 Mac 平台识别及 ISO / JIS 键盘尚未实机验收。
+
 **已实测**（作者环境，非全面验收）：
 | 功能 | 官方 Windows 被控端 | 官方 Mac 被控端 | 本项目 Linux 主机 |
 |---|---|---|---|
