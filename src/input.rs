@@ -265,6 +265,8 @@ impl InputInjector {
             unsafe {x11_release_all();}
         } else if self.backend==crate::desktop_backend::DesktopBackend::Wayland && self.portal.lock().unwrap().is_none() {
             crate::wayland::release_all();
+        } else if self.backend==crate::desktop_backend::DesktopBackend::Portal && self.portal.lock().unwrap().is_none() {
+            // Nothing is bound yet (e.g. the first locked connection): no input can be held.
         } else {
             // Portal/Wayland cannot query global state. Sweep every key/button
             // that this host can emit through the currently bound session.
