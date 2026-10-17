@@ -128,6 +128,7 @@ every 60 s.
 | `src/auth.rs`, `src/config.rs`, `src/login.rs`, `src/login_ui.rs` | signed REST client, config, device init + QR login, GTK window |
 | `src/webrtc.rs` | peer connection, data channels, CONTROL dispatch, initialization messages |
 | `src/video.rs`, `src/capture_setting.rs`, `src/video_track.rs`, `src/hevc.rs` | FFmpeg H.264/H.265 pipeline, one video track for both codecs (RFC 7798 HEVC payloader); viewer quality/fps/resolution/chroma settings |
+| `src/locked_video.rs` | low-rate synthetic black video on the negotiated track while Portal is pending and locked; enables iPhone cold auto unlock (#29), requires FFmpeg libx264/libx265 for the selected codec |
 | `src/audio.rs` | Pulse/PipeWire monitor → Opus audio track |
 | `src/input.rs`, `src/input_mapping.rs`, `src/uinput.rs` | input injection (X11 XTest / Wayland / portal / uinput), Windows VK → keysym → evdev |
 | `src/cursor.rs` | pointer shape mirroring (X11) |

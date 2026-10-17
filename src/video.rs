@@ -274,7 +274,7 @@ fn ffmpeg_spec() -> FfmpegSpec {
     }
 }
 
-fn ffmpeg_command() -> Command { ffmpeg_spec().command() }
+pub(crate) fn ffmpeg_command() -> Command { ffmpeg_spec().command() }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FfmpegTimingMode { Modern, Legacy }
@@ -673,7 +673,7 @@ fn wayland_capture_command(executable:&std::path::Path,fps:u32)->Command {
     command
 }
 
-fn transport_closed(pc: &RTCPeerConnection) -> bool {
+pub(crate) fn transport_closed(pc: &RTCPeerConnection) -> bool {
     matches!(pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed)
         || pc.sctp().state() == webrtc::sctp_transport::sctp_transport_state::RTCSctpTransportState::Closed
 }

@@ -287,12 +287,15 @@ impl WebRtcSession {
             let state_pc = streaming_pc.clone();
             tokio::spawn(async move {
                 let screen = if let Some(desktop) = stream_desktop {
+                    if let Err(error) = crate::locked_video::run(&streaming_pc, &video_track, &desktop).await {
+                        log::warn!("Locked desktop video unavailable: {error}");
+                    }
                     let mut updates = desktop.subscribe();
                     loop {
                         let state = updates.borrow_and_update().clone();
                         if state.ready() { break Some(state.screen); }
                         if !state.waiting { return; }
-                        if matches!(streaming_pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed) { return; }
+                        if crate::video::transport_closed(&streaming_pc) { return; }
                         tokio::select! {
                             changed = updates.changed() => if changed.is_err() { return; },
                             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
