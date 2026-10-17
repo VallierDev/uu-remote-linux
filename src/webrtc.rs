@@ -562,7 +562,8 @@ impl WebRtcSession {
                                         changed = locked.changed() => if changed.is_err() { return; },
                                         _ = async {
                                             loop {
-                                                if channel.ready_state() == webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed { return; }
+                                                if matches!(channel.ready_state(), webrtc::data_channel::data_channel_state::RTCDataChannelState::Closing
+                                                    | webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed) { return; }
                                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                             }
                                         } => return,
@@ -804,8 +805,9 @@ impl WebRtcSession {
                             if crate::terminal::is_frame(&msg.data) { term.handle(&msg.data); return; }
                         }
                         if channel_name == "CONTROL_DATA_CHANNEL" && is_capture_setting_message(&msg.data) {
-                            if capture_requests.try_send(msg.data.to_vec()).is_err() {
-                                log::warn!("Capture setting queue full or closed; request dropped");
+                            // Back-pressure like the old inline handler instead of dropping the latest setting.
+                            if capture_requests.send(msg.data.to_vec()).await.is_err() {
+                                log::warn!("Capture setting queue closed; request dropped");
                             }
                             return;
                         }
@@ -970,7 +972,8 @@ impl WebRtcSession {
                                     log::info!("CONTROL system-state query: fields={:?} secure_desktop={}", shape, id == Some(1));
                                     if id == Some(1) {
                                         let locked = *lock_for_message.borrow();
-                                        crate::session_lock::send_state(&reply_chan, &out_sequence, locked != Some(false)).await;
+                                        // Unknown (no logind session, e.g. Xvfb) stays unlocked, as before.
+                                        crate::session_lock::send_state(&reply_chan, &out_sequence, locked == Some(true)).await;
                                     }
                                 }
                                 if let Some(simple) = simple {
