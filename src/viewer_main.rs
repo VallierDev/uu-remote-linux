@@ -97,12 +97,8 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     }.map_err(|e|e.to_string())?;
     #[cfg(feature="viewer-sdl")]
     if let Some((window,_))=desktop.as_mut().filter(|_|!view_only){
-        let mut platform=room.publisher_platform.map(i64::from);
-        if platform.is_none() && account_connection{
-            let data=api.device_list().await.map_err(|e|e.to_string())?;
-            platform=viewer::api::device_platform(&data,&args[1]);
-        }
-        window.set_mac(platform.ok_or("Cannot determine remote keyboard platform")?==4);
+        let device=account_connection.then_some(args[1].as_str());
+        window.set_mac(api.target_is_mac(&room,device).await.map_err(|e|e.to_string())?);
     }
     let options=Options{timeout:Duration::from_secs(12),legacy_prefix:legacy,ready_policy:policy};
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;

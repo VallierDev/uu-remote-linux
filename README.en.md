@@ -430,9 +430,11 @@ terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsd
   4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
 
 Mac targets use native macOS keycodes; Windows / Linux targets retain Windows VK. Keys follow physical positions, without
-automatically translating Ctrl to Command; on a Mac target the PC Super / Windows key acts as Command. Control sessions fail
-explicitly if the keyboard platform cannot be determined; view-only sessions do not need that lookup. Mac platform detection
-for remote assistance and ISO / JIS keyboards have not been tested live.
+automatically translating Ctrl to Command; on a Mac target the PC Super / Windows key acts as Command. Only verified target
+platform values 1 (Windows / this project's Linux host) and 4 (Mac) are accepted; unknown values fail explicitly. Account
+connections look up the selected device only when the platform is absent; assistance requires it in the join response.
+View-only sessions skip this lookup. Media keys and some JIS-specific keys are not mapped; Mac platform detection for remote
+assistance and ISO / JIS keyboards have not been tested live.
 
 **Tested live** (author's setup, not full acceptance):
 | Feature | Official Windows host | Official Mac host | This project's Linux host |

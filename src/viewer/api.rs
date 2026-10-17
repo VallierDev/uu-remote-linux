@@ -16,14 +16,14 @@ pub struct JoinData {
     #[serde(default)] pub international_connect: bool,
     #[serde(default)] pub publisher_platform: Option<i32>,
 }
-pub fn device_platform(data:&Value,device:&str)->Option<i64>{
+fn device_platform(data:&Value,device:&str)->Option<i64>{
     ["my_binded_devices","others_shared_devices"].into_iter()
         .filter_map(|key|data.get(key).and_then(Value::as_array)).flatten()
         .find(|d|d.get("device_id").and_then(Value::as_str)==Some(device))
         .and_then(|d|d.get("platform")).and_then(Value::as_i64)
 }
 #[derive(Debug, PartialEq, Eq)]
-pub enum Error { AuthenticationExpired, Api(i32, String), InvalidResponse, Transport, MissingRoom, InvalidDevice, InvalidAssist }
+pub enum Error { AuthenticationExpired, Api(i32, String), InvalidResponse, Transport, MissingRoom, InvalidDevice, InvalidAssist, UnknownKeyboardPlatform }
 impl std::fmt::Display for Error {
     // The server's short message is user-facing (e.g. 2002 「被控端正在被远控中，无法发起连接」).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -34,6 +34,7 @@ impl std::fmt::Display for Error {
             Error::InvalidAssist => write!(f, "请输入对方的设备 ID 和有效验证码"),
             Error::InvalidResponse => write!(f, "服务器响应格式无效"),
             Error::MissingRoom => write!(f, "服务器未返回可用的房间或信令信息"),
+            Error::UnknownKeyboardPlatform => write!(f, "无法确定目标键盘平台，不能启用控制"),
             Error::Api(code, _) => write!(f, "连接请求失败（错误码 {code}）"),
             _ => write!(f, "viewer API: {self:?}"),
         }
@@ -161,6 +162,21 @@ impl Api {
         if status != 200 || body.get("code").and_then(Value::as_i64) != Some(0) { return Err(Error::InvalidResponse); }
         body.get("data").cloned().ok_or(Error::InvalidResponse)
     }
+    pub async fn target_is_mac(&self,room:&JoinData,device:Option<&str>)->Result<bool,Error>{
+        let platform=match room.publisher_platform {
+            Some(platform)=>Some(i64::from(platform)),
+            None=>match device {
+                Some(device)=>device_platform(&self.device_list().await?,device),
+                None=>None,
+            },
+        };
+        // Observed device/share platforms: 1 = Windows (also our Linux host), 4 = Mac.
+        match platform {
+            Some(1)=>Ok(false),
+            Some(4)=>Ok(true),
+            _=>Err(Error::UnknownKeyboardPlatform),
+        }
+    }
     /// Method and wire-key mapping remain unverified. Caller must select both explicitly.
     pub async fn devices(&self, method: reqwest::Method, array_pointer: &str) -> Result<Vec<Value>, Error> {
         let (status, body) = self.request(method, "/api/v1/device/list", None).await?;
@@ -206,6 +222,8 @@ mod tests {
         let data = parse_join(200, fixture.clone()).unwrap();
         assert_eq!(data.signaling_list.len(), 1);
         assert_eq!(data.publisher_platform,None);
+        let mut empty=fixture.clone();empty["data"]["publisher_platform"]=Value::Null;
+        assert_eq!(parse_join(200,empty).unwrap().publisher_platform,None);
         let mut mac=fixture.clone();mac["data"]["publisher_platform"]=json!(4);
         assert_eq!(parse_join(200,mac).unwrap().publisher_platform,Some(4));
         for key in ["report_token", "report_url"] {
@@ -262,6 +280,62 @@ mod http_tests {
         (url,job)
     }
     fn signer()->UUAuthClient {UUAuthClient::new(Credentials{token:"synthetic-auth".into(),sign_key:"synthetic-key".into(),..Default::default()})}
+    fn room(platform:Option<i32>)->JoinData {
+        let mut room=parse_join(200,serde_json::from_str(include_str!("../../tests/fixtures/viewer/join.json")).unwrap()).unwrap();
+        room.publisher_platform=platform;room
+    }
+    #[tokio::test]
+    async fn keyboard_platform_uses_room_metadata_without_device_lookup(){
+        let api=Api::new(signer(),"http://127.0.0.1:1");
+        for device in [None,Some("synthetic-device")] {
+            assert_eq!(api.target_is_mac(&room(Some(1)),device).await,Ok(false));
+            assert_eq!(api.target_is_mac(&room(Some(4)),device).await,Ok(true));
+            for platform in [0,-1,2,3,5,999,i32::MIN,i32::MAX] {
+                assert_eq!(api.target_is_mac(&room(Some(platform)),device).await,Err(Error::UnknownKeyboardPlatform));
+            }
+        }
+        assert_eq!(api.target_is_mac(&room(None),None).await,Err(Error::UnknownKeyboardPlatform));
+    }
+    #[tokio::test]
+    async fn keyboard_platform_looks_up_only_the_selected_account_device(){
+        for list in ["my_binded_devices","others_shared_devices"] {
+            for (platform,mac) in [(1,false),(4,true)] {
+                let data=json!({list:[{"device_id":"unrelated","platform":4},
+                    {"device_id":"synthetic-device","platform":platform}]});
+                let(url,job)=server(vec![(200,json!({"code":0,"data":data}))]).await;
+                assert_eq!(Api::new(signer(),&url).target_is_mac(&room(None),Some("synthetic-device")).await,Ok(mac));
+                let requests=job.await.unwrap();assert_eq!(requests.len(),1);
+                assert!(requests[0].starts_with("GET /api/v1/device/list "));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn keyboard_platform_rejects_unknown_or_malformed_device_metadata(){
+        let mut devices=vec![json!({"device_id":"unrelated","platform":4}),json!({"device_id":"synthetic-device"})];
+        for platform in [json!(0),json!(-1),json!(999),json!("4"),json!(true),json!(4.5),json!(null),json!(u64::MAX)] {
+            devices.push(json!({"device_id":"synthetic-device","platform":platform}));
+        }
+        for device in devices {
+            let data=json!({"my_binded_devices":[device]});
+            let(url,job)=server(vec![(200,json!({"code":0,"data":data}))]).await;
+            assert_eq!(Api::new(signer(),&url).target_is_mac(&room(None),Some("synthetic-device")).await,Err(Error::UnknownKeyboardPlatform));
+            assert_eq!(job.await.unwrap().len(),1);
+        }
+    }
+    #[tokio::test]
+    async fn keyboard_platform_propagates_device_lookup_failures(){
+        for (status,body,error) in [
+            (422,json!({"code":1120}),Error::AuthenticationExpired),
+            (503,json!({"code":5000}),Error::InvalidResponse),
+            (200,json!({"code":0}),Error::InvalidResponse),
+        ] {
+            let(url,job)=server(vec![(status,body)]).await;
+            assert_eq!(Api::new(signer(),&url).target_is_mac(&room(None),Some("synthetic-device")).await,Err(error));
+            assert_eq!(job.await.unwrap().len(),1);
+        }
+        let api=Api::new(signer(),"http://127.0.0.1:1");
+        assert_eq!(api.target_is_mac(&room(None),Some("synthetic-device")).await,Err(Error::Transport));
+    }
     #[tokio::test]
     async fn signed_join_and_explicit_device_list_use_only_loopback_http() {
         let fixture=serde_json::from_str(include_str!("../../tests/fixtures/viewer/join.json")).unwrap();
@@ -344,6 +418,10 @@ mod strict_tests {
         let fixture:Value=serde_json::from_str(include_str!("../../tests/fixtures/viewer/join.json")).unwrap();
         for (key,bad) in [("token",json!(false)),("signaling_list",json!([7])),("ws_connect_timeout_ms",json!(2147483648u64)),("streamer_retry_delta_ms",json!(null)),("international_connect",json!(1)),("report_token",json!(null)),("report_url",json!(7)),("report_server_address",json!([]))] {
             let mut v=fixture.clone();v["data"][key]=bad;assert!(matches!(parse_join(200,v),Err(Error::InvalidResponse)));
+        }
+        for platform in [json!("4"),json!(true),json!(4.5),json!(2147483648u64),json!(-2147483649i64)] {
+            let mut v=fixture.clone();v["data"]["publisher_platform"]=platform;
+            assert!(matches!(parse_join(200,v),Err(Error::InvalidResponse)));
         }
         for key in ["code","msg"] {
             let mut v=fixture.clone();v.as_object_mut().unwrap().remove(key);assert!(matches!(parse_join(200,v),Err(Error::InvalidResponse)));
