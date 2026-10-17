@@ -124,6 +124,7 @@ impl SyncState {
                 _=>{},
             }
         }
+        if value.as_ref().is_some_and(|text|text.contains('\0')){return Err("clipboard text contains NUL")}
         Ok((replies,value))
     }
 }
@@ -251,6 +252,15 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         assert_eq!(decode_wire(header).unwrap()[0].value,WireValue::Varint(73));
         assert!(state.receive(&wire::envelope(1,17,&[18,1,255])).is_err());
         assert!(state.receive(&wire::envelope(1,17,&text::encode(1,&"a".repeat(MAX_TEXT+1),false))).is_err());
+    }
+    #[test] fn rejected_nul_does_not_stop_later_valid_updates(){
+        let mut state=SyncState::default();
+        for kind in [17,21]{
+            let payload=if kind==17{text::encode(1,"nul\0text",false)}else{text::text_request(73,"nul\0text")};
+            assert!(state.receive(&wire::envelope(1,kind,&payload)).is_err());
+            let(_,value)=state.receive(&wire::envelope(2,17,&text::encode(2,"valid",false))).unwrap();
+            assert_eq!(value.as_deref(),Some("valid"));
+        }
     }
     // Match webrtc.rs: CONTROL and TEXT have separate rich States, and only TEXT has a desktop sink.
     fn native_host_exchange(outbound:usize,reverse:bool)->(Option<String>,bool){
