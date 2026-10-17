@@ -60,9 +60,19 @@ mod native {
         Ok(true)
     }
     #[derive(Default)]
-    struct Recovery { retry_at: Option<std::time::Instant> }
+    struct Recovery { retry_at: Option<std::time::Instant>, failed_until: Option<std::time::Instant>, denied: bool }
     impl Recovery {
+        // Shared by the encoder's stream-loss recovery and the desktop supervisor: a failed open
+        // backs both off, and a terminal consent/format failure stops the encoder from prompting again.
+        fn failed(&mut self, now: std::time::Instant, code: i32) {
+            let until = now + std::time::Duration::from_secs(5);
+            self.failed_until = Some(until);
+            self.retry_at = Some(until);
+            if matches!(code, 4 | 5 | 6 | 8 | 14) { self.denied = true; }
+        }
+        fn succeeded(&mut self) { *self = Self::default(); }
         fn ready(&mut self, now: std::time::Instant, unlocked: impl FnOnce() -> bool) -> bool {
+            if self.denied { return false; }
             let deadline = self.retry_at.get_or_insert(now + std::time::Duration::from_secs(1));
             if now < *deadline { return false; }
             *deadline = now + std::time::Duration::from_secs(1);
@@ -160,13 +170,16 @@ mod native {
                     Err(TryLockError::Poisoned(_)) => return Err(super::PortalError { code: 3 }),
                 }
             };
+            if recovery.failed_until.is_some_and(|until| std::time::Instant::now() < until) {
+                return Err(super::PortalError { code: 3 });
+            }
             let alive = {
                 let handle = self.handle.lock().map_err(|_| super::PortalError { code: 3 })?;
                 unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 && uu_portal_capture_alive(handle.0.as_ptr()) != 0 }
             };
             if alive { return Ok(false); }
 
-            super::open_then_install(cancelled, || Self::open_cancellable(cancelled), |replacement| {
+            let result = super::open_then_install(cancelled, || Self::open_cancellable(cancelled), |replacement| {
                 self.check_geometry(&replacement)?;
                 let replacement_handle = replacement.handle.into_inner().map_err(|_| super::PortalError { code: 3 })?;
                 let mut handle = self.handle.lock().map_err(|_| super::PortalError { code: 3 })?;
@@ -175,9 +188,14 @@ mod native {
                 clear_pause_for_unlocked_replacement(&self.was_locked, *self.locked.borrow());
                 log::info!("Portal capture session restored after closure");
                 Ok(())
-            })?;
-            recovery.retry_at = None;
-            Ok(true)
+            });
+            match result {
+                Ok(()) => { recovery.succeeded(); Ok(true) }
+                Err(error) => {
+                    if error.code != 13 { recovery.failed(std::time::Instant::now(), error.code); }
+                    Err(error)
+                }
+            }
         }
         pub fn pause(&self) {
             if let Ok(handle) = self.handle.lock() {
@@ -232,15 +250,15 @@ mod native {
                         self.was_locked.store(true, std::sync::atomic::Ordering::Release);
                         false
                     }) { return Ok(None); }
-                    let replacement = match Self::open() {
+                    let replacement = match Self::open_inner(None) {
                         Ok(value) => value,
                         Err(error) => {
                             log::warn!("Portal capture recovery deferred: {error}");
-                            recovery.retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                            recovery.failed(std::time::Instant::now(), error.code);
                             return Ok(None);
                         }
                     };
-                    recovery.retry_at = None;
+                    recovery.succeeded();
                     self.check_geometry(&replacement).map_err(|error| error.to_string())?;
                     // Consent can outlive the unlocked state checked above.
                     if *self.locked.borrow() != Some(false) || self.was_locked.load(std::sync::atomic::Ordering::Acquire) {
@@ -447,6 +465,20 @@ mod native {
                 else { assert!(!result.unwrap()); }
                 assert_eq!(*current.try_lock().unwrap(), 1);
             }
+        }
+
+        #[test]
+        fn terminal_failure_stops_encoder_recovery_until_the_supervisor_succeeds() {
+            let now = std::time::Instant::now();
+            let later = now + std::time::Duration::from_secs(60);
+            let mut recovery = Recovery::default();
+            recovery.failed(now, 3);
+            assert!(!recovery.denied && recovery.failed_until.is_some());
+            recovery.failed(now, 4);
+            assert!(recovery.denied);
+            assert!(!recovery.ready(later, || panic!("denied consent must not be probed again")));
+            recovery.succeeded();
+            assert!(!recovery.denied && recovery.failed_until.is_none() && recovery.retry_at.is_none());
         }
 
         #[test]

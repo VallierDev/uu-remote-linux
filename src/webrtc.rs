@@ -772,7 +772,12 @@ impl WebRtcSession {
 
 
                 d.on_message(Box::new(move |msg: DataChannelMessage| {
-                    let screen = portal_desktop.as_ref().map_or_else(|| screen.clone(), |desktop| desktop.snapshot().screen);
+                    // Keep the whole state: a cached screen waiting for a closed Portal is not ready for input.
+                    let (screen, desktop_ready) = portal_desktop.as_ref().map_or_else(|| (screen.clone(), true), |desktop| {
+                        let state = desktop.snapshot();
+                        let ready = state.ready();
+                        (state.screen, ready)
+                    });
                     let channel_name = lbl.clone();
                     let input_worker = inp.clone();
                     let message_input_session=channel_input_session.clone();
@@ -1032,7 +1037,7 @@ impl WebRtcSession {
                                     match crate::control_protocol::decode_control(&msg.data) {
                                         Ok(crate::control_protocol::ControlMessage::Input(event)) => {
                                             if screen.backend == crate::desktop_backend::DesktopBackend::Portal
-                                                && (screen.init_error.is_some() || *lock_for_message.borrow() != Some(false)) { return; }
+                                                && (screen.init_error.is_some() || !desktop_ready || *lock_for_message.borrow() != Some(false)) { return; }
                                             use crate::control_protocol::ControlInput;
                                             // Separate receipt budgets keep motion floods from hiding clicks.
                                             static RECEIPTS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
