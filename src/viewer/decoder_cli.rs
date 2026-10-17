@@ -1,5 +1,5 @@
 //! H.264/H.265 decoding through an external `ffmpeg` process, like the host's encoder pipeline.
-//! Needs only the ffmpeg CLI (any recent version), not FFmpeg development libraries.
+//! Needs only the ffmpeg CLI, not FFmpeg development libraries.
 //! Output is scaled into a fixed letterboxed size so every frame has a known byte length.
 use super::desktop::{Decoder,Frame};
 use super::media::Codec;
@@ -27,7 +27,8 @@ impl Cli {
                 "-pix_fmt","rgb24",
                 // Raw H.264/H.265 carries no timestamps; constant-rate output dropped almost every frame of
                 // the official Mac host's stream (270 → 2). Pass frames through unchanged.
-                "-fps_mode","passthrough","-f","rawvideo","pipe:1"])
+                // -vsync 0 also supports Ubuntu 22.04's FFmpeg 4.4, which lacks -fps_mode.
+                "-vsync","0","-f","rawvideo","pipe:1"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
             .spawn().map_err(|e|format!("Start ffmpeg decoder: {e}"))?;
         let input=child.stdin.take().ok_or("ffmpeg stdin missing")?;
@@ -91,12 +92,13 @@ impl Drop for Cli { fn drop(&mut self) { let _=self.child.kill(); let _=self.chi
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
                 Err(e)=>panic!("{codec:?} decoder did not finish: {e}"),
             }}
+            let status=cli.child.wait().unwrap();
+            assert!(status.success(),"{codec:?}: ffmpeg exited with {status}");
             assert!(!frames.is_empty(),"{codec:?}: no RGB frames");
             for frame in frames {
                 assert_eq!(frame.rgb.len(),32*32*3);
                 assert!(frame.rgb.chunks_exact(3).all(|p|p[0]>220 && p[1]<30 && p[2]<30),"{codec:?}: RGB conversion");
             }
-            assert!(cli.child.wait().unwrap().success());
         }
     }
 }
