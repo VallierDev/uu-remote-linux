@@ -57,6 +57,13 @@ The remote application still controls whether it receives bracketed paste and
 mouse movement. Ctrl-C during a transfer cancels that paste. Input typed while
 the upload is running is queued, so Enter cannot overtake the uploaded path.
 
+Ghostty's title bar shows the connection phase, upload percentage, transferred
+size, transfer speed and elapsed time. Its progress indicator tracks the upload
+too. Progress is derived from OpenSSH's transfer meter, aggregated across copied
+files; it is not a simulated timer. The original terminal title is restored when
+the upload finishes, fails or is cancelled, and no terminal cells are overwritten.
+Filename and error output from SCP stays private; only numeric progress is shown.
+
 ## Scope and failure behavior
 
 - Only file-URL clipboard entries copied in Finder are uploaded, and only when
@@ -91,5 +98,6 @@ UU_PASTE_TEST_HOST=uu-server UU_PASTE_TEST_CONFIG="$HOME/.config/your-uu-ssh.con
 The Swift test uses a private pasteboard and never touches the user's clipboard.
 Python tests exercise fragmented paste framing, shell quoting, plain text,
 mouse reports, failed uploads, queued Enter, PTY restoration and exit status.
-The optional live test transfers synthetic binary files and verifies hashes.
+The optional live tests transfer synthetic binary files and verify hashes,
+including a throttled upload that must report intermediate byte progress.
 Physical Command-C/Command-V behavior in Finder/Ghostty remains a manual check.

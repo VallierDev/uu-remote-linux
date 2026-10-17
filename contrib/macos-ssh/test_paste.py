@@ -151,13 +151,79 @@ class FileTests(unittest.TestCase):
             paste.run_private([sys.executable, "-c", "import time;time.sleep(30)"], cancel, 3)
 
 
+class ProgressTests(unittest.TestCase):
+    def test_numeric_meter_handles_fragments_multiple_files_and_rounding(self):
+        for fragment in (1, 7, 9999):
+            reports = []
+            meter = paste.SCPMeter([1048576, 1025], lambda *args: reports.append(args))
+            wire = (b"\rprivate-file  0%    0    0.0KB/s   --:-- ETA"
+                    b"\rprivate-file 50%  512KB 128.0KB/s   00:04 ETA"
+                    b"\rprivate-file 100% 1024KB 128.0KB/s   00:08\r\n"
+                    b"\rsecret-other  0%    0   0.0KB/s   --:-- ETA"
+                    b"\rsecret-other 100% 1025  64.0KB/s   00:00\r\n")
+            for offset in range(0, len(wire), fragment):
+                meter.feed(wire[offset:offset + fragment])
+            self.assertIn(("uploading", 524288, 1049601, 131072), reports)
+            self.assertEqual(reports[-1], ("uploading", 1049601, 1049601, 65536))
+            self.assertEqual(meter.index, 2)
+            self.assertEqual([p[1] for p in reports], sorted(p[1] for p in reports))
+            self.assertNotIn("private-file", repr(reports))
+            self.assertNotIn("secret-other", repr(reports))
+
+    def test_unrecognized_output_is_not_displayed_and_buffer_is_bounded(self):
+        reports = []
+        meter = paste.SCPMeter([10], lambda *args: reports.append(args))
+        meter.feed(b"private error " * 10000 + b" 999% 5 1.0KB/s 00:00\n")
+        self.assertEqual(reports, [])
+        self.assertLessEqual(len(meter.buffer), 512)
+
+    def test_metered_process_captures_progress_privately_and_preserves_failure_cancellation(self):
+        reports = []
+        code = ("import os;assert os.isatty(1);assert os.tcgetpgrp(1)==os.getpgrp();"
+                "os.write(1,b'\\rprivate-file 100% 1025 64.0KB/s 00:00\\n')")
+        paste.run_metered([sys.executable, "-c", code], threading.Event(), 5,
+                          paste.SCPMeter([1025], lambda *args: reports.append(args)))
+        self.assertEqual(reports[-1], ("uploading", 1025, 1025, 65536))
+        with self.assertRaises(paste.PasteError):
+            paste.run_metered([sys.executable, "-c", "raise SystemExit(2)"], threading.Event(), 5,
+                              paste.SCPMeter([1], lambda *_: None))
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(paste.PasteError):
+            paste.run_metered([sys.executable, "-c", "import time;time.sleep(30)"], cancel, 5,
+                              paste.SCPMeter([1], lambda *_: None))
+
+    def test_display_restores_split_remote_title_and_never_changes_terminal_cells(self):
+        output = []
+        display = paste.UploadDisplay(output.append)
+        for byte in b"\x1b]2;remote app title\x1b\\":
+            display.observe(bytes([byte]))
+        with mock.patch.object(paste.time, "monotonic", return_value=10):
+            display.start(1048576)
+        with mock.patch.object(paste.time, "monotonic", return_value=13):
+            display.update("uploading", 524288, 1048576, 131072)
+            display.render()
+            display.render()  # Throttled, not a second display update.
+        self.assertEqual(len(output), 2)
+        self.assertIn(b"Connecting", output[0])
+        self.assertIn(b"Uploading 50% | 512.0 KiB/1.0 MiB | 128.0 KiB/s | 3s", output[1])
+        self.assertIn(b"\x1b]9;4;1;50\x1b\\", output[1])
+        display.observe(b"\x1b]0;new remote title\x07")
+        display.finish()
+        self.assertEqual(output[-1], b"\x1b]9;4;0\x1b\\\x1b]2;new remote title\x1b\\")
+        display.finish()
+        self.assertEqual(len(output), 3)
+        self.assertTrue(all(b"\n" not in item and b"\r" not in item for item in output))
+
+
 HARNESS = r'''
 import os, runpy, sys, time, json
 h = runpy.run_path(sys.argv[1])
 paths, remote, mode, fail = json.loads(sys.argv[2])
 class Upload:
-    def upload(self, files, cancel):
+    def upload(self, files, cancel, progress):
         assert files == paths
+        progress('uploading',512,1024,256)
         time.sleep(0.1)
         if fail == 'cancel':
             assert cancel.wait(5)
@@ -276,6 +342,11 @@ while True: signal.pause()
                         self.assertEqual(restored, original)
                         if fail:
                             self.assertNotIn(str(file).encode(), output)
+                        if not ordinary:
+                            self.assertIn(b"UU upload: Connecting", output)
+                            self.assertIn(b"\x1b]9;4;0\x1b\\", output)
+                        if fail == 'cancel':
+                            self.assertIn(b"UU upload: Cancelling", output)
                     finally:
                         if proc.poll() is None:
                             proc.kill()
@@ -286,6 +357,30 @@ while True: signal.pause()
 
 @unittest.skipUnless(os.environ.get("UU_PASTE_TEST_HOST"), "set UU_PASTE_TEST_HOST for a real mapped SSH test")
 class MappedSSHTests(unittest.TestCase):
+    def test_live_upload_reports_intermediate_progress_and_verified_completion(self):
+        host = os.environ["UU_PASTE_TEST_HOST"]
+        uploader = paste.Uploader(os.environ.get("UU_PASTE_TEST_CONFIG"), host)
+        uploader.scp.extend(["-l", "1024"])  # Deliberately slow a synthetic transfer.
+        reports = []
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "private progress 中文.bin"
+            source.write_bytes(os.urandom(1024 * 1024))
+            paths = shlex.split(uploader.upload([str(source)], threading.Event(),
+                                               lambda *args: reports.append(args)).decode())
+            try:
+                total = source.stat().st_size
+                self.assertEqual(reports[0], ("connecting", 0, total, 0))
+                self.assertTrue(any(0 < done < total and speed > 0
+                                    for stage, done, size, speed in reports if stage == "uploading"))
+                self.assertEqual(reports[-1], ("finishing", total, total, 0))
+                self.assertNotIn(source.name, repr(reports))
+                remote = paste.run_private([*uploader.ssh, "sha256sum -- " + shlex.quote(paths[0])],
+                                           threading.Event(), 30)
+                self.assertEqual(remote.split()[0].decode(), hashlib.sha256(source.read_bytes()).hexdigest())
+            finally:
+                paste.run_private([*uploader.ssh, "rm -rf -- " + shlex.quote(str(Path(paths[0]).parent))],
+                                  threading.Event(), 30)
+
     def test_paste_through_real_pty_and_uu_ssh_opens_uploaded_files(self):
         host = os.environ["UU_PASTE_TEST_HOST"]
         config = os.environ.get("UU_PASTE_TEST_CONFIG")

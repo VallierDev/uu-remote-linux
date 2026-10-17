@@ -15,6 +15,7 @@ import select
 import shlex
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import termios
@@ -171,9 +172,107 @@ def copied_files(data, read_clipboard):
     return paths
 
 
-def run_private(args, cancel, timeout):
+class SCPMeter:
+    """Reduce OpenSSH's private progress output to numeric batch counters."""
+
+    # OpenSSH progressmeter.c writes: filename percent size rate time [ETA].
+    # Anchor at the numeric suffix; filenames and errors are never displayed.
+    record = re.compile(rb" (\d{1,3})%\s+(\d{1,20}(?:[KMGT]B)?)\s+"
+                        rb"(\d{1,20}(?:\.\d{1,10})?[KMGT]B)/s\s+"
+                        rb"(?:\d+:\d\d(?::\d\d)?(?: ETA)?|--:-- ETA|- stalled -)\s*$")
+
+    def __init__(self, sizes, report):
+        self.sizes, self.report = sizes, report
+        self.buffer, self.index, self.finished = b"", 0, 0
+        self.current, self.percent = 0, 0
+
+    @staticmethod
+    def amount(token):
+        match = re.fullmatch(rb"(\d+(?:\.\d+)?)([KMGT])?B?", token)
+        return int(float(match[1]) * 1024 ** (b" KMGT".index(match[2]) if match[2] else 0))
+
+    def parse(self, line):
+        match = self.record.search(line)
+        if not match or self.index >= len(self.sizes):
+            return
+        percent = int(match[1])
+        if percent > 100:
+            return
+        self.percent = max(self.percent, percent)
+        size = self.sizes[self.index]
+        self.current = max(self.current, min(size, self.amount(match[2])))
+        if percent == 100:
+            self.current = size
+        self.report("uploading", self.finished + self.current, sum(self.sizes), self.amount(match[3]))
+
+    def feed(self, data):
+        for piece in re.split(rb"([\r\n])", data):
+            if piece in (b"\r", b"\n"):
+                self.parse(self.buffer)
+                self.buffer = b""
+                if piece == b"\n" and self.percent == 100:
+                    self.finished += self.sizes[self.index]
+                    self.index += 1
+                    self.current = self.percent = 0
+            else:
+                # Keep only enough for a numeric suffix, not unlimited errors.
+                self.buffer = (self.buffer + piece)[-512:]
+        self.parse(self.buffer)
+
+
+def run_metered(args, cancel, timeout, meter):
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 120, 0, 0))
+
+    try:
+        # The upload runs on a worker thread, so avoid Python preexec_fn after
+        # fork. Acquire the private controlling TTY in a fresh interpreter.
+        launch = ("import fcntl,os,sys,termios;fcntl.ioctl(1,termios.TIOCSCTTY,0);"
+                  "os.execv(sys.argv[1],sys.argv[1:])")
+        with subprocess.Popen([sys.executable, "-c", launch, *args],
+                              stdin=subprocess.DEVNULL, stdout=slave, stderr=slave,
+                              start_new_session=True) as process:
+            os.close(slave)
+            slave = None
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    if cancel.is_set() or time.monotonic() > deadline:
+                        raise PasteError("Upload cancelled or timed out; paste was not sent.")
+                    if select.select([master], [], [], 0.1)[0]:
+                        try:
+                            data = os.read(master, 65536)
+                        except OSError as error:
+                            if error.errno != errno.EIO:
+                                raise
+                            data = b""
+                        if not data:
+                            break
+                        meter.feed(data)
+                    elif process.poll() is not None:
+                        break
+                try:
+                    status = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    raise PasteError("Upload timed out; paste was not sent.") from None
+                if status:
+                    raise PasteError("Upload failed; paste was not sent.")
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+    finally:
+        os.close(master)
+        if slave is not None:
+            os.close(slave)
+    return b""
+
+
+def run_private(args, cancel, timeout, meter=None):
     # Neither SSH errors nor SCP output may disclose paths, clipboard/file data,
     # or credentials. Authentication never reads from the interactive terminal.
+    if meter is not None:
+        return run_metered(args, cancel, timeout, meter)
     with subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL, start_new_session=True) as process:
         deadline = time.monotonic() + timeout
@@ -199,7 +298,10 @@ class Uploader:
         self.scp = ["/usr/bin/scp", "-q", *common]
         self.host = host
 
-    def upload(self, paths, cancel):
+    def upload(self, paths, cancel, progress=None):
+        sizes = [os.stat(path).st_size for path in paths] if progress else []
+        if progress:
+            progress("connecting", 0, sum(sizes), 0)
         script = ('umask 077; d="$HOME/.local/share/uuremote/uploads"; '
                   'mkdir -p "$d" && mktemp -d "$d/paste.XXXXXXXX"')
         try:
@@ -213,7 +315,14 @@ class Uploader:
         try:
             # Use modern SCP's SFTP mode, never legacy SCP (-O). Unique batch
             # directories prevent overwrites; all local paths are absolute.
-            run_private([*self.scp, *paths, f"{self.host}:{directory}/"], cancel, 300)
+            if progress:
+                progress("uploading", 0, sum(sizes), 0)
+                scp = self.scp[:1] + self.scp[2:]  # Remove only our own -q.
+                run_private([*scp, *paths, f"{self.host}:{directory}/"], cancel, 300,
+                            SCPMeter(sizes, progress))
+                progress("finishing", sum(sizes), sum(sizes), 0)
+            else:
+                run_private([*self.scp, *paths, f"{self.host}:{directory}/"], cancel, 300)
         except (PasteError, OSError):
             # Clean only this batch, with quoted remote shell syntax. Cancellation
             # of one upload must not stop another SSH/UU session.
@@ -229,6 +338,70 @@ def write_all(fd, data):
     view = memoryview(data)
     while view:
         view = view[os.write(fd, view):]
+
+
+def display_size(size):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+
+
+class UploadDisplay:
+    """Session-local title and OSC 9;4 progress; terminal cells stay untouched."""
+
+    # https://ghostty.org/docs/vt/osc/conemu: states 0=clear, 1=percent, 3=busy.
+
+    def __init__(self, emit):
+        self.emit, self.active = emit, False
+        self.title, self.pending = b"UU SSH", b""
+        self.state = ("connecting", 0, 0, 0)
+        self.started = self.rendered = 0
+
+    def observe(self, data):
+        self.pending = (self.pending + data)[-8192:]
+        for match in re.finditer(rb"\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)", self.pending):
+            self.title = match[1]
+        # Retain only an incomplete OSC title across output reads.
+        index = self.pending.rfind(b"\x1b]")
+        if index < 0:
+            self.pending = b"\x1b" if self.pending.endswith(b"\x1b") else b""
+        else:
+            tail = self.pending[index:]
+            self.pending = tail if b"\x07" not in tail and b"\x1b\\" not in tail else b""
+
+    def start(self, total):
+        self.active = True
+        self.started = time.monotonic()
+        self.state = ("connecting", 0, total, 0)
+        self.render(force=True)
+
+    def update(self, stage, done, total, speed):
+        self.state = stage, done, total, speed
+
+    def render(self, force=False):
+        now = time.monotonic()
+        if not self.active or (not force and now - self.rendered < 0.2):
+            return
+        self.rendered = now
+        stage, done, total, speed = self.state
+        elapsed = int(now - self.started)
+        if stage in ("connecting", "cancelling"):
+            label = "Connecting" if stage == "connecting" else "Cancelling"
+            text = f"UU upload: {label} | {display_size(total)} | {elapsed}s"
+            indicator = b"\x1b]9;4;3\x1b\\"
+        else:
+            percent = min(100, int(done * 100 / total)) if total else 100
+            label = "Finishing" if stage == "finishing" else "Uploading"
+            text = (f"UU upload: {label} {percent}% | {display_size(done)}/{display_size(total)}"
+                    f" | {display_size(speed)}/s | {elapsed}s")
+            indicator = f"\x1b]9;4;1;{percent}\x1b\\".encode()
+        self.emit(b"\x1b]2;" + text.encode() + b"\x1b\\" + indicator)
+
+    def finish(self):
+        if self.active:
+            self.active = False
+            self.emit(b"\x1b]9;4;0\x1b\\\x1b]2;" + self.title + b"\x1b\\")
 
 
 def relay(command, read_clipboard, uploader):
@@ -259,13 +432,15 @@ def relay(command, read_clipboard, uploader):
                         for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
     frames, modes = InputFrames(), OutputModes()
     events, completed = collections.deque(), queue.Queue()
+    updates = queue.Queue()
+    display = UploadDisplay(lambda data: write_all(1, data))
     cancel, uploading, interrupted = threading.Event(), False, False
     worker = None
     last_input = time.monotonic()
 
     def upload_worker(paths):
         try:
-            completed.put((uploader.upload(paths, cancel), None))
+            completed.put((uploader.upload(paths, cancel, lambda *args: updates.put(args)), None))
         except (OSError, PasteError):
             completed.put((None, "Upload failed or cancelled; paste was not sent."))
 
@@ -283,6 +458,9 @@ def relay(command, read_clipboard, uploader):
             index, offset = positions[-1]
             cancel.set()
             interrupted = True
+            _, done, total, _ = display.state
+            display.update("cancelling", done, total, 0)
+            display.render(force=True)
             frames = InputFrames()
             events.clear()
             events.extend(frames.feed(pending[index][1][offset + 1:]))
@@ -294,13 +472,19 @@ def relay(command, read_clipboard, uploader):
         write_all(1, ENABLE)
         while True:
             interrupt_upload()
+            while not updates.empty():
+                update = updates.get_nowait()
+                if not interrupted:
+                    display.update(*update)
             if uploading:
+                display.render()
                 try:
                     data, error = completed.get_nowait()
                 except queue.Empty:
                     pass
                 else:
                     uploading = False
+                    display.finish()
                     if error:
                         notice(error)
                     elif not interrupted:
@@ -321,8 +505,14 @@ def relay(command, read_clipboard, uploader):
                 if files is None:
                     write_all(master, paste_bytes(data, modes.bracketed))
                 else:
+                    try:
+                        total = sum(os.stat(path).st_size for path in files)
+                    except OSError:
+                        notice("A copied file is no longer readable; paste was not sent.")
+                        continue
                     cancel.clear()
                     uploading, interrupted = True, False
+                    display.start(total)
                     worker = threading.Thread(target=upload_worker, args=(files,), daemon=True)
                     worker.start()
             interrupt_upload()
@@ -336,6 +526,7 @@ def relay(command, read_clipboard, uploader):
                     data = b""
                 if not data:
                     break
+                display.observe(data)
                 write_all(1, modes.feed(data))
             if 0 in readable:
                 data = os.read(0, 65536)
@@ -358,6 +549,7 @@ def relay(command, read_clipboard, uploader):
         for sig, previous in previous_signals.items():
             signal.signal(sig, previous)
         termios.tcsetattr(0, termios.TCSADRAIN, original)
+        display.finish()
         write_all(1, DISABLE)
         os.close(master)
         if child.poll() is None:

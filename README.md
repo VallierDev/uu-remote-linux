@@ -212,6 +212,7 @@ install -Dm644 contrib/desktop/uu-remote-linux.desktop ~/.local/share/applicatio
 **Mac 终端粘贴文件**：使用 Ghostty 通过 UU 端口映射连接 SSH 时，可安装
 [Mac SSH 粘贴助手](contrib/macos-ssh/README.md)。在 Finder 复制文件后按 Command-V，
 助手先通过同一个 SSH 别名上传文件，再插入服务器路径；普通文本和鼠标报告正常透传。
+Ghostty 标题栏和进度条显示上传进度、已传大小、速度和耗时。
 这是可选的 Mac 端工具，不会改变官方 UU 内置终端；暂不支持文件夹、拖放或原始截图剪贴板。
 
 **虚拟桌面**：需要完整的远程桌面时，用 Xvfb 创建一块虚拟屏幕，再在上面跑一个桌面环境（推荐 Xfce）：
