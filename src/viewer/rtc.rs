@@ -63,7 +63,7 @@ fn media_engine(shape:&Shape)->Result<MediaEngine,String>{
     }Ok(engine)
 }
 impl Peer {
-    pub async fn new(config:RTCConfiguration, shape:&Shape, app_id:&str, ice_id:&str, remote_client:&str, outbound:mpsc::Sender<Value>, settings:SettingEngine)->Result<Self,String> {
+    pub async fn new(config:RTCConfiguration, shape:&Shape, app_id:&str, ice_id:&str, remote_client:&str, outbound:mpsc::Sender<Value>, settings:SettingEngine, mut clipboard:super::clipboard::Bridge)->Result<Self,String> {
         shape.validate_session()?;
         let mut engine=media_engine(shape)?;
         // UU RTP metadata the official Mac viewer offers (src/rtp_metadata.rs on the host side).
@@ -155,7 +155,6 @@ impl Peer {
                 }
             }
             let mut channels=Vec::new();
-            let mut clipboard=super::clipboard::Bridge::new(shape.capture_type==1);
             let clipboard_enabled=clipboard.enabled;
             // Diagnostic: hosts may open their own channels; log the label and message count only.
             pc.on_data_channel(Box::new(|channel|Box::pin(async move {

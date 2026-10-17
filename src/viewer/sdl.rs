@@ -1,15 +1,34 @@
 use super::{desktop::{Frame,FrameSink},input::{Input,Viewport},session::Session};
 use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum,rect::Rect};
-pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool }
+pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
+    clipboard:sdl2::clipboard::ClipboardUtil, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest> }
 impl Window {
     pub fn new()->Result<Self,String>{
         let sdl=sdl2::init()?;let video=sdl.video()?;
         let window=video.window("Native viewer (experimental)",1280,720).position_centered().resizable().build().map_err(|_|"Window creation failed")?;
         let canvas=window.into_canvas().build().map_err(|_|"Renderer creation failed")?;
-        let events=sdl.event_pump()?;Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false})
+        let events=sdl.event_pump()?;let clipboard=video.clipboard();
+        let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
+        Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_tx,clipboard_requests})
     }
+    pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone())}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
     fn viewport(&self)->Viewport {Viewport::fit(self.canvas.window().size(),self.frame)}
+    fn poll_clipboard(&mut self){
+        // Use the existing SDL window; wl-paste creates a transient toplevel on GNOME every poll.
+        while let Ok(request)=self.clipboard_requests.try_recv(){
+            use super::clipboard::{ClipboardRequest,MAX_TEXT};
+            match request {
+                ClipboardRequest::Read(reply)=>{
+                    let result=if self.clipboard.has_clipboard_text(){
+                        self.clipboard.clipboard_text().map(|text|(text.len()<=MAX_TEXT).then_some(text)).map_err(|_|())
+                    }else{Ok(None)};
+                    let _=reply.send(result);
+                },
+                ClipboardRequest::Write(text,reply)=>{let _=reply.send(self.clipboard.set_clipboard_text(&text).map_err(|_|()));},
+            }
+        }
+    }
     pub fn poll(&mut self,input:&mut Input)->(bool,Vec<serde_json::Value>){
         let viewport=self.viewport();
         translate_actions(self.events.poll_iter(),input,viewport,&mut self.focused,&mut self.files)
@@ -87,6 +106,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
             _=tick.tick()=>{
                 if let Some(playback)=audio.as_mut(){if playback.pump().is_err(){log::warn!("Viewer audio playback stopped");audio=None;}}
                 let (quit,messages)=window.poll(&mut input);
+                window.poll_clipboard();
                 requested|=std::mem::take(&mut window.files);
                 #[cfg(uu_gtk)] {
                     if files.as_ref().is_some_and(|f|f.is_finished()){
@@ -119,6 +139,29 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[tokio::test] async fn clipboard_requests_use_existing_window(){
+        if std::env::var_os("UU_VIEWER_CLIPBOARD_TEST_CHILD").is_none(){
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","viewer::sdl::tests::clipboard_requests_use_existing_window","--test-threads=1"])
+                .env("SDL_VIDEODRIVER","dummy").env("UU_VIEWER_CLIPBOARD_TEST_CHILD","1").output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return
+        }
+        let mut window=Window::new().unwrap();
+        let tx=window.clipboard_tx.clone();
+        use super::super::clipboard::ClipboardRequest;
+        for text in ["clipboard text\n",""]{
+            let(reply,rx)=tokio::sync::oneshot::channel();
+            tx.send(ClipboardRequest::Write(text.into(),reply)).await.unwrap();
+            window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok(()));
+            let(reply,rx)=tokio::sync::oneshot::channel();
+            tx.send(ClipboardRequest::Read(reply)).await.unwrap();
+            window.poll_clipboard();assert_eq!(rx.await.unwrap(),Ok((!text.is_empty()).then(||text.to_owned())));
+        }
+        let bridge=window.clipboard_bridge();assert!(bridge.enabled);
+        drop(window);
+        assert!(tx.is_closed());drop(bridge);
+        let window=Window::new().unwrap();assert!(window.clipboard_bridge().enabled);
+    }
     #[test] fn file_shortcut_is_local_in_control_and_watch_modes(){
         use sdl2::keyboard::{Scancode as S,Mod as M};
         for watch in [false,true]{

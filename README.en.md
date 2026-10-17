@@ -411,7 +411,7 @@ hosts or this project's Linux host), and can start remote assistance with someon
 separate from the host `uuremote-server`; the default host build and behaviour are unchanged.
 
 **Get it**: release tarballs include `uuremote-viewer` (x86_64) from this version on. Runtime needs GTK3, SDL2 (Ubuntu/Debian:
-`libsdl2-2.0-0`) and the `ffmpeg` command; clipboard needs `wl-clipboard` (Wayland) or `xclip`/`xsel` (X11); the terminal needs a local
+`libsdl2-2.0-0`) and the `ffmpeg` command; SDL desktop windows synchronize text clipboard directly on Wayland/X11 without extra clipboard tools; the terminal needs a local
 terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsdl2-dev`, then
 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`.
 

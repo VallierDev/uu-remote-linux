@@ -75,7 +75,7 @@ impl Shape {
         if h264_only {shape.decoders.retain(|d|d.codec==1);shape.codecs.retain(|c|c.video_codec==1);}
         shape
     }
-    pub fn connect_options(&self, device:&str) -> Result<Vec<u8>,String> {
+    pub fn connect_options(&self, device:&str, clipboard:bool) -> Result<Vec<u8>,String> {
         self.validate()?;
         let mut out=Vec::new(); int(1,self.capture_type.into(),&mut out);
         if [1,8].contains(&self.capture_type) { int(2,u64::MAX,&mut out); }
@@ -100,7 +100,7 @@ impl Shape {
         int(8,self.platform.into(),&mut out); bytes(9,device.as_bytes(),&mut out); int(10,1,&mut out);
         if self.capture_type==1 {
             let mut flags=Vec::new(); for [field,version] in &self.feature_flag { if *field!=8 {int((*field).into(),(*version).into(),&mut flags);} }
-            if super::clipboard::available(){int(8,3,&mut flags);}
+            if clipboard{int(8,3,&mut flags);}
             bytes(11,&flags,&mut out);
         }
         if self.capture_type!=5 { bytes(12,self.client_version.as_bytes(),&mut out); }
@@ -176,7 +176,7 @@ mod tests {
         let mut s=shape();
         for capture in [1,5,8,9] {
             s.capture_type=capture;
-            let b=s.connect_options("synthetic-device").unwrap(); let f=decode_wire(&b).unwrap();
+            let b=s.connect_options("synthetic-device",false).unwrap(); let f=decode_wire(&b).unwrap();
             let numbers:Vec<u32>=f.iter().map(|f|f.number).collect();
             let expected=match capture {1=>vec![1,2,3,4,4,4,4,6,6,7,8,9,10,11,12],5=>vec![1,3,4,4,4,4,6,6,7,8,9,10],8=>vec![1,2,8,9,10,12],_=>vec![1,8,9,10,12]};
             assert_eq!(numbers,expected);
