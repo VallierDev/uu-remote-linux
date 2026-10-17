@@ -377,7 +377,7 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 也可以凭对方的设备 ID 和验证码发起远程协助。它是实验性功能，与主机 `uuremote-server` 相互独立，默认主机构建和行为不变。
 
 **获取**：Release 包从本版本起附带 `uuremote-viewer`（x86_64）。运行时需要 GTK3、SDL2（Ubuntu/Debian：`libsdl2-2.0-0`）和
-`ffmpeg` 命令；剪贴板需要 `wl-clipboard`（Wayland）或 `xclip`/`xsel`（X11）；终端功能需要本机终端程序（可用 `TERMINAL` 指定）。
+`ffmpeg` 命令；SDL 桌面窗口直接同步文本剪贴板（Wayland/X11），无需额外剪贴板工具；终端功能需要本机终端程序（可用 `TERMINAL` 指定）。
 从源码构建：`sudo apt install libsdl2-dev`，然后 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`。
 
 **使用**：

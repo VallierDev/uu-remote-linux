@@ -92,7 +92,11 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
         Some(code)=>api.join_share(&args[1],&code).await,
         None=>api.join(&args[1],force,true).await,
     }.map_err(|e|e.to_string())?;
-    let options=Options{timeout:Duration::from_secs(12),legacy_prefix:legacy,ready_policy:policy};
+    #[cfg(feature="viewer-sdl")]
+    let clipboard=desktop.as_ref().map(|(window,_)|window.clipboard_bridge()).unwrap_or_else(||clipboard::Bridge::new(false));
+    #[cfg(not(feature="viewer-sdl"))]
+    let clipboard=clipboard::Bridge::new(shape.capture_type==1);
+    let options=Options{timeout:Duration::from_secs(12),legacy_prefix:legacy,ready_policy:policy,clipboard};
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
     #[cfg(feature="viewer-sdl")]
     let result=if let Some((window,decoder))=desktop.as_mut(){viewer::sdl::run(&mut session,window,decoder.as_mut(),view_only).await}else{session.run().await};
@@ -139,7 +143,7 @@ async fn tool_command(args:&[String])->Result<(),String>{
     let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),auth::BASE_URL);
     let room=api.join(&args[1],false,true).await.map_err(|e|e.to_string())?;
     // Match the existing UI connection framing (9bb42d5); the host tolerates this prefix.
-    let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly};
+    let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly,clipboard:clipboard::Bridge::new(false)};
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
     let result=async{
         let(io,rx)=viewer::tools::attach(&session.peer)?;
@@ -168,7 +172,7 @@ async fn power_command(args:&[String])->Result<(),String>{
     shape.capture_type=5;shape.feature_flag.clear();
     let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),auth::BASE_URL);
     let room=api.join(&args[1],false,true).await.map_err(|e|e.to_string())?;
-    let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly};
+    let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly,clipboard:clipboard::Bridge::new(false)};
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
     let result=viewer::power::run(&mut session,action).await;
     session.close().await;

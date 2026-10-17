@@ -4,7 +4,7 @@ use std::{sync::atomic::Ordering,time::Duration};
 use tokio::sync::mpsc;
 use webrtc::api::setting_engine::SettingEngine;
 
-pub struct Options {pub timeout:Duration,pub legacy_prefix:bool,pub ready_policy:ReadyPolicy}
+pub struct Options {pub timeout:Duration,pub legacy_prefix:bool,pub ready_policy:ReadyPolicy,pub clipboard:super::clipboard::Bridge}
 pub struct Session {pub peer:Peer,signal:Signal,candidates:mpsc::Receiver<Value>,policy:ReadyPolicy}
 impl Session {
     pub async fn open(room:&JoinData,shape:&Shape,device:&str,client:&str,options:Options,settings:SettingEngine)->Result<Self,String> {
@@ -13,7 +13,7 @@ impl Session {
         let timeout=if room.ws_connect_timeout_ms>0 {Duration::from_millis(room.ws_connect_timeout_ms as u64)}else{options.timeout};
         let mut signal=Signal::connect(&room.signaling_list,&room.token,timeout,options.legacy_prefix).await?;
         let result=async {
-            let result=signal.control(shape.control(client,&app,&ice)?,shape.connect_options(device)?,options.timeout).await?;
+            let result=signal.control(shape.control(client,&app,&ice)?,shape.connect_options(device,options.clipboard.enabled)?,options.timeout).await?;
             // Key names per ICE entry and URL scheme only (no values) to see where TURN credentials live.
             if let Some(list)=result.get("iceServers").and_then(Value::as_array) {
                 let summary:Vec<String>=list.iter().map(|s|{
@@ -31,7 +31,7 @@ impl Session {
             let remote=result.get("client_id").and_then(Value::as_str).filter(|s|!s.is_empty()).ok_or("Control acknowledgement missing peer route")?;
             let config=rtc::configuration(&result)?;
             let(tx,rx)=mpsc::channel(256);
-            let peer=Peer::new(config,shape,&app,&ice,remote,tx,settings).await?;
+            let peer=Peer::new(config,shape,&app,&ice,remote,tx,settings,options.clipboard).await?;
             // The official host drops an offer whose ice_id is not yet in its connection table
             // (libstreamer 0xc3080); give it time to process be-controlled first.
             let delay=std::env::var("UU_VIEWER_OFFER_DELAY_MS").ok().and_then(|v|v.parse().ok()).unwrap_or(0u64).min(10_000);

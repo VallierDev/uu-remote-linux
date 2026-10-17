@@ -148,7 +148,7 @@ async fn complete_session_uses_loopback_signaling_and_virtual_rtc_through_echo()
             }
         });
         let room:JoinData=serde_json::from_value(json!({"token":"synthetic-room-ticket","signaling_list":[url],"report_token":"synthetic-report","report_url":""})).unwrap();
-        let options=Options{timeout:Duration::from_secs(3),legacy_prefix:false,ready_policy:ReadyPolicy::Explicit};
+        let options=Options{timeout:Duration::from_secs(3),legacy_prefix:false,ready_policy:ReadyPolicy::Explicit,clipboard:super::clipboard::Bridge::new(false)};
         let mut session=Session::open(&room,&shape(),"synthetic-device","synthetic-client",options,viewer_settings).await.unwrap();
         assert_eq!(session.peer.channels.len(),5);
         let(tool_io,mut tool_rx)=super::tools::attach(&session.peer).unwrap();
@@ -188,7 +188,7 @@ async fn complete_session_uses_loopback_signaling_and_virtual_rtc_through_echo()
 #[tokio::test]
 async fn early_candidates_and_foreign_session_messages_are_scoped() {
     let(settings,_,router)=virtual_network().await;let(tx,_rx)=mpsc::channel(256);
-    let mut peer=Peer::new(RTCConfiguration::default(),&shape(),"synthetic-app","synthetic-ice","synthetic-host",tx,settings).await.unwrap();
+    let mut peer=Peer::new(RTCConfiguration::default(),&shape(),"synthetic-app","synthetic-ice","synthetic-host",tx,settings,super::clipboard::Bridge::new(false)).await.unwrap();
     assert!(!peer.matches_route(&json!({"ice_id":"foreign"})));
     assert!(!peer.matches_route(&json!({"app_control_id":"foreign"})));
     peer.receive(&json!({"type":"answer","ice_id":"foreign","sdp":"invalid"})).await.unwrap();
@@ -201,8 +201,8 @@ async fn early_candidates_and_foreign_session_messages_are_scoped() {
 async fn closing_one_peer_preserves_another_peer() {
     let(a,b,router)=virtual_network().await;
     let(tx1,_rx1)=mpsc::channel(256);let(tx2,_rx2)=mpsc::channel(256);
-    let first=Peer::new(RTCConfiguration::default(),&shape(),"synthetic-first","synthetic-first-ice","synthetic-host",tx1,a).await.unwrap();
-    let second=Peer::new(RTCConfiguration::default(),&shape(),"synthetic-second","synthetic-second-ice","synthetic-host",tx2,b).await.unwrap();
+    let first=Peer::new(RTCConfiguration::default(),&shape(),"synthetic-first","synthetic-first-ice","synthetic-host",tx1,a,super::clipboard::Bridge::new(false)).await.unwrap();
+    let second=Peer::new(RTCConfiguration::default(),&shape(),"synthetic-second","synthetic-second-ice","synthetic-host",tx2,b,super::clipboard::Bridge::new(false)).await.unwrap();
     first.close().await;
     assert_ne!(second.pc.connection_state(),webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed);
     assert_eq!(second.channels.len(),5);
@@ -220,7 +220,7 @@ async fn opus_and_video_tracks_are_received_independently_in_memory() {
         let video=Arc::new(TrackLocalStaticRTP::new(RTCRtpCodecCapability{mime_type:"video/H264".into(),clock_rate:90000,sdp_fmtp_line:"level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f".into(),..Default::default()},"video".into(),"test".into()));
         host.add_track(audio.clone() as Arc<dyn TrackLocal+Send+Sync>).await.unwrap();host.add_track(video.clone() as Arc<dyn TrackLocal+Send+Sync>).await.unwrap();
         let(tx,_rx)=mpsc::channel(256);
-        let peer=Peer::new(RTCConfiguration::default(),&shape(),"app","ice","host",tx,viewer_settings).await.unwrap();
+        let peer=Peer::new(RTCConfiguration::default(),&shape(),"app","ice","host",tx,viewer_settings,super::clipboard::Bridge::new(false)).await.unwrap();
         let mut gathered=peer.pc.gathering_complete_promise().await;peer.offer().await.unwrap();gathered.recv().await;
         let offer=peer.pc.local_description().await.unwrap();assert!(offer.sdp.contains("m=audio") && offer.sdp.contains("opus/48000/2"));
         host.set_remote_description(offer).await.unwrap();let answer=host.create_answer(None).await.unwrap();
@@ -267,7 +267,7 @@ async fn desktop_file_window_reattaches_without_replacing_peer(){
             }));}
         })}));
         let(tx,_rx)=mpsc::channel(256);
-        let peer=Peer::new(RTCConfiguration::default(),&shape(),"app","ice","host",tx,viewer_settings).await.unwrap();
+        let peer=Peer::new(RTCConfiguration::default(),&shape(),"app","ice","host",tx,viewer_settings,super::clipboard::Bridge::new(false)).await.unwrap();
         let mut gathered=peer.pc.gathering_complete_promise().await;peer.offer().await.unwrap();gathered.recv().await;
         host.set_remote_description(peer.pc.local_description().await.unwrap()).await.unwrap();
         let answer=host.create_answer(None).await.unwrap();let mut gathered=host.gathering_complete_promise().await;
