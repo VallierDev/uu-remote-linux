@@ -94,7 +94,7 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 | 魔兽世界排队提醒等插件 | 不支持，会明确告诉客户端「无插件」 |
 | Linux 系统登录界面 | 还不支持控制开机后的系统登录界面（还没有人登录 Linux 桌面时）；这种情况可以用无头模式或虚拟桌面（见下文）。注意：这里说的是 Linux 系统登录，**不登录 UU 账号**现在可以通过「远程协助」使用 |
 | 跨运营商 / 受限网络的中继连接 | 已接入官方下发的 ICE 服务器，但复杂网络环境未充分测试 |
-| 作为控制端（在 Linux 上控制别的电脑） | 不在本项目范围 |
+| 作为控制端（在 Linux 上控制别的电脑） | 🧪 实验性 `uuremote-viewer`，见[下文](#实验性原生控制端uuremote-viewer) |
 
 ## 安装
 
@@ -370,3 +370,35 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 当前仅为线性帧缓冲原型：VM 的 GDM 截图仍是黑屏，**没有通过登录界面视觉验收**，不承诺锁屏可用。
 键鼠需 uinput；没有桌面会话时不提供剪贴板。
 无头模式下桌面连接没有找到官方的「无桌面」错误码，因此保持原有 offer 行为。
+
+## 实验性原生控制端（uuremote-viewer）
+
+`uuremote-viewer` 是 Linux 上的**控制端**：用你的 UU 账号连接并控制其他设备（官方 Windows / Mac 被控端，或本项目的 Linux 主机），
+也可以凭对方的设备 ID 和验证码发起远程协助。它是实验性功能，与主机 `uuremote-server` 相互独立，默认主机构建和行为不变。
+
+**获取**：Release 包从本版本起附带 `uuremote-viewer`（x86_64）。运行时需要 GTK3、SDL2（Ubuntu/Debian：`libsdl2-2.0-0`）和
+`ffmpeg` 命令；剪贴板需要 `wl-clipboard`（Wayland）或 `xclip`/`xsel`（X11）；终端功能需要本机终端程序（可用 `TERMINAL` 指定）。
+从源码构建：`sudo apt install libsdl2-dev`，然后 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`。
+
+**使用**：
+- `uuremote-viewer login`：扫码登录（复用同目录下 `uuremote-server` 的登录窗口；`--no-gui` 为终端二维码）。控制端与主机共用
+  `~/.config/uuremote/config.json`（可用 `UU_CONFIG` 另指定），因此**不能用同一身份连接本机上的主机**；控制其他设备不受影响。
+- `uuremote-viewer ui`：启动窗口，列出账号下的设备，可进入桌面、只看模式、文件传输、终端、端口映射、重启/关机、远程协助。
+- 命令行：`connect DEVICE false - echo legacy [--view-only]`（桌面）、`files DEVICE ls|get|put …`、`terminal DEVICE [SESSION]`、
+  `terminal-ui DEVICE NAME`、`portmap DEVICE LOCAL_PORT HOST PORT`（只监听 127.0.0.1）、`power DEVICE reboot|shutdown`、
+  `assist CONNECT_ID`（验证码从 stdin 读取一行，不能作为参数传入）。`uuremote-viewer --help` 查看全部参数。
+- 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
+  `UU_VIEWER_VIEW_ONLY=1` 只看不控，`UU_VIEWER_FFMPEG` 指定 ffmpeg 路径。
+
+**已实测**（作者环境，非全面验收）：
+| 功能 | 官方 Windows 被控端 | 官方 Mac 被控端 | 本项目 Linux 主机 |
+|---|---|---|---|
+| 桌面画面（H.264） | ✅ | ✅ | ✅ |
+| 键盘、鼠标 | ✅ | — | ✅ |
+| 文件列表 / 下载 / 上传 | ✅ 列表、下载 | — | ✅ |
+| 端口映射、终端 | — | — | ✅ |
+| 剪贴板（文本，双向）、声音 | — | — | ✅（虚拟机） |
+| 远程协助（ID + 验证码） | — | — | ✅（虚拟机，访客主机） |
+
+「—」表示尚未测试。**未实测**：重启/关机（只应在可以重启的测试机上尝试）、终端会话列表的新建与接回、Wayland 下的窗口与剪贴板、
+H.265 与 4:4:4（目前只解码 H.264 4:2:0）、多显示器。日志只记录字段号、大小和状态，不记录键盘、剪贴板、文件内容、验证码或凭据。

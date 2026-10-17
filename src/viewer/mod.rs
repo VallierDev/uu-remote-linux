@@ -1,0 +1,37 @@
+//! Opt-in controller session; independent of the host room and peer lifecycle.
+pub mod api;
+pub mod assist;
+pub mod wire;
+pub mod signal;
+pub mod rtc;
+pub mod session;
+#[cfg(test)] mod tests;
+
+pub mod media;
+pub mod audio;
+pub mod input;
+pub mod desktop;
+#[cfg(feature="viewer-ffmpeg")] pub mod decoder;
+#[cfg(feature="viewer-sdl")] pub mod decoder_cli;
+#[cfg(uu_gtk)] pub mod ui;
+#[cfg(uu_gtk)] pub mod tools_ui;
+#[cfg(feature="viewer-sdl")] pub mod sdl;
+
+pub mod tools;
+
+pub mod clipboard;
+pub mod power;
+
+fn device_label(name:Option<&str>)->&str{
+    name.filter(|name|!name.is_empty()).unwrap_or("远端设备")
+}
+
+#[cfg(test)]
+mod device_label_tests {
+    #[test]
+    fn device_name_or_fallback(){
+        assert_eq!(super::device_label(Some("测试电脑")),"测试电脑");
+        assert_eq!(super::device_label(None),"远端设备");
+        assert_eq!(super::device_label(Some("")),"远端设备");
+    }
+}

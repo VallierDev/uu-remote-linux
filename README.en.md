@@ -107,7 +107,7 @@ mapping and hardware acceleration remain unverified. This is not zero-copy VAAPI
 | Plugins such as the WoW queue notifier | Not supported; the client is told that no plugins exist |
 | Linux login screen | The system login screen (before anyone logs in to the Linux desktop) cannot be controlled yet; use headless mode or a virtual desktop (see below). This is about the Linux login: **without a UU account** the host can now be used through remote assistance |
 | Relay connections on restrictive networks | Uses the ICE servers provided by the UU cloud; complex network setups are not thoroughly tested |
-| Acting as a viewer (controlling other machines from Linux) | Out of scope |
+| Acting as a viewer (controlling other machines from Linux) | 🧪 Experimental `uuremote-viewer`, see [below](#experimental-native-viewer-uuremote-viewer) |
 
 ## Installation
 
@@ -403,3 +403,39 @@ This capability is broad: it applies to the whole network-facing process and can
 The VM GDM greeter capture was solid black (failed visual acceptance); lock/greeter support and Intel/AMD hardware remain unverified. Use uinput for input; clipboard
 is unavailable without a desktop session. No default release behavior changes.
 No official "no desktop" error code was found for headless desktop offers, so the existing offer behavior is retained.
+
+## Experimental native viewer (uuremote-viewer)
+
+`uuremote-viewer` is a Linux **viewer/controller**: it connects to and controls other devices on your UU account (official Windows / Mac
+hosts or this project's Linux host), and can start remote assistance with someone's device ID and code. It is experimental and
+separate from the host `uuremote-server`; the default host build and behaviour are unchanged.
+
+**Get it**: release tarballs include `uuremote-viewer` (x86_64) from this version on. Runtime needs GTK3, SDL2 (Ubuntu/Debian:
+`libsdl2-2.0-0`) and the `ffmpeg` command; clipboard needs `wl-clipboard` (Wayland) or `xclip`/`xsel` (X11); the terminal needs a local
+terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsdl2-dev`, then
+`cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`.
+
+**Use**:
+- `uuremote-viewer login`: QR login (reuses the sibling `uuremote-server` login window; `--no-gui` prints a terminal QR). The viewer
+  shares `~/.config/uuremote/config.json` with the host (`UU_CONFIG` selects another), so it **cannot connect to a host on the same
+  machine with the same identity**; other devices are fine.
+- `uuremote-viewer ui`: launcher listing your devices: desktop, view-only, files, terminal, port mapping, reboot/shutdown, assistance.
+- CLI: `connect DEVICE false - echo legacy [--view-only]` (desktop), `files DEVICE ls|get|put …`, `terminal DEVICE [SESSION]`,
+  `terminal-ui DEVICE NAME`, `portmap DEVICE LOCAL_PORT HOST PORT` (listens on 127.0.0.1 only), `power DEVICE reboot|shutdown`,
+  `assist CONNECT_ID` (the code is read from one stdin line, never an argument). See `uuremote-viewer --help`.
+- Ctrl+Alt+F in the desktop window opens the files window on the same connection. `UU_VIEWER_AUDIO=0` disables sound,
+  `UU_VIEWER_CLIPBOARD=0` the clipboard, `UU_VIEWER_VIEW_ONLY=1` input; `UU_VIEWER_FFMPEG` selects the ffmpeg binary.
+
+**Tested live** (author's setup, not full acceptance):
+| Feature | Official Windows host | Official Mac host | This project's Linux host |
+|---|---|---|---|
+| Desktop video (H.264) | ✅ | ✅ | ✅ |
+| Keyboard, mouse | ✅ | — | ✅ |
+| File list / download / upload | ✅ list, download | — | ✅ |
+| Port mapping, terminal | — | — | ✅ |
+| Clipboard (text, both ways), sound | — | — | ✅ (VM) |
+| Remote assistance (ID + code) | — | — | ✅ (VM, guest host) |
+
+"—" = not tested yet. **Not tested live**: reboot/shutdown (only try on a machine you can restart), terminal session list
+create/reattach, Wayland windows and clipboard, H.265 and 4:4:4 (only H.264 4:2:0 is decoded), multiple monitors. Logs carry field
+numbers, sizes and states only, never keystrokes, clipboard or file contents, codes or credentials.

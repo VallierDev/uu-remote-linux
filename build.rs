@@ -3,6 +3,8 @@ fn main() {
     println!("cargo:rerun-if-changed=c_engine/x11_engine.c");
     println!("cargo:rerun-if-changed=c_engine/clipboard.c");
     println!("cargo:rerun-if-changed=c_engine/assist_window.c");
+    println!("cargo:rerun-if-changed=c_engine/viewer_window.c");
+    println!("cargo:rerun-if-changed=c_engine/viewer_tools.c");
     println!("cargo:rerun-if-changed=c_engine/pam_check.c");
     println!("cargo:rerun-if-env-changed=UU_NO_GTK");
     println!("cargo:rustc-check-cfg=cfg(uu_gtk)");
@@ -36,7 +38,7 @@ fn main() {
         match (std::env::var_os("UU_NO_GTK").is_none()).then(|| gtk("--cflags").zip(gtk("--libs"))).flatten() {
             Some((cflags, libs)) => {
                 let mut build = cc::Build::new();
-                build.file("c_engine/assist_window.c").flag_if_supported("-Wno-deprecated-declarations");
+                build.file("c_engine/assist_window.c").file("c_engine/viewer_window.c").file("c_engine/viewer_tools.c").flag_if_supported("-Wno-deprecated-declarations");
                 for flag in cflags.split_whitespace() { build.flag(flag); }
                 build.compile("uu_login_window");
                 for flag in libs.split_whitespace() {

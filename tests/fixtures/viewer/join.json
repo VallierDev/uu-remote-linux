@@ -1,0 +1,1 @@
+{"code":0,"msg":"fixture only","data":{"token":"synthetic-room-ticket","signaling_list":["ws://signaling.example.invalid"],"ws_connect_timeout_ms":1000,"report_token":"synthetic-report-ticket","report_url":"https://reports.example.invalid","report_server_address":"","streamer_retry_delta_ms":0,"international_connect":false}}

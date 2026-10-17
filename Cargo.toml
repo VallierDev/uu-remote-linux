@@ -2,6 +2,7 @@
 name = "uu-remote-linux"
 version = "0.1.31"
 edition = "2021"
+default-run = "uuremote-server"
 authors = ["uu-remote-linux contributors"]
 description = "Unofficial Linux host for NetEase UU Remote: control a Linux desktop from the official clients"
 readme = "README.md"
@@ -13,8 +14,16 @@ repository = "https://github.com/VallierDev/uu-remote-linux"
 name = "uuremote-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "uuremote-viewer"
+path = "src/viewer_main.rs"
+required-features = ["native-viewer"]
+
 [features]
 default = []
+native-viewer = []
+viewer-ffmpeg = ["native-viewer", "dep:ffmpeg-next"]
+viewer-sdl = ["native-viewer", "dep:sdl2"]
 wayland = []
 # Experimental direct linear framebuffer capture; never enabled in release builds.
 kms = []
@@ -46,6 +55,8 @@ qrcode = { version = "0.14", default-features = false }
 env_logger = "0.11"
 ffmpeg-next = { version = "6.1", optional = true, default-features = false, features = ["codec", "format", "device", "software-scaling", "software-resampling"] }
 x11rb = { version = "0.13", features = ["damage", "shm", "allow-unsafe-code"], optional = true }
+
+sdl2 = { version = "0.37", optional = true, features = ["use-pkgconfig"] }
 
 [build-dependencies]
 cc = "1.0"

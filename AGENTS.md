@@ -7,8 +7,9 @@ This file is written for large language model agents (Claude Code, Codex, Cursor
 ## 1. What this project is
 
 - An **unofficial Linux host** for NetEase UU Remote (网易 UU 远程). The official Mac / Windows / mobile
-  clients connect to it and control the Linux desktop. There is no viewer/controller side here.
-- One Rust binary, `uuremote-server` (Cargo package `uu-remote-linux`), plus small C engines in `c_engine/`
+  clients connect to it and control the Linux desktop. An experimental Linux viewer/controller, `uuremote-viewer`
+  (`src/viewer_main.rs`, `src/viewer/`, feature `native-viewer`), connects to other hosts with the same protocol.
+- One host binary, `uuremote-server` (Cargo package `uu-remote-linux`), plus small C engines in `c_engine/`
   compiled by `build.rs`. No Wine, no NetEase binaries.
 - The host registers with the UU cloud as a **Windows PC** (`x-param-plat=1`) so the official clients accept it.
 - License GPL-3.0. Not affiliated with NetEase.
@@ -50,6 +51,7 @@ cargo test                                   # unit tests (macOS builds use C st
 cargo build --release                        # X11 host
 cargo build --release --features wayland     # + Hyprland/wlroots
 cargo build --release --features wayland,portal   # + GNOME/KDE Wayland via xdg-desktop-portal
+cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer   # viewer (needs libsdl2-dev)
 ```
 
 - `build.rs` links X11/Xext/Xtst/Xfixes and `dl` (PAM is loaded at runtime with `dlopen`), and builds the GTK3
@@ -144,6 +146,8 @@ every 60 s.
 | `c_engine/x11_engine.c`, `c_engine/clipboard.c` | X11 capture/input/selection |
 | `c_engine/wayland_engine.c`, `c_engine/portal_engine.c` | Wayland and portal engines |
 | `src/assist.rs`, `c_engine/assist_window.c` | remote assistance (guest + account) and the unified GTK main window (assist + account/QR card) |
+| `src/viewer_main.rs`, `src/viewer/` | experimental viewer (`--features native-viewer,viewer-sdl`): cloud join, WebRTC offer side, SDL desktop window (ffmpeg CLI decode), files/terminal/portmap/power/assist tools, GTK launcher |
+| `c_engine/viewer_window.c`, `c_engine/viewer_tools.c` | viewer GTK launcher and tool windows (files, port mapping, terminal list) |
 
 Diagnostic subcommands: `login [--no-gui]`, `unlock-check` (password on stdin, prints only accepted/rejected),
 `desktop-probe [new.png]`, `desktop-video-probe` (`UU_PROBE_FPS`, `UU_PROBE_FRAMES`, `UU_PROBE_QUALITY` 1-5 = viewer bitrate preset, 5 auto; `UU_PROBE_INPUT` fixed video/image sequence, `UU_PROBE_LOOP=1` repeats), `wayland-input-probe`, `clipboard-acceptance`,
