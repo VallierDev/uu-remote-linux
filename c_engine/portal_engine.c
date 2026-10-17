@@ -24,6 +24,9 @@
 #define REQUEST "org.freedesktop.portal.Request"
 #define SESSION "org.freedesktop.portal.Session"
 #define PORTAL_RENEGOTIATION_TIMEOUT (5 * G_TIME_SPAN_SECOND)
+#define PORTAL_DISPLAY_GRACE (200 * G_TIME_SPAN_MILLISECOND)
+#define MUTTER_DISPLAY "org.gnome.Mutter.DisplayConfig"
+#define MUTTER_DISPLAY_PATH "/org/gnome/Mutter/DisplayConfig"
 
 struct uu_portal {
     GDBusConnection *bus;
@@ -33,7 +36,7 @@ struct uu_portal {
     int dbus_started;
     char *session;
     char *restore_token;
-    guint closed_subscription, clipboard_owner_subscription, clipboard_transfer_subscription;
+    guint closed_subscription, clipboard_owner_subscription, clipboard_transfer_subscription, display_subscription;
     int clipboard_enabled, clipboard_changed;
     char *clipboard_text, *clipboard_mime;
     size_t clipboard_length;
@@ -51,7 +54,7 @@ struct uu_portal {
     int error;
     enum pw_stream_state state;
     int format_valid, stream_started;
-    gint64 interrupted_at;
+    gint64 interrupted_at, display_changed_at;
     uint32_t node, width, height;
     int logical_width, logical_height;
     int absolute_stream_pixels;
@@ -176,14 +179,31 @@ static int has_interface(struct uu_portal *p, const char *interface) {
 static void update_interruption(struct uu_portal *p) {
     if (p->stream_started && p->state == PW_STREAM_STATE_PAUSED && !p->format_valid) {
         if (!p->interrupted_at) p->interrupted_at = g_get_monotonic_time();
-    } else p->interrupted_at = 0;
+    } else {
+        if (p->interrupted_at) p->display_changed_at = 0;
+        p->interrupted_at = 0;
+    }
+}
+static void monitors_changed(GDBusConnection *bus, const gchar *sender, const gchar *path,
+    const gchar *interface, const gchar *signal, GVariant *parameters, gpointer data) {
+    struct uu_portal *p = data;
+    pthread_mutex_lock(&p->lock);
+    /* #27: measured NULL format 10-36ms after the notification, with PAUSED
+     * 5-9ms before it. Preserve a correlated signal across repeated changes. */
+    if (p->stream_started && (!p->display_changed_at || !p->interrupted_at ||
+        p->display_changed_at < p->interrupted_at - PORTAL_DISPLAY_GRACE))
+        p->display_changed_at = g_get_monotonic_time();
+    pthread_mutex_unlock(&p->lock);
 }
 static void stream_state(void *data, enum pw_stream_state old, enum pw_stream_state state, const char *message) {
     (void)old; (void)message;
     struct uu_portal *p = data;
     pthread_mutex_lock(&p->lock);
     p->state = state;
-    if (state == PW_STREAM_STATE_STREAMING) p->stream_started = 1;
+    if (state == PW_STREAM_STATE_STREAMING) {
+        p->stream_started = 1;
+        p->display_changed_at = 0;
+    }
     update_interruption(p);
     pthread_mutex_unlock(&p->lock);
     if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) fail(data, 9);
@@ -213,6 +233,7 @@ static void stream_format(void *data, uint32_t id, const struct spa_pod *param) 
     p->width = info.size.width; p->height = info.size.height; p->format = info.format;
     p->frame_length = length;
     p->format_valid = 1;
+    p->display_changed_at = 0;
     update_interruption(p);
     pthread_cond_broadcast(&p->changed);
     pthread_mutex_unlock(&p->lock);
@@ -444,6 +465,9 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     g_variant_unref(results);
     if (*error) goto done;
     p->main_loop = g_main_loop_new(p->context, FALSE);
+    if (p->absolute_stream_pixels)
+        p->display_subscription = g_dbus_connection_signal_subscribe(p->bus, MUTTER_DISPLAY, MUTTER_DISPLAY,
+            "MonitorsChanged", MUTTER_DISPLAY_PATH, NULL, G_DBUS_SIGNAL_FLAGS_NONE, monitors_changed, p, NULL);
     g_main_context_pop_thread_default(p->context);
     if (pthread_create(&p->dbus_thread, NULL, run_dbus, p)) {
         *error = 3; p->cancelled = NULL; p->cancel_data = NULL;
@@ -496,6 +520,7 @@ void uu_portal_close(struct uu_portal *p) {
     if (p->clipboard_owner_subscription) g_dbus_connection_signal_unsubscribe(p->bus,p->clipboard_owner_subscription);
     if (p->clipboard_transfer_subscription) g_dbus_connection_signal_unsubscribe(p->bus,p->clipboard_transfer_subscription);
     if (p->closed_subscription) g_dbus_connection_signal_unsubscribe(p->bus, p->closed_subscription);
+    if (p->display_subscription) g_dbus_connection_signal_unsubscribe(p->bus, p->display_subscription);
     if (p->dbus_started) {
         /* A queued source also handles close racing with thread startup; an
          * immediate g_main_loop_quit before run would leave run blocking. */
@@ -503,6 +528,8 @@ void uu_portal_close(struct uu_portal *p) {
         g_source_set_callback(quit, quit_dbus_loop, p->main_loop, NULL);
         g_source_attach(quit, p->context); g_source_unref(quit);
         g_main_context_wakeup(p->context); pthread_join(p->dbus_thread, NULL);
+    } else if (p->context) {
+        while (g_main_context_iteration(p->context, FALSE)) {}
     }
     if (p->pw_loop) pw_thread_loop_stop(p->pw_loop);
     if (p->stream) pw_stream_destroy(p->stream);
@@ -531,8 +558,11 @@ int uu_portal_capture(struct uu_portal *p, uint8_t *frame, size_t length) {
  * paused, format-less renegotiation observed after a live scaling change (#25).
  * Called with the frame mutex held; recovery runs on the Rust capture worker. */
 static int stream_stalled(struct uu_portal *p) {
-    return p->state == PW_STREAM_STATE_PAUSED && !p->format_valid && p->interrupted_at &&
-        g_get_monotonic_time() - p->interrupted_at >= PORTAL_RENEGOTIATION_TIMEOUT;
+    if (p->state != PW_STREAM_STATE_PAUSED || p->format_valid || !p->interrupted_at) return 0;
+    gint64 now = g_get_monotonic_time();
+    return now - p->interrupted_at >= PORTAL_RENEGOTIATION_TIMEOUT ||
+        (p->display_changed_at && p->display_changed_at >= p->interrupted_at - PORTAL_DISPLAY_GRACE &&
+         now - MAX(p->interrupted_at, p->display_changed_at) >= PORTAL_DISPLAY_GRACE);
 }
 int uu_portal_capture_since(struct uu_portal *p, uint8_t *frame, size_t length, uint64_t *revision) {
     if (!p || !frame) return 11;

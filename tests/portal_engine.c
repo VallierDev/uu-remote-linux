@@ -184,6 +184,148 @@ static void portal_changed_physical_format_still_fails(void) {
     assert(uu_portal_capture_since(p, pixels, sizeof(pixels), NULL) == 8);
     uu_portal_close(p);
 }
+static void display_change(struct uu_portal *p) {
+    monitors_changed(NULL, NULL, NULL, NULL, NULL, NULL, p);
+}
+static struct uu_portal *streaming_portal(void) {
+    struct uu_portal *p = test_portal();
+    test_format(p, 2, 2);
+    stream_state(p, PW_STREAM_STATE_UNCONNECTED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    return p;
+}
+static void portal_display_change_recovery(void) {
+    /* Notification, PAUSED and NULL can arrive in any order. */
+    const unsigned orders[][3] = {{0,1,2}, {0,2,1}, {1,0,2}, {1,2,0}, {2,0,1}, {2,1,0}};
+    for (size_t order = 0; order < G_N_ELEMENTS(orders); order++) {
+        test_monotonic_time = 10000000;
+        struct uu_portal *p = streaming_portal();
+        for (unsigned n = 0; n < 3; n++) {
+            test_monotonic_time += 20 * G_TIME_SPAN_MILLISECOND;
+            switch (orders[order][n]) {
+                case 0: display_change(p); break;
+                case 1: stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL); break;
+                case 2: stream_format(p, SPA_PARAM_Format, NULL); break;
+            }
+        }
+        gint64 deadline = MAX(p->display_changed_at, p->interrupted_at) + PORTAL_DISPLAY_GRACE;
+        test_monotonic_time = deadline - 1;
+        assert(uu_portal_capture_alive(p));
+        test_monotonic_time++;
+        assert(!uu_portal_capture_alive(p) && uu_portal_alive(p));
+        p->clipboard_enabled = 1;
+        assert(uu_portal_clipboard_ready(p));
+        uint8_t pixels[16];
+        assert(uu_portal_capture(p, pixels, sizeof(pixels)) == 9);
+        uu_portal_close(p);
+    }
+    /* A delayed notification still accelerates an existing invalid pause. */
+    test_monotonic_time = 20000000;
+    struct uu_portal *p = streaming_portal();
+    stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    stream_format(p, SPA_PARAM_Format, NULL);
+    test_monotonic_time += G_TIME_SPAN_SECOND;
+    display_change(p);
+    gint64 notified_at = p->display_changed_at;
+    test_monotonic_time += 100 * G_TIME_SPAN_MILLISECOND;
+    display_change(p);
+    assert(p->display_changed_at == notified_at); /* Repeated signals cannot postpone recovery. */
+    test_monotonic_time = notified_at + PORTAL_DISPLAY_GRACE;
+    assert(!uu_portal_capture_alive(p) && uu_portal_alive(p));
+    uu_portal_close(p);
+}
+static void portal_display_change_healthy_and_stale(void) {
+    test_monotonic_time = 30000000;
+    struct uu_portal *p = test_portal();
+    display_change(p);
+    assert(!p->display_changed_at); /* Ignore notifications during startup. */
+    uu_portal_close(p);
+
+    p = streaming_portal();
+    display_change(p);
+    test_monotonic_time += 60 * G_TIME_SPAN_SECOND;
+    assert(uu_portal_capture_alive(p)); /* No new frames on a static screen is healthy. */
+    stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    assert(uu_portal_capture_alive(p)); /* A valid format must not trigger recovery. */
+    stream_format(p, SPA_PARAM_Format, NULL);
+    gint64 invalid_at = test_monotonic_time;
+    test_monotonic_time += PORTAL_DISPLAY_GRACE;
+    assert(uu_portal_capture_alive(p)); /* The notification from a minute ago is unrelated. */
+    test_monotonic_time = invalid_at + PORTAL_RENEGOTIATION_TIMEOUT;
+    assert(!uu_portal_capture_alive(p));
+    uu_portal_close(p);
+
+    test_monotonic_time = 100000000;
+    p = streaming_portal();
+    display_change(p);
+    stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    stream_format(p, SPA_PARAM_Format, NULL);
+    test_monotonic_time += PORTAL_DISPLAY_GRACE - 1;
+    test_format(p, 2, 2); /* Natural renegotiation wins before the early check. */
+    assert(!p->display_changed_at && !p->interrupted_at);
+    test_monotonic_time += G_TIME_SPAN_SECOND;
+    assert(uu_portal_capture_alive(p));
+    stream_format(p, SPA_PARAM_Format, NULL);
+    test_monotonic_time += PORTAL_DISPLAY_GRACE;
+    assert(uu_portal_capture_alive(p)); /* Recovered signal cannot accelerate another failure. */
+    display_change(p); /* A later display change correlates with the retained invalid state. */
+    test_monotonic_time += PORTAL_DISPLAY_GRACE;
+    assert(!uu_portal_capture_alive(p) && uu_portal_alive(p));
+    /* Even after the fast deadline, recovery can still win before replacement. */
+    test_format(p, 2, 2);
+    assert(uu_portal_capture_alive(p) && !p->display_changed_at);
+    display_change(p);
+    test_format(p, 2, 2); /* Successful format without an invalid pause discards its hint. */
+    assert(!p->display_changed_at);
+    display_change(p);
+    stream_state(p, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
+    assert(!p->display_changed_at);
+    uu_portal_close(p);
+}
+static void portal_display_subscription_lifecycle(void) {
+    GTestDBus *test_bus = g_test_dbus_new(G_TEST_DBUS_NONE);
+    g_test_dbus_up(test_bus);
+    GDBusConnection *bus = g_dbus_connection_new_for_address_sync(g_test_dbus_get_bus_address(test_bus),
+        G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
+        NULL, NULL, NULL);
+    assert(bus);
+    const char *sender = g_dbus_connection_get_unique_name(bus);
+    for (unsigned threaded = 0; threaded < 2; threaded++) {
+        struct uu_portal *p = streaming_portal();
+        p->bus = g_object_ref(bus);
+        p->context = g_main_context_new();
+        p->main_loop = g_main_loop_new(p->context, FALSE);
+        g_main_context_push_thread_default(p->context);
+        p->display_subscription = g_dbus_connection_signal_subscribe(bus, sender, MUTTER_DISPLAY,
+            "MonitorsChanged", MUTTER_DISPLAY_PATH, NULL, G_DBUS_SIGNAL_FLAGS_NONE, monitors_changed, p, NULL);
+        g_main_context_pop_thread_default(p->context);
+        /* A synchronous roundtrip places the match rule before the signal. */
+        GVariant *reply = g_dbus_connection_call_sync(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus", "GetId", NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
+        assert(reply); g_variant_unref(reply);
+        assert(g_dbus_connection_emit_signal(bus, NULL, MUTTER_DISPLAY_PATH, MUTTER_DISPLAY,
+            "MonitorsChanged", g_variant_new("()"), NULL));
+        assert(g_dbus_connection_flush_sync(bus, NULL, NULL));
+        /* The test clock is fixed; use a bounded iteration count for delivery. */
+        for (unsigned attempt = 0; attempt < 1000 && !p->display_changed_at; attempt++) {
+            while (g_main_context_iteration(p->context, FALSE)) {}
+            if (!p->display_changed_at) g_usleep(1000);
+        }
+        assert(p->display_changed_at);
+        if (threaded) {
+            assert(!pthread_create(&p->dbus_thread, NULL, run_dbus, p));
+            p->dbus_started = 1;
+        }
+        assert(g_dbus_connection_emit_signal(bus, NULL, MUTTER_DISPLAY_PATH, MUTTER_DISPLAY,
+            "MonitorsChanged", g_variant_new("()"), NULL));
+        assert(g_dbus_connection_flush_sync(bus, NULL, NULL));
+        uu_portal_close(p); /* Queued signals and immediate loop shutdown must be safe. */
+    }
+    g_dbus_connection_close_sync(bus, NULL, NULL);
+    g_object_unref(bus);
+    g_test_dbus_down(test_bus);
+    g_object_unref(test_bus);
+}
 
 static int cancel_immediately(void *data) { return *(const int *)data; }
 struct cancel_later { int *cancelled; int polls; };
@@ -282,6 +424,9 @@ int main(void) {
     portal_renegotiation_recovery();
     portal_renegotiation_event_order_and_healthy_states();
     portal_changed_physical_format_still_fails();
+    portal_display_change_recovery();
+    portal_display_change_healthy_and_stale();
+    portal_display_subscription_lifecycle();
     cancellable_waits();
     clipboard_bounds();
     capture_with_optional_geometry(0);
