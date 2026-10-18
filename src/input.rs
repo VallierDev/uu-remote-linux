@@ -360,13 +360,27 @@ impl InputInjector {
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::key(symbol,pressed) }
         else { unsafe { x11_key_symbol(symbol as libc::c_ulong,i32::from(pressed)) } }
     }
-    /// Mobile input-method text (`text_input`). X11 only for now; other backends log once.
+    /// Mobile input-method text (`text_input`). X11 types it directly; Wayland re-maps a spare
+    /// keycode in the virtual keyboard's keymap. Other backends log once.
     pub fn text_input(&self, text: &str) {
         let _serial=self.serial.lock().unwrap();
         let Ok(c_text)=std::ffi::CString::new(text.replace('\0',"")) else { return };
         if self.backend==crate::desktop_backend::DesktopBackend::X11 {
             let typed=unsafe { x11_type_utf8(c_text.as_ptr()) };
             log::info!("Desktop text input: chars={} result={}", text.chars().count(), typed);
+        } else if self.backend==crate::desktop_backend::DesktopBackend::Wayland {
+            // Escape hatch: keep the old behaviour without rebuilding.
+            if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
+            let typed=crate::wayland::type_utf8(text);
+            if typed>=0 {
+                log::info!("Desktop text input: chars={} result={}", text.chars().count(), typed);
+                return;
+            }
+            // A keymap whose keycodes are all mapped cannot carry text; report it once.
+            static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true,std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("Mobile text input unavailable on the Wayland backend (no spare keycode in this keymap)");
+            }
         } else {
             static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true,std::sync::atomic::Ordering::Relaxed) {

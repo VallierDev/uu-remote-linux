@@ -8,6 +8,26 @@ extern "C" {
     fn uu_wl_key(symbol: u64, pressed: i32) -> i32;
     fn uu_wl_wake() -> i32;
     fn uu_wl_release_all() -> i32;
+    fn uu_wl_type_utf8(text: *const libc::c_char) -> i32;
+    fn uu_wl_text_ready() -> i32;
+}
+/// How many characters one keymap upload can carry; 0 means this keymap has no spare keycode.
+pub fn text_ready()->i32 {
+    #[cfg(all(target_os="linux",feature="wayland"))]
+    { return unsafe { uu_wl_text_ready() }; }
+    #[cfg(not(all(target_os="linux",feature="wayland")))]
+    -1
+}
+/// Mobile input-method text (#13/#46). Returns the number of characters typed, or a negative code
+/// when this keymap has no spare keycode to carry them. Never logs the text.
+pub fn type_utf8(text:&str)->i32 {
+    #[cfg(all(target_os="linux",feature="wayland"))]
+    {
+        let Ok(c_text)=std::ffi::CString::new(text.replace('\0',"")) else { return -1 };
+        return unsafe { uu_wl_type_utf8(c_text.as_ptr()) };
+    }
+    #[cfg(not(all(target_os="linux",feature="wayland")))]
+    { let _=text; -1 }
 }
 pub fn release_all()->i32 {
     #[cfg(all(target_os="linux",feature="wayland"))]
@@ -142,5 +162,35 @@ pub fn input_probe()->Result<(),String> {
     }
     std::thread::sleep(std::time::Duration::from_millis(250));
     println!("Wayland test events sent; verify the native GTK acceptance report.");
+    Ok(())
+}
+
+/// Local diagnostic for the mobile-text path: report the keymap's capacity for it, then type a
+/// sample into the focused window. Only the built-in sample is echoed; UU_PROBE_TEXT stays private.
+pub fn text_probe()->Result<(),String> {
+    init()?;
+    let ready=text_ready();
+    if ready<=0 { return Err("this keymap has no spare keycode: mobile text input cannot be carried".into()); }
+    const SAMPLE:&str="uu remote abc 你好世界";
+    let (sample,builtin)=match std::env::var("UU_PROBE_TEXT") {
+        Ok(value)=>(value,false), Err(_)=>(SAMPLE.to_owned(),true),
+    };
+    println!("Wayland text probe: spare keycodes={ready} characters={} bytes={}",sample.chars().count(),sample.len());
+    if builtin { println!("Sample: {sample}"); }
+    // UU_PROBE_SEQUENCE types each |-separated field as its own call - one text_input message each,
+    // the way the phone's input method sends them - with UU_PROBE_STEP_MS between the calls. One
+    // process means one virtual keyboard, exactly as the host has.
+    let step=std::env::var("UU_PROBE_STEP_MS").ok().and_then(|v|v.parse::<u64>().ok()).unwrap_or(0);
+    let sequence=std::env::var("UU_PROBE_SEQUENCE").unwrap_or_else(|_|sample.clone());
+    let mut typed=0;
+    for (index,message) in sequence.split('|').enumerate() {
+        if index>0 && step>0 { std::thread::sleep(std::time::Duration::from_millis(step)); }
+        let one=type_utf8(message);
+        if one<0 { return Err(format!("Wayland text typing failed ({one})")); }
+        typed+=one;
+    }
+    if typed<0 { return Err(format!("Wayland text typing failed ({typed})")); }
+    println!("Typed {typed} of {} characters in {} calls; check that they match.",
+        sequence.chars().filter(|character|*character!='|').count(),sequence.split('|').count());
     Ok(())
 }

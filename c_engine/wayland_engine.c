@@ -58,6 +58,14 @@ static struct xkb_context *xkb;
 static struct xkb_keymap *keymap;
 static struct xkb_state *key_state;
 static unsigned char held_keys[768];
+/* Mobile input-method text (#13/#46). The protocol has no per-key remap request, but
+   zwp_virtual_keyboard_v1_keymap may be re-sent at any time, so the pristine keymap text is kept
+   and a spare keycode is pointed at one character's keysym at a time. Never logs the text. */
+#define UU_TEXT_SPARE 32
+static char *keymap_text;
+static size_t keymap_text_len, keymap_insert;
+static xkb_keycode_t spare_codes[UU_TEXT_SPARE];
+static unsigned spare_count;
 struct output { struct wl_output *handle; char name[128]; int transform,scale; uint32_t width,height; };
 static struct output outputs[32];
 static unsigned output_count, selected;
@@ -115,6 +123,164 @@ static int sync_display(void) {
     int result=dispatch_until(&ready);
     if (!ready) wl_callback_destroy(cb);
     return result;
+}
+/* Hand a keymap to the virtual keyboard. The compositor dups the fd, so it is closed here. */
+static int upload_keymap(const char *text,size_t length) {
+    int fd=memfd_create("uuremote-keymap",MFD_CLOEXEC);
+    if(fd<0) return -1;
+    if(ftruncate(fd,(off_t)length)!=0 || write(fd,text,length)!=(ssize_t)length) { close(fd); return -1; }
+    zwp_virtual_keyboard_v1_keymap(keyboard,WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,fd,(uint32_t)length);
+    close(fd);
+    return 0;
+}
+/* A keymap uploaded to a keyboard the seat already has is never handed to the focused client again,
+   so pressing the remapped keycodes would still be translated with the keymap it has - which is how
+   every message came out as the one before it. Re-attaching the keyboard is what makes the
+   compositor send the keymap to the client (measured 2026-10-18 on Hyprland 0.56.2). */
+static int rekey_keyboard(void) {
+    if(!keyboard_manager || !seat) return -1;
+    if(keyboard) zwp_virtual_keyboard_v1_destroy(keyboard);
+    keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
+    return keyboard?0:-1;
+}
+/* Offset of the '}' that closes the xkb_symbols section, so extra keys can be declared there.
+   Pairing the braces is enough because the bodies are balanced; looking for the last "};" is not,
+   the keymap's own brace follows, and an optional xkb_geometry section may too. */
+static size_t symbols_close(const char *text) {
+    const char *section=strstr(text,"xkb_symbols");
+    if(!section) return 0;
+    const char *open=strchr(section,'{');
+    if(!open) return 0;
+    int depth=0;
+    for(const char *p=open;*p;p++) {
+        if(*p=='{') depth++;
+        else if(*p=='}' && --depth==0) return (size_t)(p-text);
+    }
+    return 0;
+}
+/* Named keycodes the keymap gives no symbol to. Reading the compositor's own list is the only
+   portable way: pressing an unmapped keycode types nothing, and uu_wl_key never matches one
+   because it searches by keysym. Highest first, since uu_wl_key takes the lowest match. */
+static unsigned find_spare_codes(xkb_keycode_t *out,unsigned limit) {
+    unsigned count=0;
+    xkb_keycode_t min=xkb_keymap_min_keycode(keymap);
+    for(xkb_keycode_t code=xkb_keymap_max_keycode(keymap);code>min && count<limit;code--) {
+        if(code<8 || code>=sizeof(held_keys) || !xkb_keymap_key_get_name(keymap,code)) continue;
+        int mapped=0;
+        for(xkb_level_index_t level=0;level<xkb_keymap_num_levels_for_key(keymap,code,0) && !mapped;level++) {
+            const xkb_keysym_t *syms;
+            if(xkb_keymap_key_get_syms_by_level(keymap,code,0,level,&syms)>0) mapped=1;
+        }
+        if(!mapped) out[count++]=code;
+    }
+    return count;
+}
+/* A keycode the session keymap already produces this symbol with, unshifted. Typing through it
+   needs no upload, so no client can mistranslate it - and it is how plain latin text and spaces
+   arrive without touching the keymap at all. Spares never match: the pristine keymap leaves them
+   unmapped. */
+static xkb_keycode_t existing_keycode(xkb_keysym_t symbol) {
+    for(xkb_keycode_t code=xkb_keymap_min_keycode(keymap);code<=xkb_keymap_max_keycode(keymap);code++) {
+        if(code<8 || code>=sizeof(held_keys)) continue;
+        const xkb_keysym_t *syms;
+        if(xkb_keymap_key_get_syms_by_level(keymap,code,0,0,&syms)==1 && syms[0]==symbol) return code;
+    }
+    return 0;
+}
+static void press_keycode(xkb_keycode_t code) {
+    zwp_virtual_keyboard_v1_key(keyboard,timestamp(),code-8,WL_KEYBOARD_KEY_STATE_PRESSED);
+    zwp_virtual_keyboard_v1_key(keyboard,timestamp(),code-8,WL_KEYBOARD_KEY_STATE_RELEASED);
+    held_keys[code]=0;
+}
+/* The replaced keyboard starts with nothing held, and a keycode held_keys still calls held would be
+   skipped by uu_wl_key's next press of it. */
+static void release_held_keys_locked(void) {
+    for(xkb_keycode_t code=xkb_keymap_min_keycode(keymap);code<=xkb_keymap_max_keycode(keymap);code++) {
+        if(code<8 || code>=sizeof(held_keys) || !held_keys[code]) continue;
+        zwp_virtual_keyboard_v1_key(keyboard,timestamp(),code-8,WL_KEYBOARD_KEY_STATE_RELEASED);
+        xkb_state_update_key(key_state,code,XKB_KEY_UP);
+    }
+    memset(held_keys,0,sizeof(held_keys));
+}
+/* Upload one batch: re-attach the keyboard so the client takes the keymap, point spare keycodes at
+   these symbols, wait for the compositor to install it, then press them. Spares are left out of
+   key_state and held_keys: pressed and released here. */
+static int flush_batch(char *buffer,size_t capacity,const char names[][64],const xkb_keycode_t *codes,unsigned count,int *typed) {
+    release_held_keys_locked();
+    if(rekey_keyboard()!=0) return -1;
+    size_t at=keymap_insert;
+    memcpy(buffer,keymap_text,at);
+    for(unsigned i=0;i<count;i++) {
+        int wrote=snprintf(buffer+at,capacity-at,"\tkey <%s> { [ %s ] };\n",xkb_keymap_key_get_name(keymap,codes[i]),names[i]);
+        if(wrote<0 || (size_t)wrote>=capacity-at) return -1;
+        at+=(size_t)wrote;
+    }
+    memcpy(buffer+at,keymap_text+keymap_insert,keymap_text_len-keymap_insert);
+    if(upload_keymap(buffer,at+(keymap_text_len-keymap_insert))!=0) return -1;
+    if(sync_display()!=0) return -1;
+    for(unsigned i=0;i<count;i++) { press_keycode(codes[i]); (*typed)++; }
+    return 0;
+}
+/* Type UTF-8 like xdotool type does on X11, but on Wayland: characters the session keymap already
+   has go out as ordinary keycodes, the rest share the spares of one keymap upload (~70 KB, so one
+   batch per upload), in text order. Never logs the text. */
+static int type_utf8_locked(const char *text) {
+    size_t capacity=keymap_text_len+(size_t)UU_TEXT_SPARE*96+64;
+    char *buffer=malloc(capacity);
+    if(!buffer) return -1;
+    char names[UU_TEXT_SPARE][64];
+    xkb_keycode_t codes[UU_TEXT_SPARE];
+    unsigned count=0;
+    int typed=0, failed=0;
+    const unsigned char *p=(const unsigned char *)text;
+    while(*p && !failed) {
+        unsigned cp=0; int n=0;
+        if(*p<0x80) { cp=*p; n=1; }
+        else if((*p&0xE0)==0xC0 && (p[1]&0xC0)==0x80) { cp=((p[0]&0x1F)<<6)|(p[1]&0x3F); n=2; }
+        else if((*p&0xF0)==0xE0 && (p[1]&0xC0)==0x80 && (p[2]&0xC0)==0x80) { cp=((p[0]&0x0F)<<12)|((p[1]&0x3F)<<6)|(p[2]&0x3F); n=3; }
+        else if((*p&0xF8)==0xF0 && (p[1]&0xC0)==0x80 && (p[2]&0xC0)==0x80 && (p[3]&0xC0)==0x80) { cp=((p[0]&0x07)<<18)|((p[1]&0x3F)<<12)|((p[2]&0x3F)<<6)|(p[3]&0x3F); n=4; }
+        else { p++; continue; }
+        p+=n;
+        xkb_keysym_t sym;
+        if(cp=='\n') sym=0xff0d;                                       /* Return */
+        else if(cp=='\t') sym=0xff09;                                  /* Tab */
+        else if(cp<0x20 || cp==0x7f || (cp>=0x80 && cp<0xa0)) continue; /* controls carry no text */
+        else if(cp<0x100) sym=cp;                                      /* Latin-1 keysyms equal the code point */
+        else sym=(xkb_keysym_t)(0x1000000|cp);                         /* Unicode keysym */
+        xkb_keycode_t existing=existing_keycode(sym);
+        if(existing) {
+            if(count && flush_batch(buffer,capacity,names,codes,count,&typed)!=0) { failed=1; break; }
+            count=0;
+            press_keycode(existing); typed++;
+            continue;
+        }
+        if(count==UU_TEXT_SPARE) {
+            if(flush_batch(buffer,capacity,names,codes,count,&typed)!=0) { failed=1; break; }
+            count=0;
+        }
+        /* The name is what the keymap parser reads back; an unnamed keysym cannot be spelled. */
+        if(xkb_keysym_get_name(sym,names[count],sizeof(names[count]))<=0) continue;
+        codes[count]=spare_codes[count];
+        count++;
+    }
+    if(!failed && count) failed=flush_batch(buffer,capacity,names,codes,count,&typed)!=0;
+    free(buffer);
+    /* Restore the pristine keymap whatever happened above, so uu_wl_key keeps its own symbol map. */
+    if(upload_keymap(keymap_text,keymap_text_len)!=0) return -1;
+    return failed && !typed?-1:typed;
+}
+int uu_wl_type_utf8(const char *text) {
+    pthread_mutex_lock(&lock);
+    int typed=-1;
+    if(initialized && text && keymap_text && keymap_insert && spare_count) typed=type_utf8_locked(text);
+    if(typed>=0 && wl_display_flush(display)<0) typed=-1;
+    pthread_mutex_unlock(&lock); return typed;
+}
+/* Diagnostic: how many characters one keymap upload can carry, 0 when this keymap has no spare. */
+int uu_wl_text_ready(void) {
+    pthread_mutex_lock(&lock);
+    int ready=initialized && keymap_text && keymap_insert ? (int)spare_count : 0;
+    pthread_mutex_unlock(&lock); return ready;
 }
 static void output_geometry(void*d,struct wl_output*o,int32_t x,int32_t y,int32_t w,int32_t h,int32_t sub,const char*m,const char*model,int32_t transform) { ((struct output*)d)->transform=transform; }
 static void output_mode(void*d,struct wl_output*o,uint32_t f,int32_t w,int32_t h,int32_t rate) {
@@ -357,6 +523,7 @@ static void reset(void) {
     dmabuf=NULL; dmabuf_requested=dmabuf_disabled=dmabuf_reported=0; dmabuf_linear_formats=0;
     pending=0; output_count=0; initialized=0; memset(outputs,0,sizeof(outputs));
     memset(held_keys,0,sizeof(held_keys));
+    free(keymap_text); keymap_text=NULL; keymap_text_len=keymap_insert=0; spare_count=0;
 }
 int uu_wl_init(int32_t *w,int32_t *h) {
     pthread_mutex_lock(&lock);
@@ -390,15 +557,15 @@ int uu_wl_init(int32_t *w,int32_t *h) {
     keymap=xkb_keymap_new_from_names(xkb,&names,XKB_KEYMAP_COMPILE_NO_FLAGS);
     if(!keymap) goto end;
     key_state=xkb_state_new(keymap); if(!key_state) goto end;
-    char *map=xkb_keymap_get_as_string(keymap,XKB_KEYMAP_FORMAT_TEXT_V1);
-    if(!map) goto end;
-    size_t length=strlen(map)+1;
-    int fd=memfd_create("uuremote-keymap",MFD_CLOEXEC);
-    if(fd<0) { free(map); goto end; }
-    if(ftruncate(fd,(off_t)length)!=0 || write(fd,map,length)!=(ssize_t)length) { free(map); close(fd); goto end; }
-    free(map);
-    zwp_virtual_keyboard_v1_keymap(keyboard,WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,fd,length); close(fd);
+    keymap_text=xkb_keymap_get_as_string(keymap,XKB_KEYMAP_FORMAT_TEXT_V1);
+    if(!keymap_text) goto end;
+    keymap_text_len=strlen(keymap_text)+1;
+    if(upload_keymap(keymap_text,keymap_text_len)!=0) goto end;
     if(sync_display()!=0) goto end;
+    /* Text typing needs unmapped keycodes and a place to declare them. A keymap without either
+       only costs that path - uu_wl_type_utf8 refuses and the caller keeps its own fallback. */
+    keymap_insert=symbols_close(keymap_text);
+    spare_count=find_spare_codes(spare_codes,sizeof(spare_codes)/sizeof(spare_codes[0]));
     initialized=1; *w=width; *h=height; result=0;
 end:
     if(result!=0) reset();
