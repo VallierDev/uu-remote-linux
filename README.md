@@ -37,6 +37,7 @@
 | 远程协助（实验性） | 像官方客户端一样，把**设备 ID + 验证码**发给别人，对方在 UU「开始协助」里输入即可连接；登录前（访客身份）和登录后都能用，见下文 |
 | 远程桌面 | H.264 视频，NVIDIA 显卡用 NVENC 硬件编码，否则用 libx264；查看端绘制本地鼠标，不会出现双光标 |
 | 鼠标 / 键盘 | 绝对/相对移动、点击、滚轮、按键；修复了网络延迟导致的按键连发；Wayland 下可用 uinput 虚拟键鼠（不依赖键盘布局，见下文） |
+| 手机输入法文字 | 手机输入法提交的文字进当前输入框；X11 原生，Wayland 装 [fcitx5 插件](contrib/fcitx5-ime/README.md)，未装时回退为剪贴板粘贴 |
 | Mac 快捷键 | **推荐**：在 Mac 远控窗口菜单里关闭「使用 macOS 快捷键」，之后和在 Mac 上一样：Cmd+C/V/A/F/X/Z 是复制、粘贴、全选、查找、剪切、撤销（终端里 Cmd+C/V 自动变成 Ctrl+Shift+C/V），Ctrl+C 在终端里始终是中断。保持开启时，客户端会把 Cmd 和 Ctrl 都当成 Ctrl 发送：终端里 Ctrl+V / Cmd+V 自动转成粘贴，Ctrl+C 是中断，复制用 Cmd+Shift+C（X11） |
 | 鼠标指针样式 | 远端指针形状实时同步（X11） |
 | 剪贴板 | 双向文本同步 |
@@ -321,6 +322,21 @@ flowchart LR
 HEVC 的访问单元按 RFC 7798 的图片边界切分，不依赖 AUD：`hevc_vaapi` 带 `-aud 1` 时只在 IRAP 处写 AUD，并把其余
 画面从码流里丢掉，读取端按 AUD 切分就会把整个 GOP 当成一帧，再被 IRAP 门控全部拒绝——对外表现为连接停在
 「正在传输画面」，而主机侧只有约 12 kbit/s。`UU_VIDEO_CODEC=h265` 可显式选中 H.265，便于对照排查。
+
+### 手机输入法文字（Wayland 需要插件）
+
+手机输入法提交的文字走 `text_input`，主机把它送进当前输入框。X11 用 keysym 重映射直接输入；Wayland 上没有
+等价的通用协议（KWin 不实现 `zwp_virtual_keyboard_manager_v1`，`zwp_input_method_v2` 又由本机输入法占用），
+所以默认交给本机 fcitx5：装上 [contrib/fcitx5-ime](contrib/fcitx5-ime/README.md) 后，文本被提交进当前输入
+上下文，等价于你自己用输入法打字，不占用剪贴板。没有插件时回退为「剪贴板 + `Shift+Insert`」粘贴（会覆盖
+剪贴板，终端里同样可用）。
+
+装完插件要在 KDE 里重启输入法（系统设置 → 键盘 → 输入法：先选「无」再选回 Fcitx 5，或注销重登）：KWin 的
+launcher 负责把 compositor 的输入法连接交给 fcitx5，只重启 fcitx5 进程时插件会加载但看不到输入上下文。
+主机日志里 `committed by fcitx5` 表示走插件，`pasted from clipboard` 表示回退路径。
+
+插件**不会被自动安装**：没装就是上面的剪贴板回退（主机只往 socket 写，不动文件系统、不调 sudo）。
+卸载用 `contrib/fcitx5-ime/build.sh --uninstall`；不卸载的话它只是留在 `/usr` 里空转，没有影响。
 
 ### VAAPI 硬件编码（显式启用）
 

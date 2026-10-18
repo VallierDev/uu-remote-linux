@@ -43,6 +43,7 @@
 | Remote assistance (experimental) | Like the official client: share the **device ID + verification code**; the other person enters them under 开始协助 in UU Remote. Works before sign-in (guest identity) and after; see below |
 | Remote desktop | H.264 video, NVENC hardware encoding on NVIDIA GPUs, libx264 otherwise; the viewer draws its local pointer, so there is no double cursor |
 | Mouse / keyboard | Absolute and relative motion, clicks, wheel, keys; no spurious key repeat on high-latency links; optional uinput virtual devices on Wayland (layout independent, see below) |
+| Mobile input-method text | Committed text lands in the focused field; native on X11, on Wayland through the [fcitx5 addon](contrib/fcitx5-ime/README.md), with a clipboard-paste fallback |
 | Mac shortcuts | **Recommended**: turn off 「使用 macOS 快捷键」 (use macOS shortcuts) in the Mac viewer's remote-window menu; then Cmd+C/V/A/F/X/Z work as on a Mac (Cmd+C/V become Ctrl+Shift+C/V in terminals) and Ctrl+C always interrupts. With the option on, the viewer sends Cmd as Ctrl: in a terminal Ctrl+V / Cmd+V paste, Ctrl+C interrupts, copy is Cmd+Shift+C (X11) |
 | Pointer shape | Remote cursor shape is mirrored to the viewer (X11) |
 | Clipboard | Two-way text sync |
@@ -362,6 +363,24 @@ HEVC access units are split on RFC 7798 picture boundaries instead of AUDs: `hev
 AUD only at IRAPs and drops every other picture from the bitstream, so an AUD-based reader turns a whole GOP into
 one "frame" and the IRAP gate then rejects all of them: the connection stalls at "transferring" while the host
 sends about 12 kbit/s. `UU_VIDEO_CODEC=h265` selects H.265 explicitly for A/B diagnosis.
+
+### Mobile input-method text (the addon is needed on Wayland)
+
+Text committed by a phone keyboard arrives as `text_input`. X11 types it with a remapped keysym. Wayland has no
+protocol a third party may use for this (KWin does not implement `zwp_virtual_keyboard_manager_v1`, and
+`zwp_input_method_v2` belongs to the local input method), so the text is handed to fcitx5: with
+[contrib/fcitx5-ime](contrib/fcitx5-ime/README.md) installed it is committed into the focused input context,
+exactly as if you had typed it, and the clipboard stays untouched. Without the addon the fallback is a clipboard
+paste (`Shift+Insert`), which replaces the clipboard but still works in terminals.
+
+On KDE the addon needs the input method restarted from the desktop (System Settings, Keyboard, Input Method: pick
+"None" and then Fcitx 5 again, or log out and back in): KWin's launcher hands the compositor's input-method
+connection to fcitx5, and a plain fcitx5 restart loads the addon without giving it any input context. The host log
+says `committed by fcitx5` for the addon path and `pasted from clipboard` for the fallback.
+
+The addon is **never installed automatically**: without it you get the clipboard fallback above (the host only
+writes to the socket and never touches the filesystem or calls sudo). Remove it with
+`contrib/fcitx5-ime/build.sh --uninstall`; leaving it installed is harmless, it just idles.
 
 ### VAAPI (opt-in / 显式启用)
 

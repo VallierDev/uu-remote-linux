@@ -360,24 +360,97 @@ impl InputInjector {
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::key(symbol,pressed) }
         else { unsafe { x11_key_symbol(symbol as libc::c_ulong,i32::from(pressed)) } }
     }
-    /// Mobile input-method text (`text_input`). X11 only for now; other backends log once.
+    /// Mobile input-method text (`text_input`). X11 types it with a remapped keysym. On Wayland it goes
+    /// to the local fcitx5 addon (`contrib/fcitx5-ime`), which commits it into the focused input
+    /// context; without that addon the fallback is one clipboard paste, because KWin has no
+    /// virtual-keyboard protocol that would let a third party type arbitrary text.
     pub fn text_input(&self, text: &str) {
         let _serial=self.serial.lock().unwrap();
-        let Ok(c_text)=std::ffi::CString::new(text.replace('\0',"")) else { return };
+        let text=text.replace('\0',"");
         if self.backend==crate::desktop_backend::DesktopBackend::X11 {
+            let Ok(c_text)=std::ffi::CString::new(text.as_str()) else { return };
             let typed=unsafe { x11_type_utf8(c_text.as_ptr()) };
             log::info!("Desktop text input: chars={} result={}", text.chars().count(), typed);
-        } else {
-            static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true,std::sync::atomic::Ordering::Relaxed) {
-                log::warn!("Mobile text input is not supported on the {:?} backend yet", self.backend);
+        } else if commit_via_fcitx(&text) {
+            static IME_AUDIT:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+            if IME_AUDIT.fetch_add(1,std::sync::atomic::Ordering::Relaxed) < 8 {
+                log::info!("Desktop text input: chars={} committed by fcitx5", text.chars().count());
             }
+        } else {
+            self.paste_text(&text);
         }
+    }
+
+    /// Wayland fallback without the addon: hand the text to the desktop as a paste. Shift+Insert
+    /// pastes in terminals and in GTK/Qt/Chromium fields alike, where Ctrl+V is a raw control byte.
+    /// A failed clipboard offer never pastes, so the keystroke can only insert the text that was
+    /// just handed over.
+    fn paste_text(&self, text: &str) {
+        static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+        if text.is_empty() { return; }
+        let refuse=move |reason: String| {
+            if !WARNED.swap(true,std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("Desktop text input unavailable: {reason}");
+            }
+        };
+        let Some(portal)=self.portal.lock().unwrap().clone() else { return refuse("portal clipboard session is not bound".into()) };
+        if let Err(error)=portal.clipboard_set(text) { return refuse(error); }
+        const SHIFT_L:u64=0xffe1; const INSERT:u64=0xff63;
+        // Without a held Shift an Insert alone toggles overwrite mode in editors, so a failed
+        // modifier press aborts the paste instead of sending the bare key.
+        let shift=self.inject_key(SHIFT_L,true);
+        if shift!=0 { return refuse(format!("Shift press failed ({shift})")); }
+        let result=self.inject_key(INSERT,true)|self.inject_key(INSERT,false)|self.inject_key(SHIFT_L,false);
+        log::info!("Desktop text input: chars={} pasted from clipboard result={}", text.chars().count(), result);
     }
     pub fn key_event(&self, keycode: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
         if self.backend!=crate::desktop_backend::DesktopBackend::X11 { return; }
         unsafe { x11_key_event(keycode, if is_press { 1 } else { 0 }) };
+    }
+}
+
+/// Hands `text` to the fcitx5 addon socket in `dir` (`uuremote-ime.sock`, built from
+/// `contrib/fcitx5-ime`), which commits it into the focused input context: no clipboard and no
+/// keycodes are involved, so nothing else on the desktop notices. False when the addon is not
+/// running. The caller holds the input serial lock, so a stuck fcitx5 must not block injection.
+#[cfg(unix)]
+fn commit_via_fcitx_within(dir: &std::path::Path, text: &str) -> bool {
+    use std::io::Write;
+    let Ok(mut stream)=std::os::unix::net::UnixStream::connect(dir.join("uuremote-ime.sock")) else { return false };
+    let _=stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+    stream.write_all(text.as_bytes()).is_ok()
+}
+#[cfg(not(unix))]
+fn commit_via_fcitx_within(_dir: &std::path::Path, _text: &str) -> bool { false }
+
+fn commit_via_fcitx(text: &str) -> bool {
+    let Some(dir)=std::env::var_os("XDG_RUNTIME_DIR") else { return false };
+    commit_via_fcitx_within(std::path::Path::new(&dir), text)
+}
+
+#[cfg(test)]
+mod text_input_tests {
+    use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn reaches_the_ime_socket_and_fails_when_it_is_missing() {
+        let dir=std::env::temp_dir().join(format!("uu-ime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("uuremote-ime.sock");
+        let _=std::fs::remove_file(&path);
+        assert!(!commit_via_fcitx_within(&dir, "no listener"));
+        let listener=std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let received=std::thread::spawn(move || {
+            let (mut stream,_)=listener.accept().unwrap();
+            let mut buffer=Vec::new();
+            std::io::Read::read_to_end(&mut stream,&mut buffer).unwrap();
+            buffer
+        });
+        assert!(commit_via_fcitx_within(&dir, "你好"));
+        assert_eq!(received.join().unwrap(), "你好".as_bytes());
+        let _=std::fs::remove_file(&path);
+        let _=std::fs::remove_dir(&dir);
     }
 }
 
