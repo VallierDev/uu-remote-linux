@@ -286,8 +286,22 @@ fn encoder_options(settings: &VideoSettings, encoder: Encoder, gop: &str, rgb: O
     options.into_iter().map(str::to_owned).collect()
 }
 
-fn scale_options(settings: &VideoSettings, encoder: Encoder) -> Vec<String> {
-    if encoder == Encoder::Vaapi { return vec!["-vf".into(), vaapi_filter(settings.output)]; }
+/// Filter chain for a capture of `source` size (None when the input size is not known yet, e.g.
+/// the fixed-input probe). H.264/HEVC 4:2:0 encoders — and NVENC's surface allocation — require
+/// even frame dimensions, but the captured size is not always even: the portal backend reports the
+/// compositor's logical desktop size, so two stacked monitors at 150% scale capture 2560x2507 and
+/// every encoder failed to open ("height not divisible by 2 (2560x2507)" from libx264,
+/// "InitializeEncoder failed: out of memory (10)" from h264_nvenc), leaving the viewer stuck on the
+/// 正在传输画面 spinner. When the native capture size is odd, pad the odd row/column; the host
+/// display mode and every reported capture setting stay untouched.
+fn scale_options(settings: &VideoSettings, encoder: Encoder, source: Option<(u32,u32)>) -> Vec<String> {
+    const EVEN_PAD: &str = "pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black";
+    let odd_capture = settings.output.is_none() && source.is_some_and(|(w,h)| w % 2 != 0 || h % 2 != 0);
+    if encoder == Encoder::Vaapi {
+        let filtered = if odd_capture { format!("{EVEN_PAD},{}", vaapi_filter(None)) } else { vaapi_filter(settings.output) };
+        return vec!["-vf".into(), filtered];
+    }
+    if odd_capture { return vec!["-vf".into(), EVEN_PAD.into()]; }
     settings.output.map_or_else(Vec::new, |(w,h)| vec!["-vf".into(), format!("scale={w}:{h}:flags=bilinear")])
 }
 
@@ -582,6 +596,7 @@ async fn read_encoder_with(
             display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec));
         return read_inprocess(config, latest, sequence, idr, budget).await;
     }
+    let source_size = size;
     let size = format!("{}x{}", size.0, size.1);
     let fps = settings.fps.to_string();
     // Keep the IDR interval at 2 s whatever the frame rate.
@@ -605,7 +620,7 @@ async fn read_encoder_with(
             "-video_size",&size,"-i",&display,"-an"]);
     }
     // 其他分辨率: scale the captured desktop (the host display mode is left untouched).
-    command.args(scale_options(&settings, encoder));
+    command.args(scale_options(&settings, encoder, Some(source_size)));
     command.args(encoder_options(&settings, encoder, &gop, rgb));
     // x11grab paces against an absolute schedule; after a capture stall it grabs
     // back-to-back to "catch up" (measured 69 frames in 200ms). vfr on a 1/FPS
@@ -768,7 +783,7 @@ fn probe_input_command(spec:&FfmpegSpec,input:&std::ffi::OsStr,loop_input:bool,s
     if loop_input { command.args(["-stream_loop","-1"]); }
     // Override source timestamps so clips and image sequences use the same nominal probe rate.
     command.args(["-r",&settings.fps.to_string(),"-i"]).arg(input).args(["-map","0:v:0","-an"]);
-    command.args(scale_options(settings,encoder));
+    command.args(scale_options(settings,encoder,None));
     command.args(encoder_options(settings,encoder,&gop_frames(settings.fps,false).to_string(),None));
     command.args(timing_args(timing,settings.fps));
     command.args(["-frames:v",&wanted.to_string(),"-f",if settings.codec==VideoCodec::H265 {"hevc"} else {"h264"},"pipe:1"]);
@@ -982,6 +997,28 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_frame_dimensions_are_padded_to_even() {
+        // A scaled compositor can report an odd logical desktop (e.g. two stacked 150% monitors →
+        // 2560x2507); H.264/HEVC 4:2:0 encoders reject odd dimensions, so a native-size capture
+        // with a known odd size gets a pad filter. Even sizes, explicit output scaling and the
+        // fixed-input probe (size unknown) keep their existing filter chains.
+        let native = VideoSettings { output: None, ..Default::default() };
+        let pad = "pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black";
+        for encoder in [Encoder::Cpu, Encoder::Nvenc] {
+            assert_eq!(scale_options(&native, encoder, Some((2560, 2507))), vec!["-vf".to_string(), pad.to_string()]);
+            assert!(scale_options(&native, encoder, Some((2560, 2508))).is_empty());
+            assert!(scale_options(&native, encoder, None).is_empty());
+        }
+        assert_eq!(scale_options(&native, Encoder::Vaapi, Some((2560, 2507))),
+            vec!["-vf".to_string(), format!("{pad},format=nv12,hwupload")]);
+        assert_eq!(scale_options(&native, Encoder::Vaapi, Some((2560, 2508))),
+            vec!["-vf".to_string(), "format=nv12,hwupload".to_string()]);
+        let scaled = VideoSettings { output: Some((1280, 720)), ..Default::default() };
+        assert_eq!(scale_options(&scaled, Encoder::Cpu, Some((2560, 2507))),
+            vec!["-vf".to_string(), "scale=1280:720:flags=bilinear".to_string()]);
+    }
+
+    #[test]
     fn fixed_input_arguments_share_production_encoding_options() {
         let spec=FfmpegSpec {program:"ffmpeg".into(),ld_library_path:None,path:None};
         for encoder in [Encoder::Cpu,Encoder::Nvenc,Encoder::Vaapi] {
@@ -993,7 +1030,7 @@ mod tests {
                     let args:Vec<_>=command.as_std().get_args().map(|a|a.to_str().unwrap().to_owned()).collect();
                     let expected=encoder_options(&settings,encoder,&gop_frames(30,false).to_string(),None);
                     assert!(args.windows(expected.len()).any(|w|w==expected));
-                    let scale=scale_options(&settings,encoder);
+                    let scale=scale_options(&settings,encoder,None);
                     assert!(args.windows(scale.len()).any(|w|w==scale));
                     assert!(args.windows(4).any(|w|w==["-r","30","-i","frames/%05d.png"]));
                     assert!(args.windows(2).any(|w|w==["-frames:v","17"]));
