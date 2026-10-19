@@ -258,6 +258,7 @@ systemctl --user restart uuremote-native.service
 | `UU_REMOTE_ASSIST=0` | 关闭远程协助（未登录时也不再以访客身份提供协助） |
 | `UU_ASSIST_ALLOW=1` | 启动时就允许他人远程协助（覆盖窗口里保存的开关状态） |
 | `UU_PORT_MAPPING=0` | 关闭端口映射（对应官方被控端的开关） |
+| `UU_USE_PROXY=1` | 使用环境变量里的 HTTP/SOCKS 代理；默认忽略代理、直连网易服务器 |
 
 「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。
 

@@ -288,6 +288,7 @@ Common environment variables:
 | `UU_ASSIST_ALLOW=1` | Allow remote assistance at start (overrides the saved switch) |
 | `UU_LOGIN_WINDOW=0` | Do not open the login window automatically when credentials are missing |
 | `UU_PORT_MAPPING=0` | Disable port mapping (the official host's controlled-side switch) |
+| `UU_USE_PROXY=1` | Honor HTTP/SOCKS proxy environment variables; by default proxies are ignored and NetEase servers are reached directly |
 
 Host settings such as "lock after remote session" and "mute host" are stored in
 `~/.config/uuremote/host_settings.json`.

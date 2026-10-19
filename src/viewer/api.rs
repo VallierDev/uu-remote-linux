@@ -93,7 +93,7 @@ pub struct Api {
 }
 impl Api {
     pub fn new(signer: UUAuthClient, base: &str) -> Self {
-        Self { signer, base: base.trim_end_matches('/').into(), http: reqwest::Client::builder().timeout(Duration::from_secs(12)).build().unwrap() }
+        Self { signer, base: base.trim_end_matches('/').into(), http: crate::auth::http_client_builder().timeout(Duration::from_secs(12)).build().unwrap() }
     }
     pub async fn join_share(&self, connect_id: &str, connect_code: &str) -> Result<JoinData, Error> {
         if connect_id.trim().is_empty() || connect_code.trim().is_empty() || connect_id.chars().chain(connect_code.chars()).any(char::is_control) { return Err(Error::InvalidAssist); }

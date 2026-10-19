@@ -121,9 +121,24 @@ fn redact_urls(text: &str) -> String {
     out
 }
 
+/// Cloud API clients ignore ambient HTTP/SOCKS proxy settings by default: a local
+/// proxy that intercepts TLS breaks login and signaling. `UU_USE_PROXY=1` opts back
+/// into reqwest's standard proxy environment handling.
+pub fn http_client_builder() -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if std::env::var("UU_USE_PROXY").ok().as_deref().is_some_and(proxy_requested) {
+        builder
+    } else {
+        builder.no_proxy()
+    }
+}
+fn proxy_requested(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
 impl UUAuthClient {
     pub fn new(creds: Credentials) -> Self {
-        let http = reqwest::Client::builder()
+        let http = http_client_builder()
             .timeout(std::time::Duration::from_secs(12))
             .build()
             .unwrap();
@@ -345,5 +360,11 @@ mod guest_tests {
     fn transport_error_redacts_proxy_credentials_and_queries() {
         let text = super::redact_urls("proxy http://user:secret@proxy.example:3128 failed for (https://api.example/p?token=abc)");
         assert_eq!(text, "proxy http://proxy.example:3128 failed for (https://api.example/p)");
+    }
+
+    #[test]
+    fn proxy_opt_in_accepts_only_explicit_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] { assert!(super::proxy_requested(value)); }
+        for value in ["", "0", "false", "no", "off", "2"] { assert!(!super::proxy_requested(value)); }
     }
 }

@@ -116,6 +116,7 @@ viewer does not reconnect them automatically.
 | `UU_FFMPEG_ROOT` | FFmpeg prefix (`bin/ffmpeg`, libs in `lib/x86_64-linux-gnu`) |
 | `UU_AUDIO=0`, `UU_AUDIO_SOURCE` | disable sound / choose the Pulse source (default `@DEFAULT_MONITOR@`) |
 | `UU_LOGIN_WINDOW=0` | don't auto-open the login window |
+| `UU_USE_PROXY=1` | honor HTTP/SOCKS proxy env vars; cloud API clients bypass env proxies by default |
 | `UU_REMOTE_ASSIST=0`, `UU_ASSIST_ALLOW=1`, `UU_ASSIST_UI=tty`, `UU_ASSIST_DEBUG=1` | disable assistance / allow at start / terminal UI for `assist` / include the server's short error message in assist errors |
 
 Token has no expiry field; API code 1120 (HTTP 422) means invalid/expired → re-login. The config is re-read
