@@ -101,7 +101,9 @@ fn drain(encoder: &mut encoder::Video, packet: &mut Packet, units: &mpsc::Sender
 
 /// Opens the selected video encoder for `config`. Returns the encoder, its input pixel format and output size.
 fn open_encoder(config: &Config) -> Result<(encoder::Video, Pixel, u32, u32), String> {
+    // H.264/HEVC 4:2:0 and NVENC need even dimensions; an odd native capture is padded (see run_damage).
     let (width, height) = config.output.unwrap_or(config.input);
+    let (width, height) = (width + width % 2, height + height % 2);
     let codec = encoder::find_by_name(config.encoder.name_for(config.codec))
         .ok_or_else(|| format!("{} is not available in this FFmpeg build", config.encoder.name_for(config.codec)))?;
     // Allocate for this codec so FFmpeg fills its defaults; libx264 rejects a context allocated without one.
@@ -278,7 +280,11 @@ pub fn run(config: Config, units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBoo
 fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>) -> Result<(), String> {
     let (mut encoder, pixel, width, height) = open_encoder(&config)?;
     let (cap_width, cap_height) = capture.size();
-    let mut captured = frame::Video::new(Pixel::BGRZ, cap_width, cap_height);
+    // Native size uses the even encoder size. The extra row/column is never overwritten, so it stays black.
+    let native = config.output.is_none();
+    let (frame_width, frame_height) = if native { (width, height) } else { (cap_width, cap_height) };
+    let mut captured = frame::Video::new(Pixel::BGRZ, frame_width, frame_height);
+    if native { captured.data_mut(0).fill(0); }
     let mut converted = frame::Video::empty();
     let mut scaler = None;
     let mut packet = Packet::empty();
@@ -324,11 +330,11 @@ fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<En
         let slot = slot.max(last_slot + 1);
         last_slot = slot;
 
-        let frame = if pixel == Pixel::BGRZ && width == cap_width && height == cap_height {
+        let frame = if pixel == Pixel::BGRZ && width == captured.width() && height == captured.height() {
             &mut captured
         } else {
             if scaler.is_none() {
-                scaler = Some(scaling::Context::get(Pixel::BGRZ, cap_width, cap_height, pixel, width, height, scaling::Flags::BILINEAR).map_err(text)?);
+                scaler = Some(scaling::Context::get(Pixel::BGRZ, captured.width(), captured.height(), pixel, width, height, scaling::Flags::BILINEAR).map_err(text)?);
             }
             if dirty {
                 if let Some(context) = scaler.as_mut() { context.run(&captured, &mut converted).map_err(text)?; }
