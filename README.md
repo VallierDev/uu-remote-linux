@@ -198,9 +198,7 @@ PartOf=graphical-session.target
 
 [Service]
 Environment=RUST_LOG=info
-# GNOME/KDE 等现代桌面会自动导入 DISPLAY / WAYLAND_DISPLAY 到用户管理器。
-# 若使用 Xfce、i3 等不自动导入会话环境的轻量桌面，可按需补充：
-# Environment=DISPLAY=:0
+# GNOME/KDE 等桌面会把 DISPLAY / WAYLAND_DISPLAY 导入用户管理器，并启动 graphical-session.target
 ExecStart=%h/.local/bin/uuremote-server
 Restart=always
 RestartSec=5
@@ -217,6 +215,9 @@ journalctl --user -u uuremote-native.service -f   # 看到 availability=Some("re
 ```
 
 如果还没有登录，服务会自动在桌面上弹出扫码窗口。
+
+Xfce、i3 等不启动 `graphical-session.target` 的桌面，按上面的写法开机不会自启：把 `[Install]` 改成 `WantedBy=default.target`，
+并加上 `Environment=DISPLAY=:0`（按实际显示器填写），再重新 `enable`。下文的无头模式、虚拟桌面同理。
 
 ### 5. Wayland 下使用 uinput 虚拟键鼠（推荐）
 
@@ -257,7 +258,7 @@ install -Dm644 contrib/desktop/uu-remote-linux-viewer.desktop ~/.local/share/app
 ## 没有显示器的服务器
 
 **无头模式**：只要终端、文件传输和端口映射，不需要图形界面。在服务里加 `Environment=UU_DESKTOP_BACKEND=none`，
-再执行 `loginctl enable-linger $USER`，这样开机后不用登录，systemd 用户服务（以及 `XDG_RUNTIME_DIR`、用户 D-Bus）也会自动启动。
+把 `[Install]` 改成 `WantedBy=default.target`（无人登录时 `graphical-session.target` 不会启动），再执行 `loginctl enable-linger $USER`，这样开机后不用登录，systemd 用户服务（以及 `XDG_RUNTIME_DIR`、用户 D-Bus）也会自动启动。
 无头模式下控制端点「远程桌面」会一直显示正在连接，这是正常的。首次登录用 `uuremote-server login --no-gui` 在终端里扫码。
 
 **群晖 / NAS（Docker）**：没有桌面的 NAS 可以用容器运行无头模式（文件传输、终端、端口映射）。

@@ -79,17 +79,21 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
    [Unit]
    Description=UU Remote Linux host (unofficial)
    After=graphical-session.target
+   PartOf=graphical-session.target
    [Service]
    Environment=RUST_LOG=info
-   Environment=DISPLAY=:0
-   # GNOME on Xorg usually needs: Environment=XAUTHORITY=/run/user/<uid>/gdm/Xauthority
    ExecStart=%h/.local/bin/uuremote-server
    Restart=always
    RestartSec=5
    [Install]
-   WantedBy=default.target
+   WantedBy=graphical-session.target
    ```
 
+   Same as packaging/deb. GNOME/KDE import DISPLAY / WAYLAND_DISPLAY and start graphical-session.target; do not hard-code
+   DISPLAY there (it overrides the session's real one, XWayland is often :1); under default.target the unit can
+   start before WAYLAND_DISPLAY is imported and fall back to X11. Desktops without that target (Xfce, i3), headless
+   (`UU_DESKTOP_BACKEND=none` + linger) and the Xvfb virtual desktop need `WantedBy=default.target` plus an explicit
+   `Environment=DISPLAY=...` (GNOME on Xorg outside the session: `XAUTHORITY=/run/user/<uid>/gdm/Xauthority`).
    Find the real display/Xauthority with `loginctl show-session <id> -p Display` / `ps -o args -C Xorg`.
 5. `systemctl --user daemon-reload && systemctl --user enable --now uuremote-native.service`
 6. Verify: `journalctl --user -u uuremote-native.service -f` must show

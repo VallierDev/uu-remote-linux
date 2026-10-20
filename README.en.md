@@ -215,9 +215,7 @@ PartOf=graphical-session.target
 
 [Service]
 Environment=RUST_LOG=info
-# Modern desktops like GNOME/KDE automatically import DISPLAY / WAYLAND_DISPLAY into systemd --user.
-# For minimal desktops/WMs that do not (e.g. Xfce, i3), uncomment and adjust if needed:
-# Environment=DISPLAY=:0
+# GNOME/KDE import DISPLAY / WAYLAND_DISPLAY into the user manager and start graphical-session.target
 ExecStart=%h/.local/bin/uuremote-server
 Restart=always
 RestartSec=5
@@ -234,6 +232,10 @@ journalctl --user -u uuremote-native.service -f   # online once you see availabi
 ```
 
 If you have not logged in yet, the service opens the QR login window on your desktop.
+
+Desktops that never start `graphical-session.target` (e.g. Xfce, i3) will not autostart this unit: change `[Install]` to
+`WantedBy=default.target`, add `Environment=DISPLAY=:0` (your actual display) and `enable` again. The same applies to
+headless mode and the virtual desktop below.
 
 ### 5. uinput virtual keyboard/mouse on Wayland (recommended)
 
@@ -285,7 +287,7 @@ the same account cannot assist each other, an official restriction).
 ## Servers without a monitor
 
 **Headless mode** (terminal, file transfer and port mapping only): add `Environment=UU_DESKTOP_BACKEND=none` to the
-service and run `loginctl enable-linger $USER`, so the systemd user manager (with `XDG_RUNTIME_DIR` and the user D-Bus)
+service, change `[Install]` to `WantedBy=default.target` (`graphical-session.target` never starts without a login), and run `loginctl enable-linger $USER`, so the systemd user manager (with `XDG_RUNTIME_DIR` and the user D-Bus)
 starts at boot without a login. The viewer's remote desktop keeps showing "connecting" in this mode; that is expected.
 Log in once with `uuremote-server login --no-gui` (QR in the terminal).
 
