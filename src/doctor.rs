@@ -38,6 +38,14 @@ async fn command_output(program: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// Whether the report must say that this session has no screen to capture: neither DISPLAY nor
+/// WAYLAND_DISPLAY is set, and the backend is the X11 one that needs a display to open.
+fn missing_display(backend: crate::desktop_backend::DesktopBackend, headless: bool,
+                   display: Option<&std::ffi::OsStr>, wayland: Option<&std::ffi::OsStr>) -> bool {
+    !headless && backend == crate::desktop_backend::DesktopBackend::X11
+        && display.is_none() && wayland.is_none()
+}
+
 pub async fn run() -> Result<(), String> {
     use crate::desktop_backend as backend;
     use crate::engine_plugin::{load, Engine};
@@ -65,6 +73,13 @@ pub async fn run() -> Result<(), String> {
     line("selected backend", match &selected { Ok(b) if backend::headless() => format!("none (headless, {b:?} unused)"), Ok(b) => format!("{b:?}"), Err(e) => format!("error: {e}") });
     if selected.as_ref().is_ok_and(|b| *b == backend::DesktopBackend::X11) && backend::wayland_session_running() && !backend::headless() {
         println!("  ! X11 backend inside a Wayland session: the picture will be black");
+    }
+    // A session without any display cannot capture a screen; say so instead of naming a backend.
+    if let Ok(selected) = &selected {
+        if missing_display(*selected, backend::headless(), std::env::var_os("DISPLAY").as_deref(), std::env::var_os("WAYLAND_DISPLAY").as_deref()) {
+            println!("  ! no display in this session (DISPLAY and WAYLAND_DISPLAY are unset): the desktop backend cannot capture a screen");
+            println!("    terminal, file transfer and port mapping still work; UU_DESKTOP_BACKEND=none marks the host as headless");
+        }
     }
     if cfg!(feature = "engine-plugins") {
         for engine in [Engine::Wayland, Engine::Portal] {
@@ -132,5 +147,19 @@ mod tests {
         let home = std::env::var("HOME").unwrap_or_default();
         if home.len() > 1 { assert_eq!(super::redact(&format!("{home}/.config/x")), "~/.config/x"); }
         assert_eq!(super::env_state("UU_DOCTOR_TEST_SURELY_UNSET"), "unset");
+    }
+    #[test]
+    fn a_session_without_any_display_is_reported() {
+        use crate::desktop_backend::DesktopBackend;
+        let display = std::ffi::OsStr::new(":0");
+        let wayland = std::ffi::OsStr::new("wayland-1");
+        // No DISPLAY and no WAYLAND_DISPLAY: nothing can be captured.
+        assert!(super::missing_display(DesktopBackend::X11, false, None, None));
+        // One of them present: the backend has a screen to open.
+        assert!(!super::missing_display(DesktopBackend::X11, false, Some(display), None));
+        assert!(!super::missing_display(DesktopBackend::X11, false, None, Some(wayland)));
+        // Another backend, or a headless host: not this warning.
+        assert!(!super::missing_display(DesktopBackend::Wayland, false, None, None));
+        assert!(!super::missing_display(DesktopBackend::X11, true, None, None));
     }
 }
