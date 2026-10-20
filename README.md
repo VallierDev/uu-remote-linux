@@ -217,7 +217,7 @@ journalctl --user -u uuremote-native.service -f   # 看到 availability=Some("re
 如果还没有登录，服务会自动在桌面上弹出扫码窗口。
 
 Xfce、i3 等不启动 `graphical-session.target` 的桌面，按上面的写法开机不会自启：把 `[Install]` 改成 `WantedBy=default.target`，
-并加上 `Environment=DISPLAY=:0`（按实际显示器填写），再重新 `enable`。下文的无头模式、虚拟桌面同理。
+并加上 `Environment=DISPLAY=:0`（按实际显示器填写），再重新 `enable`。下文的无头模式、虚拟桌面也要用 `default.target`。
 
 ### 5. Wayland 下使用 uinput 虚拟键鼠（推荐）
 

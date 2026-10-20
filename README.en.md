@@ -234,8 +234,8 @@ journalctl --user -u uuremote-native.service -f   # online once you see availabi
 If you have not logged in yet, the service opens the QR login window on your desktop.
 
 Desktops that never start `graphical-session.target` (e.g. Xfce, i3) will not autostart this unit: change `[Install]` to
-`WantedBy=default.target`, add `Environment=DISPLAY=:0` (your actual display) and `enable` again. The same applies to
-headless mode and the virtual desktop below.
+`WantedBy=default.target`, add `Environment=DISPLAY=:0` (your actual display) and `enable` again. Headless mode and the
+virtual desktop below also need `default.target`.
 
 ### 5. uinput virtual keyboard/mouse on Wayland (recommended)
 
