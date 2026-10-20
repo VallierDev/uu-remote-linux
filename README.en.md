@@ -211,17 +211,19 @@ machine, in `~/.config/uuremote/config.json` (mode 0600).
 [Unit]
 Description=UU Remote Linux host (unofficial)
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Environment=RUST_LOG=info
-# X11 desktops need the display; on GNOME, XAUTHORITY is usually /run/user/<uid>/gdm/Xauthority
-Environment=DISPLAY=:0
+# Modern desktops like GNOME/KDE automatically import DISPLAY / WAYLAND_DISPLAY into systemd --user.
+# For minimal desktops/WMs that do not (e.g. Xfce, i3), uncomment and adjust if needed:
+# Environment=DISPLAY=:0
 ExecStart=%h/.local/bin/uuremote-server
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 ```
 
 ```sh

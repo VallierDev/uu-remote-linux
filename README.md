@@ -194,17 +194,19 @@ FFmpeg 7 及以上会在依赖 `ffmpeg-sys-next` 里报 `avfft.h file not found`
 [Unit]
 Description=UU Remote Linux host (unofficial)
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Environment=RUST_LOG=info
-# X11 桌面需要指明显示器；GNOME 的 XAUTHORITY 一般在 /run/user/<uid>/gdm/Xauthority
-Environment=DISPLAY=:0
+# GNOME/KDE 等现代桌面会自动导入 DISPLAY / WAYLAND_DISPLAY 到用户管理器。
+# 若使用 Xfce、i3 等不自动导入会话环境的轻量桌面，可按需补充：
+# Environment=DISPLAY=:0
 ExecStart=%h/.local/bin/uuremote-server
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target
 ```
 
 ```sh
