@@ -366,8 +366,8 @@ impl InputInjector {
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::key(symbol,pressed) }
         else { unsafe { x11_key_symbol(symbol as libc::c_ulong,i32::from(pressed)) } }
     }
-    /// Mobile input-method text (`text_input`). X11 types it directly; Wayland re-maps a spare
-    /// keycode in the virtual keyboard's keymap. Other backends log once.
+    /// Mobile input-method text (`text_input`). X11 types it directly; Wayland uses a separate
+    /// text-only virtual keyboard. Other backends log once.
     pub fn text_input(&self, text: &str) {
         let _serial=self.serial.lock().unwrap();
         let Ok(c_text)=std::ffi::CString::new(text.replace('\0',"")) else { return };

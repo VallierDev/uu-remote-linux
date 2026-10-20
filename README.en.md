@@ -104,19 +104,21 @@ failure falls back to SHM. The virgl VM verified fallback only: successful impor
 mapping and hardware acceleration remain unverified. This is not zero-copy VAAPI;
 `UU_VIDEO_ENCODER=vaapi` still uploads CPU frames through FFmpeg.
 
-### Hyprland monitor switching (experimental)
+### Hyprland / niri monitor switching (experimental)
 
 Native Wayland absolute pointer motion now targets the captured output by default, fixing multi-monitor click offsets. uinput may still handle keyboard, buttons and relative motion.
 
 Set `UU_WAYLAND_MULTISCREEN=1` to select physical monitors from the phone client. `UU_WAYLAND_OUTPUT` chooses the initial output. Capture and absolute pointer targeting switch together across different resolutions, scales and desktop positions.
 
-Switching reuses one video track and pauses input until the new source sends a frame. Capture/encoder failure or a first-frame timeout requests restoration of the previous source. The inventory uses `hyprctl` and supports unrotated outputs; restart the host after monitor hotplug or layout changes. Phone-side switching and clicks were tested on Omarchy / Hyprland with 2560×1440 at 125% and 1920×1080 at 133.33%.
+Switching reuses one video track and pauses input until the new source sends a frame. Capture/encoder failure or a first-frame timeout requests restoration of the previous source. On Hyprland the inventory uses `hyprctl`; restart the host after monitor hotplug or layout changes. Phone-side switching and clicks were tested on Omarchy / Hyprland with 2560×1440 at 125% and 1920×1080 at 133.33%.
+
+On niri, monitor enumeration uses `niri msg --json outputs`. Normal and 90/180/270-degree outputs are supported; reflected transforms are excluded. Restart the host after output layout changes. Mobile text uses a separate virtual keyboard with printable physical keycodes for Chromium/Electron and XWayland compatibility.
 
 ## Not implemented / not supported
 
 | Feature | Status |
 |---|---|
-| Switching between multiple monitors | Experimental on native Hyprland Wayland; see above |
+| Switching between multiple monitors | Experimental on native Hyprland / niri Wayland; see above |
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; VAAPI and `inproc-av` stay 4:2:0 and report that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |

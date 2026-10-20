@@ -82,7 +82,7 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1
         run: |
-          for source in tests/portal_engine.c tests/portal_input.c tests/portal_eis.c tests/desktop_power.c; do
+          for source in tests/portal_engine.c tests/portal_input.c tests/portal_eis.c tests/desktop_power.c tests/wayland_transform.c; do
             target="/tmp/$(basename "$source" .c)"
             cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
               -Wall -Wextra -Wno-unused-parameter "$source" -o "$target" \
