@@ -601,7 +601,11 @@ end:
 int uu_wl_wake(void) {
     pthread_mutex_lock(&lock); int result=-1;
     /* Output power management is optional; missing it must not block screencopy. */
-    if(initialized && !power) result=0;
+    if(initialized && (!power || power_failed)) {
+        /* No power manager, or the compositor refused the mode (outputs without DPMS,
+           headless outputs): streaming continues, the screen simply stays as it is. */
+        result=0;
+    }
     if(initialized && power && !power_failed) {
         zwlr_output_power_v1_set_mode(power,ZWLR_OUTPUT_POWER_V1_MODE_ON);
         if(sync_display()==0 && !power_failed) result=0;
