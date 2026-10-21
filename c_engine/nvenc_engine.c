@@ -307,29 +307,18 @@ int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size)
         return -4;
     }
 
-    // Unregister old VRAM resource from NVENC
-    if (engine->reg_res.registeredResource && engine->encoder) {
-        engine->fn.nvEncUnregisterResource(engine->encoder, engine->reg_res.registeredResource);
-        memset(&engine->reg_res, 0, sizeof(engine->reg_res));
-    }
+    // Register host pinned device pointer with NVENC before releasing fallback buffer
+    NV_ENC_REGISTER_RESOURCE new_reg;
+    memset(&new_reg, 0, sizeof(new_reg));
+    new_reg.version = NV_ENC_REGISTER_RESOURCE_VER;
+    new_reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+    new_reg.width = engine->width;
+    new_reg.height = engine->height;
+    new_reg.pitch = engine->width * 4;
+    new_reg.resourceToRegister = (void*)dev_ptr;
+    new_reg.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
 
-    // Free unused VRAM buffer
-    if (engine->cu_dptr && engine->cuMemFree) {
-        engine->cuMemFree(engine->cu_dptr);
-        engine->cu_dptr = 0;
-    }
-
-    // Register host pinned device pointer with NVENC
-    memset(&engine->reg_res, 0, sizeof(engine->reg_res));
-    engine->reg_res.version = NV_ENC_REGISTER_RESOURCE_VER;
-    engine->reg_res.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
-    engine->reg_res.width = engine->width;
-    engine->reg_res.height = engine->height;
-    engine->reg_res.pitch = engine->width * 4;
-    engine->reg_res.resourceToRegister = (void*)dev_ptr;
-    engine->reg_res.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
-
-    NVENCSTATUS nvres = engine->fn.nvEncRegisterResource(engine->encoder, &engine->reg_res);
+    NVENCSTATUS nvres = engine->fn.nvEncRegisterResource(engine->encoder, &new_reg);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncRegisterResource (pinned host) failed: %d\n", nvres);
         if (engine->cuMemHostUnregister) engine->cuMemHostUnregister(host_ptr);
@@ -337,12 +326,22 @@ int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size)
         return -5;
     }
 
+    // Now that new host resource is successfully registered, unregister old fallback VRAM resource
+    if (engine->reg_res.registeredResource && engine->encoder) {
+        engine->fn.nvEncUnregisterResource(engine->encoder, engine->reg_res.registeredResource);
+    }
+    if (engine->cu_dptr && engine->cuMemFree) {
+        engine->cuMemFree(engine->cu_dptr);
+        engine->cu_dptr = 0;
+    }
+    engine->reg_res = new_reg;
+
     engine->registered_host_ptr = host_ptr;
     engine->registered_host_size = size;
     engine->registered_dev_ptr = dev_ptr;
     engine->is_zero_copy = 1;
 
-    fprintf(stderr, "[nvenc] Zero-Copy Pinned Memory DMA enabled successfully! dev_ptr=0x%llx\n", (unsigned long long)dev_ptr);
+    // Zero-Copy enabled successfully (address omitted per logging policy)
     if (engine->cuCtxPopCurrent && engine->cu_ctx) {
         engine->cuCtxPopCurrent(&old_ctx);
     }

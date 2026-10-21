@@ -302,7 +302,7 @@ fn nvidia_present() -> bool {
 /// in-process encoder are 4:2:0 only).
 pub fn full_chroma_available() -> bool {
     #[cfg(feature = "inproc-av")]
-    if crate::inproc_encoder::selected() {
+    if crate::inproc_encoder::selected(Encoder::requested()) {
         return false;
     }
     Encoder::requested() != Encoder::Vaapi
@@ -1027,7 +1027,7 @@ async fn read_encoder_with(
         None
     };
     #[cfg(feature = "inproc-av")]
-    if !wayland && portal.is_none() && crate::inproc_encoder::selected() {
+    if !wayland && portal.is_none() && crate::inproc_encoder::selected(encoder) {
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             display: display.clone(),

@@ -82,8 +82,8 @@ pub fn damage_enabled() -> bool {
     std::env::var("UU_CAPTURE").map_or(true, |v| v != "grab")
 }
 
-pub fn selected() -> bool {
-    !disabled() && crate::config::ffmpeg_root().is_none()
+pub fn selected(encoder: crate::video::Encoder) -> bool {
+    encoder == crate::video::Encoder::Nvenc && !disabled() && crate::config::ffmpeg_root().is_none()
 }
 
 pub struct EncodedUnit {
@@ -191,6 +191,7 @@ pub fn run(
     let mut next_tick = Instant::now();
     let mut last_send = Instant::now();
     let mut permits = VecDeque::with_capacity(4);
+    let mut scaled_buf = Vec::new();
 
     let locked = crate::session_lock::watch_locked();
     let mut last_locked = *locked.borrow();
@@ -258,13 +259,29 @@ pub fn run(
                 )
             }
         } else {
-            // Fallback mode: capture slice and upload via cuMemcpyHtoD
+            // Fallback mode: capture slice and scale if requested resolution differs
             let source = capture.capture()?;
+            let (target_ptr, pitch) = if cap_width == width && cap_height == height {
+                (source.as_ptr(), bytes_per_line as u32)
+            } else {
+                if scaled_buf.len() != (width * height * 4) as usize {
+                    scaled_buf.resize((width * height * 4) as usize, 0);
+                }
+                scale_nearest_argb32(
+                    source,
+                    cap_width,
+                    cap_height,
+                    &mut scaled_buf,
+                    width,
+                    height,
+                );
+                (scaled_buf.as_ptr(), width * 4)
+            };
             unsafe {
                 nvenc_encode_frame(
                     engine.0,
-                    source.as_ptr(),
-                    bytes_per_line as u32,
+                    target_ptr,
+                    pitch,
                     force_idr,
                     &mut out_data,
                     &mut out_len,
@@ -305,5 +322,31 @@ pub fn run(
         }
         last_send = now;
         keepalive = random_keepalive(&mut seed);
+    }
+}
+
+fn scale_nearest_argb32(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+    let src_stride = src_w as usize * 4;
+    let dst_stride = dst_w as usize * 4;
+    for dy in 0..dst_h {
+        let sy = ((dy as u64 * src_h as u64) / dst_h as u64) as usize;
+        let src_row = &src[sy * src_stride..];
+        let dst_row = &mut dst[dy as usize * dst_stride..(dy as usize + 1) * dst_stride];
+        for dx in 0..dst_w {
+            let sx = ((dx as u64 * src_w as u64) / dst_w as u64) as usize;
+            let src_px = &src_row[sx * 4..sx * 4 + 4];
+            let dst_px = &mut dst_row[dx as usize * 4..dx as usize * 4 + 4];
+            dst_px.copy_from_slice(src_px);
+        }
     }
 }
