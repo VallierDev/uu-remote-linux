@@ -115,23 +115,24 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
         nvenc_destroy(engine);
         return NULL;
     }
+    int ctx_pushed = 0;
     if (engine->cuCtxPushCurrent) {
-        engine->cuCtxPushCurrent(engine->cu_ctx);
+        if (engine->cuCtxPushCurrent(engine->cu_ctx) == CUDA_SUCCESS) {
+            ctx_pushed = 1;
+        }
     }
 
     // 2. Load NVENC
     engine->nvenc_lib = dlopen("libnvidia-encode.so.1", RTLD_NOW);
     if (!engine->nvenc_lib) {
         fprintf(stderr, "[nvenc] dlopen libnvidia-encode.so.1 failed: %s\n", dlerror());
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
 
     tNvEncodeAPICreateInstance create_inst = (tNvEncodeAPICreateInstance)dlsym(engine->nvenc_lib, "NvEncodeAPICreateInstance");
     if (!create_inst) {
         fprintf(stderr, "[nvenc] dlsym NvEncodeAPICreateInstance failed\n");
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
 
     memset(&engine->fn, 0, sizeof(engine->fn));
@@ -139,8 +140,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     NVENCSTATUS nvres = create_inst(&engine->fn);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] NvEncodeAPICreateInstance failed: %d\n", nvres);
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
 
     // 3. Open Encode Session
@@ -154,8 +154,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     nvres = engine->fn.nvEncOpenEncodeSessionEx(&open_params, &engine->encoder);
     if (nvres != NV_ENC_SUCCESS || !engine->encoder) {
         fprintf(stderr, "[nvenc] nvEncOpenEncodeSessionEx failed: %d\n", nvres);
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
 
     // 4. Query Preset Config
@@ -174,8 +173,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     );
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncGetEncodePresetConfigEx failed: %d\n", nvres);
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
 
     NV_ENC_CONFIG enc_cfg;
@@ -186,10 +184,20 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     enc_cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
     enc_cfg.rcParams.averageBitRate = (uint32_t)(config->target_bps > 0 ? config->target_bps : 10000000);
     enc_cfg.rcParams.maxBitRate = (uint32_t)(config->max_bps > 0 ? config->max_bps : 15000000);
-    enc_cfg.rcParams.vbvBufferSize = (uint32_t)(config->max_bps > 0 ? config->max_bps / 10 : 1500000);
+    enc_cfg.rcParams.vbvBufferSize = (uint32_t)(config->buffer_bits > 0 ? config->buffer_bits : (config->max_bps > 0 ? config->max_bps / 10 : 1500000));
     enc_cfg.rcParams.targetQuality = (uint8_t)(config->cq > 0 ? config->cq : 28);
     enc_cfg.rcParams.enableAQ = 1;
-    enc_cfg.rcParams.enableTemporalAQ = 1;
+    // Check if hardware/codec supports Temporal AQ
+    NV_ENC_CAPS_PARAM caps_param;
+    memset(&caps_param, 0, sizeof(caps_param));
+    caps_param.version = NV_ENC_CAPS_PARAM_VER;
+    caps_param.capsToQuery = NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ;
+    int caps_val = 0;
+    if (engine->fn.nvEncGetEncodeCaps(engine->encoder, codec_guid, &caps_param, &caps_val) == NV_ENC_SUCCESS && caps_val > 0) {
+        enc_cfg.rcParams.enableTemporalAQ = 1;
+    } else {
+        enc_cfg.rcParams.enableTemporalAQ = 0;
+    }
 
     if (engine->is_hevc) {
         enc_cfg.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
@@ -222,8 +230,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     nvres = engine->fn.nvEncInitializeEncoder(engine->encoder, &init_params);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncInitializeEncoder failed: %d\n", nvres);
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
 
     // 6. Allocate fallback CUDA VRAM input buffer (ARGB32)
@@ -231,8 +238,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     cures = engine->cuMemAlloc(&engine->cu_dptr, engine->frame_bytes);
     if (cures != CUDA_SUCCESS) {
         fprintf(stderr, "[nvenc] cuMemAlloc failed: %d\n", cures);
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
 
     // Register fallback resource with NVENC initially
@@ -248,8 +254,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     nvres = engine->fn.nvEncRegisterResource(engine->encoder, &engine->reg_res);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncRegisterResource failed: %d\n", nvres);
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
 
     // 7. Create bitstream output buffer
@@ -259,20 +264,27 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     nvres = engine->fn.nvEncCreateBitstreamBuffer(engine->encoder, &bs_buf);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncCreateBitstreamBuffer failed: %d\n", nvres);
-        nvenc_destroy(engine);
-        return NULL;
+        goto fail_after_ctx;
     }
     engine->bitstream_buf = bs_buf.bitstreamBuffer;
 
     engine->output_staging_cap = 2 * 1024 * 1024;
     engine->output_staging = (uint8_t*)malloc(engine->output_staging_cap);
 
-    CUcontext dummy = NULL;
-    if (engine->cuCtxPopCurrent && engine->cu_ctx) {
+    if (ctx_pushed && engine->cuCtxPopCurrent) {
+        CUcontext dummy = NULL;
         engine->cuCtxPopCurrent(&dummy);
     }
 
     return engine;
+
+fail_after_ctx:
+    if (ctx_pushed && engine->cuCtxPopCurrent) {
+        CUcontext dummy = NULL;
+        engine->cuCtxPopCurrent(&dummy);
+    }
+    nvenc_destroy(engine);
+    return NULL;
 }
 
 int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size) {
@@ -444,8 +456,6 @@ int nvenc_encode_frame(
         return -4;
     }
 
-    engine->fn.nvEncUnmapInputResource(engine->encoder, map_res.mappedResource);
-
     // 4. Lock bitstream
     NV_ENC_LOCK_BITSTREAM lock_bs;
     memset(&lock_bs, 0, sizeof(lock_bs));
@@ -456,6 +466,7 @@ int nvenc_encode_frame(
     nvres = engine->fn.nvEncLockBitstream(engine->encoder, &lock_bs);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncLockBitstream failed: %d\n", nvres);
+        engine->fn.nvEncUnmapInputResource(engine->encoder, map_res.mappedResource);
         if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
         return -5;
     }
@@ -476,6 +487,8 @@ int nvenc_encode_frame(
     }
 
     engine->fn.nvEncUnlockBitstream(engine->encoder, engine->bitstream_buf);
+    // Unmap input resource only after the bitstream lock/output is completed per SDK requirements
+    engine->fn.nvEncUnmapInputResource(engine->encoder, map_res.mappedResource);
     if (engine->cuCtxPopCurrent && engine->cu_ctx) {
         engine->cuCtxPopCurrent(&old_ctx);
     }

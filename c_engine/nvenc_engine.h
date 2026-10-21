@@ -18,6 +18,7 @@ typedef struct {
     uint32_t cq;
     int64_t target_bps;
     int64_t max_bps;
+    int64_t buffer_bits;
     int is_hevc; // 1 = H.265, 0 = H.264
 } NvencConfig;
 

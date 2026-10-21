@@ -24,6 +24,7 @@ struct NvencConfigFFI {
     cq: u32,
     target_bps: i64,
     max_bps: i64,
+    buffer_bits: i64,
     is_hevc: libc::c_int,
 }
 
@@ -83,7 +84,7 @@ pub fn damage_enabled() -> bool {
 }
 
 pub fn selected(encoder: crate::video::Encoder) -> bool {
-    encoder == crate::video::Encoder::Nvenc && !disabled() && crate::config::ffmpeg_root().is_none()
+    encoder == crate::video::Encoder::Nvenc && damage_enabled() && !disabled() && crate::config::ffmpeg_root().is_none()
 }
 
 pub struct EncodedUnit {
@@ -144,6 +145,7 @@ pub fn run(
         cq: config.cq,
         target_bps: config.target_bps,
         max_bps: config.max_bps,
+        buffer_bits: config.buffer_bits,
         is_hevc,
     };
 
