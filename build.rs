@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=c_engine/wayland_transform.h");
     println!("cargo:rerun-if-changed=c_engine/portal_clipboard.inc");
     println!("cargo:rerun-if-changed=c_engine/x11_engine.c");
     println!("cargo:rerun-if-changed=c_engine/clipboard.c");

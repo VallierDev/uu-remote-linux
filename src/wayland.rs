@@ -12,7 +12,7 @@ crate::engine_ffi! { crate::engine_plugin::Engine::Wayland;
     fn uu_wl_type_utf8(text: *const libc::c_char) -> i32;
     fn uu_wl_text_ready() -> i32;
 }
-/// How many characters one keymap upload can carry; 0 means this keymap has no spare keycode.
+/// How many characters one text-only keymap upload can carry.
 pub fn text_ready()->i32 {
     #[cfg(all(target_os="linux",feature="wayland"))]
     { return unsafe { uu_wl_text_ready() }; }
@@ -20,7 +20,7 @@ pub fn text_ready()->i32 {
     -1
 }
 /// Mobile input-method text (#13/#46). Returns the number of characters typed, or a negative code
-/// when this keymap has no spare keycode to carry them. Never logs the text.
+/// when no usable text keycode is available. Never logs the text.
 pub fn type_utf8(text:&str)->i32 {
     #[cfg(all(target_os="linux",feature="wayland"))]
     {
@@ -179,7 +179,7 @@ pub fn input_probe()->Result<(),String> {
 pub fn text_probe()->Result<(),String> {
     init()?;
     let ready=text_ready();
-    if ready<=0 { return Err("this keymap has no spare keycode: mobile text input cannot be carried".into()); }
+    if ready<=0 { return Err("this keymap has no usable text keycode".into()); }
     const SAMPLE:&str="uu remote abc 你好世界";
     let (sample,builtin)=match std::env::var("UU_PROBE_TEXT") {
         Ok(value)=>(value,false), Err(_)=>(SAMPLE.to_owned(),true),
@@ -199,6 +199,7 @@ pub fn text_probe()->Result<(),String> {
         typed+=one;
     }
     if typed<0 { return Err(format!("Wayland text typing failed ({typed})")); }
+    std::thread::sleep(std::time::Duration::from_millis(100));
     println!("Typed {typed} of {} characters in {} calls; check that they match.",
         sequence.chars().filter(|character|*character!='|').count(),sequence.split('|').count());
     Ok(())
@@ -226,13 +227,30 @@ pub fn outputs() -> &'static [Output] {
         if !cfg!(all(target_os="linux",feature="wayland"))
             || std::env::var("UU_WAYLAND_MULTISCREEN").ok().as_deref()!=Some("1")
             || crate::desktop_backend::detect().ok()!=Some(crate::desktop_backend::DesktopBackend::Wayland) {return Vec::new();}
-        let output=std::process::Command::new("hyprctl").args(["monitors","-j"]).output();
-        let result=output.map_err(|_|"hyprctl unavailable").and_then(|output| {
-            if !output.status.success() {return Err("hyprctl failed");}
-            parse_outputs(&output.stdout,&std::env::var("UU_WAYLAND_OUTPUT").unwrap_or_default())
+        let niri=std::env::var_os("NIRI_SOCKET").is_some();
+        let output=if niri {std::process::Command::new("niri").args(["msg","--json","outputs"]).output()}
+            else {std::process::Command::new("hyprctl").args(["monitors","-j"]).output()};
+        let result=output.map_err(|_|"monitor command unavailable").and_then(|output| {
+            if !output.status.success() {return Err("monitor command failed");}
+            let preferred=std::env::var("UU_WAYLAND_OUTPUT").unwrap_or_default();
+            if niri {parse_niri_outputs(&output.stdout,&preferred)} else {parse_outputs(&output.stdout,&preferred)}
         });
         match result {Ok(outputs)=>outputs,Err(reason)=>{log::warn!("Wayland multi-screen disabled: {}",reason);Vec::new()}}
     })
+}
+fn parse_niri_outputs(json:&[u8],preferred:&str)->Result<Vec<Output>,&'static str> {
+    let inventory=serde_json::from_slice::<serde_json::Map<String,serde_json::Value>>(json).map_err(|_|"Invalid niri inventory")?;
+    let monitors:Vec<_>=inventory.values().filter_map(|m| {
+        let logical=m["logical"].as_object()?;
+        let mode=m["modes"].as_array()?.get(usize::try_from(m["current_mode"].as_u64()?).ok()?)?;
+        let transform=logical.get("transform")?.as_str()?;
+        if !matches!(transform,"Normal"|"90"|"180"|"270") {return None;}
+        let (w,h)=(mode["width"].as_u64()?,mode["height"].as_u64()?);
+        let (w,h)=if matches!(transform,"90"|"270") {(h,w)} else {(w,h)};
+        Some(serde_json::json!({"name":m["name"],"width":w,"height":h,"transform":0,
+            "refreshRate":mode["refresh_rate"].as_f64()?/1000.0}))
+    }).collect();
+    parse_outputs(&serde_json::to_vec(&monitors).map_err(|_|"Invalid niri inventory")?,preferred)
 }
 fn parse_outputs(json:&[u8],preferred:&str)->Result<Vec<Output>,&'static str> {
     let monitors=serde_json::from_slice::<Vec<serde_json::Value>>(json).map_err(|_|"Invalid monitor inventory")?;
@@ -333,6 +351,28 @@ mod selection_regressions {
         s.sent(0,old);assert!(!s.ready());
         s.sent(1,current);assert!(!s.ready());
         s.sent(0,current);assert!(s.ready());
+    }
+    #[test]
+    #[ignore = "requires an unlocked Wayland session and UU_WAYLAND_MULTISCREEN=1"]
+    fn live_monitor_switch_captures_each_output() {
+        assert!(outputs().len()>1);
+        init().unwrap();
+        for (id,output) in outputs().iter().enumerate() {
+            select(id).unwrap();
+            let mut frame=vec![0;(output.width as usize)*(output.height as usize)*4];
+            capture(&mut frame).unwrap();
+            assert_eq!(selected(),id);
+        }
+        select(0).unwrap();
+    }
+    #[test]
+    fn niri_inventory_uses_active_mode_and_rotated_pixel_size() {
+        let json=br#"{"one":{"name":"DP-1","modes":[{"width":2240,"height":1400,"refresh_rate":60000}],"current_mode":0,"logical":{"transform":"90"}},
+          "off":{"name":"off","modes":[],"current_mode":null,"logical":null}}"#;
+        let outputs=parse_niri_outputs(json,"").unwrap();
+        assert_eq!((outputs.len(),outputs[0].width,outputs[0].height,outputs[0].fps),(1,1400,2240,60));
+        assert!(parse_niri_outputs(json,"off").is_err());
+        assert!(parse_niri_outputs(b"[]","").is_err());
     }
     #[test]
     fn mixed_scale_inventory_preserves_pixel_sizes_and_preferred_output() {
