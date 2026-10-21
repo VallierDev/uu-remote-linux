@@ -117,7 +117,7 @@ Switching reuses one video track and pauses input until the new source sends a f
 | Feature | Status |
 |---|---|
 | Switching between multiple monitors | Experimental on native Hyprland Wayland; see above |
-| True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; VAAPI stays 4:2:0; `inproc-av` native NVENC currently encodes YUV420 and reports that to the client |
+| True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; VAAPI and `inproc-av` stay 4:2:0 and report that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
 | Privacy screen on the host | Not implemented |
@@ -188,7 +188,7 @@ cargo build --release --features wayland,portal   # + GNOME/KDE on Wayland
 ```
 
 The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config --modversion libavcodec` = 60.x); FFmpeg 7+ fails inside `ffmpeg-sys-next` with `avfft.h file not found` (#63).
-On the host side, `--features inproc-av` has been rewritten as a **native NVENC in-process encoder** (leveraging CUDA zero-copy pinned memory), **requiring no FFmpeg development headers/libraries** at compile time and dynamically loading NVIDIA driver libraries (`libcuda.so.1` and `libnvidia-encode.so.1`) at runtime. Non-NVENC encoders (e.g. VAAPI) or capture modes without damage automatically fall back to the external process pipeline. Default builds and release packages require neither feature.
+The host's optional `--features inproc-av` encodes with NVENC inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime and needs a driver with NVENC API 12.1 (530 or newer). When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy. CPU and VAAPI encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process NVENC session fails it falls back to FFmpeg's NVENC process pipeline, then to the CPU. The default build and the release packages need neither feature.
 
 ### 3. Log in
 
@@ -430,7 +430,7 @@ The FFmpeg process uploads NV12 frames to a VAAPI frame pool.
 VBR uses the viewer bitrate preset and CQ-derived minimum QP, no B-frames, async depth 1,
 AUD and the existing GOP/VFR timing. Unsupported device/driver/initialization falls back to libx264
 with a warning. Accepted on Intel UHD 770 (iHD) with the default FFmpeg process pipeline and the official Mac
-viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). AMD hardware encoding has not been verified on hardware yet.
+viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). AMD is not hardware-verified.
 
 The default VAAPI VBV buffer (100-500 kbit) squeezes keyframes hard at high resolution: on a 2560x1440
 H.264 VAAPI stream capped at 30 Mbit/s the first IDR measured 59,910 bytes and the picture blurred at

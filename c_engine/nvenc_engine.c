@@ -6,6 +6,8 @@
 #include <ffnvcodec/dynlink_cuda.h>
 #include <ffnvcodec/nvEncodeAPI.h>
 
+// Struct revisions come from the vendored nvEncodeAPI.h (*_VER macros), so the session must be
+// opened with that header's NVENCAPI_VERSION; older drivers are rejected in nvenc_create.
 #define CU_MEMHOSTREGISTER_DEVICEMAP 0x02
 
 typedef CUresult CUDAAPI (*tcuMemHostRegister)(void *p, size_t bytesize, unsigned int Flags);
@@ -15,7 +17,6 @@ typedef NVENCSTATUS NVENCAPI (*tNvEncodeAPICreateInstance)(NV_ENCODE_API_FUNCTIO
 typedef NVENCSTATUS NVENCAPI (*tNvEncodeAPIGetMaxSupportedVersion)(uint32_t *version);
 
 struct NvencEngine {
-    uint32_t api_ver;
     void *cuda_lib;
     void *nvenc_lib;
 
@@ -23,7 +24,8 @@ struct NvencEngine {
     tcuDeviceGet *cuDeviceGet;
     tcuDevicePrimaryCtxRetain *cuDevicePrimaryCtxRetain;
     tcuDevicePrimaryCtxRelease *cuDevicePrimaryCtxRelease;
-    CUdevice dev;
+    tcuCtxCreate_v2 *cuCtxCreate;
+    tcuCtxDestroy_v2 *cuCtxDestroy;
     tcuCtxPushCurrent_v2 *cuCtxPushCurrent;
     tcuCtxPopCurrent_v2 *cuCtxPopCurrent;
     tcuMemAlloc_v2 *cuMemAlloc;
@@ -33,14 +35,14 @@ struct NvencEngine {
     tcuMemHostGetDevicePointer cuMemHostGetDevicePointer;
     tcuMemHostUnregister cuMemHostUnregister;
 
+    CUdevice dev;
     CUcontext cu_ctx;
+    int is_standalone_ctx; // cuCtxCreate fallback (primary context unavailable, seen on GB10)
     CUdeviceptr cu_dptr;
     size_t frame_bytes;
 
-    // Zero-Copy Host Pinned Memory registration
+    // Pinned XShm buffer registered for direct DMA reads
     void *registered_host_ptr;
-    size_t registered_host_size;
-    CUdeviceptr registered_dev_ptr;
     int is_zero_copy;
 
     NV_ENCODE_API_FUNCTION_LIST fn;
@@ -57,6 +59,18 @@ struct NvencEngine {
     size_t output_staging_cap;
 };
 
+// Returns 1 when the context was pushed; pop only in that case.
+static int ctx_push(NvencEngine *engine) {
+    return engine->cuCtxPushCurrent && engine->cu_ctx && engine->cuCtxPushCurrent(engine->cu_ctx) == CUDA_SUCCESS;
+}
+
+static void ctx_pop(NvencEngine *engine, int pushed) {
+    if (pushed && engine->cuCtxPopCurrent) {
+        CUcontext dummy = NULL;
+        engine->cuCtxPopCurrent(&dummy);
+    }
+}
+
 NvencEngine* nvenc_create(const NvencConfig* config) {
     if (!config || config->width == 0 || config->height == 0) {
         return NULL;
@@ -72,7 +86,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     // 1. Load CUDA driver
     engine->cuda_lib = dlopen("libcuda.so.1", RTLD_NOW);
     if (!engine->cuda_lib) {
-        fprintf(stderr, "[nvenc] dlopen libcuda.so.1 failed: %s\n", dlerror());
+        fprintf(stderr, "[nvenc] dlopen libcuda.so.1 failed\n");
         free(engine);
         return NULL;
     }
@@ -80,7 +94,11 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     engine->cuInit = (tcuInit*)dlsym(engine->cuda_lib, "cuInit");
     engine->cuDeviceGet = (tcuDeviceGet*)dlsym(engine->cuda_lib, "cuDeviceGet");
     engine->cuDevicePrimaryCtxRetain = (tcuDevicePrimaryCtxRetain*)dlsym(engine->cuda_lib, "cuDevicePrimaryCtxRetain");
-    engine->cuDevicePrimaryCtxRelease = (tcuDevicePrimaryCtxRelease*)dlsym(engine->cuda_lib, "cuDevicePrimaryCtxRelease");
+    engine->cuDevicePrimaryCtxRelease = (tcuDevicePrimaryCtxRelease*)dlsym(engine->cuda_lib, "cuDevicePrimaryCtxRelease_v2");
+    if (!engine->cuDevicePrimaryCtxRelease)
+        engine->cuDevicePrimaryCtxRelease = (tcuDevicePrimaryCtxRelease*)dlsym(engine->cuda_lib, "cuDevicePrimaryCtxRelease");
+    engine->cuCtxCreate = (tcuCtxCreate_v2*)dlsym(engine->cuda_lib, "cuCtxCreate_v2");
+    engine->cuCtxDestroy = (tcuCtxDestroy_v2*)dlsym(engine->cuda_lib, "cuCtxDestroy_v2");
     engine->cuCtxPushCurrent = (tcuCtxPushCurrent_v2*)dlsym(engine->cuda_lib, "cuCtxPushCurrent_v2");
     engine->cuCtxPopCurrent = (tcuCtxPopCurrent_v2*)dlsym(engine->cuda_lib, "cuCtxPopCurrent_v2");
     engine->cuMemAlloc = (tcuMemAlloc_v2*)dlsym(engine->cuda_lib, "cuMemAlloc_v2");
@@ -91,7 +109,8 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     engine->cuMemHostUnregister = (tcuMemHostUnregister)dlsym(engine->cuda_lib, "cuMemHostUnregister");
 
     if (!engine->cuInit || !engine->cuDeviceGet || !engine->cuDevicePrimaryCtxRetain ||
-        !engine->cuDevicePrimaryCtxRelease || !engine->cuMemAlloc || !engine->cuMemFree || !engine->cuMemcpyHtoD) {
+        !engine->cuDevicePrimaryCtxRelease || !engine->cuCtxPushCurrent || !engine->cuCtxPopCurrent ||
+        !engine->cuMemAlloc || !engine->cuMemFree || !engine->cuMemcpyHtoD) {
         fprintf(stderr, "[nvenc] Missing CUDA driver symbols\n");
         nvenc_destroy(engine);
         return NULL;
@@ -112,85 +131,85 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     }
 
     cures = engine->cuDevicePrimaryCtxRetain(&engine->cu_ctx, engine->dev);
+    if ((cures != CUDA_SUCCESS || !engine->cu_ctx) && engine->cuCtxCreate && engine->cuCtxDestroy) {
+        engine->cu_ctx = NULL;
+        // cuCtxCreate makes the new context current; the push below makes it current again
+        cures = engine->cuCtxCreate(&engine->cu_ctx, 0, engine->dev);
+        if (cures == CUDA_SUCCESS && engine->cu_ctx) {
+            CUcontext dummy = NULL;
+            engine->cuCtxPopCurrent(&dummy);
+            engine->is_standalone_ctx = 1;
+        }
+    }
     if (cures != CUDA_SUCCESS || !engine->cu_ctx) {
-        fprintf(stderr, "[nvenc] cuDevicePrimaryCtxRetain failed: %d\n", cures);
+        fprintf(stderr, "[nvenc] CUDA context creation failed: %d\n", cures);
+        engine->cu_ctx = NULL;
         nvenc_destroy(engine);
         return NULL;
     }
-    int ctx_pushed = 0;
-    if (engine->cuCtxPushCurrent) {
-        if (engine->cuCtxPushCurrent(engine->cu_ctx) == CUDA_SUCCESS) {
-            ctx_pushed = 1;
-        }
+    int pushed = ctx_push(engine);
+    if (!pushed) {
+        fprintf(stderr, "[nvenc] cuCtxPushCurrent failed\n");
+        nvenc_destroy(engine);
+        return NULL;
     }
 
     // 2. Load NVENC
     engine->nvenc_lib = dlopen("libnvidia-encode.so.1", RTLD_NOW);
     if (!engine->nvenc_lib) {
-        fprintf(stderr, "[nvenc] dlopen libnvidia-encode.so.1 failed: %s\n", dlerror());
-        goto fail_after_ctx;
+        fprintf(stderr, "[nvenc] dlopen libnvidia-encode.so.1 failed\n");
+        goto fail;
     }
 
-    uint32_t driver_major = NVENCAPI_MAJOR_VERSION;
-    uint32_t driver_minor = NVENCAPI_MINOR_VERSION;
-
+    // Like FFmpeg: the driver must support the header's API version, otherwise fall back.
     tNvEncodeAPIGetMaxSupportedVersion get_max_ver = (tNvEncodeAPIGetMaxSupportedVersion)dlsym(
-        engine->nvenc_lib, "NvEncodeAPIGetMaxSupportedVersion"
-    );
-    if (get_max_ver) {
-        uint32_t max_supported_ver = 0;
-        NVENCSTATUS vres = get_max_ver(&max_supported_ver);
-        if (vres == NV_ENC_SUCCESS && (max_supported_ver >> 4) >= 11) {
-            driver_major = max_supported_ver >> 4;
-            driver_minor = max_supported_ver & 0xf;
-            if (driver_major > NVENCAPI_MAJOR_VERSION || 
-               (driver_major == NVENCAPI_MAJOR_VERSION && driver_minor > NVENCAPI_MINOR_VERSION)) {
-                driver_major = NVENCAPI_MAJOR_VERSION;
-                driver_minor = NVENCAPI_MINOR_VERSION;
-            }
-        } else {
-            fprintf(stderr, "[nvenc] Driver supported NVENC API version is invalid or < 11\n");
-            goto fail_after_ctx;
-        }
+        engine->nvenc_lib, "NvEncodeAPIGetMaxSupportedVersion");
+    uint32_t max_supported_ver = 0;
+    if (!get_max_ver || get_max_ver(&max_supported_ver) != NV_ENC_SUCCESS) {
+        fprintf(stderr, "[nvenc] NvEncodeAPIGetMaxSupportedVersion failed\n");
+        goto fail;
     }
-
-    uint32_t current_api_ver = driver_major | (driver_minor << 24);
-    #define DYN_STRUCT_VER(v, api) ((uint32_t)(api) | ((v) << 16) | (0x7 << 28))
+    if (max_supported_ver < ((NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION)) {
+        fprintf(stderr, "[nvenc] Driver NVENC API %u.%u is older than required %d.%d; update the NVIDIA driver\n",
+                max_supported_ver >> 4, max_supported_ver & 0xf, NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
+        goto fail;
+    }
 
     tNvEncodeAPICreateInstance create_inst = (tNvEncodeAPICreateInstance)dlsym(engine->nvenc_lib, "NvEncodeAPICreateInstance");
     if (!create_inst) {
         fprintf(stderr, "[nvenc] dlsym NvEncodeAPICreateInstance failed\n");
-        goto fail_after_ctx;
+        goto fail;
     }
 
     memset(&engine->fn, 0, sizeof(engine->fn));
-    engine->fn.version = DYN_STRUCT_VER(2, current_api_ver);
+    engine->fn.version = NV_ENCODE_API_FUNCTION_LIST_VER;
     NVENCSTATUS nvres = create_inst(&engine->fn);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] NvEncodeAPICreateInstance failed: %d\n", nvres);
-        goto fail_after_ctx;
+        goto fail;
     }
 
     // 3. Open Encode Session
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS open_params;
     memset(&open_params, 0, sizeof(open_params));
-    open_params.version = DYN_STRUCT_VER(1, current_api_ver);
+    open_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
     open_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
     open_params.device = engine->cu_ctx;
-    open_params.apiVersion = current_api_ver;
+    open_params.apiVersion = NVENCAPI_VERSION;
 
     nvres = engine->fn.nvEncOpenEncodeSessionEx(&open_params, &engine->encoder);
     if (nvres != NV_ENC_SUCCESS || !engine->encoder) {
         fprintf(stderr, "[nvenc] nvEncOpenEncodeSessionEx failed: %d\n", nvres);
-        goto fail_after_ctx;
+        engine->encoder = NULL;
+        goto fail;
     }
 
     // 4. Query Preset Config
     GUID codec_guid = engine->is_hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
     NV_ENC_PRESET_CONFIG preset_cfg;
     memset(&preset_cfg, 0, sizeof(preset_cfg));
-    preset_cfg.version = DYN_STRUCT_VER(5, current_api_ver) | (1u << 31);
-    preset_cfg.presetCfg.version = DYN_STRUCT_VER(9, current_api_ver) | (1u << 31);
+    preset_cfg.version = NV_ENC_PRESET_CONFIG_VER;
+    preset_cfg.presetCfg.version = NV_ENC_CONFIG_VER;
 
     nvres = engine->fn.nvEncGetEncodePresetConfigEx(
         engine->encoder,
@@ -201,7 +220,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     );
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncGetEncodePresetConfigEx failed: %d\n", nvres);
-        goto fail_after_ctx;
+        goto fail;
     }
 
     NV_ENC_CONFIG enc_cfg;
@@ -215,17 +234,14 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     enc_cfg.rcParams.vbvBufferSize = (uint32_t)(config->buffer_bits > 0 ? config->buffer_bits : (config->max_bps > 0 ? config->max_bps / 10 : 1500000));
     enc_cfg.rcParams.targetQuality = (uint8_t)(config->cq > 0 ? config->cq : 28);
     enc_cfg.rcParams.enableAQ = 1;
-    // Check if hardware/codec supports Temporal AQ
+    // Temporal AQ only where the hardware/codec reports it
     NV_ENC_CAPS_PARAM caps_param;
     memset(&caps_param, 0, sizeof(caps_param));
-    caps_param.version = DYN_STRUCT_VER(1, current_api_ver);
+    caps_param.version = NV_ENC_CAPS_PARAM_VER;
     caps_param.capsToQuery = NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ;
     int caps_val = 0;
-    if (engine->fn.nvEncGetEncodeCaps(engine->encoder, codec_guid, &caps_param, &caps_val) == NV_ENC_SUCCESS && caps_val > 0) {
-        enc_cfg.rcParams.enableTemporalAQ = 1;
-    } else {
-        enc_cfg.rcParams.enableTemporalAQ = 0;
-    }
+    enc_cfg.rcParams.enableTemporalAQ =
+        engine->fn.nvEncGetEncodeCaps(engine->encoder, codec_guid, &caps_param, &caps_val) == NV_ENC_SUCCESS && caps_val > 0;
 
     if (engine->is_hevc) {
         enc_cfg.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
@@ -242,7 +258,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     // 5. Initialize Encoder
     NV_ENC_INITIALIZE_PARAMS init_params;
     memset(&init_params, 0, sizeof(init_params));
-    init_params.version = DYN_STRUCT_VER(7, current_api_ver) | (1u << 31);
+    init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
     init_params.encodeGUID = codec_guid;
     init_params.presetGUID = NV_ENC_PRESET_P4_GUID;
     init_params.encodeWidth = engine->width;
@@ -258,20 +274,20 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     nvres = engine->fn.nvEncInitializeEncoder(engine->encoder, &init_params);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncInitializeEncoder failed: %d\n", nvres);
-        goto fail_after_ctx;
+        goto fail;
     }
 
-    // 6. Allocate fallback CUDA VRAM input buffer (ARGB32)
+    // 6. Device input buffer (ARGB32), used until a host buffer is registered
     engine->frame_bytes = (size_t)engine->width * engine->height * 4;
     cures = engine->cuMemAlloc(&engine->cu_dptr, engine->frame_bytes);
     if (cures != CUDA_SUCCESS) {
         fprintf(stderr, "[nvenc] cuMemAlloc failed: %d\n", cures);
-        goto fail_after_ctx;
+        engine->cu_dptr = 0;
+        goto fail;
     }
 
-    // Register fallback resource with NVENC initially
     memset(&engine->reg_res, 0, sizeof(engine->reg_res));
-    engine->reg_res.version = DYN_STRUCT_VER(4, current_api_ver);
+    engine->reg_res.version = NV_ENC_REGISTER_RESOURCE_VER;
     engine->reg_res.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
     engine->reg_res.width = engine->width;
     engine->reg_res.height = engine->height;
@@ -282,36 +298,34 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     nvres = engine->fn.nvEncRegisterResource(engine->encoder, &engine->reg_res);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncRegisterResource failed: %d\n", nvres);
-        goto fail_after_ctx;
+        engine->reg_res.registeredResource = NULL;
+        goto fail;
     }
 
     // 7. Create bitstream output buffer
     NV_ENC_CREATE_BITSTREAM_BUFFER bs_buf;
     memset(&bs_buf, 0, sizeof(bs_buf));
-    bs_buf.version = DYN_STRUCT_VER(1, current_api_ver);
+    bs_buf.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
     nvres = engine->fn.nvEncCreateBitstreamBuffer(engine->encoder, &bs_buf);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncCreateBitstreamBuffer failed: %d\n", nvres);
-        goto fail_after_ctx;
+        goto fail;
     }
     engine->bitstream_buf = bs_buf.bitstreamBuffer;
 
     engine->output_staging_cap = 2 * 1024 * 1024;
     engine->output_staging = (uint8_t*)malloc(engine->output_staging_cap);
-    engine->api_ver = current_api_ver;
-
-    if (ctx_pushed && engine->cuCtxPopCurrent) {
-        CUcontext dummy = NULL;
-        engine->cuCtxPopCurrent(&dummy);
+    if (!engine->output_staging) {
+        fprintf(stderr, "[nvenc] output buffer allocation failed\n");
+        goto fail;
     }
 
+    ctx_pop(engine, pushed);
     return engine;
 
-fail_after_ctx:
-    if (ctx_pushed && engine->cuCtxPopCurrent) {
-        CUcontext dummy = NULL;
-        engine->cuCtxPopCurrent(&dummy);
-    }
+fail:
+    // Pop the creation push first; nvenc_destroy pushes and pops on its own.
+    ctx_pop(engine, pushed);
     nvenc_destroy(engine);
     return NULL;
 }
@@ -320,14 +334,12 @@ int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size)
     if (!engine || !host_ptr || size < engine->frame_bytes) {
         return -1;
     }
-    if (!engine->cuMemHostRegister || !engine->cuMemHostGetDevicePointer) {
+    if (!engine->cuMemHostRegister || !engine->cuMemHostGetDevicePointer || !engine->cuMemHostUnregister) {
         return -2;
     }
 
-    CUcontext old_ctx = NULL;
-    if (engine->cuCtxPushCurrent && engine->cu_ctx) {
-        engine->cuCtxPushCurrent(engine->cu_ctx);
-    }
+    int pushed = ctx_push(engine);
+    if (!pushed) return -2;
 
     // If already registered, unregister first
     nvenc_unregister_host_buffer(engine);
@@ -335,7 +347,7 @@ int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size)
     CUresult cures = engine->cuMemHostRegister(host_ptr, size, CU_MEMHOSTREGISTER_DEVICEMAP);
     if (cures != CUDA_SUCCESS) {
         fprintf(stderr, "[nvenc] cuMemHostRegister failed: %d\n", cures);
-        if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
+        ctx_pop(engine, pushed);
         return -3;
     }
 
@@ -343,15 +355,15 @@ int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size)
     cures = engine->cuMemHostGetDevicePointer(&dev_ptr, host_ptr, 0);
     if (cures != CUDA_SUCCESS || dev_ptr == 0) {
         fprintf(stderr, "[nvenc] cuMemHostGetDevicePointer failed: %d\n", cures);
-        if (engine->cuMemHostUnregister) engine->cuMemHostUnregister(host_ptr);
-        if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
+        engine->cuMemHostUnregister(host_ptr);
+        ctx_pop(engine, pushed);
         return -4;
     }
 
-    // Register host pinned device pointer with NVENC before releasing fallback buffer
+    // Register the pinned buffer before releasing the device buffer, so a failure keeps the copy path working
     NV_ENC_REGISTER_RESOURCE new_reg;
     memset(&new_reg, 0, sizeof(new_reg));
-    new_reg.version = DYN_STRUCT_VER(4, engine->api_ver);
+    new_reg.version = NV_ENC_REGISTER_RESOURCE_VER;
     new_reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
     new_reg.width = engine->width;
     new_reg.height = engine->height;
@@ -362,33 +374,27 @@ int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size)
     NVENCSTATUS nvres = engine->fn.nvEncRegisterResource(engine->encoder, &new_reg);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncRegisterResource (pinned host) failed: %d\n", nvres);
-        if (engine->cuMemHostUnregister) engine->cuMemHostUnregister(host_ptr);
-        if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
+        engine->cuMemHostUnregister(host_ptr);
+        ctx_pop(engine, pushed);
         return -5;
     }
 
-    // Now that new host resource is successfully registered, unregister old fallback VRAM resource
-    if (engine->reg_res.registeredResource && engine->encoder) {
+    if (engine->reg_res.registeredResource) {
         engine->fn.nvEncUnregisterResource(engine->encoder, engine->reg_res.registeredResource);
     }
-    if (engine->cu_dptr && engine->cuMemFree) {
+    if (engine->cu_dptr) {
         engine->cuMemFree(engine->cu_dptr);
         engine->cu_dptr = 0;
     }
     engine->reg_res = new_reg;
-
     engine->registered_host_ptr = host_ptr;
-    engine->registered_host_size = size;
-    engine->registered_dev_ptr = dev_ptr;
     engine->is_zero_copy = 1;
 
-    // Zero-Copy enabled successfully (address omitted per logging policy)
-    if (engine->cuCtxPopCurrent && engine->cu_ctx) {
-        engine->cuCtxPopCurrent(&old_ctx);
-    }
+    ctx_pop(engine, pushed);
     return 0;
 }
 
+// Caller has the context current.
 void nvenc_unregister_host_buffer(NvencEngine* engine) {
     if (!engine || !engine->is_zero_copy) return;
 
@@ -396,13 +402,10 @@ void nvenc_unregister_host_buffer(NvencEngine* engine) {
         engine->fn.nvEncUnregisterResource(engine->encoder, engine->reg_res.registeredResource);
         memset(&engine->reg_res, 0, sizeof(engine->reg_res));
     }
-
     if (engine->registered_host_ptr && engine->cuMemHostUnregister) {
         engine->cuMemHostUnregister(engine->registered_host_ptr);
         engine->registered_host_ptr = NULL;
     }
-
-    engine->registered_dev_ptr = 0;
     engine->is_zero_copy = 0;
 }
 
@@ -414,58 +417,54 @@ int nvenc_encode_frame(
     const uint8_t** out_data,
     uint32_t* out_len
 ) {
-    if (!engine || !out_data || !out_len) {
+    if (!engine || !out_data || !out_len || !engine->reg_res.registeredResource) {
         return -1;
     }
+    *out_data = NULL;
+    *out_len = 0;
 
-    CUcontext old_ctx = NULL;
-    if (engine->cuCtxPushCurrent && engine->cu_ctx) {
-        engine->cuCtxPushCurrent(engine->cu_ctx);
-    }
+    int pushed = ctx_push(engine);
+    if (!pushed) return -1;
 
-    // If NOT Zero-Copy, copy from host RAM to VRAM
+    // Without a registered host buffer, copy the frame into the device buffer
     if (!engine->is_zero_copy) {
         if (!input_argb) {
-            if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
+            ctx_pop(engine, pushed);
             return -1;
         }
-        CUresult cures;
+        CUresult cures = CUDA_SUCCESS;
         if (pitch == engine->width * 4) {
             cures = engine->cuMemcpyHtoD(engine->cu_dptr, input_argb, engine->frame_bytes);
         } else {
-            for (uint32_t y = 0; y < engine->height; y++) {
+            for (uint32_t y = 0; y < engine->height && cures == CUDA_SUCCESS; y++) {
                 cures = engine->cuMemcpyHtoD(
                     engine->cu_dptr + (size_t)y * engine->width * 4,
                     input_argb + (size_t)y * pitch,
                     engine->width * 4
                 );
-                if (cures != CUDA_SUCCESS) break;
             }
         }
         if (cures != CUDA_SUCCESS) {
             fprintf(stderr, "[nvenc] cuMemcpyHtoD failed: %d\n", cures);
-            if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
+            ctx_pop(engine, pushed);
             return -2;
         }
     }
-    // When is_zero_copy == 1, GPU DMA engine reads directly from XShm buffer, ZERO CPU MEMCPY!
 
-    // 2. Map resource
     NV_ENC_MAP_INPUT_RESOURCE map_res;
     memset(&map_res, 0, sizeof(map_res));
-    map_res.version = DYN_STRUCT_VER(1, engine->api_ver);
+    map_res.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
     map_res.registeredResource = engine->reg_res.registeredResource;
     NVENCSTATUS nvres = engine->fn.nvEncMapInputResource(engine->encoder, &map_res);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncMapInputResource failed: %d\n", nvres);
-        if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
+        ctx_pop(engine, pushed);
         return -3;
     }
 
-    // 3. Submit encode picture
     NV_ENC_PIC_PARAMS pic_params;
     memset(&pic_params, 0, sizeof(pic_params));
-    pic_params.version = DYN_STRUCT_VER(6, engine->api_ver) | (1u << 31);
+    pic_params.version = NV_ENC_PIC_PARAMS_VER;
     pic_params.inputWidth = engine->width;
     pic_params.inputHeight = engine->height;
     pic_params.inputPitch = engine->width * 4;
@@ -481,14 +480,13 @@ int nvenc_encode_frame(
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncEncodePicture failed: %d\n", nvres);
         engine->fn.nvEncUnmapInputResource(engine->encoder, map_res.mappedResource);
-        if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
+        ctx_pop(engine, pushed);
         return -4;
     }
 
-    // 4. Lock bitstream
     NV_ENC_LOCK_BITSTREAM lock_bs;
     memset(&lock_bs, 0, sizeof(lock_bs));
-    lock_bs.version = DYN_STRUCT_VER(2, engine->api_ver) | (1u << 31);
+    lock_bs.version = NV_ENC_LOCK_BITSTREAM_VER;
     lock_bs.outputBitstream = engine->bitstream_buf;
     lock_bs.doNotWait = 0;
 
@@ -496,87 +494,72 @@ int nvenc_encode_frame(
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncLockBitstream failed: %d\n", nvres);
         engine->fn.nvEncUnmapInputResource(engine->encoder, map_res.mappedResource);
-        if (engine->cuCtxPopCurrent && engine->cu_ctx) engine->cuCtxPopCurrent(&old_ctx);
+        ctx_pop(engine, pushed);
         return -5;
     }
 
+    int rc = 0;
     uint32_t size = lock_bs.bitstreamSizeInBytes;
     if (size > engine->output_staging_cap) {
-        engine->output_staging_cap = size + 64 * 1024;
-        engine->output_staging = (uint8_t*)realloc(engine->output_staging, engine->output_staging_cap);
+        size_t cap = (size_t)size + 64 * 1024;
+        uint8_t *grown = (uint8_t*)realloc(engine->output_staging, cap);
+        if (grown) {
+            engine->output_staging = grown;
+            engine->output_staging_cap = cap;
+        } else {
+            fprintf(stderr, "[nvenc] output buffer allocation failed: %u bytes\n", size);
+            rc = -6;
+        }
     }
-
-    if (size > 0 && lock_bs.bitstreamBufferPtr && engine->output_staging) {
+    if (rc == 0 && size > 0 && lock_bs.bitstreamBufferPtr) {
         memcpy(engine->output_staging, lock_bs.bitstreamBufferPtr, size);
         *out_data = engine->output_staging;
         *out_len = size;
-    } else {
-        *out_data = NULL;
-        *out_len = 0;
     }
 
     engine->fn.nvEncUnlockBitstream(engine->encoder, engine->bitstream_buf);
-    // Unmap input resource only after the bitstream lock/output is completed per SDK requirements
+    // The SDK allows unmapping only after the bitstream lock returned for this picture
     engine->fn.nvEncUnmapInputResource(engine->encoder, map_res.mappedResource);
-    if (engine->cuCtxPopCurrent && engine->cu_ctx) {
-        engine->cuCtxPopCurrent(&old_ctx);
-    }
-    return 0;
+    ctx_pop(engine, pushed);
+    return rc;
 }
 
 void nvenc_destroy(NvencEngine* engine) {
     if (!engine) return;
 
-    CUcontext old_ctx = NULL;
-    if (engine->cuCtxPushCurrent && engine->cu_ctx) {
-        engine->cuCtxPushCurrent(engine->cu_ctx);
+    int pushed = ctx_push(engine);
+    // Without a current context the NVENC/CUDA objects cannot be released safely; leak them.
+    if (pushed) {
+        if (engine->bitstream_buf && engine->encoder) {
+            engine->fn.nvEncDestroyBitstreamBuffer(engine->encoder, engine->bitstream_buf);
+            engine->bitstream_buf = NULL;
+        }
+
+        nvenc_unregister_host_buffer(engine);
+
+        if (engine->reg_res.registeredResource && engine->encoder) {
+            engine->fn.nvEncUnregisterResource(engine->encoder, engine->reg_res.registeredResource);
+            memset(&engine->reg_res, 0, sizeof(engine->reg_res));
+        }
+        if (engine->cu_dptr) {
+            engine->cuMemFree(engine->cu_dptr);
+            engine->cu_dptr = 0;
+        }
+        if (engine->encoder) {
+            engine->fn.nvEncDestroyEncoder(engine->encoder);
+            engine->encoder = NULL;
+        }
+        ctx_pop(engine, pushed);
     }
 
-    if (engine->bitstream_buf && engine->encoder && engine->fn.nvEncDestroyBitstreamBuffer) {
-        engine->fn.nvEncDestroyBitstreamBuffer(engine->encoder, engine->bitstream_buf);
-        engine->bitstream_buf = NULL;
-    }
-
-    nvenc_unregister_host_buffer(engine);
-
-    if (engine->reg_res.registeredResource && engine->encoder && engine->fn.nvEncUnregisterResource) {
-        engine->fn.nvEncUnregisterResource(engine->encoder, engine->reg_res.registeredResource);
-        memset(&engine->reg_res, 0, sizeof(engine->reg_res));
-    }
-
-    if (engine->cu_dptr && engine->cuMemFree) {
-        engine->cuMemFree(engine->cu_dptr);
-        engine->cu_dptr = 0;
-    }
-
-    if (engine->encoder && engine->fn.nvEncDestroyEncoder) {
-        engine->fn.nvEncDestroyEncoder(engine->encoder);
-        engine->encoder = NULL;
-    }
-
-    if (engine->cuCtxPopCurrent && engine->cu_ctx) {
-        engine->cuCtxPopCurrent(&old_ctx);
-    }
-
-    if (engine->cu_ctx && engine->cuDevicePrimaryCtxRelease) {
-        engine->cuDevicePrimaryCtxRelease(engine->dev);
+    if (engine->cu_ctx) {
+        if (engine->is_standalone_ctx) engine->cuCtxDestroy(engine->cu_ctx);
+        else engine->cuDevicePrimaryCtxRelease(engine->dev);
         engine->cu_ctx = NULL;
     }
 
-    if (engine->output_staging) {
-        free(engine->output_staging);
-        engine->output_staging = NULL;
-    }
-
-    if (engine->nvenc_lib) {
-        dlclose(engine->nvenc_lib);
-        engine->nvenc_lib = NULL;
-    }
-
-    if (engine->cuda_lib) {
-        dlclose(engine->cuda_lib);
-        engine->cuda_lib = NULL;
-    }
-
+    free(engine->output_staging);
+    // libcuda/libnvidia-encode stay loaded: their driver threads outlive the session, and
+    // dlclose crashed them on the next encoder start (SEGV_MAPERR in libnvcuvid).
     free(engine);
 }

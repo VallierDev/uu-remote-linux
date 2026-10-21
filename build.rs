@@ -33,12 +33,6 @@ fn main() {
             x11_build.file("c_engine/nvenc_engine.c");
             x11_build.include("vendor/ffnvcodec");
         }
-        if let Ok(output) = std::process::Command::new("pkg-config").args(["--cflags", "ffnvcodec"]).output() {
-            if output.status.success() {
-                for flag in String::from_utf8_lossy(&output.stdout).split_whitespace() { x11_build.flag(flag); }
-            }
-        }
-        x11_build.flag_if_supported("-I/usr/include/ffnvcodec");
         x11_build.compile("x11_engine");
 
         println!("cargo:rustc-link-lib=X11");

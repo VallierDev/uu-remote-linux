@@ -1,7 +1,7 @@
 //! Standalone benchmark tool measuring:
 //! 1. Host Memory Copy Bandwidth & CPU Cost (What FFmpeg/Sway CPU swizzling does)
 //! 2. NVENC H.265 Hardware Throughput & Latency (1920x1200 @ ultra-low-latency)
-//! 3. Zero-Copy DMA Host Memory Integration
+//! 3. NVENC reading a registered (pinned) host buffer
 
 use std::time::Instant;
 
@@ -43,7 +43,7 @@ fn main() {
     println!("    -> CPU Core Saturation  : {:.1}% of 1 core consumed solely by memcpy at 60 FPS", cpu_load_60fps);
     println!();
 
-    // Benchmark 2: Native NVENC Zero-Copy Hardware Pipeline
+    // Benchmark 2: in-process NVENC reading a registered host buffer (device copy when registration fails)
     #[cfg(feature = "inproc-av")]
     {
         extern "C" {
@@ -64,6 +64,7 @@ fn main() {
             fn nvenc_destroy(engine: *mut std::ffi::c_void);
         }
 
+        // Must match NvencConfig in c_engine/nvenc_engine.h.
         #[repr(C)]
         struct NvencConfigFFI {
             width: u32,
@@ -73,6 +74,7 @@ fn main() {
             cq: u32,
             target_bps: i64,
             max_bps: i64,
+            buffer_bits: i64,
             is_hevc: i32,
         }
 
@@ -84,54 +86,46 @@ fn main() {
             cq: 18,
             target_bps: 16_000_000,
             max_bps: 30_000_000,
+            buffer_bits: 500_000,
             is_hevc: 1, // H.265 / HEVC
         };
 
-        println!("[2] Native In-Process NVENC Hardware Encoding (Zero-Copy Pinned DMA)");
+        println!("[2] In-process NVENC H.265 encoding");
         unsafe {
             let engine = nvenc_create(&cfg);
-            if !engine.is_null() {
-                let res = nvenc_register_host_buffer(engine, host_pixels.as_mut_ptr() as *mut _, frame_bytes);
-                if res == 0 {
-                    let mut out_data: *const u8 = std::ptr::null();
-                    let mut out_len: u32 = 0;
+            if engine.is_null() {
+                println!("    [SKIP] NVENC driver not available on this system.");
+            } else {
+                let registered = nvenc_register_host_buffer(engine, host_pixels.as_mut_ptr() as *mut _, frame_bytes) == 0;
+                println!("    -> Input path           : {}", if registered { "registered host buffer (DMA)" } else { "cuMemcpyHtoD copy" });
+                let input = if registered { std::ptr::null() } else { host_pixels.as_ptr() };
+                let mut out_data: *const u8 = std::ptr::null();
+                let mut out_len: u32 = 0;
+                // Warmup
+                let _ = nvenc_encode_frame(engine, input, width * 4, 1, &mut out_data, &mut out_len);
 
-                    // Warmup
-                    let _ = nvenc_encode_frame(engine, std::ptr::null(), width * 4, 1, &mut out_data, &mut out_len);
-
-                    let start_dma = Instant::now();
-                    let mut encoded_bytes = 0u64;
-                    for i in 0..frames {
-                        let idr = if i == 0 { 1 } else { 0 };
-                        let res = nvenc_encode_frame(engine, std::ptr::null(), width * 4, idr, &mut out_data, &mut out_len);
-                        if res == 0 {
-                            encoded_bytes += out_len as u64;
-                        }
+                let start = Instant::now();
+                let (mut encoded_bytes, mut encoded_frames) = (0u64, 0usize);
+                for i in 0..frames {
+                    if nvenc_encode_frame(engine, input, width * 4, i32::from(i == 0), &mut out_data, &mut out_len) == 0 {
+                        encoded_bytes += u64::from(out_len);
+                        encoded_frames += 1;
                     }
-                    let duration_dma = start_dma.elapsed();
-                    let dma_per_frame = duration_dma.as_secs_f64() * 1000.0 / frames as f64;
-                    let max_fps = 1000.0 / dma_per_frame;
-                    println!("    -> Total encode time    : {:.2?}", duration_dma);
-                    println!("    -> Per-frame latency    : {:.3} ms", dma_per_frame);
-                    println!("    -> Max Encoder Capacity : {:.1} FPS (Capable of real-time 60/120 FPS)", max_fps);
-                    println!("    -> CPU Memcpy Eliminated: {:.2} MB per second saved!", (frame_bytes as f64 * 60.0) / 1024.0 / 1024.0);
-                    println!("    -> Stream Output Bitrate: {:.2} Mbps average", (encoded_bytes as f64 * 8.0) / duration_dma.as_secs_f64() / 1e6);
+                }
+                let elapsed = start.elapsed();
+                if encoded_frames == 0 {
+                    println!("    [FAIL] no frame was encoded");
                 } else {
-                    println!("    [FAIL] nvenc_register_host_buffer returned {}", res);
+                    let per_frame = elapsed.as_secs_f64() * 1000.0 / encoded_frames as f64;
+                    println!("    -> Encoded frames       : {encoded_frames}/{frames} in {elapsed:.2?}");
+                    println!("    -> Per-frame latency    : {per_frame:.3} ms ({:.1} FPS max)", 1000.0 / per_frame);
+                    println!("    -> Output bitrate       : {:.2} Mbps average", encoded_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e6);
+                    if registered {
+                        println!("    -> Host-to-device copy  : none ({:.0} MB/s at 60 fps avoided)", frame_bytes as f64 * 60.0 / 1024.0 / 1024.0);
+                    }
                 }
                 nvenc_destroy(engine);
-            } else {
-                println!("    [SKIP] NVENC driver not available on this system.");
             }
         }
     }
-
-    println!();
-    println!("=========================================================");
-    println!("                    Summary & Conclusion                 ");
-    println!("=========================================================");
-    println!("  - Zero-Copy DMA avoids ~527 MB/s of continuous CPU memory copies.");
-    println!("  - Hardware NVENC achieves sub-8ms 1920x1200 HEVC frame submission.");
-    println!("  - Frees host CPU for application workload (browsers, IDEs, etc).");
-    println!("=========================================================");
 }

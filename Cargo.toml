@@ -30,8 +30,8 @@ kms = []
 portal = []
 # Build the wayland/portal engines as runtime-loaded libuu-wayland.so / libuu-portal.so (release packages).
 engine-plugins = []
-# In-process capture and encoding through FFmpeg 6 libraries (libavcodec/libavdevice dev packages).
-# Off by default so release binaries do not link the build machine's libav.
+# In-process X11 capture and NVENC encoding: vendored NVENC headers, NVIDIA driver libraries loaded at runtime.
+# Other encoders keep the FFmpeg process pipeline. Off by default.
 inproc-av = ["dep:x11rb"]
 
 [dependencies]

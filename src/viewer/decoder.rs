@@ -1,4 +1,4 @@
-//! Uses the same optional FFmpeg dependency as the host inproc-av feature.
+//! Uses the optional FFmpeg 6 libraries of the `viewer-ffmpeg` feature.
 use super::desktop::{Decoder,Frame};
 use ffmpeg_next as av;
 use super::media::Codec;

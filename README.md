@@ -103,7 +103,7 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 | 功能 | 状态 |
 |---|---|
 | 多显示器切换 | Hyprland 原生 Wayland 后端实验性支持，见上文 |
-| 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；VAAPI 管线仍为 4:2:0；`inproc-av` 原生 NVENC 管线当前输出 YUV420 并如实回报客户端 |
+| 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；VAAPI 和 `inproc-av` 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
 | 被控端防窥模式 | 未实现 |
@@ -172,7 +172,7 @@ cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 ```
 
 控制端的 `viewer-ffmpeg` 只支持 **FFmpeg 6.x**（`pkg-config --modversion libavcodec` 为 60.x）；FFmpeg 7 及以上会在依赖 `ffmpeg-sys-next` 里报 `avfft.h file not found`（#63）。
-服务端可选的 `--features inproc-av` 现已升级为**原生 NVENC 进程内硬编码器**（基于 CUDA Zero-Copy 机制），**无需链接 FFmpeg 开发库**，仅在运行时动态加载 NVIDIA 驱动库（`libcuda.so.1` 与 `libnvidia-encode.so.1`）。非 NVENC 硬件编码（如 VAAPI）或未启用 damage 时会自动保持走稳定外部进程管线。默认构建和预编译包均不需要该特性。
+服务端可选的 `--features inproc-av` 是 X11 下的进程内 NVENC 编码：不链接 FFmpeg 开发库，运行时加载 NVIDIA 驱动库（`libcuda.so.1`、`libnvidia-encode.so.1`），需要支持 NVENC API 12.1 的驱动（530 及以上）。截屏与编码尺寸一致时 NVENC 直接读取 XShm 缓冲，省去一次主机到显存的拷贝。CPU、VAAPI 编码或 `UU_CAPTURE=grab` 仍走外部 FFmpeg 进程；进程内 NVENC 启动失败时先回退到 FFmpeg 的 NVENC 进程管线，再回退到 CPU。默认构建和预编译包都不需要该特性。
 
 ### 3. 登录
 

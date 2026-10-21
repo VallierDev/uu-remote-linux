@@ -25,16 +25,16 @@ typedef struct {
 // Initialize and open an NVENC encoding session. Returns NULL on error.
 NvencEngine* nvenc_create(const NvencConfig* config);
 
-// Register host shared memory (XShm buffer) as CUDA Pinned Memory for Zero-Copy DMA.
+// Register host shared memory (XShm buffer) as CUDA pinned memory that NVENC reads by DMA.
 // Returns 0 on success, negative value on error.
 int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size);
 
-// Unregister previously registered host buffer.
+// Unregister a previously registered host buffer (the CUDA context must be current).
 void nvenc_unregister_host_buffer(NvencEngine* engine);
 
 // Encode one frame.
 // If host buffer was registered via nvenc_register_host_buffer, input_argb can be NULL
-// and the encoder will directly DMA read from the registered host memory (True Zero-Copy).
+// and the encoder reads the registered host memory directly (no host-to-device copy).
 // force_idr: 1 to force keyframe/IDR, 0 otherwise
 // out_data: pointer to receive the bitstream buffer (valid until next encode call or destroy)
 // out_len: pointer to receive the bitstream size in bytes

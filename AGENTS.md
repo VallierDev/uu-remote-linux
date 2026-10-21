@@ -38,9 +38,10 @@ Dependencies (Ubuntu/Debian):
 ```sh
 sudo apt install build-essential pkg-config \
     libx11-dev libxext-dev libxtst-dev libxfixes-dev libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev libgtk-3-dev ffmpeg
-# --features inproc-av:      libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev
-#                            (FFmpeg 6.x only; in-process capture/encoding, Ubuntu 24.04 ships it. FFmpeg >= 7
-#                            fails in ffmpeg-sys-next with "avfft.h file not found", before our build.rs runs)
+# --features inproc-av:      nothing extra (X11 in-process capture + native NVENC; vendored NVENC headers,
+#                            libcuda/libnvidia-encode are dlopen'ed at runtime; NVENC API 12.1, driver >= 530)
+# --features viewer-ffmpeg:  libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev
+#                            (FFmpeg 6.x only. FFmpeg >= 7 fails in ffmpeg-sys-next with "avfft.h file not found")
 # --features wayland:        libwayland-dev libxkbcommon-dev wl-clipboard
 # --features wayland,portal: + libglib2.0-dev libpipewire-0.3-dev libei-dev (libei >= 1.1)
 ```
@@ -183,7 +184,7 @@ started a second full host server instead, so check that a subcommand exists in 
   5 Auto, 6 Custom. Resolution: 16/17 pixel size or 5/6, 10 resolution_type (3 = follow remote).
   Field 7 `chorma_format` (ChromaFormat 1 = 4:2:0, 3 = 4:4:4) is sent when 真彩 is toggled; ff_capture_setting versions
   are cumulative (3 CHROMA_SAMPLING, 4 CUSTOM_BITRATE, 5 DPI_SCALE, 6 HDR). 4:4:4 = NVENC `high444p` / x264 `high444`
-  with `yuv444p`; VAAPI and inproc stay 4:2:0.
+  with `yuv444p`; VAAPI and the in-process NVENC engine stay 4:2:0.
   Reply `RpcResponse{2 CaptureSettingResponse{}}` (no errors = applied) and send Message 25 CaptureSettingSync
   (field 3 = the chroma actually encoded).
 - ConnectOptions field 4 `decoder_cap_list` = DecoderCap {1 fps, 2 codec_type (1 H264, 2 H265), 3 width, 4 height,
@@ -275,12 +276,12 @@ started a second full host server instead, so check that a subcommand exists in 
 
 `UU_VIDEO_ENCODER=vaapi` selects Intel/AMD H.264 VAAPI; `UU_VAAPI_DEVICE` defaults to
 `/dev/dri/renderD128` (render-node permissions required). No automatic VAAPI selection.
-Both FFmpeg process and `--features inproc-av` upload NV12 frames to a VAAPI frame pool.
+The FFmpeg process pipeline uploads NV12 frames to a VAAPI frame pool (`--features inproc-av` is NVENC only;
+VAAPI and CPU encoders always use the process pipeline).
 VBR uses the viewer bitrate preset and CQ-derived minimum QP, no B-frames, async depth 1,
 AUD and the existing GOP/VFR timing. Unsupported device/driver/initialization falls back to libx264
 with a warning. Accepted on Intel UHD 770 (iHD) with the default FFmpeg process pipeline and the official Mac
-viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). AMD and the `inproc-av`
-VAAPI path are not hardware-verified.
+viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). AMD is not hardware-verified.
 
 ### Virtual audio / 虚拟声卡
 
@@ -321,8 +322,8 @@ This permission can inject into the whole seat, including lock/greeter screens.
 Optional VAAPI: `intel-media-driver` (modern Intel) or `libva-mesa-driver` (AMD), `libva-utils`
 for `vainfo`. Optional KMS: `libdrm`. Virtual Xfce: `xorg-server-xvfb xorg-xauth xorg-xdpyinfo
 xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`.
-Rolling Arch FFmpeg may be newer than supported `inproc-av` (FFmpeg 6.x); use the default process
-pipeline or build against a separate FFmpeg 6 prefix. Do not downgrade the system FFmpeg.
+Rolling Arch FFmpeg may be newer than supported `viewer-ffmpeg` (FFmpeg 6.x); build it against a separate
+FFmpeg 6 prefix. Do not downgrade the system FFmpeg. The host's `inproc-av` does not link FFmpeg.
 User-bus headless setup and the official Mac checklist: [virtual desktop acceptance](contrib/virtual-desktop/ACCEPTANCE.md).
 
 ### Experimental KMS / 实验后端
