@@ -3,6 +3,8 @@ fn main() {
     println!("cargo:rerun-if-changed=c_engine/x11_engine.c");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.c");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.h");
+    println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/dynlink_cuda.h");
+    println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/nvEncodeAPI.h");
     println!("cargo:rerun-if-changed=c_engine/clipboard.c");
     println!("cargo:rerun-if-changed=c_engine/assist_window.c");
     println!("cargo:rerun-if-changed=c_engine/viewer_window.c");
@@ -28,6 +30,7 @@ fn main() {
             .file("c_engine/nvenc_engine.c")
             .file("c_engine/clipboard.c")
             .file("c_engine/pam_check.c");
+        x11_build.include("vendor/ffnvcodec");
         if let Ok(output) = std::process::Command::new("pkg-config").args(["--cflags", "ffnvcodec"]).output() {
             if output.status.success() {
                 for flag in String::from_utf8_lossy(&output.stdout).split_whitespace() { x11_build.flag(flag); }
