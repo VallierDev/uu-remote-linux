@@ -31,6 +31,8 @@ fn main() {
             .file("c_engine/pam_check.c");
         if std::env::var_os("CARGO_FEATURE_INPROC_AV").is_some() {
             x11_build.file("c_engine/nvenc_engine.c");
+            x11_build.file("c_engine/vaapi_engine.c");
+            x11_build.file("c_engine/dri3_capture.c");
             x11_build.include("vendor/ffnvcodec");
         }
         x11_build.compile("x11_engine");
@@ -39,7 +41,14 @@ fn main() {
         println!("cargo:rustc-link-lib=Xext");
         println!("cargo:rustc-link-lib=Xtst");
         println!("cargo:rustc-link-lib=Xfixes");
-        println!("cargo:rustc-link-lib=dl"); // pam_check.c loads libpam at runtime
+        println!("cargo:rustc-link-lib=dl");
+        println!("cargo:rustc-link-lib=va");
+        println!("cargo:rustc-link-lib=va-drm");
+        println!("cargo:rustc-link-lib=gbm");
+        println!("cargo:rustc-link-lib=X11-xcb");
+        println!("cargo:rustc-link-lib=xcb");
+        println!("cargo:rustc-link-lib=xcb-dri3");
+        println!("cargo:rustc-link-lib=xcb-damage"); // pam_check.c loads libpam at runtime
         // Optional GTK3 login window: built when gtk+-3.0 is installed, else `login` stays text-only.
         let gtk = |arg: &str| std::process::Command::new("pkg-config").args([arg, "gtk+-3.0"]).output().ok()
             .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
