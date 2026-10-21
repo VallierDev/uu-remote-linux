@@ -279,8 +279,11 @@ started a second full host server instead, so check that a subcommand exists in 
 
 `UU_VIDEO_ENCODER=vaapi` selects Intel/AMD H.264 VAAPI; `UU_VAAPI_DEVICE` defaults to
 `/dev/dri/renderD128` (render-node permissions required). No automatic VAAPI selection.
-The FFmpeg process pipeline uploads NV12 frames to a VAAPI frame pool (`--features inproc-av` is NVENC only;
-VAAPI and CPU encoders always use the process pipeline).
+The FFmpeg process pipeline uploads NV12 frames to a VAAPI frame pool. With `--features inproc-av` on X11, VAAPI
+H.264/HEVC Main runs in process: a DRI3 DMA-BUF of the root (XShm upload without DRI3) goes through VPP to NV12
+and VCN, with SPS/PPS(/VPS) and slice headers packed by the host as radeonsi (Mesa 26) needs; parameters follow
+FFmpeg's hevc_vaapi/h264_vaapi on that driver. Accepted on AMD HawkPoint1 (Mesa 26.2.3) with the official
+mobile viewer (presets, fps, scaling); Intel iHD is not verified.
 VBR uses the viewer bitrate preset and CQ-derived minimum QP, no B-frames, async depth 1,
 AUD and the existing GOP/VFR timing. Unsupported device/driver/initialization falls back to libx264
 with a warning. Accepted on Intel UHD 770 (iHD) with the default FFmpeg process pipeline and the official Mac

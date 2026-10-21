@@ -38,6 +38,8 @@ Dri3Capture* dri3_capture_create(const char* display_name, uint32_t width, uint3
         return NULL;
     }
 
+    // Events are read with xcb_poll_for_event below, so XCB, not Xlib, must own the queue
+    XSetEventQueueOwner(dpy, XCBOwnsEventQueue);
     xcb_connection_t *conn = XGetXCBConnection(dpy);
     const xcb_setup_t *setup = xcb_get_setup(conn);
     xcb_screen_t *screen = xcb_setup_roots_iterator(setup).data;
@@ -127,7 +129,10 @@ Dri3Capture* dri3_capture_create(const char* display_name, uint32_t width, uint3
     }
 
     xcb_gcontext_t gc = xcb_generate_id(conn);
-    xcb_create_gc(conn, gc, pix, 0, NULL);
+    // The default ClipByChildren copies only the root background (solid black); XShmGetImage on the root
+    // includes child windows, so the blit must too.
+    uint32_t gc_mode = XCB_SUBWINDOW_MODE_INCLUDE_INFERIORS;
+    xcb_create_gc(conn, gc, pix, XCB_GC_SUBWINDOW_MODE, &gc_mode);
 
     // Setup XDamage on root window
     const xcb_query_extension_reply_t *ext = xcb_get_extension_data(conn, &xcb_damage_id);
@@ -164,7 +169,11 @@ Dri3Capture* dri3_capture_create(const char* display_name, uint32_t width, uint3
 int dri3_capture_blit(Dri3Capture* cap) {
     if (!cap) return -1;
     xcb_copy_area(cap->conn, cap->screen->root, cap->pix, cap->gc, 0, 0, 0, 0, cap->width, cap->height);
-    xcb_flush(cap->conn);
+    // Round trip: the server has executed (and flushed to the GPU) the copy before VAAPI reads the BO;
+    // xcb_flush alone only sends the request.
+    xcb_get_input_focus_reply_t *r = xcb_get_input_focus_reply(cap->conn, xcb_get_input_focus(cap->conn), NULL);
+    if (!r) return -1;
+    free(r);
     return 0;
 }
 
@@ -190,19 +199,23 @@ int dri3_capture_wait_damage(Dri3Capture* cap, int timeout_ms) {
     struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
     int ret = poll(&pfd, 1, timeout_ms);
     if (ret > 0 && (pfd.revents & POLLIN)) {
-        while ((ev = xcb_poll_for_event(cap->conn)) != NULL) {
+        // Readable but not yet a whole event: polling again would return at once and spin a core
+        ev = xcb_poll_for_event(cap->conn);
+        if (!ev) ev = xcb_wait_for_event(cap->conn);
+        if (!ev) return -1;
+        do {
             if ((ev->response_type & 0x7f) == (cap->damage_event_code + XCB_DAMAGE_NOTIFY)) {
                 damaged = 1;
             }
             free(ev);
-        }
+        } while ((ev = xcb_poll_for_event(cap->conn)) != NULL);
         if (damaged) {
             xcb_damage_subtract(cap->conn, cap->damage, XCB_NONE, XCB_NONE);
             xcb_flush(cap->conn);
             return 1;
         }
     }
-    return 0;
+    return ret < 0 ? -1 : 0;
 }
 
 int dri3_capture_get_dma_fd(Dri3Capture* cap) {

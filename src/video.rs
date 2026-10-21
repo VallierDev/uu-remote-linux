@@ -609,15 +609,15 @@ async fn read_encoder_with(
         if (capture.width,capture.height)!=size { return Err("KMS mode changed; restart host to refresh desktop geometry".into()); }
         Some(Arc::new(capture))
     } else { None };
-    // The native VAAPI engine encodes H.264 only; an H.265 negotiation stays on the FFmpeg pipeline.
     #[cfg(feature = "inproc-av")]
-    if allow_inproc && (encoder != Encoder::Vaapi || settings.codec == VideoCodec::H264) && native_inproc(&display, portal.is_some(), encoder) {
+    if allow_inproc && native_inproc(&display, portal.is_some(), encoder) {
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
             gop: gop_frames(settings.fps, true) as u32, cq: settings.cq() as u32,
             target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
             max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec, chroma: settings.chroma,
+            vaapi: encoder == Encoder::Vaapi,
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} pipeline=in-process",
             display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec));

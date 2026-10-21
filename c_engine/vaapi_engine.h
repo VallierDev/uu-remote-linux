@@ -18,6 +18,8 @@ typedef struct {
     uint32_t fps;
     uint32_t gop;
     int64_t target_bps;
+    int64_t max_bps;     // VBR ceiling (viewer preset maxrate)
+    int64_t buffer_bits; // HRD buffer size
     int is_hevc;
     const char *device;  // DRM render node (UU_VAAPI_DEVICE); NULL = /dev/dri/renderD128
 } VaapiConfig;
