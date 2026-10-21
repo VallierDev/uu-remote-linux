@@ -57,14 +57,8 @@ fn read_packets(stdout: impl Read, tx: &tokio::sync::mpsc::Sender<bytes::Bytes>)
 fn start(source: &str, tx: tokio::sync::mpsc::Sender<bytes::Bytes>)
     -> Result<(Stopper, tokio::task::JoinHandle<Result<(), String>>), String> {
     let stop = Arc::new(AtomicBool::new(false));
-    #[cfg(feature = "inproc-av")]
-    if crate::inproc_encoder::selected() {
-        let job = tokio::task::spawn_blocking({
-            let (stop, source) = (stop.clone(), source.to_owned());
-            move || crate::inproc_encoder::run_audio(&source, tx, stop)
-        });
-        return Ok((Stopper { stop, child: None }, job));
-    }
+    // Note: Video inproc uses direct NVENC; audio uses standard pulse encoder
+
     let mut child = spawn_encoder(source)?;
     let stdout = child.stdout.take().ok_or("Encoder stdout missing")?;
     let job = tokio::task::spawn_blocking(move || read_packets(stdout, &tx));

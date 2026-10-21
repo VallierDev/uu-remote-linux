@@ -32,7 +32,7 @@ portal = []
 engine-plugins = []
 # In-process capture and encoding through FFmpeg 6 libraries (libavcodec/libavdevice dev packages).
 # Off by default so release binaries do not link the build machine's libav.
-inproc-av = ["dep:ffmpeg-next", "dep:x11rb"]
+inproc-av = ["dep:x11rb"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
