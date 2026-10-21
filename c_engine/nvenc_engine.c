@@ -15,6 +15,7 @@ typedef NVENCSTATUS NVENCAPI (*tNvEncodeAPICreateInstance)(NV_ENCODE_API_FUNCTIO
 typedef NVENCSTATUS NVENCAPI (*tNvEncodeAPIGetMaxSupportedVersion)(uint32_t *version);
 
 struct NvencEngine {
+    uint32_t api_ver;
     void *cuda_lib;
     void *nvenc_lib;
 
@@ -130,22 +131,31 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
         goto fail_after_ctx;
     }
 
+    uint32_t driver_major = NVENCAPI_MAJOR_VERSION;
+    uint32_t driver_minor = NVENCAPI_MINOR_VERSION;
+
     tNvEncodeAPIGetMaxSupportedVersion get_max_ver = (tNvEncodeAPIGetMaxSupportedVersion)dlsym(
         engine->nvenc_lib, "NvEncodeAPIGetMaxSupportedVersion"
     );
     if (get_max_ver) {
         uint32_t max_supported_ver = 0;
         NVENCSTATUS vres = get_max_ver(&max_supported_ver);
-        uint32_t driver_major = max_supported_ver >> 4;
-        uint32_t driver_minor = max_supported_ver & 0xf;
-        if (vres != NV_ENC_SUCCESS || driver_major < NVENCAPI_MAJOR_VERSION ||
-            (driver_major == NVENCAPI_MAJOR_VERSION && driver_minor < NVENCAPI_MINOR_VERSION)) {
-            fprintf(stderr,
-                "[nvenc] Driver supported NVENC API version %u.%u is older than required compiled version %u.%u\n",
-                driver_major, driver_minor, NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
+        if (vres == NV_ENC_SUCCESS && (max_supported_ver >> 4) >= 11) {
+            driver_major = max_supported_ver >> 4;
+            driver_minor = max_supported_ver & 0xf;
+            if (driver_major > NVENCAPI_MAJOR_VERSION || 
+               (driver_major == NVENCAPI_MAJOR_VERSION && driver_minor > NVENCAPI_MINOR_VERSION)) {
+                driver_major = NVENCAPI_MAJOR_VERSION;
+                driver_minor = NVENCAPI_MINOR_VERSION;
+            }
+        } else {
+            fprintf(stderr, "[nvenc] Driver supported NVENC API version is invalid or < 11\n");
             goto fail_after_ctx;
         }
     }
+
+    uint32_t current_api_ver = driver_major | (driver_minor << 24);
+    #define DYN_STRUCT_VER(v, api) ((uint32_t)(api) | ((v) << 16) | (0x7 << 28))
 
     tNvEncodeAPICreateInstance create_inst = (tNvEncodeAPICreateInstance)dlsym(engine->nvenc_lib, "NvEncodeAPICreateInstance");
     if (!create_inst) {
@@ -154,7 +164,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     }
 
     memset(&engine->fn, 0, sizeof(engine->fn));
-    engine->fn.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+    engine->fn.version = DYN_STRUCT_VER(2, current_api_ver);
     NVENCSTATUS nvres = create_inst(&engine->fn);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] NvEncodeAPICreateInstance failed: %d\n", nvres);
@@ -164,10 +174,10 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     // 3. Open Encode Session
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS open_params;
     memset(&open_params, 0, sizeof(open_params));
-    open_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+    open_params.version = DYN_STRUCT_VER(1, current_api_ver);
     open_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
     open_params.device = engine->cu_ctx;
-    open_params.apiVersion = NVENCAPI_VERSION;
+    open_params.apiVersion = current_api_ver;
 
     nvres = engine->fn.nvEncOpenEncodeSessionEx(&open_params, &engine->encoder);
     if (nvres != NV_ENC_SUCCESS || !engine->encoder) {
@@ -179,8 +189,8 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     GUID codec_guid = engine->is_hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
     NV_ENC_PRESET_CONFIG preset_cfg;
     memset(&preset_cfg, 0, sizeof(preset_cfg));
-    preset_cfg.version = NV_ENC_PRESET_CONFIG_VER;
-    preset_cfg.presetCfg.version = NV_ENC_CONFIG_VER;
+    preset_cfg.version = DYN_STRUCT_VER(5, current_api_ver) | (1u << 31);
+    preset_cfg.presetCfg.version = DYN_STRUCT_VER(9, current_api_ver) | (1u << 31);
 
     nvres = engine->fn.nvEncGetEncodePresetConfigEx(
         engine->encoder,
@@ -208,7 +218,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     // Check if hardware/codec supports Temporal AQ
     NV_ENC_CAPS_PARAM caps_param;
     memset(&caps_param, 0, sizeof(caps_param));
-    caps_param.version = NV_ENC_CAPS_PARAM_VER;
+    caps_param.version = DYN_STRUCT_VER(1, current_api_ver);
     caps_param.capsToQuery = NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ;
     int caps_val = 0;
     if (engine->fn.nvEncGetEncodeCaps(engine->encoder, codec_guid, &caps_param, &caps_val) == NV_ENC_SUCCESS && caps_val > 0) {
@@ -232,7 +242,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     // 5. Initialize Encoder
     NV_ENC_INITIALIZE_PARAMS init_params;
     memset(&init_params, 0, sizeof(init_params));
-    init_params.version = NV_ENC_INITIALIZE_PARAMS_VER;
+    init_params.version = DYN_STRUCT_VER(7, current_api_ver) | (1u << 31);
     init_params.encodeGUID = codec_guid;
     init_params.presetGUID = NV_ENC_PRESET_P4_GUID;
     init_params.encodeWidth = engine->width;
@@ -261,7 +271,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
 
     // Register fallback resource with NVENC initially
     memset(&engine->reg_res, 0, sizeof(engine->reg_res));
-    engine->reg_res.version = NV_ENC_REGISTER_RESOURCE_VER;
+    engine->reg_res.version = DYN_STRUCT_VER(4, current_api_ver);
     engine->reg_res.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
     engine->reg_res.width = engine->width;
     engine->reg_res.height = engine->height;
@@ -278,7 +288,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     // 7. Create bitstream output buffer
     NV_ENC_CREATE_BITSTREAM_BUFFER bs_buf;
     memset(&bs_buf, 0, sizeof(bs_buf));
-    bs_buf.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+    bs_buf.version = DYN_STRUCT_VER(1, current_api_ver);
     nvres = engine->fn.nvEncCreateBitstreamBuffer(engine->encoder, &bs_buf);
     if (nvres != NV_ENC_SUCCESS) {
         fprintf(stderr, "[nvenc] nvEncCreateBitstreamBuffer failed: %d\n", nvres);
@@ -288,6 +298,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
 
     engine->output_staging_cap = 2 * 1024 * 1024;
     engine->output_staging = (uint8_t*)malloc(engine->output_staging_cap);
+    engine->api_ver = current_api_ver;
 
     if (ctx_pushed && engine->cuCtxPopCurrent) {
         CUcontext dummy = NULL;
@@ -340,7 +351,7 @@ int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size)
     // Register host pinned device pointer with NVENC before releasing fallback buffer
     NV_ENC_REGISTER_RESOURCE new_reg;
     memset(&new_reg, 0, sizeof(new_reg));
-    new_reg.version = NV_ENC_REGISTER_RESOURCE_VER;
+    new_reg.version = DYN_STRUCT_VER(4, engine->api_ver);
     new_reg.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
     new_reg.width = engine->width;
     new_reg.height = engine->height;
@@ -442,7 +453,7 @@ int nvenc_encode_frame(
     // 2. Map resource
     NV_ENC_MAP_INPUT_RESOURCE map_res;
     memset(&map_res, 0, sizeof(map_res));
-    map_res.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+    map_res.version = DYN_STRUCT_VER(1, engine->api_ver);
     map_res.registeredResource = engine->reg_res.registeredResource;
     NVENCSTATUS nvres = engine->fn.nvEncMapInputResource(engine->encoder, &map_res);
     if (nvres != NV_ENC_SUCCESS) {
@@ -454,7 +465,7 @@ int nvenc_encode_frame(
     // 3. Submit encode picture
     NV_ENC_PIC_PARAMS pic_params;
     memset(&pic_params, 0, sizeof(pic_params));
-    pic_params.version = NV_ENC_PIC_PARAMS_VER;
+    pic_params.version = DYN_STRUCT_VER(6, engine->api_ver) | (1u << 31);
     pic_params.inputWidth = engine->width;
     pic_params.inputHeight = engine->height;
     pic_params.inputPitch = engine->width * 4;
@@ -477,7 +488,7 @@ int nvenc_encode_frame(
     // 4. Lock bitstream
     NV_ENC_LOCK_BITSTREAM lock_bs;
     memset(&lock_bs, 0, sizeof(lock_bs));
-    lock_bs.version = NV_ENC_LOCK_BITSTREAM_VER;
+    lock_bs.version = DYN_STRUCT_VER(2, engine->api_ver) | (1u << 31);
     lock_bs.outputBitstream = engine->bitstream_buf;
     lock_bs.doNotWait = 0;
 
