@@ -328,9 +328,12 @@ impl InputInjector {
         // uinput ABS axes span the compositor's whole desktop. A captured output
         // uses its own pixel space; bind absolute motion to that Wayland output,
         // including when uinput remains in use for keyboard/buttons/relative input.
-        if !relative && self.backend==crate::desktop_backend::DesktopBackend::Wayland {
-            return crate::wayland::move_pointer(x,y,false);
+        if !relative && self.backend==crate::desktop_backend::DesktopBackend::Wayland
+            && crate::wayland::move_pointer(x,y,false)==0 {
+            return 0;
         }
+        // Compositors without wlr-virtual-pointer reject absolute motion here; fall
+        // through to the uinput absolute pointer instead of reporting a phantom success.
         if let Some(uinput)=&self.uinput {
             if relative { return Self::uinput_result(uinput.move_relative(x,y)); }
             let (w,h)=*self.screen.lock().unwrap();
