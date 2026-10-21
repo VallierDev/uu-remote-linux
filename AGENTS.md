@@ -161,7 +161,7 @@ every 60 s.
 
 Diagnostic subcommands: `doctor` (paste-safe report: session, selected backend, engine plugins, uinput, encoders,
 default codec, sign-in/service state; booleans and names only), `login [--no-gui]`, `unlock-check` (password on stdin, prints only accepted/rejected),
-`desktop-probe [new.png]`, `desktop-video-probe` (`UU_PROBE_FPS`, `UU_PROBE_FRAMES`, `UU_PROBE_QUALITY` 1-5 = viewer bitrate preset, 5 auto; `UU_PROBE_INPUT` fixed video/image sequence, `UU_PROBE_LOOP=1` repeats), `wayland-input-probe`, `clipboard-acceptance`,
+`desktop-probe [new.png]`, `desktop-video-probe` (`UU_PROBE_FPS`, `UU_PROBE_FRAMES`, `UU_PROBE_QUALITY` 1-5 = viewer bitrate preset, 5 auto; `UU_PROBE_CHROMA=444` 真彩; `UU_PROBE_INPUT` fixed video/image sequence, `UU_PROBE_LOOP=1` repeats), `wayland-input-probe`, `clipboard-acceptance`,
 `portal-acceptance`, `help`. Unknown arguments exit with code 2. Builds up to v0.1.0 did **not** reject them and
 started a second full host server instead, so check that a subcommand exists in the binary you run.
 
@@ -184,7 +184,7 @@ started a second full host server instead, so check that a subcommand exists in 
   5 Auto, 6 Custom. Resolution: 16/17 pixel size or 5/6, 10 resolution_type (3 = follow remote).
   Field 7 `chorma_format` (ChromaFormat 1 = 4:2:0, 3 = 4:4:4) is sent when 真彩 is toggled; ff_capture_setting versions
   are cumulative (3 CHROMA_SAMPLING, 4 CUSTOM_BITRATE, 5 DPI_SCALE, 6 HDR). 4:4:4 = NVENC `high444p` / x264 `high444`
-  with `yuv444p`; VAAPI and the in-process NVENC engine stay 4:2:0.
+  with `yuv444p`; the in-process NVENC engine uses High 4:4:4 / HEVC FRExt (AQ off); VAAPI stays 4:2:0.
   Reply `RpcResponse{2 CaptureSettingResponse{}}` (no errors = applied) and send Message 25 CaptureSettingSync
   (field 3 = the chroma actually encoded).
 - ConnectOptions field 4 `decoder_cap_list` = DecoderCap {1 fps, 2 codec_type (1 H264, 2 H265), 3 width, 4 height,

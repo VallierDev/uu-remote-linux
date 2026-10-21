@@ -103,7 +103,7 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 | 功能 | 状态 |
 |---|---|
 | 多显示器切换 | Hyprland 原生 Wayland 后端实验性支持，见上文 |
-| 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；VAAPI 和 `inproc-av` 管线仍为 4:2:0，并如实回报给客户端 |
+| 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；`inproc-av` 原生 NVENC 输出 H.264 High 4:4:4 / HEVC FRExt；VAAPI 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
 | 被控端防窥模式 | 未实现 |

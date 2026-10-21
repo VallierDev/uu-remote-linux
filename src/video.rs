@@ -198,11 +198,9 @@ impl Encoder {
 fn nvidia_present() -> bool {
     std::path::Path::new("/proc/driver/nvidia/version").exists() || std::path::Path::new("/dev/nvidia0").exists()
 }
-/// 真彩 (4:4:4) needs the FFmpeg process pipeline with NVENC or libx264 (h264_vaapi and the
-/// in-process encoder are 4:2:0 only).
+/// 真彩 (4:4:4): NVENC (in-process or FFmpeg) and libx264; h264_vaapi is 4:2:0 only.
+/// A GPU without 4:4:4 NVENC falls back to libx264, which keeps 4:4:4.
 pub fn full_chroma_available() -> bool {
-    #[cfg(feature = "inproc-av")]
-    if crate::inproc_encoder::selected(Encoder::requested()) { return false; }
     Encoder::requested() != Encoder::Vaapi
 }
 
@@ -618,7 +616,7 @@ async fn read_encoder_with(
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
             gop: gop_frames(settings.fps, true) as u32, cq: settings.cq() as u32,
             target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
-            max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec,
+            max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec, chroma: settings.chroma,
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} pipeline=in-process",
             display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec));
@@ -793,7 +791,10 @@ fn probe_settings() -> Result<VideoSettings,String> {
         None=>crate::capture_setting::QUALITY_AUTO,
         Some(v)=>v.parse::<u64>().ok().filter(|q|(1..=5).contains(q)).ok_or("UU_PROBE_QUALITY must be 1-5")?,
     };
-    Ok(VideoSettings {fps,quality,codec:probe_codec(),..VideoSettings::default()})
+    let mut settings=VideoSettings {fps,quality,codec:probe_codec(),..VideoSettings::default()};
+    // UU_PROBE_CHROMA=444 requests 真彩 like the viewer does (only where full_chroma_available()).
+    if std::env::var("UU_PROBE_CHROMA").as_deref()==Ok("444") && full_chroma_available() { settings.chroma=crate::capture_setting::CHROMA_444; }
+    Ok(settings)
 }
 
 /// The probe follows `UU_VIDEO_CODEC` so the HEVC path can be measured at all (H.264 otherwise),

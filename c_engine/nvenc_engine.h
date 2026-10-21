@@ -19,7 +19,8 @@ typedef struct {
     int64_t target_bps;
     int64_t max_bps;
     int64_t buffer_bits;
-    int is_hevc; // 1 = H.265, 0 = H.264
+    int is_hevc;    // 1 = H.265, 0 = H.264
+    int chroma_444; // 1 = 4:4:4 (H.264 High 4:4:4 / HEVC FRExt), 0 = 4:2:0
 } NvencConfig;
 
 // Initialize and open an NVENC encoding session. Returns NULL on error.

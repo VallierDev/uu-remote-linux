@@ -233,23 +233,38 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     enc_cfg.rcParams.maxBitRate = (uint32_t)(config->max_bps > 0 ? config->max_bps : 15000000);
     enc_cfg.rcParams.vbvBufferSize = (uint32_t)(config->buffer_bits > 0 ? config->buffer_bits : (config->max_bps > 0 ? config->max_bps / 10 : 1500000));
     enc_cfg.rcParams.targetQuality = (uint8_t)(config->cq > 0 ? config->cq : 28);
-    enc_cfg.rcParams.enableAQ = 1;
-    // Temporal AQ only where the hardware/codec reports it
     NV_ENC_CAPS_PARAM caps_param;
     memset(&caps_param, 0, sizeof(caps_param));
     caps_param.version = NV_ENC_CAPS_PARAM_VER;
-    caps_param.capsToQuery = NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ;
     int caps_val = 0;
-    enc_cfg.rcParams.enableTemporalAQ =
-        engine->fn.nvEncGetEncodeCaps(engine->encoder, codec_guid, &caps_param, &caps_val) == NV_ENC_SUCCESS && caps_val > 0;
+    if (config->chroma_444) {
+        // GPUs without 4:4:4 encode fail here; the caller falls back to FFmpeg/libx264, which keep 4:4:4.
+        caps_param.capsToQuery = NV_ENC_CAPS_SUPPORT_YUV444_ENCODE;
+        if (engine->fn.nvEncGetEncodeCaps(engine->encoder, codec_guid, &caps_param, &caps_val) != NV_ENC_SUCCESS || caps_val <= 0) {
+            fprintf(stderr, "[nvenc] 4:4:4 encoding not supported for this codec\n");
+            goto fail;
+        }
+        // NVENC rejects AQ / temporal AQ in 4:4:4 mode.
+        enc_cfg.rcParams.enableAQ = 0;
+        enc_cfg.rcParams.enableTemporalAQ = 0;
+    } else {
+        enc_cfg.rcParams.enableAQ = 1;
+        // Temporal AQ only where the hardware/codec reports it
+        caps_param.capsToQuery = NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ;
+        caps_val = 0;
+        enc_cfg.rcParams.enableTemporalAQ =
+            engine->fn.nvEncGetEncodeCaps(engine->encoder, codec_guid, &caps_param, &caps_val) == NV_ENC_SUCCESS && caps_val > 0;
+    }
 
     if (engine->is_hevc) {
-        enc_cfg.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+        enc_cfg.profileGUID = config->chroma_444 ? NV_ENC_HEVC_PROFILE_FREXT_GUID : NV_ENC_HEVC_PROFILE_MAIN_GUID;
+        enc_cfg.encodeCodecConfig.hevcConfig.chromaFormatIDC = config->chroma_444 ? 3 : 1;
         enc_cfg.encodeCodecConfig.hevcConfig.idrPeriod = enc_cfg.gopLength;
         enc_cfg.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
         enc_cfg.encodeCodecConfig.hevcConfig.outputAUD = 1;
     } else {
-        enc_cfg.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
+        enc_cfg.profileGUID = config->chroma_444 ? NV_ENC_H264_PROFILE_HIGH_444_GUID : NV_ENC_H264_PROFILE_BASELINE_GUID;
+        enc_cfg.encodeCodecConfig.h264Config.chromaFormatIDC = config->chroma_444 ? 3 : 1;
         enc_cfg.encodeCodecConfig.h264Config.idrPeriod = enc_cfg.gopLength;
         enc_cfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
         enc_cfg.encodeCodecConfig.h264Config.outputAUD = 1;

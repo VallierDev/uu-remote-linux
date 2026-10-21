@@ -26,6 +26,7 @@ struct NvencConfigFFI {
     max_bps: i64,
     buffer_bits: i64,
     is_hevc: libc::c_int,
+    chroma_444: libc::c_int,
 }
 
 extern "C" {
@@ -70,6 +71,8 @@ pub struct Config {
     pub max_bps: i64,
     pub buffer_bits: i64,
     pub codec: crate::capture_setting::VideoCodec,
+    /// ChromaFormat (capture_setting::CHROMA_444 = 4:4:4).
+    pub chroma: u64,
 }
 
 pub fn disabled() -> bool {
@@ -145,14 +148,16 @@ pub fn run(
         0
     };
 
+    let chroma_444 = libc::c_int::from(config.chroma == crate::capture_setting::CHROMA_444);
     log::info!(
-        "Initializing Native In-Process NVENC: {}x{}, {} fps, GOP {}, CQ {}, HEVC={}",
+        "Initializing Native In-Process NVENC: {}x{}, {} fps, GOP {}, CQ {}, HEVC={}, 4:4:4={}",
         width,
         height,
         config.fps,
         config.gop,
         config.cq,
-        is_hevc == 1
+        is_hevc == 1,
+        chroma_444 == 1
     );
 
     let ffi_cfg = NvencConfigFFI {
@@ -165,6 +170,7 @@ pub fn run(
         max_bps: config.max_bps,
         buffer_bits: config.buffer_bits,
         is_hevc,
+        chroma_444,
     };
 
     let mut capture = DamageCapture::open(&config.display)

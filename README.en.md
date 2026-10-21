@@ -117,7 +117,7 @@ Switching reuses one video track and pauses input until the new source sends a f
 | Feature | Status |
 |---|---|
 | Switching between multiple monitors | Experimental on native Hyprland Wayland; see above |
-| True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; VAAPI and `inproc-av` stay 4:2:0 and report that to the client |
+| True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
 | Privacy screen on the host | Not implemented |

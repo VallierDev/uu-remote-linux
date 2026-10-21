@@ -76,6 +76,7 @@ fn main() {
             max_bps: i64,
             buffer_bits: i64,
             is_hevc: i32,
+            chroma_444: i32,
         }
 
         let cfg = NvencConfigFFI {
@@ -88,6 +89,7 @@ fn main() {
             max_bps: 30_000_000,
             buffer_bits: 500_000,
             is_hevc: 1, // H.265 / HEVC
+            chroma_444: i32::from(std::env::var("UU_BENCH_CHROMA").as_deref() == Ok("444")),
         };
 
         println!("[2] In-process NVENC H.265 encoding");
