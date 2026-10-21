@@ -609,8 +609,9 @@ async fn read_encoder_with(
         if (capture.width,capture.height)!=size { return Err("KMS mode changed; restart host to refresh desktop geometry".into()); }
         Some(Arc::new(capture))
     } else { None };
+    // The native VAAPI engine encodes H.264 only; an H.265 negotiation stays on the FFmpeg pipeline.
     #[cfg(feature = "inproc-av")]
-    if allow_inproc && native_inproc(&display, portal.is_some(), encoder) {
+    if allow_inproc && (encoder != Encoder::Vaapi || settings.codec == VideoCodec::H264) && native_inproc(&display, portal.is_some(), encoder) {
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),

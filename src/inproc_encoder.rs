@@ -40,10 +40,13 @@ struct VaapiEngineOpaque {
 struct VaapiConfigFFI {
     width: u32,
     height: u32,
+    cap_width: u32,
+    cap_height: u32,
     fps: u32,
     gop: u32,
     target_bps: i64,
     is_hevc: libc::c_int,
+    device: *const libc::c_char,
 }
 
 #[repr(C)]
@@ -202,7 +205,7 @@ pub fn run(
     let is_hevc = if config.codec == crate::capture_setting::VideoCodec::H265 { 1 } else { 0 };
 
     if std::env::var("UU_VIDEO_ENCODER").map_or(false, |v| v == "vaapi") {
-        run_vaapi(config, units, stop, idr, budget, width, height, is_hevc)
+        run_vaapi(config, units, stop, idr, budget, is_hevc)
     } else {
         run_nvenc(config, units, stop, idr, budget, width, height, is_hevc)
     }
@@ -214,22 +217,28 @@ fn run_vaapi(
     stop: Arc<AtomicBool>,
     idr: Arc<AtomicBool>,
     budget: Arc<Semaphore>,
-    width: u32,
-    height: u32,
     is_hevc: libc::c_int,
 ) -> Result<(), String> {
+    let (out_w, out_h) = config.output.unwrap_or(config.input);
+    let (out_w, out_h) = (out_w + out_w % 2, out_h + out_h % 2);
+    let (cap_w, cap_h) = config.input;
+    let c_device = CString::new(crate::video::vaapi_device()).unwrap_or_default();
     let ffi_cfg = VaapiConfigFFI {
-        width,
-        height,
+        width: out_w,
+        height: out_h,
+        cap_width: cap_w,
+        cap_height: cap_h,
         fps: config.fps,
         gop: config.gop,
         target_bps: config.target_bps,
         is_hevc,
+        device: c_device.as_ptr(),
     };
 
     let c_display = CString::new(config.display.as_str()).unwrap_or_default();
 
-    let raw_dri3 = unsafe { dri3_capture_create(c_display.as_ptr(), width, height) };
+    // Capture stays at the full input size; VPP scales to the encode size
+    let raw_dri3 = unsafe { dri3_capture_create(c_display.as_ptr(), cap_w, cap_h) };
     let mut dri3_cap = if !raw_dri3.is_null() {
         Some(SafeDri3Capture(raw_dri3))
     } else {
@@ -335,8 +344,13 @@ fn run_vaapi(
             let cap = fallback_capture.as_mut().unwrap();
             let (cap_w, _) = cap.size();
             let pitch = cap_w as u32 * 4;
+            // Without refresh the XShm segment stays at its initial contents and every frame is black.
+            cap.refresh()?;
             unsafe {
-                vaapi_upload_host_buffer(engine.0, cap.shm_raw_ptr(), pitch);
+                let upload = vaapi_upload_host_buffer(engine.0, cap.shm_raw_ptr(), pitch);
+                if upload != 0 {
+                    return Err(format!("vaapi_upload_host_buffer failed: {upload}"));
+                }
                 let res = vaapi_encode_frame(engine.0, if force_idr { 1 } else { 0 }, &mut out_data, &mut out_len);
                 if res != 0 {
                     return Err(format!("vaapi_encode_frame failed: {res}"));
@@ -481,6 +495,10 @@ fn run_nvenc(
 
         let mut out_data: *const u8 = std::ptr::null();
         let mut out_len: u32 = 0;
+
+        // Zero-copy or not, NVENC reads the XShm segment: pull the damaged pixels in first
+        // (#74 had this in the registered-buffer branch; the refactor dropped it).
+        capture.refresh()?;
 
         let res = if zero_copy {
             unsafe {

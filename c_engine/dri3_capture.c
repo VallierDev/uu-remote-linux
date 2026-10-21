@@ -46,6 +46,14 @@ Dri3Capture* dri3_capture_create(const char* display_name, uint32_t width, uint3
         return NULL;
     }
 
+    // Check the extension first: a DRI3 request on a server without it breaks the connection,
+    // and the Xlib cleanup below then exits the process.
+    const xcb_query_extension_reply_t *dri3_ext = xcb_get_extension_data(conn, &xcb_dri3_id);
+    if (!dri3_ext || !dri3_ext->present) {
+        fprintf(stderr, "[dri3_capture] DRI3 extension not supported on display\n");
+        XCloseDisplay(dpy);
+        return NULL;
+    }
     // Query DRI3
     xcb_dri3_query_version_cookie_t qvc = xcb_dri3_query_version(conn, 1, 2);
     xcb_dri3_query_version_reply_t *qvr = xcb_dri3_query_version_reply(conn, qvc, NULL);
@@ -92,8 +100,19 @@ Dri3Capture* dri3_capture_create(const char* display_name, uint32_t width, uint3
 
     xcb_pixmap_t pix = xcb_generate_id(conn);
     xcb_generic_error_t *err = NULL;
+    // XCB takes ownership of the fd it sends and closes it after transmission; only a
+    // duplicate goes to X11, bo_fd stays ours for the VAAPI import and teardown.
+    int send_fd = fcntl(bo_fd, F_DUPFD_CLOEXEC, 3);
+    if (send_fd < 0) {
+        close(bo_fd);
+        gbm_bo_destroy(bo);
+        gbm_device_destroy(gbm);
+        close(drm_fd);
+        XCloseDisplay(dpy);
+        return NULL;
+    }
     xcb_void_cookie_t pc = xcb_dri3_pixmap_from_buffer_checked(
-        conn, pix, screen->root, stride * h, w, h, stride, screen->root_depth, 32, bo_fd
+        conn, pix, screen->root, stride * h, w, h, stride, screen->root_depth, 32, send_fd
     );
     err = xcb_request_check(conn, pc);
     if (err) {

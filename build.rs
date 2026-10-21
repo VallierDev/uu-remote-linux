@@ -33,7 +33,17 @@ fn main() {
             x11_build.file("c_engine/nvenc_engine.c");
             x11_build.file("c_engine/vaapi_engine.c");
             x11_build.file("c_engine/dri3_capture.c");
+            for f in ["c_engine/vaapi_engine.c", "c_engine/vaapi_engine.h", "c_engine/dri3_capture.c", "c_engine/dri3_capture.h"] {
+                println!("cargo:rerun-if-changed={f}");
+            }
             x11_build.include("vendor/ffnvcodec");
+            // libva/libva-drm are dlopen'ed at runtime (like NVENC's libcuda); these are
+            // link-time-only deps of the DRI3/VAAPI engines and must stay out of default builds.
+            println!("cargo:rustc-link-lib=gbm");
+            println!("cargo:rustc-link-lib=X11-xcb");
+            println!("cargo:rustc-link-lib=xcb");
+            println!("cargo:rustc-link-lib=xcb-dri3");
+            println!("cargo:rustc-link-lib=xcb-damage");
         }
         x11_build.compile("x11_engine");
 
@@ -41,14 +51,7 @@ fn main() {
         println!("cargo:rustc-link-lib=Xext");
         println!("cargo:rustc-link-lib=Xtst");
         println!("cargo:rustc-link-lib=Xfixes");
-        println!("cargo:rustc-link-lib=dl");
-        println!("cargo:rustc-link-lib=va");
-        println!("cargo:rustc-link-lib=va-drm");
-        println!("cargo:rustc-link-lib=gbm");
-        println!("cargo:rustc-link-lib=X11-xcb");
-        println!("cargo:rustc-link-lib=xcb");
-        println!("cargo:rustc-link-lib=xcb-dri3");
-        println!("cargo:rustc-link-lib=xcb-damage"); // pam_check.c loads libpam at runtime
+        println!("cargo:rustc-link-lib=dl"); // pam_check.c loads libpam at runtime
         // Optional GTK3 login window: built when gtk+-3.0 is installed, else `login` stays text-only.
         let gtk = |arg: &str| std::process::Command::new("pkg-config").args([arg, "gtk+-3.0"]).output().ok()
             .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
