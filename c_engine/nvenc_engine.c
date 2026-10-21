@@ -12,6 +12,7 @@ typedef CUresult CUDAAPI (*tcuMemHostRegister)(void *p, size_t bytesize, unsigne
 typedef CUresult CUDAAPI (*tcuMemHostGetDevicePointer)(CUdeviceptr *pdptr, void *p, unsigned int Flags);
 typedef CUresult CUDAAPI (*tcuMemHostUnregister)(void *p);
 typedef NVENCSTATUS NVENCAPI (*tNvEncodeAPICreateInstance)(NV_ENCODE_API_FUNCTION_LIST *functionList);
+typedef NVENCSTATUS NVENCAPI (*tNvEncodeAPIGetMaxSupportedVersion)(uint32_t *version);
 
 struct NvencEngine {
     void *cuda_lib;
@@ -127,6 +128,23 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     if (!engine->nvenc_lib) {
         fprintf(stderr, "[nvenc] dlopen libnvidia-encode.so.1 failed: %s\n", dlerror());
         goto fail_after_ctx;
+    }
+
+    tNvEncodeAPIGetMaxSupportedVersion get_max_ver = (tNvEncodeAPIGetMaxSupportedVersion)dlsym(
+        engine->nvenc_lib, "NvEncodeAPIGetMaxSupportedVersion"
+    );
+    if (get_max_ver) {
+        uint32_t max_supported_ver = 0;
+        NVENCSTATUS vres = get_max_ver(&max_supported_ver);
+        uint32_t driver_major = max_supported_ver >> 4;
+        uint32_t driver_minor = max_supported_ver & 0xf;
+        if (vres != NV_ENC_SUCCESS || driver_major < NVENCAPI_MAJOR_VERSION ||
+            (driver_major == NVENCAPI_MAJOR_VERSION && driver_minor < NVENCAPI_MINOR_VERSION)) {
+            fprintf(stderr,
+                "[nvenc] Driver supported NVENC API version %u.%u is older than required compiled version %u.%u\n",
+                driver_major, driver_minor, NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION);
+            goto fail_after_ctx;
+        }
     }
 
     tNvEncodeAPICreateInstance create_inst = (tNvEncodeAPICreateInstance)dlsym(engine->nvenc_lib, "NvEncodeAPICreateInstance");
