@@ -67,3 +67,8 @@ cc = "1.0"
 webrtc-dtls = { path = "vendor/webrtc-dtls" }
 # Larger data-channel receive buffer (see vendor/webrtc/src/data_channel/mod.rs).
 webrtc = { path = "vendor/webrtc" }
+
+[[bench]]
+name = "nvenc_pipeline_bench"
+harness = false
+required-features = ["inproc-av"]
