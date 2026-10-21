@@ -553,9 +553,6 @@ int uu_wl_init(int32_t *w,int32_t *h) {
         zwlr_output_power_v1_add_listener(power,&power_listener,NULL);
     }
     if(pointer_manager) pointer=zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(pointer_manager,seat,outputs[selected].handle);
-    /* Some compositors (e.g. Denial) only hand a virtual keyboard to their active input
-       method and reject everyone else at the protocol level. Keyboard injection then falls
-       back to uinput on the caller side; capture must still come up. */
     /* Some compositors reject a virtual keyboard from anything that is not their active
        input method (Denial does), and a rejected proxy poisons later requests. Allow the
        caller to opt out and rely on uinput for key input instead. */
@@ -670,7 +667,8 @@ end:
 }
 int uu_wl_move(int32_t x,int32_t y,int relative) {
     pthread_mutex_lock(&lock); int result=-1;
-    if(initialized && !pointer) { goto end; } /* no virtual pointer: report failure so the caller falls back to uinput */
+    /* -2: no virtual pointer at all, so the caller may use uinput; -1 stays a real failure. */
+    if(initialized && !pointer) { result=-2; goto end; }
     if(initialized) {
         if(relative) {
             /* UU reports pixels (source DPR=1); Wayland motion is in logical points. */
