@@ -332,6 +332,7 @@ Common environment variables:
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
 | `UU_WAYLAND_MULTISCREEN=1` | Enable Hyprland physical monitor switching (off by default) |
 | `UU_WAYLAND_OUTPUT` | Initial native Wayland output name, e.g. `HDMI-A-1` |
+| `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | Native Wayland skips the virtual keyboard (e.g. Denial reserves it for its input method); keys go through uinput. Without wlr-virtual-pointer the pointer also uses uinput (#72) |
 | `UU_INPUT_BACKEND` | `auto` (default: uinput on Wayland when accessible) / `uinput` / `native` |
 | `UU_TERMINAL_SHORTCUTS=0` | Disable the Ctrl+V paste rewrite in terminal windows |
 | `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: opt-in Intel/AMD; `nvenc`: force NVENC; unset: NVENC only when an NVIDIA driver is loaded, else CPU |

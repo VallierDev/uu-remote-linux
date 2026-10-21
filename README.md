@@ -300,6 +300,7 @@ systemctl --user restart uuremote-native.service
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
 | `UU_WAYLAND_MULTISCREEN=1` | 启用 Hyprland 物理显示器切换（默认关闭） |
 | `UU_WAYLAND_OUTPUT` | 原生 Wayland 默认采集输出名称，例如 `HDMI-A-1` |
+| `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
 | `UU_INPUT_BACKEND` | `auto`（默认，Wayland 下可用时用 uinput）/ `uinput` / `native` |
 | `UU_TERMINAL_SHORTCUTS=0` | 关闭终端窗口里的 Ctrl+V 粘贴转换 |
 | `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置时检测到 NVIDIA 驱动才用 NVENC，否则用 CPU |
