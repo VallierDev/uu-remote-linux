@@ -438,10 +438,12 @@ AUD only at IRAPs and drops every other picture from the bitstream, so an AUD-ba
 one "frame" and the IRAP gate then rejects all of them: the connection stalls at "transferring" while the host
 sends about 12 kbit/s. `UU_VIDEO_CODEC=h265` selects H.265 explicitly for A/B diagnosis.
 
-### VAAPI (opt-in / 显式启用)
+### VAAPI
 
-`UU_VIDEO_ENCODER=vaapi` selects Intel/AMD H.264 VAAPI; `UU_VAAPI_DEVICE` defaults to
-`/dev/dri/renderD128` (render-node permissions required). No automatic VAAPI selection.
+`UU_VIDEO_ENCODER=vaapi` or `set-encoder vaapi` selects Intel/AMD H.264 VAAPI explicitly.
+`UU_VAAPI_DEVICE` defaults to `/dev/dri/renderD128` (render-node permissions required).
+With `auto` and no NVIDIA driver, VAAPI is a probed candidate before CPU; an NVIDIA driver
+keeps the order NVENC then CPU and does not try VAAPI.
 The FFmpeg process uploads NV12 frames to a VAAPI frame pool; a self-built `--features inproc-av`
 binary instead runs VAAPI in process on X11 (a DRI3 DMA-BUF of the root window zero-copy, or XShm
 upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC).

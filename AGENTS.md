@@ -277,10 +277,12 @@ started a second full host server instead, so check that a subcommand exists in 
 - Update README.md / README.en.md when user-visible features or limitations change, and add
   `docs/release-notes/<tag>.md` before tagging a release.
 
-### VAAPI (opt-in / 显式启用)
+### VAAPI
 
-`UU_VIDEO_ENCODER=vaapi` selects Intel/AMD H.264 VAAPI; `UU_VAAPI_DEVICE` defaults to
-`/dev/dri/renderD128` (render-node permissions required). No automatic VAAPI selection.
+`UU_VIDEO_ENCODER=vaapi` or `set-encoder vaapi` selects Intel/AMD H.264 VAAPI explicitly.
+`UU_VAAPI_DEVICE` defaults to `/dev/dri/renderD128` (render-node permissions required).
+Auto probes VAAPI only when no NVIDIA driver is present (then CPU); with NVIDIA the order
+is NVENC then CPU.
 The FFmpeg process pipeline uploads NV12 frames to a VAAPI frame pool. With `--features inproc-av` on X11, VAAPI
 H.264/HEVC Main runs in process: a DRI3 DMA-BUF of the root (XShm upload without DRI3) goes through VPP to NV12
 and VCN, with SPS/PPS(/VPS) and slice headers packed by the host as radeonsi (Mesa 26) needs; parameters follow

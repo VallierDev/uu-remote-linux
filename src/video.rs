@@ -471,6 +471,14 @@ pub fn warm_auto_probe() {
     tokio::spawn(async { let _ = run_auto_probe().await; });
 }
 
+/// Diagnostics that encode must see the same auto choice as a warmed-up host.
+/// An explicit encoder (setting or env) skips the probe.
+pub async fn ensure_auto_probed() {
+    if crate::video_select::selection().encoder_source == crate::video_select::Source::Auto {
+        let _ = run_auto_probe().await;
+    }
+}
+
 /// Run the probe to completion (doctor, or the background warm-up). Cached for the process.
 pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
     if let Some(cached) = crate::video_select::cached_probe() { return cached; }
@@ -930,6 +938,7 @@ async fn probe_input_size(spec:&FfmpegSpec,input:&std::ffi::OsStr)->Result<(u32,
 
 /// Fixed input bypasses desktop initialization and always uses the FFmpeg process encoder.
 pub async fn probe_input(input:OsString,path:Option<String>)->Result<(),String> {
+    ensure_auto_probed().await;
     use std::io::Write;
     let settings=probe_settings()?;
     let wanted:u64=std::env::var("UU_PROBE_FRAMES").ok().and_then(|v|v.parse().ok()).unwrap_or(5);
@@ -980,6 +989,7 @@ pub async fn probe_input(input:OsString,path:Option<String>)->Result<(),String> 
 
 /// Exercise the real capture/encoder chain without UU auth or a network peer.
 pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,path:Option<String>)->Result<(),String> {
+    ensure_auto_probed().await;
     use std::io::Write;
     let mut file=match path {
         Some(path)=>Some(std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e|format!("Video probe file: {e}"))?),
