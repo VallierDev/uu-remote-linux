@@ -305,6 +305,29 @@ static void on_status_menu(GtkStatusIcon *i, guint button, guint time, gpointer 
     (void)i; (void)button; (void)time; (void)d;
     gtk_menu_popup_at_pointer(GTK_MENU(tray_menu), NULL);
 }
+// Monochrome tray icon that follows light/dark panels: GTK and the GNOME AppIndicator extension
+// recolor "-symbolic" names, KDE recolors the ColorScheme-Text class. Written to the user cache
+// and offered as an icon theme path, so it needs no package install.
+static const char TRAY_ICON_NAME[] = "uu-remote-linux-symbolic";
+static const char TRAY_ICON_SVG[] =
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\">"
+    "<style id=\"current-color-scheme\">.ColorScheme-Text{color:#232629}</style>"
+    "<path class=\"ColorScheme-Text\" fill=\"currentColor\" fill-rule=\"evenodd\" d=\"M2.5 2h11A1.5 1.5 0 0 1 15 3.5v7a1.5 1.5 0 0 1-1.5 1.5h-11"
+    "A1.5 1.5 0 0 1 1 10.5v-7A1.5 1.5 0 0 1 2.5 2zm0 1.5v7h11v-7z\"/>"
+    "<path class=\"ColorScheme-Text\" fill=\"currentColor\" d=\"M7.25 12h1.5v1.5H11a.75.75 0 0 1 0 1.5H5a.75.75 0 0 1 0-1.5h2.25z"
+    "M11.5 4.5v4l-1.35-1.35-3.1 3.1-1.2-1.2 3.1-3.1L7.5 4.5z\"/></svg>\n";
+// Returns the theme path holding the icon (hicolor layout plus a loose copy), or NULL.
+static gchar *write_tray_icon(void) {
+    gchar *root = g_build_filename(g_get_user_cache_dir(), "uu-remote-linux", "icons", NULL);
+    gchar *apps = g_build_filename(root, "hicolor", "scalable", "apps", NULL);
+    gchar *file = g_strconcat(TRAY_ICON_NAME, ".svg", NULL);
+    gchar *themed = g_build_filename(apps, file, NULL), *loose = g_build_filename(root, file, NULL);
+    int ok = g_mkdir_with_parents(apps, 0700) == 0 && g_file_set_contents(themed, TRAY_ICON_SVG, -1, NULL)
+          && g_file_set_contents(loose, TRAY_ICON_SVG, -1, NULL);
+    g_free(apps); g_free(file); g_free(themed); g_free(loose);
+    if (!ok) { g_free(root); return NULL; }
+    return root;
+}
 static void build_tray(void) {
     tray_menu = gtk_menu_new();
     GtkWidget *open = gtk_menu_item_new_with_label("打开主窗口");
@@ -318,7 +341,10 @@ static void build_tray(void) {
     gtk_menu_shell_append(GTK_MENU_SHELL(tray_menu), gtk_separator_menu_item_new());
     gtk_menu_shell_append(GTK_MENU_SHELL(tray_menu), quit);
     gtk_widget_show_all(tray_menu);
-    const char *icon = gtk_icon_theme_has_icon(gtk_icon_theme_get_default(), "uu-remote-linux") ? "uu-remote-linux" : "computer";
+    gchar *icon_path = write_tray_icon();
+    if (icon_path) gtk_icon_theme_append_search_path(gtk_icon_theme_get_default(), icon_path);
+    const char *fallback = gtk_icon_theme_has_icon(gtk_icon_theme_get_default(), "uu-remote-linux") ? "uu-remote-linux" : "computer";
+    const char *icon = icon_path ? TRAY_ICON_NAME : fallback;
 
     // StatusNotifierItem (GNOME AppIndicator extension, KDE): libayatana-appindicator3 / libappindicator3.
     const char *libs[] = { "libayatana-appindicator3.so.1", "libappindicator3.so.1" };
@@ -329,8 +355,11 @@ static void build_tray(void) {
         void (*set_status)(void *, int) = (void (*)(void *, int))dlsym(h, "app_indicator_set_status");
         void (*set_menu)(void *, GtkMenu *) = (void (*)(void *, GtkMenu *))dlsym(h, "app_indicator_set_menu");
         void (*set_title)(void *, const char *) = (void (*)(void *, const char *))dlsym(h, "app_indicator_set_title");
+        void (*set_theme_path)(void *, const char *) = (void (*)(void *, const char *))dlsym(h, "app_indicator_set_icon_theme_path");
         if (ind_new && set_status && set_menu) {
-            void *ind = ind_new("uu-remote-linux", icon, 0 /* APPLICATION_STATUS */);
+            // Without a theme path the panel cannot find the cached icon; keep the installed one.
+            void *ind = ind_new("uu-remote-linux", set_theme_path ? icon : fallback, 0 /* APPLICATION_STATUS */);
+            if (icon_path && set_theme_path) set_theme_path(ind, icon_path);
             if (set_title) set_title(ind, "UU 远程 Linux 主机");
             set_menu(ind, GTK_MENU(tray_menu));
             set_status(ind, 1 /* ACTIVE */);
