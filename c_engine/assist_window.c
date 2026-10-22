@@ -306,9 +306,11 @@ static void on_status_menu(GtkStatusIcon *i, guint button, guint time, gpointer 
     gtk_menu_popup_at_pointer(GTK_MENU(tray_menu), NULL);
 }
 // Monochrome tray icon that follows light/dark panels: GTK and the GNOME AppIndicator extension
-// recolor "-symbolic" names, KDE recolors the ColorScheme-Text class. Written to the user cache
-// and offered as an icon theme path, so it needs no package install.
-static const char TRAY_ICON_NAME[] = "uu-remote-linux-symbolic";
+// recolor "-symbolic" names, KDE recolors the ColorScheme-Text class. Installed into the user's
+// hicolor theme (found by every panel's default lookup) and also offered as the icon theme path,
+// so it needs no package install. KDE tries dash-trimmed names ("uu-remote-linux") in each theme
+// before the next one, so the name must not trim into the colored app icon (#87).
+static const char TRAY_ICON_NAME[] = "uuremote-tray-symbolic";
 static const char TRAY_ICON_SVG[] =
     "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\">"
     "<style id=\"current-color-scheme\">.ColorScheme-Text{color:#232629}</style>"
@@ -316,15 +318,16 @@ static const char TRAY_ICON_SVG[] =
     "A1.5 1.5 0 0 1 1 10.5v-7A1.5 1.5 0 0 1 2.5 2zm0 1.5v7h11v-7z\"/>"
     "<path class=\"ColorScheme-Text\" fill=\"currentColor\" d=\"M7.25 12h1.5v1.5H11a.75.75 0 0 1 0 1.5H5a.75.75 0 0 1 0-1.5h2.25z"
     "M11.5 4.5v4l-1.35-1.35-3.1 3.1-1.2-1.2 3.1-3.1L7.5 4.5z\"/></svg>\n";
-// Returns the theme path holding the icon (hicolor layout plus a loose copy), or NULL.
+// Returns the icon theme root holding the icon ($XDG_DATA_HOME/icons), or NULL.
 static gchar *write_tray_icon(void) {
-    gchar *root = g_build_filename(g_get_user_cache_dir(), "uu-remote-linux", "icons", NULL);
+    gchar *root = g_build_filename(g_get_user_data_dir(), "icons", NULL);
     gchar *apps = g_build_filename(root, "hicolor", "scalable", "apps", NULL);
     gchar *file = g_strconcat(TRAY_ICON_NAME, ".svg", NULL);
-    gchar *themed = g_build_filename(apps, file, NULL), *loose = g_build_filename(root, file, NULL);
-    int ok = g_mkdir_with_parents(apps, 0700) == 0 && g_file_set_contents(themed, TRAY_ICON_SVG, -1, NULL)
-          && g_file_set_contents(loose, TRAY_ICON_SVG, -1, NULL);
-    g_free(apps); g_free(file); g_free(themed); g_free(loose);
+    gchar *path = g_build_filename(apps, file, NULL), *current = NULL;
+    // Rewriting an unchanged file would only make icon caches rescan.
+    int ok = g_file_get_contents(path, &current, NULL, NULL) && strcmp(current, TRAY_ICON_SVG) == 0;
+    if (!ok) ok = g_mkdir_with_parents(apps, 0755) == 0 && g_file_set_contents(path, TRAY_ICON_SVG, -1, NULL);
+    g_free(apps); g_free(file); g_free(path); g_free(current);
     if (!ok) { g_free(root); return NULL; }
     return root;
 }
