@@ -25,11 +25,14 @@ pub const SET_AUTO_LOCK: u64 = 19;
 /// Host settings from the viewer's 安全 menu. The viewer sends them only when a switch is toggled
 /// and shows what SystemMetrics reports, so they are host-wide and persisted (like the official
 /// host), not per connection: a reconnect must still lock / mute.
-#[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Settings {
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Settings {
     #[serde(default)] auto_lock: bool,
     #[serde(default)] keep_mute: bool,
     #[serde(default)] mute_permanent: bool,
+    /// "auto" or absent does not override the environment. Illegal values are ignored at read time.
+    #[serde(default)] pub(crate) video_encoder: Option<String>,
+    #[serde(default)] pub(crate) video_codec: Option<String>,
 }
 
 struct HostState {
@@ -39,22 +42,56 @@ struct HostState {
     desktop_sessions: usize,
 }
 
-fn settings_path() -> std::path::PathBuf { crate::config::path().with_file_name("host_settings.json") }
+pub(crate) fn settings_path() -> std::path::PathBuf { crate::config::path().with_file_name("host_settings.json") }
+
+pub(crate) fn load_settings() -> Settings {
+    std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Re-read, apply `patch`, write via a temp file and rename (mode 0600).
+pub(crate) fn merge_save(patch: impl FnOnce(&mut Settings)) -> Result<Settings, String> {
+    merge_write(patch)?;
+    let settings = load_settings();
+    if let Ok(mut guard) = state().lock() { guard.settings = settings.clone(); }
+    Ok(settings)
+}
+
+pub(crate) fn reload_settings() -> Settings {
+    let settings = load_settings();
+    if let Ok(mut guard) = state().lock() { guard.settings = settings.clone(); }
+    settings
+}
 
 fn state() -> &'static Mutex<HostState> {
     static STATE: std::sync::OnceLock<Mutex<HostState>> = std::sync::OnceLock::new();
     STATE.get_or_init(|| {
-        let settings = std::fs::read(settings_path()).ok()
-            .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let settings = load_settings();
         Mutex::new(HostState { settings, restore: None, desktop_sessions: 0 })
     })
 }
 
-fn save(settings: &Settings) {
+/// Re-read, copy only the security switches from `settings`, keep video_* from disk.
+fn save(settings: &Settings) -> Result<(), String> {
+    merge_write(|disk| {
+        disk.auto_lock = settings.auto_lock;
+        disk.keep_mute = settings.keep_mute;
+        disk.mute_permanent = settings.mute_permanent;
+    })
+}
+
+fn merge_write(patch: impl FnOnce(&mut Settings)) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let path = settings_path();
-    let result = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())
-        .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()));
-    if let Err(e) = result { log::warn!("Host settings not saved: {}", e); }
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    let mut disk = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    patch(&mut disk);
+    let json = serde_json::to_vec_pretty(&disk).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(|e| e.to_string())?;
+    file.write_all(&json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Handle for one desktop connection (system actions are host-wide).
@@ -142,7 +179,7 @@ impl PeerActions {
             _ => {}
         }
         let mut state = state().lock().unwrap();
-        let before = state.settings;
+        let before = state.settings.clone();
         match action {
             // 静音运行 on: the viewer sends MUTE_SYSTEM + MUTE_TEMPORARY (observed), off: MUTE_RESTORE.
             MUTE_SYSTEM | MUTE_TEMPORARY => {
@@ -172,7 +209,7 @@ impl PeerActions {
             }
             _ => return false,
         }
-        if state.settings != before { save(&state.settings); }
+        if state.settings != before { if let Err(e) = save(&state.settings) { log::warn!("Host settings not saved: {e}"); } }
         true
     }
 
@@ -205,7 +242,7 @@ impl PeerActions {
     pub fn metrics_payload(&self, sound: bool, desktop: crate::system_metrics::Permission) -> Vec<u8> {
         use crate::system_metrics::payload_with_settings;
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-        let current = state().lock().unwrap().settings;
+        let current = state().lock().unwrap().settings.clone();
         payload_with_settings(desktop, desktop, desktop, &home, &crate::system_metrics::Settings {
             sound, keep_mute: current.keep_mute, mute_permanent: current.mute_permanent, auto_lock: current.auto_lock,
         })
@@ -272,6 +309,38 @@ mod tests {
         assert_eq!(fields[1].number, 12);
         assert_eq!(fields[1].value, WireValue::Bytes(&[26, 3, b'w', b'o', b'w']));
         assert!(plugin_response(&decode_wire(&[10, 2, 8, 9]).unwrap()).is_none());
+    }
+    #[test]
+    fn merge_save_keeps_security_fields_and_mode() {
+        let _guard = crate::config::test_env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("uu-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        std::env::set_var("UU_CONFIG", &cfg);
+        let path = settings_path();
+        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":true,"mute_permanent":false}"#).unwrap();
+        let saved = merge_save(|s| s.video_encoder = Some("vaapi".into())).unwrap();
+        assert!(saved.auto_lock && saved.keep_mute && !saved.mute_permanent);
+        assert_eq!(saved.video_encoder.as_deref(), Some("vaapi"));
+        let again = merge_save(|s| s.video_codec = Some("h264".into())).unwrap();
+        assert_eq!(again.video_encoder.as_deref(), Some("vaapi"));
+        assert_eq!(again.video_codec.as_deref(), Some("h264"));
+        assert!(again.auto_lock);
+        let mode = { use std::os::unix::fs::PermissionsExt; std::fs::metadata(&path).unwrap().permissions().mode() & 0o777 };
+        assert_eq!(mode, 0o600);
+        // A mute/lock save must not drop video_* written after the in-memory copy was taken.
+        let mut memory = load_settings();
+        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":true,"mute_permanent":false,"video_encoder":"nvenc","video_codec":"h265"}"#).unwrap();
+        memory.keep_mute = false;
+        save(&memory).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["video_encoder"], "nvenc");
+        assert_eq!(disk["video_codec"], "h265");
+        assert_eq!(disk["keep_mute"], false);
+        assert_eq!(disk["auto_lock"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("UU_CONFIG");
     }
     #[test]
     fn args_shape_never_contains_values() {

@@ -306,7 +306,8 @@ systemctl --user restart uuremote-native.service
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
 | `UU_INPUT_BACKEND` | `auto`（默认，Wayland 下可用时用 uinput）/ `uinput` / `native` |
 | `UU_TERMINAL_SHORTCUTS=0` | 关闭终端窗口里的 Ctrl+V 粘贴转换 |
-| `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置时检测到 NVIDIA 驱动才用 NVENC，否则用 CPU |
+| `UU_VIDEO_ENCODER` | `cpu` / `vaapi` / `nvenc` / `auto`。低于 `host_settings.json` 里的同名字段。`auto` 或未设置：探测一次（显示由 NVIDIA 驱动则 NVENC，否则 VAAPI→NVENC→CPU），结果缓存到进程退出 |
+| `UU_VIDEO_CODEC` | `h264` / `h265` / `auto`。低于设置文件。`auto`：硬件编码器优先 H.265，CPU 用 H.264。会话中途修改要等下次桌面连接 |
 | `UU_VAAPI_BUFFER_MS` | VAAPI 的 VBV 缓冲（10–1000 ms，仅 `UU_VIDEO_ENCODER=vaapi` 时生效）；高分辨率下关键帧被压糊时用它换稳定画质 |
 | `UU_FFMPEG_ROOT` | 使用指定目录下的 FFmpeg |
 | `UU_AUDIO=0` | 关闭声音转发；`UU_AUDIO_SOURCE` 指定 PulseAudio 采集源 |
@@ -317,7 +318,7 @@ systemctl --user restart uuremote-native.service
 | `UU_WOL_HELPER=1` | 实验性：让这台主机像官方 Windows 被控端一样充当「远程开机」辅助设备——登录后向网易上报本机局域网信息，收到云端唤醒请求时向同一局域网发送唤醒包（未经端到端验证） |
 | `UU_USE_PROXY=1` | 使用环境变量里的 HTTP/SOCKS 代理；默认忽略代理、直连网易服务器 |
 
-「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。
+「远程结束后自动锁屏」「静音运行」以及 `video_encoder` / `video_codec` 保存在 `~/.config/uuremote/host_settings.json`（0600）。`uuremote-server set-encoder auto|cpu|vaapi|nvenc` 与 `set-codec auto|h264|h265` 合并写入并在 host 运行时发 `SIGUSR2`：编码器对进行中的桌面流立即切换且不断开，codec 下次建流生效。也可手改文件后 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。显式值与 v0.2.23 的环境变量行为一致；只有 `auto` 会按真实编码探测，可能从 NVENC 改为 VAAPI。恢复旧选择：`set-encoder nvenc` 或 `set-encoder cpu`。
 
 自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 
@@ -383,11 +384,12 @@ HEVC 的访问单元按 RFC 7798 的图片边界切分，不依赖 AUD：`hevc_v
 画面从码流里丢掉，读取端按 AUD 切分就会把整个 GOP 当成一帧，再被 IRAP 门控全部拒绝——对外表现为连接停在
 「正在传输画面」，而主机侧只有约 12 kbit/s。`UU_VIDEO_CODEC=h265` 可显式选中 H.265，便于对照排查。
 
-### VAAPI 硬件编码（显式启用）
+### VAAPI 硬件编码
 
 设置 `UU_VIDEO_ENCODER=vaapi` 使用 Intel/AMD H.264 VAAPI；`UU_VAAPI_DEVICE` 默认
-`/dev/dri/renderD128`，运行用户需要 render 节点权限。不会自动选择 VAAPI；设备或驱动初始化
-失败会明确警告并回退 libx264。外部 FFmpeg 先转 NV12 再上传硬件帧。
+`/dev/dri/renderD128`，运行用户需要 render 节点权限。未设置或 `auto` 时，主机探测一帧真实编码，
+在 NVIDIA 没有驱动当前显示、且 VAAPI 产出 IDR 时会选中它（`set-encoder cpu` / `nvenc` 可改回）。
+设备或驱动初始化失败会明确警告并回退 libx264。外部 FFmpeg 先转 NV12 再上传硬件帧。
 VBR 使用控制端码率预设及 CQ 对应的最小 QP，无 B 帧、async depth=1，并保留现有 GOP/VFR 规则。
 Intel 核显（UHD 770，iHD 驱动）已实机验收：默认的外部 FFmpeg 管线用官方 Mac 控制端测试了各档画质、帧率、缩放和重连，全程硬件编码、无回退，CPU 占用比 libx264 低约 40%（该数字为 FFmpeg 进程管线时代的测量）。AMD 核显已在**进程内原生引擎**上实机验收（`--features inproc-av`）：官方 Mac 客户端的端到端会话在 HawkPoint（Mesa 26.2.3）与 Cezanne（Mesa 26.2.5）上通过验收（HEVC，含画质档、帧率、缩放）；Cezanne 上另以探测验证了 H.264 与两条采集路径——XShm 上传（码流可解码、画面正确）与 DRI3 DMA-BUF 零拷贝导入。同机实测（1920×1200@60，Cezanne iGPU + RTX 3050 Ti 双显卡）：进程内 VAAPI 每帧编码 CPU 约为 libx264（FFmpeg 管线 superfast）的 **1/12**、进程内 NVENC 的 **1/5**；外部 FFmpeg 进程管线（预编译包使用）在 AMD 上未单独验证。
 

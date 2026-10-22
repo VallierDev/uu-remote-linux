@@ -30,6 +30,7 @@ mod signaling;
 mod terminal;
 mod webrtc;
 mod video;
+mod video_select;
 mod video_track;
 mod locked_video;
 #[cfg(test)]
@@ -127,12 +128,76 @@ fn systemd_unit() -> Option<String> {
     cgroup.lines().find_map(|l| l.rsplit('/').next().filter(|u| u.ends_with(".service")).map(str::to_owned))
 }
 fn display_present() -> bool { std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() }
+
+fn set_video_pref() -> Result<(), Box<dyn std::error::Error>> {
+    let which = std::env::args().nth(1).unwrap_or_default();
+    let value = std::env::args().nth(2).unwrap_or_default();
+    let usage = if which == "set-encoder" { "usage: uuremote-server set-encoder auto|cpu|vaapi|nvenc" } else { "usage: uuremote-server set-codec auto|h264|h265" };
+    let ok = if which == "set-encoder" { video_select::parse_encoder(Some(&value)).is_some() } else { video_select::parse_codec(Some(&value)).is_some() };
+    if reject_cli(Some(&which), std::env::args().len(), ok) == Some(2) { eprintln!("{usage}"); std::process::exit(2); }
+    let stored = value.to_ascii_lowercase();
+    let stored = if stored == "hevc" { "h265".to_owned() } else { stored };
+    system_actions::merge_save(|settings| {
+        if which == "set-encoder" { settings.video_encoder = Some(stored.clone()); }
+        else { settings.video_codec = Some(stored.clone()); }
+    })?;
+    let selection = video_select::selection();
+    let notified = notify_host_reload();
+    let encoder_line = if which == "set-encoder" && stored == "auto" && video_select::cached_probe().is_none() {
+        "auto (probed by the running host)".to_owned()
+    } else {
+        format!("{:?}", selection.encoder).to_ascii_lowercase()
+    };
+    println!("encoder={} source={} codec_pref={} source={}",
+        encoder_line, video_select::encoder_source_label(selection.encoder_source),
+        match selection.codec_pref { video_select::CodecPref::Auto => "auto", video_select::CodecPref::H264 => "h264", video_select::CodecPref::H265 => "h265" },
+        video_select::source_label(selection.codec_source));
+    if which == "set-encoder" {
+        if stored == "auto" && video_select::cached_probe().is_none() {
+            println!("encoder: auto; the running host probes on the next desktop stream");
+        }
+        println!("{}", if notified { "encoder: notified the running host" } else { "encoder: written; takes effect on the next desktop stream" });
+    } else {
+        println!("codec: takes effect the next time a desktop connection starts");
+    }
+    Ok(())
+}
+
+fn notify_host_reload() -> bool {
+    let Some(pid) = std::fs::read_to_string(host_pid_path()).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|p| *p > 1) else { return false };
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let own = std::env::current_exe().ok();
+    if exe.as_ref().and_then(|p| p.file_name()) != own.as_ref().and_then(|p| p.file_name()) { return false; }
+    unsafe { libc::kill(pid, libc::SIGUSR2) == 0 }
+}
 /// SIGUSR1 (`uuremote-server show`) opens the host window.
 fn present_on_usr1(ui: std::sync::Arc<assist::LocalUi>) {
     // Install the handler before publishing the pid: SIGUSR1's default action terminates the process.
     let Ok(mut usr1) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) else { return };
     write_host_pid();
     tokio::spawn(async move { while usr1.recv().await.is_some() { ui.present(); } });
+}
+
+/// Unknown arguments and illegal set-encoder values exit 2 (never start a second host).
+pub(crate) fn reject_cli(arg: Option<&str>, argc: usize, value_ok: bool) -> Option<i32> {
+    const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+        "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
+    if arg.is_some_and(|a| !SUBCOMMANDS.contains(&a) && !matches!(a, "help" | "-h" | "--help")) { return Some(2); }
+    if matches!(arg, Some("set-encoder" | "set-codec")) && (argc != 3 || !value_ok) { return Some(2); }
+    None
+}
+
+#[cfg(test)]
+mod cli_exit_tests {
+    #[test]
+    fn unknown_subcommand_exits_2() {
+        assert_eq!(super::reject_cli(Some("not-a-command"), 2, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 3, false), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 2, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 3, true), None);
+        assert_eq!(super::reject_cli(Some("help"), 2, true), None);
+        assert_eq!(super::reject_cli(None, 1, true), None);
+    }
 }
 
 fn host_pid_path() -> std::path::PathBuf { config::path().with_file_name("host.pid") }
@@ -226,9 +291,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_module("uuremote_server", log::LevelFilter::Info).init();
     } else { env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init(); }
     // An unknown argument must never fall through to starting a second full host server.
-    const SUBCOMMANDS: [&str; 15] = ["doctor", "show", "assist", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
-        "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
-    if let Some(arg) = std::env::args().nth(1).filter(|a| !SUBCOMMANDS.contains(&a.as_str())) {
+    if let Some(2) = reject_cli(std::env::args().nth(1).as_deref(), std::env::args().len(), true) {
+        let arg = std::env::args().nth(1).unwrap_or_default();
+        const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+            "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
         let usage = format!("usage: uuremote-server [{}]\n  (no argument: run the host)", SUBCOMMANDS.join(" | "));
         if matches!(arg.as_str(), "help" | "-h" | "--help") { println!("{usage}"); return Ok(()); }
         eprintln!("unknown argument\n{usage}");
@@ -236,6 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if std::env::args().nth(1).as_deref() == Some("show") { return show_running_host(); }
+    if matches!(std::env::args().nth(1).as_deref(), Some("set-encoder") | Some("set-codec")) { return set_video_pref(); }
     if assist_enabled && !unified {
         if std::env::args().len() > 2 { return Err("assist accepts no additional arguments; configure it with a private UU_CONFIG".into()); }
         assist::configure()?;
@@ -466,6 +533,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     input.bind_portal(capture.portal.clone());
     input.release_held(); // recover stale input before accepting any peer
     let _pointer_worker = input.start_pointer_worker();
+    // Install before the pid file: SIGUSR2's default action terminates the process.
+    if let Ok(mut usr2) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
+        tokio::spawn(async move { while usr2.recv().await.is_some() { video_select::note_reload(); } });
+    }
+    write_host_pid();
     let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
     let shutdown_input = input.clone();
     let signal_tx = shutdown_tx.clone();

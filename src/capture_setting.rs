@@ -129,8 +129,13 @@ pub fn handle_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, na
 /// times slower than libx264 (measured 15 vs 155 fps at 1080p on a 4-core ARM host, #59), so CPU
 /// hosts default to H.264. UU_VIDEO_CODEC=h264 / h265 overrides.
 pub fn preferred_codec(h264: bool, h265: bool) -> VideoCodec {
-    let forced = std::env::var("UU_VIDEO_CODEC").ok().map(|v| v.to_ascii_lowercase());
-    pick_codec(h264, h265, forced.as_deref(), crate::video::Encoder::requested() != crate::video::Encoder::Cpu)
+    let selection = crate::video_select::selection();
+    pick_codec(h264, h265, crate::video_select::codec_force(selection.codec_pref), crate::video_select::hardware(selection.encoder))
+}
+
+/// Same decision `preferred_codec` makes once a probe report exists.
+pub fn codec_after_probe(h264: bool, h265: bool, pref: crate::video_select::CodecPref, probed: crate::video::Encoder) -> VideoCodec {
+    pick_codec(h264, h265, crate::video_select::codec_force(pref), crate::video_select::hardware(probed))
 }
 fn pick_codec(h264: bool, h265: bool, forced: Option<&str>, hardware: bool) -> VideoCodec {
     let wants_h265 = match forced { Some("h264") => false, Some("h265" | "hevc") => true, _ => hardware };
@@ -569,6 +574,10 @@ mod codec_tests {
         // Only one codec bound in the SDP: use it whatever the preference.
         assert_eq!(pick_codec(false, true, None, false), VideoCodec::H265);
         assert_eq!(pick_codec(true, false, Some("h265"), true), VideoCodec::H264);
+        // Auto follows the probed encoder: VAAPI is hardware (H.265), a CPU fallback is H.264.
+        assert_eq!(codec_after_probe(true, true, crate::video_select::CodecPref::Auto, crate::video::Encoder::Vaapi), VideoCodec::H265);
+        assert_eq!(codec_after_probe(true, true, crate::video_select::CodecPref::Auto, crate::video::Encoder::Cpu), VideoCodec::H264);
+        assert_eq!(codec_after_probe(true, true, crate::video_select::CodecPref::H264, crate::video::Encoder::Nvenc), VideoCodec::H264);
     }
 }
 

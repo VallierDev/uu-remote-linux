@@ -114,7 +114,7 @@ viewer does not reconnect them automatically.
 | Item | Meaning |
 |---|---|
 | `~/.config/uuremote/config.json` | user_id, device_id, client_id, system_id, machine_guid, token, csrf; optional `sign_key`, `ffmpeg_root`. `$UU_CONFIG` overrides the path |
-| `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent |
+| `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent; optional `video_encoder` / `video_codec` (`auto`/`cpu`/`vaapi`/`nvenc`, `auto`/`h264`/`h265`). Mode 0600. `set-encoder` / `set-codec` merge-write and `SIGUSR2` the pid in `host.pid`. Encoder applies to open desktop streams; codec on the next stream. `auto` or absent falls through |
 | `UU_DESKTOP_BACKEND` | `auto` (default) / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless: no display; desktop offers ignored; tool peers get a nominal 1920x1080 screen + Allow permissions, which the port-mapping viewer requires) |
 | `UU_DESKTOP_RESIZE=0` | X11: the viewer's 分辨率 choice scales the encoded stream instead of changing the display mode. Default: `src/desktop_mode.rs` switches the primary output via xrandr (adds a CVT-RB mode when missing, re-applies once if mutter resets it), restores the original mode for resolution_type 3 and 2 s after the last desktop stream ends |
 | `UU_NVENC_RGB=0` / `=1` | NVENC 4:2:0 without scaling takes packed BGRA/BGR0 directly (no CPU swscale). Default: on, except when a connected DRM connector belongs to an nvidia-bound card (desktop composited on the encoding GPU; #16 measured 82.6 vs 98 fps at 4K). `0` forces CPU conversion, `1` forces the direct path |
@@ -122,8 +122,8 @@ viewer does not reconnect them automatically.
 | Mac viewer Cmd | With 「使用 macOS 快捷键」 off the Mac viewer sends Cmd=VK_LWIN 0x5B, Option=0xA4, Ctrl=0xA2; connect header `controller_platform`=4 is macOS. For Mac controllers Cmd is held back: Cmd+C/V/A/F/X/Z → Ctrl+key (terminal: Cmd+C/V → Ctrl+Shift+C/V), other combos/alone → Super |
 | `UU_TERMINAL_SHORTCUTS=0` | disable Ctrl+V → Ctrl+Shift+V in focused X11 terminals (Mac Cmd and Ctrl both arrive as VK_LCONTROL) |
 | `contrib/virtual-desktop/` | Xvfb + session (`UU_VIRTUAL_SESSION`, `UU_VIRTUAL_BUS=user|private`) for monitorless hosts; serve it with `DISPLAY=:99` |
-| `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: explicit Intel/AMD; `nvenc`: force; unset: NVENC→CPU only if `/proc/driver/nvidia/version` or `/dev/nvidia0` exists, else CPU (#10) |
-| `UU_VIDEO_CODEC=h264` | force H.264 even when the viewer negotiated H.265 (default: H.265 when both sides support it) |
+| `UU_VIDEO_ENCODER` | below the settings file. `cpu` / `vaapi` / `nvenc` / `auto`. `auto` or unset: one encode probe cached until exit (NVIDIA driving the display → NVENC, else VAAPI → NVENC if a driver node exists → CPU). Explicit values keep the v0.2.23 meaning (#10, #85) |
+| `UU_VIDEO_CODEC` | below the settings file. `h264` / `h265` / `auto`. `auto`: H.265 on VAAPI/NVENC, H.264 on CPU. A change applies on the next desktop connection, not mid-session |
 | `UU_FFMPEG_ROOT` | FFmpeg prefix (`bin/ffmpeg`, libs in `lib/x86_64-linux-gnu`) |
 | `UU_AUDIO=0`, `UU_AUDIO_SOURCE` | disable sound / choose the Pulse source (default `@DEFAULT_MONITOR@`) |
 | `UU_LOGIN_WINDOW=0` | don't auto-open the login window |
@@ -144,7 +144,7 @@ for a new QR login.
 | `src/signaling.rs` | Engine.IO v4 / Socket.IO client; `be-controlled` binary attachment = ConnectOptions (field 1 capture_type) |
 | `src/auth.rs`, `src/config.rs`, `src/login.rs`, `src/login_ui.rs` | signed REST client, config, device init + QR login, GTK window |
 | `src/webrtc.rs` | peer connection, data channels, CONTROL dispatch, initialization messages |
-| `src/video.rs`, `src/capture_setting.rs`, `src/video_track.rs`, `src/hevc.rs` | FFmpeg H.264/H.265 pipeline, one video track for both codecs (RFC 7798 HEVC payloader); viewer quality/fps/resolution/chroma settings |
+| `src/video.rs`, `src/video_select.rs`, `src/capture_setting.rs`, `src/video_track.rs`, `src/hevc.rs` | FFmpeg H.264/H.265 pipeline; `video_select` resolves encoder/codec (settings file > env > probed auto) |
 | `src/locked_video.rs` | low-rate synthetic black video on the negotiated track while Portal is pending and locked; enables iPhone cold auto unlock (#29), requires FFmpeg libx264/libx265 for the selected codec |
 | `src/audio.rs` | Pulse/PipeWire monitor → Opus audio track |
 | `src/input.rs`, `src/input_mapping.rs`, `src/uinput.rs` | input injection (X11 XTest / Wayland / portal / uinput), Windows VK → keysym → evdev |
@@ -278,10 +278,11 @@ started a second full host server instead, so check that a subcommand exists in 
 - Update README.md / README.en.md when user-visible features or limitations change, and add
   `docs/release-notes/<tag>.md` before tagging a release.
 
-### VAAPI (opt-in / 显式启用)
+### VAAPI
 
 `UU_VIDEO_ENCODER=vaapi` selects Intel/AMD H.264 VAAPI; `UU_VAAPI_DEVICE` defaults to
-`/dev/dri/renderD128` (render-node permissions required). No automatic VAAPI selection.
+`/dev/dri/renderD128` (render-node permissions required). `auto` (the default) probes one real
+frame and may select VAAPI when it produces an IDR and NVIDIA is not driving the display.
 The FFmpeg process pipeline uploads NV12 frames to a VAAPI frame pool. With `--features inproc-av` on X11, VAAPI
 H.264/HEVC Main runs in process: a DRI3 DMA-BUF of the root (XShm upload without DRI3) goes through VPP to NV12
 and VCN, with SPS/PPS(/VPS) and slice headers packed by the host as radeonsi (Mesa 26) needs; parameters follow

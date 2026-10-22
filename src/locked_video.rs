@@ -55,6 +55,12 @@ where F: FnMut(VideoCodec) -> Fut, Fut: std::future::Future<Output = Result<Byte
                 if !updates.borrow().waiting || *locked.borrow() != Some(true)
                     || pc.connection_state() != RTCPeerConnectionState::Connected { continue; }
                 if frame.is_none() {
+                    // Codec auto waits for the cached probe so a later VAAPI choice is not pinned to CPU.
+                    if crate::video_select::selection().encoder_source == crate::video_select::Source::Auto
+                        && crate::video_select::cached_probe().is_none() {
+                        let snap = desktop.snapshot();
+                        crate::video::ensure_probed(crate::video::probe_size((snap.screen.width, snap.screen.height))).await;
+                    }
                     let codec = crate::capture_setting::preferred_codec(
                         track.supports(VideoCodec::H264), track.supports(VideoCodec::H265));
                     let encoded = tokio::select! {

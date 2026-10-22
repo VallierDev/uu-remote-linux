@@ -382,8 +382,11 @@ mod tests {
         assert_eq!(qr_ticket(&json!({"token": "old"})), Some("old"));
         assert_eq!(qr_ticket(&json!({"status_query_ticket": ""})), None);
     }
-    #[tokio::test]
-    async fn service_waits_until_a_new_token_is_saved() {
+    #[test]
+    fn service_waits_until_a_new_token_is_saved() {
+        let _env = crate::config::test_env_lock().lock().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
         let dir = std::env::temp_dir().join(format!("uu-login-wait-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
@@ -399,6 +402,7 @@ mod tests {
         let got = tokio::time::timeout(Duration::from_secs(10), wait_for_credentials(Some("old".into()))).await.unwrap();
         assert_eq!(got.token, "new"); // the expired token in the file is not accepted
         let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

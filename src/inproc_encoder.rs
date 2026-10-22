@@ -252,6 +252,11 @@ fn run_vaapi(
         is_hevc: libc::c_int::from(config.codec == crate::capture_setting::VideoCodec::H265),
         device: device.as_ptr(),
     };
+    // Probes set stop before the timeout expires. Check it before opening the device so a
+    // late thread cannot hold the render node while the next candidate or the real stream starts.
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let raw_engine = unsafe { vaapi_create(&ffi_cfg) };
     if raw_engine.is_null() {
         return Err("Failed to create native VAAPI engine".into());
@@ -446,6 +451,9 @@ fn run_nvenc(
     let mut capture = DamageCapture::open(&config.display)
         .map_err(|e| format!("DamageCapture::open failed on {}: {e}", config.display))?;
 
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let raw_engine = unsafe { nvenc_create(&ffi_cfg) };
     if raw_engine.is_null() {
         return Err("Failed to create native NVENC engine".into());

@@ -92,9 +92,18 @@ pub async fn run() -> Result<(), String> {
     line("UU_INPUT_BACKEND", std::env::var("UU_INPUT_BACKEND").unwrap_or_else(|_| "auto".into()));
 
     println!("-- video");
-    let encoder = crate::video::Encoder::requested();
-    line("encoder", format!("{encoder:?} (UU_VIDEO_ENCODER={})", std::env::var("UU_VIDEO_ENCODER").unwrap_or_else(|_| "auto".into())));
-    line("default codec", format!("{:?}", crate::capture_setting::preferred_codec(true, true)));
+    let selection = crate::video_select::selection();
+    let probed = crate::video_select::cached_probe().map(|p| p.order.iter().map(|e| format!("{e:?}").to_ascii_lowercase()).collect::<Vec<_>>().join(","));
+    let env_enc = std::env::var("UU_VIDEO_ENCODER").unwrap_or_else(|_| "unset".into());
+    let encoder_shown = if selection.encoder_source == crate::video_select::Source::Auto && probed.is_none() {
+        "auto (probed by the running host)".to_owned()
+    } else {
+        format!("{:?}", selection.encoder)
+    };
+    line("encoder", format!("{encoder_shown} (source={}; probed={}; UU_VIDEO_ENCODER={env_enc})",
+        crate::video_select::encoder_source_label(selection.encoder_source), probed.as_deref().unwrap_or("none")));
+    let codec = match selection.codec_pref { crate::video_select::CodecPref::Auto => "auto", crate::video_select::CodecPref::H264 => "h264", crate::video_select::CodecPref::H265 => "h265" };
+    line("codec", format!("{codec} (source={})", crate::video_select::source_label(selection.codec_source)));
     let mut ffmpeg = crate::video::ffmpeg_command();
     ffmpeg.args(["-hide_banner", "-encoders"]).kill_on_drop(true);
     match tokio::time::timeout(std::time::Duration::from_secs(5), ffmpeg.output()).await {

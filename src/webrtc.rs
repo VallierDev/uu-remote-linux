@@ -25,6 +25,11 @@ use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocalWriter;
 
+/// A 真彩 RPC changes chroma. Message 25 for that change comes from the settings watcher only.
+fn chroma_sync_on_rpc(before: u64, after: u64) -> bool {
+    before == after
+}
+
 fn is_capture_setting_message(data: &[u8]) -> bool {
     use crate::protocol::WireValue;
     let Ok(fields) = crate::protocol::decode_wire(data) else { return false; };
@@ -63,7 +68,8 @@ impl WebRtcSession {
         m.register_default_codecs()
             .map_err(|e| format!("Register standard codecs failed: {}", e))?;
 
-        let hevc = desktop && crate::video::hevc_available().await;
+        // Auto probes one IDR at this desktop's size (cached). 0×0 (init failed) uses the 1920×1080 fallback.
+        let hevc = desktop && crate::video::hevc_available(crate::video::probe_size((capture.width, capture.height))).await;
         if hevc { crate::video_track::register_hevc(&mut m).map_err(|e| format!("Register HEVC failed: {e}"))?; }
 
         m.register_header_extension(
@@ -448,6 +454,26 @@ impl WebRtcSession {
                     });
                 }
                 let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+                if label == "CONTROL_DATA_CHANNEL" {
+                    // Sole Message 25 for a chroma change: 真彩 RPC and an encoder switch that drops
+                    // 4:4:4 both publish settings.chroma. The RPC task below does not send field 25.
+                    let sync_tx = outbound.clone();
+                    let sync_seq = reply_sequence.clone();
+                    let mut sync_settings = channel_video_settings.subscribe();
+                    let sync_size = (screen.width, screen.height);
+                    tokio::spawn(async move {
+                        let mut last = *sync_settings.borrow();
+                        while sync_settings.changed().await.is_ok() {
+                            let now = *sync_settings.borrow_and_update();
+                            if now.chroma == last.chroma { last = now; continue; }
+                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            let sync = crate::capture_setting::sync_payload(&now, sync_size);
+                            let seq = sync_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let _ = sync_tx.send(crate::initialization::envelope(seq, ts, 25, &sync));
+                            last = now;
+                        }
+                    });
+                }
                 if matches!(label.as_str(),"CONTROL_DATA_CHANNEL"|"TEXT_DATA_CHANNEL") {
                     let settings = channel_video_settings.clone();
                     let track = peer_video_track.clone();
@@ -603,8 +629,12 @@ impl WebRtcSession {
                                     Err(error) => log::warn!("Screen sources update failed: {}", error),
                                 }
                             }
-                            let sync = crate::capture_setting::sync_payload(&current, input_size);
-                            let _ = response_tx.send(crate::initialization::envelope(next(), timestamp, 25, &sync));
+                            // Chroma changes are announced by the CONTROL watcher (one Message 25).
+                            // fps / quality / size still sync here; repeating field 3 is the same chroma.
+                            if chroma_sync_on_rpc(before.chroma, current.chroma) {
+                                let sync = crate::capture_setting::sync_payload(&current, input_size);
+                                let _ = response_tx.send(crate::initialization::envelope(next(), timestamp, 25, &sync));
+                            }
                         }
                     });
                 }
@@ -826,6 +856,12 @@ impl WebRtcSession {
                                 (7, crate::capture_setting::screen_sources(next_seq(), timestamp, screen_size, init_video.borrow().output, "Linux desktop")),
                             ];
                             if desktop && screen.init_error.is_none() {
+                                // Codec auto follows the encoder the probe actually picked. Probe once
+                                // here (cached, single-flight) so Message 18 is not locked to the pre-probe guess.
+                                if crate::video_select::selection().encoder_source == crate::video_select::Source::Auto
+                                    && crate::video_select::cached_probe().is_none() {
+                                    crate::video::ensure_probed(crate::video::probe_size(screen_size)).await;
+                                }
                                 let codec = crate::capture_setting::preferred_codec(init_track.supports(crate::capture_setting::VideoCodec::H264),
                                     init_track.supports(crate::capture_setting::VideoCodec::H265));
                                 init_video.send_if_modified(|current| if current.codec != codec {
@@ -1415,7 +1451,7 @@ fn negotiated_bundle_media(sdp: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::negotiated_bundle_media;
+    use super::{chroma_sync_on_rpc, negotiated_bundle_media};
     #[test]
     fn advertises_max_message_size_once_in_the_data_channel_section() {
         use super::with_max_message_size;
@@ -1423,6 +1459,13 @@ mod tests {
         let out = with_max_message_size(sdp);
         assert!(out.contains("a=sctp-port:5000\r\na=max-message-size:262144\r\n"));
         assert_eq!(with_max_message_size(&out), out);
+    }
+
+    #[test]
+    fn chroma_rpc_does_not_send_its_own_sync() {
+        use crate::capture_setting::{CHROMA_420, CHROMA_444};
+        assert!(!chroma_sync_on_rpc(CHROMA_420, CHROMA_444));
+        assert!(chroma_sync_on_rpc(CHROMA_420, CHROMA_420));
     }
 
     #[test]
