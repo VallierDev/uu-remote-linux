@@ -510,19 +510,26 @@ async fn read_encoder(
     // A failed native NVENC session (old driver, unsupported mode) still leaves FFmpeg's NVENC process pipeline.
     #[cfg(feature = "inproc-av")]
     if let Err(error) = &result {
-        if !latest.is_closed() && native_inproc(&display, portal.is_some(), encoder) {
+        if !latest.is_closed() && native_inproc(&display, portal.is_some(), encoder) && x11_resized(&display, portal.is_some(), size).is_none() {
             log::warn!("In-process {} stream unavailable; switching to the FFmpeg process pipeline: {}",encoder.name_for(settings.codec),error);
             result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,sequence.clone(),settings,idr.clone(),budget.clone()).await;
         }
     }
     match result {
         Ok(())=>Ok(()),
-        Err(error) if !latest.is_closed()=>{
+        Err(error) if !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none()=>{
             log::warn!("{} stream unavailable; switching scoped encoder to CPU: {}",encoder.name_for(settings.codec),error);
             read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget).await
         },
         Err(error)=>Err(error),
     }
+}
+
+/// A resized X11 root fails every encoder alike (x11grab BadMatch on the old size);
+/// returns the new size so the stream restarts capture instead of walking the fallback chain.
+fn x11_resized(display: &str, portal: bool, size: (u32, u32)) -> Option<(u32, u32)> {
+    if portal || display.starts_with("wayland:") || display.starts_with("kms:") { return None; }
+    crate::capture::x11_size().filter(|current| *current != size)
 }
 
 /// The native in-process NVENC path serves X11 only (not Wayland/KMS capture or a portal session).
@@ -915,7 +922,7 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
     Ok(())
 }
 
-pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
+pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, mut size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>) -> Result<(), String> {
     loop {
         if transport_closed(&pc) { return Ok(()); }
@@ -969,6 +976,13 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
         tokio::select! {
             result = &mut reader.0 => {
                 let result = result.map_err(|e| format!("Encoder reader task: {e}"))?;
+                if let Some(resized) = result.as_ref().err().and_then(|_| x11_resized(&display, portal_stream, size)) {
+                    log::info!("Desktop geometry changed during the stream ({}x{} -> {}x{}); restarting capture", size.0, size.1, resized.0, resized.1);
+                    size = resized;
+                    while receiver.try_recv().is_ok() {}
+                    reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone(), budget.clone()));
+                    continue;
+                }
                 if let (Err(error), VideoCodec::H265, true) = (&result, current.codec, track.supports(VideoCodec::H264)) {
                     log::warn!("HEVC stream failed ({error}); falling back to negotiated H264");
                     applied.send_modify(|value| value.codec = VideoCodec::H264);

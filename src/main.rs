@@ -784,7 +784,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                             continue;
                         }
                         let resized=desktop && capture.init_error.is_none() && capture.backend==desktop_backend::DesktopBackend::X11
-                            && tokio::task::spawn_blocking(crate::capture::x11_resized).await.unwrap_or(false);
+                            // Compare with this capture, not the engine: a live stream may already have refreshed it.
+                            && tokio::task::spawn_blocking(crate::capture::x11_size).await.ok().flatten().is_some_and(|size| size!=(capture.width,capture.height));
                         if resized { log::info!("Desktop geometry changed since startup; reinitializing capture"); }
                         let session_capture=if desktop && portal_desktop.is_none() && (capture.init_error.is_some() || resized) {
                             match tokio::task::spawn_blocking(ScreenCapture::new).await {

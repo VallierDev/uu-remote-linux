@@ -889,6 +889,8 @@ impl WebRtcSession {
 
                     Box::pin(async move {
                         let input_size = crate::wayland::input_size((screen.width, screen.height));
+                        // After a RandR resize the stream restarts capture at the new size; map the pointer to it.
+                        let live_x11 = screen.init_error.is_none() && screen.portal.is_none() && screen.backend == crate::desktop_backend::DesktopBackend::X11;
                         if let Some(term) = &terminal_worker {
                             if crate::terminal::is_frame(&msg.data) { term.handle(&msg.data); return; }
                         }
@@ -1160,7 +1162,7 @@ impl WebRtcSession {
                                             if let Some(session)=message_input_session.as_ref() {session.with_input(|| {
                                             if !crate::wayland::input_ready() {return;}
                                             match &event {
-                                                ControlInput::MouseAbsolute {x,y} => input_worker.mouse_absolute_normalized(*x,*y,crate::wayland::input_size(input_size)),
+                                                ControlInput::MouseAbsolute {x,y} => input_worker.mouse_absolute_normalized(*x,*y,crate::wayland::input_size(if live_x11 {crate::capture::x11_last_size().unwrap_or(input_size)} else {input_size})),
                                                 ControlInput::MouseRelative {dx,dy} => input_worker.mouse_relative(*dx,*dy),
                                                 ControlInput::MouseScroll {dx,dy} => input_worker.mouse_scroll(*dx,*dy),
                                                 ControlInput::Keyboard {key, pressed} => input_worker.windows_key_event(*key, *pressed),

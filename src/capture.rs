@@ -46,12 +46,20 @@ unsafe fn x11_display_name() -> *const libc::c_char { b":0\0".as_ptr().cast() }
 
 /// The X11 root can be resized while the host runs (RandR, xrdp reconnects); the
 /// geometry read at startup then makes x11grab reject every new connection.
-pub fn x11_resized() -> bool {
+/// Re-reads the root size; None when the X11 engine is not in use or the query fails.
+pub fn x11_size() -> Option<(u32, u32)> {
     match unsafe { x11_refresh_geometry() } {
-        1 => true,
-        0 => false,
-        code => { log::warn!("X11 geometry query failed with code {code}"); false }
+        0 | 1 => x11_last_size(),
+        -1 => None,
+        code => { log::warn!("X11 geometry query failed with code {code}"); None }
     }
+}
+
+/// The root size from the last refresh, without an X round trip (pointer mapping).
+pub fn x11_last_size() -> Option<(u32, u32)> {
+    let (mut w, mut h): (libc::c_int, libc::c_int) = (0, 0);
+    if unsafe { x11_get_dimensions(&mut w, &mut h) } != 0 || w <= 0 || h <= 0 { return None; }
+    Some((w as u32, h as u32))
 }
 
 pub struct ScreenCapture {
