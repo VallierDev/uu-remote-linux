@@ -331,6 +331,7 @@ Common environment variables:
 | `UU_CONFIG` | Config file path (default `~/.config/uuremote/config.json`) |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
 | `UU_DESKTOP_RESIZE=0` | on X11, keep the desktop resolution and only scale the encoded stream when the viewer picks a resolution |
+| `UU_NVENC_RGB=0` / `=1` | NVENC encodes BGRA directly (saves CPU). Off by default when a monitor is connected to the NVIDIA card (slower when the desktop is composited on the same GPU); `0` forces off, `1` forces on |
 | `UU_WAYLAND_MULTISCREEN=1` | Enable Hyprland physical monitor switching (off by default) |
 | `UU_WAYLAND_OUTPUT` | Initial native Wayland output name, e.g. `HDMI-A-1` |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | Native Wayland skips the virtual keyboard (e.g. Denial reserves it for its input method); keys go through uinput. Without wlr-virtual-pointer the pointer also uses uinput (#72) |

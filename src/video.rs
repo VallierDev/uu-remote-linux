@@ -262,10 +262,29 @@ fn cpu_hevc_options(settings: &VideoSettings, gop: &str) -> Vec<String> {
 
 /// NVENC converts packed RGB on the GPU (BT.601 limited range, tagged bt470bg like the swscale default;
 /// compared on the 3090), so 4:2:0 without scaling skips the CPU BGRA→YUV pass (#16: ~2 cores at 4K).
-/// `input` is the source pixel format; `UU_NVENC_RGB=0` restores CPU conversion.
+/// When the desktop is composited on the NVIDIA card itself, the packed-RGB path is slower than CPU
+/// conversion (#16: RTX 5070 at 4K, 82.6 vs 98 fps), so it stays off unless `UU_NVENC_RGB=1`.
+/// `input` is the source pixel format; `UU_NVENC_RGB=0` always restores CPU conversion.
 fn nvenc_rgb_input(settings: &VideoSettings, encoder: Encoder, input: &'static str) -> Option<&'static str> {
-    (encoder == Encoder::Nvenc && settings.chroma != crate::capture_setting::CHROMA_444 && settings.output.is_none()
-        && std::env::var("UU_NVENC_RGB").as_deref() != Ok("0")).then_some(input)
+    let wanted = match std::env::var("UU_NVENC_RGB").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => !nvidia_drives_display(std::path::Path::new("/sys/class/drm")),
+    };
+    (encoder == Encoder::Nvenc && settings.chroma != crate::capture_setting::CHROMA_444 && settings.output.is_none() && wanted)
+        .then_some(input)
+}
+
+/// A connected DRM connector (`cardN-HDMI-A-1/status`) on a card bound to the nvidia driver.
+/// Only visible with nvidia-drm modeset, which Wayland compositors require.
+fn nvidia_drives_display(drm: &std::path::Path) -> bool {
+    std::fs::read_dir(drm).into_iter().flatten().flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((card, _)) = name.split_once('-') else { return false; };
+        card.starts_with("card")
+            && std::fs::read_to_string(entry.path().join("status")).is_ok_and(|s| s.trim() == "connected")
+            && std::fs::read_link(drm.join(card).join("device/driver")).is_ok_and(|p| p.file_name().is_some_and(|n| n == "nvidia"))
+    })
 }
 
 fn encoder_options(settings: &VideoSettings, encoder: Encoder, gop: &str, rgb: Option<&'static str>) -> Vec<String> {
@@ -1062,6 +1081,28 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nvidia_display_is_detected_from_connected_connectors() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("uu-drm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let card = |n: &str, driver: &str, connector: &str, status: &str| {
+            std::fs::create_dir_all(root.join(format!("drivers/{driver}"))).unwrap();
+            std::fs::create_dir_all(root.join(format!("drm/{n}/device"))).unwrap();
+            let _ = symlink(root.join(format!("drivers/{driver}")), root.join(format!("drm/{n}/device/driver")));
+            std::fs::create_dir_all(root.join(format!("drm/{n}-{connector}"))).unwrap();
+            std::fs::write(root.join(format!("drm/{n}-{connector}/status")), format!("{status}\n")).unwrap();
+        };
+        let drm = root.join("drm");
+        card("card0", "i915", "HDMI-A-1", "connected");
+        card("card1", "nvidia", "DP-1", "disconnected");
+        assert!(!super::nvidia_drives_display(&drm), "iGPU drives the display");
+        card("card1", "nvidia", "DP-2", "connected");
+        assert!(super::nvidia_drives_display(&drm), "NVIDIA drives a display");
+        assert!(!super::nvidia_drives_display(&root.join("missing")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn native_frame_dimensions_are_padded_to_even() {
         // A scaled compositor can report an odd logical desktop (e.g. two stacked 150% monitors →

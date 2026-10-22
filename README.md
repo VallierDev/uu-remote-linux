@@ -300,6 +300,7 @@ systemctl --user restart uuremote-native.service
 | `UU_CONFIG` | 配置文件路径（默认 `~/.config/uuremote/config.json`） |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
 | `UU_DESKTOP_RESIZE=0` | X11 下控制端切换分辨率时不改桌面分辨率，只缩放编码画面 |
+| `UU_NVENC_RGB=0` / `=1` | NVENC 直接编码 BGRA（省 CPU）。显示器接在 NVIDIA 卡上时默认关闭（同卡合成时直吃反而更慢），`0` 强制关，`1` 强制开 |
 | `UU_WAYLAND_MULTISCREEN=1` | 启用 Hyprland 物理显示器切换（默认关闭） |
 | `UU_WAYLAND_OUTPUT` | 原生 Wayland 默认采集输出名称，例如 `HDMI-A-1` |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
