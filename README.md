@@ -40,7 +40,7 @@
 | Mac 快捷键 | **推荐**：在 Mac 远控窗口菜单里关闭「使用 macOS 快捷键」，之后和在 Mac 上一样：Cmd+C/V/A/F/X/Z 是复制、粘贴、全选、查找、剪切、撤销（终端里 Cmd+C/V 自动变成 Ctrl+Shift+C/V），Ctrl+C 在终端里始终是中断。保持开启时，客户端会把 Cmd 和 Ctrl 都当成 Ctrl 发送：终端里 Ctrl+V / Cmd+V 自动转成粘贴，Ctrl+C 是中断，复制用 Cmd+Shift+C（X11） |
 | 鼠标指针样式 | 远端指针形状实时同步（X11） |
 | 剪贴板 | 双向文本同步 |
-| 画质 / 帧率 / 分辨率 | 自动、原画 20M、超清 8M、高清 2M、自定义；30/60/90/144 帧；「其他分辨率」由编码器缩放，不改动主机显示器 |
+| 画质 / 帧率 / 分辨率 | 自动、原画 20M、超清 8M、高清 2M、自定义；30/60/90/144 帧；X11 下切换分辨率会像官方 Windows 被控端一样真正修改桌面分辨率（xrandr，缺少该模式时自动添加；选「原始」或断开后恢复），`UU_DESKTOP_RESIZE=0` 改为仅由编码器缩放；Wayland 仍由编码器缩放 |
 | 声音 | 采集系统声音（PulseAudio / PipeWire），Opus 编码传到控制端 |
 | 文件传输 | 上传、下载（含文件夹）、新建文件夹、重命名、删除 |
 | 终端 | 官方「终端」工具，PTY 会话，支持多会话和重命名 |
@@ -299,6 +299,7 @@ systemctl --user restart uuremote-native.service
 |---|---|
 | `UU_CONFIG` | 配置文件路径（默认 `~/.config/uuremote/config.json`） |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
+| `UU_DESKTOP_RESIZE=0` | X11 下控制端切换分辨率时不改桌面分辨率，只缩放编码画面 |
 | `UU_WAYLAND_MULTISCREEN=1` | 启用 Hyprland 物理显示器切换（默认关闭） |
 | `UU_WAYLAND_OUTPUT` | 原生 Wayland 默认采集输出名称，例如 `HDMI-A-1` |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |

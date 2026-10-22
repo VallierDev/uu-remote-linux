@@ -5,6 +5,7 @@ mod engine_plugin;
 mod doctor;
 mod wol;
 mod desktop_backend;
+mod desktop_mode;
 mod desktop_session;
 mod desktop_power;
 mod portal;

@@ -46,7 +46,7 @@
 | Mac shortcuts | **Recommended**: turn off 「使用 macOS 快捷键」 (use macOS shortcuts) in the Mac viewer's remote-window menu; then Cmd+C/V/A/F/X/Z work as on a Mac (Cmd+C/V become Ctrl+Shift+C/V in terminals) and Ctrl+C always interrupts. With the option on, the viewer sends Cmd as Ctrl: in a terminal Ctrl+V / Cmd+V paste, Ctrl+C interrupts, copy is Cmd+Shift+C (X11) |
 | Pointer shape | Remote cursor shape is mirrored to the viewer (X11) |
 | Clipboard | Two-way text sync |
-| Quality / frame rate / resolution | Auto, Original 20M, Ultra 8M, HD 2M, custom; 30/60/90/144 fps; "other resolutions" are scaled by the encoder, the host monitor is left untouched |
+| Quality / frame rate / resolution | Auto, Original 20M, Ultra 8M, HD 2M, custom; 30/60/90/144 fps; on X11 a resolution choice changes the desktop resolution itself like the official Windows host (xrandr, adding the mode when missing; restored for "original" or on disconnect), `UU_DESKTOP_RESIZE=0` scales in the encoder instead; Wayland scales in the encoder |
 | Sound | System audio captured from PulseAudio / PipeWire and sent as Opus |
 | File transfer | Upload, download (including folders), create folder, rename, delete |
 | Terminal | The official "Terminal" tool, PTY sessions, multiple sessions, rename |
@@ -330,6 +330,7 @@ Common environment variables:
 |---|---|
 | `UU_CONFIG` | Config file path (default `~/.config/uuremote/config.json`) |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
+| `UU_DESKTOP_RESIZE=0` | on X11, keep the desktop resolution and only scale the encoded stream when the viewer picks a resolution |
 | `UU_WAYLAND_MULTISCREEN=1` | Enable Hyprland physical monitor switching (off by default) |
 | `UU_WAYLAND_OUTPUT` | Initial native Wayland output name, e.g. `HDMI-A-1` |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | Native Wayland skips the virtual keyboard (e.g. Denial reserves it for its input method); keys go through uinput. Without wlr-virtual-pointer the pointer also uses uinput (#72) |

@@ -141,6 +141,21 @@ pub fn handle_rpc_with_codecs(rpc: &[WireField], settings: &watch::Sender<VideoS
     apply_rpc(rpc, settings, native, h264, h265, crate::video::full_chroma_available())
 }
 
+/// The resolution a capture/resolution RPC asks for, parsed like apply_rpc: X11 hosts apply it
+/// to the display mode itself (desktop_mode), as the official Windows host changes its resolution.
+pub fn requested_resolution(rpc: &[WireField]) -> Option<crate::desktop_mode::Request> {
+    use crate::desktop_mode::Request;
+    if let Some(request) = message(rpc, 2) {
+        let fields = decode_wire(request).ok()?;
+        if number(&fields, 10) == Some(3) { return Some(Request::Native); }
+        let (w, h) = number(&fields, 16).zip(number(&fields, 17)).or_else(|| number(&fields, 5).zip(number(&fields, 6)))?;
+        Some(Request::Size(u32::try_from(w).ok()?, u32::try_from(h).ok()?))
+    } else if let Some(request) = message(rpc, 6) {
+        let fields = decode_wire(request).ok()?;
+        Some(Request::Size(u32::try_from(number(&fields, 1)?).ok()?, u32::try_from(number(&fields, 2)?).ok()?))
+    } else { None }
+}
+
 fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool, full_chroma: bool) -> Option<Vec<u8>> {
     let header = message(rpc, 1).unwrap_or(&[]);
     let mut next = *settings.borrow();

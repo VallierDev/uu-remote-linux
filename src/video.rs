@@ -924,6 +924,7 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
 
 pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, mut size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>) -> Result<(), String> {
+    let _desktop_mode = crate::desktop_mode::StreamGuard::new();
     loop {
         if transport_closed(&pc) { return Ok(()); }
         if pc.connection_state() == RTCPeerConnectionState::Connected
@@ -963,6 +964,8 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
             let discard = next.codec != current.codec || next.source_generation != current.source_generation || next.source_id != current.source_id || send_interrupted;
             current = next;
             timeline.fps = u64::from(next.fps);
+            // A viewer resolution choice may have changed the X11 display mode (desktop_mode).
+            if let Some(resized) = x11_resized(&display, portal_stream, size) { size = resized; }
             if discard {
                 reader.0.abort();
                 let _ = (&mut reader.0).await;
