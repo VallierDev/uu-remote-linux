@@ -64,6 +64,8 @@ sdl2 = { version = "0.37", optional = true, features = ["use-pkgconfig"] }
 cc = "1.0"
 
 [patch.crates-io]
+# RTP rollover counter survives delayed NACK retransmissions (vendor/webrtc-srtp/PATCHES.md).
+webrtc-srtp = { path = "vendor/webrtc-srtp" }
 webrtc-dtls = { path = "vendor/webrtc-dtls" }
 # Larger data-channel receive buffer (see vendor/webrtc/src/data_channel/mod.rs).
 webrtc = { path = "vendor/webrtc" }

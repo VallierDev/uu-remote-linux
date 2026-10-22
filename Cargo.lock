@@ -3075,8 +3075,6 @@ dependencies = [
 [[package]]
 name = "webrtc-srtp"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "383b0f0f73ee6cce396bdbc4d54ec661861a59eae9fc988914c1a8d82c5ac272"
 dependencies = [
  "aead",
  "aes",
