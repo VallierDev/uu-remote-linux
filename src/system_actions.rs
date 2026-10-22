@@ -30,9 +30,22 @@ pub(crate) struct Settings {
     #[serde(default)] auto_lock: bool,
     #[serde(default)] keep_mute: bool,
     #[serde(default)] mute_permanent: bool,
-    /// "auto" or absent does not override the environment. Illegal values are ignored at read time.
-    #[serde(default)] pub(crate) video_encoder: Option<String>,
-    #[serde(default)] pub(crate) video_codec: Option<String>,
+    /// "auto" or absent does not override the environment. A non-string value becomes None so a bad
+    /// video field cannot drop auto_lock / mute when the document is loaded.
+    #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_encoder: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_codec: Option<String>,
+}
+
+fn lenient_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    use serde::Deserialize;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(_) => {
+            log::warn!("Ignoring non-string video_encoder/video_codec in host settings");
+            Ok(None)
+        }
+        None => Ok(None),
+    }
 }
 
 struct HostState {
@@ -73,15 +86,34 @@ fn save(settings: &Settings) -> Result<(), String> {
     })
 }
 
+/// Held across read-patch-write-rename so set-* and a security-toggle save cannot clobber each other.
+struct SettingsLock { file: std::fs::File }
+impl SettingsLock {
+    fn acquire(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock_path = path.with_file_name("host_settings.json.lock");
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(&lock_path).map_err(|e| e.to_string())?;
+        let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+        if rc != 0 { return Err(std::io::Error::last_os_error().to_string()); }
+        Ok(Self { file })
+    }
+}
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN); }
+    }
+}
+
 fn merge_write(patch: impl FnOnce(&mut Settings)) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let path = settings_path();
     if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    let _lock = SettingsLock::acquire(&path)?;
     let mut disk = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     patch(&mut disk);
     let json = serde_json::to_vec_pretty(&disk).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(|e| e.to_string())?;
     file.write_all(&json).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
@@ -333,6 +365,16 @@ mod tests {
         assert_eq!(disk["video_codec"], "h265");
         assert_eq!(disk["keep_mute"], false);
         assert_eq!(disk["auto_lock"], true);
+        // A non-string video field must not fail the whole document (security switches survive).
+        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":false,"mute_permanent":true,"video_encoder":1,"video_codec":{"x":1}}"#).unwrap();
+        let loaded = load_settings();
+        assert!(loaded.auto_lock && !loaded.keep_mute && loaded.mute_permanent);
+        assert!(loaded.video_encoder.is_none() && loaded.video_codec.is_none());
+        merge_save(|s| s.video_encoder = Some("cpu".into())).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["auto_lock"], true);
+        assert_eq!(disk["mute_permanent"], true);
+        assert_eq!(disk["video_encoder"], "cpu");
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("UU_CONFIG");
     }

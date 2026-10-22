@@ -120,6 +120,7 @@ fn custom_bitrate_bps(value: u64) -> u32 {
     bps.min(u64::from(u32::MAX)) as u32
 }
 
+#[cfg(test)]
 pub fn handle_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32)) -> Option<Vec<u8>> {
     handle_rpc_with_codecs(rpc, settings, native, true, false)
 }
@@ -128,17 +129,27 @@ pub fn handle_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, na
 /// lists H265 first in its offer) and a hardware encoder is selected. Software libx265 is about ten
 /// times slower than libx264 (measured 15 vs 155 fps at 1080p on a 4-core ARM host, #59), so CPU
 /// hosts default to H.264. UU_VIDEO_CODEC=h264 / h265 overrides.
+#[cfg(test)]
 pub fn preferred_codec(h264: bool, h265: bool) -> VideoCodec {
-    let selection = crate::video_select::selection();
+    preferred_codec_for(h264, h265, crate::video_select::selection())
+}
+
+pub fn preferred_codec_for(h264: bool, h265: bool, selection: crate::video_select::Selection) -> VideoCodec {
     pick_codec(h264, h265, crate::video_select::codec_force(selection.codec_pref), crate::video_select::hardware(selection.encoder))
 }
-fn pick_codec(h264: bool, h265: bool, forced: Option<&str>, hardware: bool) -> VideoCodec {
+
+pub(crate) fn pick_codec(h264: bool, h265: bool, forced: Option<&str>, hardware: bool) -> VideoCodec {
     let wants_h265 = match forced { Some("h264") => false, Some("h265" | "hevc") => true, _ => hardware };
     if h265 && (wants_h265 || !h264) { VideoCodec::H265 } else { VideoCodec::H264 }
 }
 
+#[cfg(test)]
 pub fn handle_rpc_with_codecs(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool) -> Option<Vec<u8>> {
-    apply_rpc(rpc, settings, native, h264, h265, crate::video::full_chroma_available())
+    handle_rpc_for(rpc, settings, native, h264, h265, crate::video_select::selection())
+}
+
+pub fn handle_rpc_for(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool, selection: crate::video_select::Selection) -> Option<Vec<u8>> {
+    apply_rpc(rpc, settings, native, h264, h265, crate::video::full_chroma_for(selection.encoder))
 }
 
 /// The resolution a capture/resolution RPC asks for, parsed like apply_rpc: X11 hosts apply it

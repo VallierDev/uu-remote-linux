@@ -65,6 +65,8 @@ impl WebRtcSession {
 
         let hevc = desktop && crate::video::hevc_available().await;
         if hevc { crate::video_track::register_hevc(&mut m).map_err(|e| format!("Register HEVC failed: {e}"))?; }
+        // Encoder, codec preference and 4:4:4 stay fixed for this peer (codec is negotiated at CONTROL open).
+        let video_selection = crate::video_select::selection();
 
         m.register_header_extension(
             webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability { uri: crate::rtp_metadata::CAPTURE_INDEX_URI.into() },
@@ -162,11 +164,13 @@ impl WebRtcSession {
         let connection_input=input_session.clone();
         let connected_signal = signaling_client.clone();
         let notified = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connected_selection = video_selection;
         pc.on_peer_connection_state_change(Box::new(move |state| {
             let ctx = connected_context.clone();
             let input=connection_input.clone();
             let sig = connected_signal.clone();
             let notified = notified.clone();
+            let video_selection = connected_selection;
             Box::pin(async move {
                 log::info!("PeerConnection State changed: {:?}", state);
                 if let Some(session)=input.as_ref() {
@@ -177,10 +181,10 @@ impl WebRtcSession {
                     tokio::spawn(async move {
                     let ctx = ctx.lock().await.clone();
                     if let (Some(client), Some(ice)) = (&ctx.client_id, ctx.ice_id.as_ref().and_then(|v| v.as_str())) {
-                        let encoder = crate::video::Encoder::requested();
+                        let encoder = video_selection.encoder;
                         let codec_impl = if encoder == crate::video::Encoder::Nvenc { crate::capability::CODEC_IMPL_NVENC } else { 5 };
                         let payload = crate::capability::device_capability(client, ice, 0, crate::video::display_fps() as i32, codec_impl,
-                            hevc, crate::video::full_chroma_available());
+                            hevc, crate::video::full_chroma_for(encoder));
                         if let Err(e) = sig.emit_event(crate::capability::FORWARD_SETTING_EVENT, payload).await {
                             log::error!("Device capability notification failed: {}", e);
                         }
@@ -299,6 +303,7 @@ impl WebRtcSession {
         }
         let portal=capture.portal.clone();
         let stream_desktop = portal_desktop.clone();
+        let stream_selection = video_selection;
         // File/terminal/port-mapping connections carry no desktop video.
         let control_video_track = video_track.clone();
         let stream_settings = video_settings.clone();
@@ -306,7 +311,7 @@ impl WebRtcSession {
             let state_pc = streaming_pc.clone();
             tokio::spawn(async move {
                 let screen = if let Some(desktop) = stream_desktop {
-                    if let Err(error) = crate::locked_video::run(&streaming_pc, &video_track, &desktop).await {
+                    if let Err(error) = crate::locked_video::run(&streaming_pc, &video_track, &desktop, stream_selection).await {
                         log::warn!("Locked desktop video unavailable: {error}");
                     }
                     let mut updates = desktop.subscribe();
@@ -324,7 +329,7 @@ impl WebRtcSession {
                 let (capture_size, capture_display, portal) = screen.as_ref().map_or(
                     (capture_size, capture_display, portal),
                     |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
-                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request).await {
+                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request, stream_selection).await {
                     // A send racing the viewer's close fails with a misleading track error.
                     if matches!(state_pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed) {
                         log::info!("Live desktop stream ended: peer connection closed ({})", e);
@@ -414,6 +419,7 @@ impl WebRtcSession {
             let peer_video_settings = video_settings.clone();
             let peer_video_track = control_video_track.clone();
             let peer_actions = peer_actions.clone();
+            let peer_selection = video_selection;
             if label == "FILE_DATA_CHANNEL" { *file_channel.lock().unwrap() = Some(d.clone()); }
 
             Box::pin(async move {
@@ -458,6 +464,7 @@ impl WebRtcSession {
                     let initial_screen = screen.clone();
                     let switch_owner=channel_input_session.clone();
                     let settings_serial=peer_settings_serial.clone();
+                    let capture_selection = peer_selection;
                     tokio::spawn(async move {
                         let mut health = tokio::time::interval(std::time::Duration::from_millis(100));
                         loop {
@@ -577,10 +584,10 @@ impl WebRtcSession {
                             let before = *settings.borrow();
                             let output_before = before.output;
                             let revision = track.revision();
-                            let apply=|| crate::capture_setting::handle_rpc_with_codecs(
+                            let apply=|| crate::capture_setting::handle_rpc_for(
                                 &rpc_fields, &settings, input_size,
                                 track.supports(crate::capture_setting::VideoCodec::H264),
-                                track.supports(crate::capture_setting::VideoCodec::H265));
+                                track.supports(crate::capture_setting::VideoCodec::H265), capture_selection);
                             let response=if let Some(owner)=&switch_owner {
                                 let mut response=None;owner.with_current(||response=apply());response
                             } else {apply()};
@@ -630,6 +637,7 @@ impl WebRtcSession {
                     let open_desktop = portal_desktop.clone();
                     let open_owner = channel_input_session.clone();
                     let open_screen = screen.clone();
+                    let open_selection = peer_selection;
                     d.on_open(Box::new(move || {
                         let init_actions = open_actions.clone();
                         let init_video = open_video.clone();
@@ -826,8 +834,8 @@ impl WebRtcSession {
                                 (7, crate::capture_setting::screen_sources(next_seq(), timestamp, screen_size, init_video.borrow().output, "Linux desktop")),
                             ];
                             if desktop && screen.init_error.is_none() {
-                                let codec = crate::capture_setting::preferred_codec(init_track.supports(crate::capture_setting::VideoCodec::H264),
-                                    init_track.supports(crate::capture_setting::VideoCodec::H265));
+                                let codec = crate::capture_setting::preferred_codec_for(init_track.supports(crate::capture_setting::VideoCodec::H264),
+                                    init_track.supports(crate::capture_setting::VideoCodec::H265), open_selection);
                                 init_video.send_if_modified(|current| if current.codec != codec {
                                     log::info!("Desktop codec selected: {:?}", codec); current.codec = codec; true } else { false });
                             }

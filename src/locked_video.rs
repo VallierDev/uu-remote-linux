@@ -25,11 +25,11 @@ async fn black_frame(codec: VideoCodec) -> Result<Bytes, String> {
     Ok(output.stdout.into())
 }
 
-pub async fn run(pc: &RTCPeerConnection, track: &VideoTrack, desktop: &PortalDesktop) -> Result<(), String> {
-    run_with_encoder(pc, track, desktop, black_frame).await
+pub async fn run(pc: &RTCPeerConnection, track: &VideoTrack, desktop: &PortalDesktop, selection: crate::video_select::Selection) -> Result<(), String> {
+    run_with_encoder(pc, track, desktop, selection, black_frame).await
 }
 
-async fn run_with_encoder<F, Fut>(pc: &RTCPeerConnection, track: &VideoTrack, desktop: &PortalDesktop, mut encode: F) -> Result<(), String>
+async fn run_with_encoder<F, Fut>(pc: &RTCPeerConnection, track: &VideoTrack, desktop: &PortalDesktop, selection: crate::video_select::Selection, mut encode: F) -> Result<(), String>
 where F: FnMut(VideoCodec) -> Fut, Fut: std::future::Future<Output = Result<Bytes, String>> {
     // #29: iPhone 4.42.0 cold ON/OFF/ON tests only sent action15 after black video.
     // Keep CONTROL permissions truthful and use the existing video track until real capture is ready.
@@ -55,8 +55,8 @@ where F: FnMut(VideoCodec) -> Fut, Fut: std::future::Future<Output = Result<Byte
                 if !updates.borrow().waiting || *locked.borrow() != Some(true)
                     || pc.connection_state() != RTCPeerConnectionState::Connected { continue; }
                 if frame.is_none() {
-                    let codec = crate::capture_setting::preferred_codec(
-                        track.supports(VideoCodec::H264), track.supports(VideoCodec::H265));
+                    let codec = crate::capture_setting::preferred_codec_for(
+                        track.supports(VideoCodec::H264), track.supports(VideoCodec::H265), selection);
                     let encoded = tokio::select! {
                         biased;
                         _ = updates.changed() => continue,

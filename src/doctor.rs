@@ -97,6 +97,9 @@ pub async fn run() -> Result<(), String> {
     let codec = match selection.codec_pref { crate::video_select::CodecPref::Auto => "auto", crate::video_select::CodecPref::H264 => "h264", crate::video_select::CodecPref::H265 => "h265" };
     line("encoder", format!("{:?} (source={}; UU_VIDEO_ENCODER={env_enc})", selection.encoder, crate::video_select::encoder_source_label(selection.encoder_source)));
     line("codec", format!("{codec} (source={})", crate::video_select::source_label(selection.codec_source)));
+    // Both codecs offered: hardware prefers H.265, CPU stays H.264 unless the preference forces one.
+    let resolved = crate::capture_setting::pick_codec(true, true, crate::video_select::codec_force(selection.codec_pref), crate::video_select::hardware(selection.encoder));
+    line("resolved codec", format!("{resolved:?}"));
     let mut ffmpeg = crate::video::ffmpeg_command();
     ffmpeg.args(["-hide_banner", "-encoders"]).kill_on_drop(true);
     match tokio::time::timeout(std::time::Duration::from_secs(5), ffmpeg.output()).await {

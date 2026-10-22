@@ -62,12 +62,10 @@ fn file_field(name: &str) -> Option<String> {
     value.get(name).and_then(|v| v.as_str()).map(str::to_owned)
 }
 
+/// Unset/auto tries NVENC only with an NVIDIA driver loaded: `ffmpeg -encoders` lists h264_nvenc
+/// on any machine, so without this every stream start first ran a doomed NVENC process (#10).
 fn legacy_auto(nvidia: bool) -> Encoder {
-    if nvidia {
-        Encoder::Nvenc
-    } else {
-        Encoder::Cpu
-    }
+    if nvidia { Encoder::Nvenc } else { Encoder::Cpu }
 }
 
 /// Setting (non-auto) beats the environment, which beats the NVIDIA/CPU default.

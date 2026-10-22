@@ -206,7 +206,7 @@ async fn exercise_locked_video(codec: VideoCodec) {
         let run_host = peers.host.clone();
         let run_track = peers.track.clone();
         let run_desktop = desktop.clone();
-        let task = tokio::spawn(async move { run(&run_host, &run_track, &run_desktop).await });
+        let task = tokio::spawn(async move { run(&run_host, &run_track, &run_desktop, crate::video_select::selection()).await });
 
         assert_ne!(peers.host.connection_state(), RTCPeerConnectionState::Connected);
         assert_no_rtp(&mut peers.packets, Duration::from_millis(150)).await;
@@ -273,7 +273,7 @@ async fn locked_video_rechecks_state_when_encoding_finishes() {
             let (encoded_tx, mut encoded_rx) = mpsc::unbounded_channel();
             let revision = peers.track.revision();
             let task = tokio::spawn(async move {
-                run_with_encoder(&run_host, &run_track, &run_desktop, |_| {
+                run_with_encoder(&run_host, &run_track, &run_desktop, crate::video_select::selection(), |_| {
                     let desktop = run_desktop.clone();
                     let lock_tx = lock_tx.clone();
                     let encoded_tx = encoded_tx.clone();
@@ -317,7 +317,7 @@ async fn locked_video_stops_on_capture_rejection_and_terminal_peer_close() {
         let run_host = peers.host.clone();
         let run_track = peers.track.clone();
         let run_desktop = rejected_desktop.clone();
-        let rejection_task = tokio::spawn(async move { run(&run_host, &run_track, &run_desktop).await });
+        let rejection_task = tokio::spawn(async move { run(&run_host, &run_track, &run_desktop, crate::video_select::selection()).await });
         rejected_desktop.publish_test_screen(
             Arc::new(ScreenCapture::unavailable("synthetic capture rejection".into())),
         );
@@ -335,7 +335,7 @@ async fn locked_video_stops_on_capture_rejection_and_terminal_peer_close() {
         let run_host = peers.host.clone();
         let run_track = peers.track.clone();
         let run_desktop = pending_desktop;
-        let close_task = tokio::spawn(async move { run(&run_host, &run_track, &run_desktop).await });
+        let close_task = tokio::spawn(async move { run(&run_host, &run_track, &run_desktop, crate::video_select::selection()).await });
         peers.host.close().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), close_task).await
             .expect("locked video task did not stop after terminal peer close")

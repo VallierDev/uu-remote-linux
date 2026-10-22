@@ -156,11 +156,12 @@ pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
     }
 }
 
+const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+    "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
+
 /// Unknown arguments and illegal set-encoder / set-codec values exit 2 (never start a second host).
 /// help / -h / --help exit 0 so main prints usage instead of starting the host.
 pub(crate) fn reject_cli(arg: Option<&str>, argc: usize, value_ok: bool) -> Option<i32> {
-    const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
-        "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
     if matches!(arg, Some("help" | "-h" | "--help")) { return Some(0); }
     if arg.is_some_and(|a| !SUBCOMMANDS.contains(&a)) { return Some(2); }
     if matches!(arg, Some("set-encoder" | "set-codec")) && (argc != 3 || !value_ok) { return Some(2); }
@@ -291,8 +292,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_module("uuremote_server", log::LevelFilter::Info).init();
     } else { env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init(); }
     // An unknown argument must never fall through to starting a second full host server.
-    const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
-        "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
     let arg1 = std::env::args().nth(1);
     let value_ok = match arg1.as_deref() {
         Some(which @ ("set-encoder" | "set-codec")) => cli_pref_ok(which, &std::env::args().nth(2).unwrap_or_default()),
