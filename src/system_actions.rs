@@ -104,13 +104,23 @@ impl Drop for SettingsLock {
     }
 }
 
+/// NotFound starts from defaults. Any other read or parse error leaves the file untouched:
+/// a bad document must not be rewritten with security switches forced off.
+fn read_for_merge(path: &std::path::Path) -> Result<Settings, String> {
+    match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(format!("host settings unreadable: {e}")),
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("host settings invalid: {e}")),
+    }
+}
+
 fn merge_write(patch: impl FnOnce(&mut Settings)) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let path = settings_path();
     if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
     let _lock = SettingsLock::acquire(&path)?;
-    let mut disk = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut disk = read_for_merge(&path)?;
     patch(&mut disk);
     let json = serde_json::to_vec_pretty(&disk).map_err(|e| e.to_string())?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -375,6 +385,32 @@ mod tests {
         assert_eq!(disk["auto_lock"], true);
         assert_eq!(disk["mute_permanent"], true);
         assert_eq!(disk["video_encoder"], "cpu");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("UU_CONFIG");
+    }
+    #[test]
+    fn merge_write_refuses_malformed_or_unreadable_settings() {
+        let _guard = crate::config::test_env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("uu-settings-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("UU_CONFIG", dir.join("config.json"));
+        let path = settings_path();
+        let malformed = br#"{"auto_lock":true, "keep_mute":"#;
+        std::fs::write(&path, malformed).unwrap();
+        let err = merge_write(|s| s.video_encoder = Some("cpu".into())).unwrap_err();
+        assert!(err.contains("invalid"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+        let bad_type = br#"{"auto_lock":"yes","keep_mute":false,"mute_permanent":false}"#;
+        std::fs::write(&path, bad_type).unwrap();
+        let err = merge_write(|s| s.video_codec = Some("h265".into())).unwrap_err();
+        assert!(err.contains("invalid"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), bad_type);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = merge_write(|s| s.video_encoder = Some("cpu".into())).unwrap_err();
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(path.is_dir());
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("UU_CONFIG");
     }

@@ -133,10 +133,14 @@ fn set_video_pref() -> Result<(), Box<dyn std::error::Error>> {
     let which = std::env::args().nth(1).unwrap_or_default();
     let stored = std::env::args().nth(2).unwrap_or_default().trim().to_ascii_lowercase();
     let stored = if stored == "hevc" { "h265".to_owned() } else { stored };
-    system_actions::merge_save(|settings| {
+    if let Err(e) = system_actions::merge_save(|settings| {
         if which == "set-encoder" { settings.video_encoder = Some(stored.clone()); }
         else { settings.video_codec = Some(stored.clone()); }
-    })?;
+    }) {
+        // Exit 2 is reserved for bad CLI input; a settings file that cannot be merged is exit 1.
+        eprintln!("{which}: {e}");
+        std::process::exit(1);
+    }
     let selection = video_select::selection();
     let codec = match selection.codec_pref { video_select::CodecPref::Auto => "auto", video_select::CodecPref::H264 => "h264", video_select::CodecPref::H265 => "h265" };
     println!("encoder={:?} source={} codec_pref={codec} source={}", selection.encoder, video_select::encoder_source_label(selection.encoder_source), video_select::source_label(selection.codec_source));

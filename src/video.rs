@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -177,7 +177,7 @@ impl CompleteFrame {
 
 const RTP_CLOCK: u64 = 90_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum Encoder { Cpu, Nvenc, Vaapi }
 impl Encoder {
     pub(crate) fn name_for(self, codec: VideoCodec) -> &'static str {
@@ -421,33 +421,50 @@ async fn ffmpeg_timing_mode(spec: &FfmpegSpec) -> FfmpegTimingMode {
     *cell.get_or_init(|| probe_timing_mode(spec)).await
 }
 
+type HevcCache = Mutex<HashMap<(FfmpegSpec, Encoder), Arc<tokio::sync::OnceCell<bool>>>>;
+
+fn hevc_cache() -> &'static HevcCache {
+    static CACHE: OnceLock<HevcCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hevc_cell(cache: &HevcCache, spec: &FfmpegSpec, encoder: Encoder) -> Arc<tokio::sync::OnceCell<bool>> {
+    let mut cache = cache.lock().expect("HEVC probe cache poisoned");
+    cache.entry((spec.clone(), encoder)).or_insert_with(|| Arc::new(tokio::sync::OnceCell::const_new())).clone()
+}
+
 /// A compiled-in encoder name does not prove that its driver can initialize.
-/// Probe one synthetic 4:2:0 frame once per process before advertising HEVC.
+/// Probe one synthetic 4:2:0 frame per resolved encoder and FFmpeg spec. set-encoder
+/// changes the snapshot for the next session, so a process-wide bool would keep advertising
+/// the first session's result.
 pub async fn hevc_available() -> bool {
-    static AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-    *AVAILABLE.get_or_init(|| async {
-        let requested = crate::video_select::selection().encoder;
-        let mut candidates = vec![requested];
-        if requested != Encoder::Cpu { candidates.push(Encoder::Cpu); }
-        for encoder in candidates {
-            let settings = VideoSettings { codec: VideoCodec::H265, ..Default::default() };
-            let mut command = ffmpeg_command();
-            command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-            if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
-            command.args(["-f", "lavfi", "-i", "color=black:size=256x256:rate=1", "-frames:v", "1", "-an"]);
-            if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
-            command.args(encoder_options(&settings, encoder, "30", None));
-            command.args(["-f", "hevc", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
-            if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(5), command.output()).await {
-                if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H265) {
-                    log::info!("HEVC encoder probe: {} ok", encoder.name_for(VideoCodec::H265));
-                    return true;
-                }
+    let spec = ffmpeg_spec();
+    let requested = crate::video_select::selection().encoder;
+    let cell = hevc_cell(hevc_cache(), &spec, requested);
+    *cell.get_or_init(|| probe_hevc(spec, requested)).await
+}
+
+async fn probe_hevc(spec: FfmpegSpec, requested: Encoder) -> bool {
+    let mut candidates = vec![requested];
+    if requested != Encoder::Cpu { candidates.push(Encoder::Cpu); }
+    for encoder in candidates {
+        let settings = VideoSettings { codec: VideoCodec::H265, ..Default::default() };
+        let mut command = spec.command();
+        command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+        if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
+        command.args(["-f", "lavfi", "-i", "color=black:size=256x256:rate=1", "-frames:v", "1", "-an"]);
+        if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
+        command.args(encoder_options(&settings, encoder, "30", None));
+        command.args(["-f", "hevc", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
+        if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(5), command.output()).await {
+            if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H265) {
+                log::info!("HEVC encoder probe: {} ok", encoder.name_for(VideoCodec::H265));
+                return true;
             }
         }
-        log::info!("HEVC encoder probe: unavailable");
-        false
-    }).await
+    }
+    log::info!("HEVC encoder probe: unavailable");
+    false
 }
 
 /// Round UP (+1ns float guard) so webrtc's floor(duration*90000) yields exactly `ticks`.
@@ -1425,6 +1442,24 @@ mod tests {
     #[ignore = "requires installed FFmpeg with a working HEVC encoder"]
     async fn hevc_capability_probe_initializes_real_encoder() {
         assert!(hevc_available().await);
+    }
+    #[tokio::test]
+    async fn hevc_probe_cache_is_keyed_by_encoder_and_ffmpeg_spec() {
+        let cache = Mutex::new(HashMap::new());
+        let spec = FfmpegSpec { program: PathBuf::from("ffmpeg"), ld_library_path: None, path: None };
+        let other = FfmpegSpec { program: PathBuf::from("/opt/ffmpeg/bin/ffmpeg"), ld_library_path: None, path: None };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lookup = |spec: &FfmpegSpec, encoder: Encoder, result: bool| {
+            let cell = hevc_cell(&cache, spec, encoder);
+            let calls = calls.clone();
+            async move { *cell.get_or_init(|| async move { calls.fetch_add(1, Ordering::SeqCst); result }).await }
+        };
+        assert!(lookup(&spec, Encoder::Cpu, true).await);
+        assert!(lookup(&spec, Encoder::Cpu, false).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!lookup(&spec, Encoder::Nvenc, false).await);
+        assert!(lookup(&other, Encoder::Cpu, true).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
     #[test]
     fn hevc_annex_b_boundaries_and_irap_use_two_byte_headers() {
