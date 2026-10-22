@@ -172,6 +172,8 @@ sudo apt install build-essential pkg-config \
 sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # optional: GNOME/KDE portal backend
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
+# optional: headers for the inproc-av VAAPI/DRI3 engines (libva itself is loaded at runtime)
+sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
 ```
 
 - A Rust toolchain is required (<https://rustup.rs>).
@@ -435,9 +437,10 @@ AUD and the existing GOP/VFR timing. Unsupported device/driver/initialization fa
 with a warning. Accepted on Intel UHD 770 (iHD) with the default FFmpeg process pipeline and the official Mac
 viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264 — a figure from the
 FFmpeg-process-pipeline era). AMD iGPUs are verified on
-the **in-process engine** (`--features inproc-av`): HawkPoint (Mesa 26.2.3) and Cezanne (Mesa 26.2.5) were
-accepted with the official Mac viewer for H.264/H.265, presets, fps and scaling, covering both the DRI3
-zero-copy and the XShm upload paths. Measured on one machine (1920x1200@60, Cezanne iGPU + RTX 3050 Ti):
+the **in-process engine** (`--features inproc-av`): end-to-end sessions with the official Mac viewer passed
+acceptance on HawkPoint (Mesa 26.2.3) and Cezanne (Mesa 26.2.5) — HEVC, presets, fps, scaling; on Cezanne,
+H.264 and both capture paths were additionally probe-verified: the XShm upload (decodable bitstream, correct
+picture) and the DRI3 zero-copy import. Measured on one machine (1920x1200@60, Cezanne iGPU + RTX 3050 Ti):
 in-process VAAPI costs about **1/12** of the per-frame encode CPU of libx264 (FFmpeg pipeline, superfast)
 and about **1/5** of in-process NVENC. The FFmpeg process pipeline (what the release packages use) is not
 separately verified on AMD.

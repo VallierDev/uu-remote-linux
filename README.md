@@ -157,6 +157,8 @@ sudo apt install build-essential pkg-config \
 sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # 可选：GNOME/KDE portal 后端
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
+# 可选：inproc-av 的 VAAPI/DRI3 引擎编译所需（libva 本体运行时加载）
+sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
 ```
 
 - 需要 Rust 工具链（<https://rustup.rs>）。
@@ -385,7 +387,7 @@ HEVC 的访问单元按 RFC 7798 的图片边界切分，不依赖 AUD：`hevc_v
 `/dev/dri/renderD128`，运行用户需要 render 节点权限。不会自动选择 VAAPI；设备或驱动初始化
 失败会明确警告并回退 libx264。外部 FFmpeg 先转 NV12 再上传硬件帧。
 VBR 使用控制端码率预设及 CQ 对应的最小 QP，无 B 帧、async depth=1，并保留现有 GOP/VFR 规则。
-Intel 核显（UHD 770，iHD 驱动）已实机验收：默认的外部 FFmpeg 管线用官方 Mac 控制端测试了各档画质、帧率、缩放和重连，全程硬件编码、无回退，CPU 占用比 libx264 低约 40%（该数字为 FFmpeg 进程管线时代的测量）。AMD 核显已在**进程内原生引擎**上实机验收（`--features inproc-av`）：HawkPoint（Mesa 26.2.3）与 Cezanne（Mesa 26.2.5）均通过官方 Mac 客户端验收 H.264/H.265、画质档、帧率与缩放，DRI3 DMA-BUF 零拷贝与无 DRI3 时的 XShm 上传两条路径都验证过。同机实测（1920×1200@60，Cezanne iGPU + RTX 3050 Ti 双显卡）：进程内 VAAPI 每帧编码 CPU 约为 libx264（FFmpeg 管线 superfast）的 **1/12**、进程内 NVENC 的 **1/5**；外部 FFmpeg 进程管线（预编译包使用）在 AMD 上未单独验证。
+Intel 核显（UHD 770，iHD 驱动）已实机验收：默认的外部 FFmpeg 管线用官方 Mac 控制端测试了各档画质、帧率、缩放和重连，全程硬件编码、无回退，CPU 占用比 libx264 低约 40%（该数字为 FFmpeg 进程管线时代的测量）。AMD 核显已在**进程内原生引擎**上实机验收（`--features inproc-av`）：官方 Mac 客户端的端到端会话在 HawkPoint（Mesa 26.2.3）与 Cezanne（Mesa 26.2.5）上通过验收（HEVC，含画质档、帧率、缩放）；Cezanne 上另以探测验证了 H.264 与两条采集路径——XShm 上传（码流可解码、画面正确）与 DRI3 DMA-BUF 零拷贝导入。同机实测（1920×1200@60，Cezanne iGPU + RTX 3050 Ti 双显卡）：进程内 VAAPI 每帧编码 CPU 约为 libx264（FFmpeg 管线 superfast）的 **1/12**、进程内 NVENC 的 **1/5**；外部 FFmpeg 进程管线（预编译包使用）在 AMD 上未单独验证。
 
 高分辨率下 VAAPI 的默认 VBV 缓冲（100–500 kbit）会把关键帧压得过狠：2560×1440 H.264 VAAPI、30M
 上限、静止画面上实测首个 IDR 只有 59,910 字节，画面每隔一个 GOP 糊一下再慢慢恢复。设
