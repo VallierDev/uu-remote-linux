@@ -63,10 +63,11 @@ impl WebRtcSession {
         m.register_default_codecs()
             .map_err(|e| format!("Register standard codecs failed: {}", e))?;
 
-        let hevc = desktop && crate::video::hevc_available().await;
-        if hevc { crate::video_track::register_hevc(&mut m).map_err(|e| format!("Register HEVC failed: {e}"))?; }
         // Encoder, codec preference and 4:4:4 stay fixed for this peer (codec is negotiated at CONTROL open).
+        // Read once before the HEVC probe so a concurrent set-encoder/set-codec cannot split capability from CONTROL.
         let video_selection = crate::video_select::selection();
+        let hevc = desktop && crate::video::hevc_available(video_selection.encoder).await;
+        if hevc { crate::video_track::register_hevc(&mut m).map_err(|e| format!("Register HEVC failed: {e}"))?; }
 
         m.register_header_extension(
             webrtc::rtp_transceiver::rtp_codec::RTCRtpHeaderExtensionCapability { uri: crate::rtp_metadata::CAPTURE_INDEX_URI.into() },

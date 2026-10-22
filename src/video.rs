@@ -434,12 +434,12 @@ fn hevc_cell(cache: &HevcCache, spec: &FfmpegSpec, encoder: Encoder) -> Arc<toki
 }
 
 /// A compiled-in encoder name does not prove that its driver can initialize.
-/// Probe one synthetic 4:2:0 frame per resolved encoder and FFmpeg spec. set-encoder
+/// Probe one synthetic 4:2:0 frame per resolved encoder and FFmpeg spec. The caller
+/// passes the session's encoder so capability matches that snapshot. set-encoder
 /// changes the snapshot for the next session, so a process-wide bool would keep advertising
 /// the first session's result.
-pub async fn hevc_available() -> bool {
+pub async fn hevc_available(requested: Encoder) -> bool {
     let spec = ffmpeg_spec();
-    let requested = crate::video_select::selection().encoder;
     let cell = hevc_cell(hevc_cache(), &spec, requested);
     *cell.get_or_init(|| probe_hevc(spec, requested)).await
 }
@@ -1441,7 +1441,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires installed FFmpeg with a working HEVC encoder"]
     async fn hevc_capability_probe_initializes_real_encoder() {
-        assert!(hevc_available().await);
+        assert!(hevc_available(crate::video_select::selection().encoder).await);
     }
     #[tokio::test]
     async fn hevc_probe_cache_is_keyed_by_encoder_and_ffmpeg_spec() {
