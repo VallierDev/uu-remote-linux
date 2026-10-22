@@ -30,6 +30,7 @@ mod signaling;
 mod terminal;
 mod webrtc;
 mod video;
+mod video_select;
 mod video_track;
 mod locked_video;
 #[cfg(test)]
@@ -127,6 +128,70 @@ fn systemd_unit() -> Option<String> {
     cgroup.lines().find_map(|l| l.rsplit('/').next().filter(|u| u.ends_with(".service")).map(str::to_owned))
 }
 fn display_present() -> bool { std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() }
+
+fn set_video_pref() -> Result<(), Box<dyn std::error::Error>> {
+    let which = std::env::args().nth(1).unwrap_or_default();
+    let stored = std::env::args().nth(2).unwrap_or_default().trim().to_ascii_lowercase();
+    let stored = if stored == "hevc" { "h265".to_owned() } else { stored };
+    system_actions::merge_save(|settings| {
+        if which == "set-encoder" { settings.video_encoder = Some(stored.clone()); }
+        else { settings.video_codec = Some(stored.clone()); }
+    })?;
+    let selection = video_select::selection();
+    let codec = match selection.codec_pref { video_select::CodecPref::Auto => "auto", video_select::CodecPref::H264 => "h264", video_select::CodecPref::H265 => "h265" };
+    println!("encoder={:?} source={} codec_pref={codec} source={}", selection.encoder, video_select::encoder_source_label(selection.encoder_source), video_select::source_label(selection.codec_source));
+    println!("takes effect the next time a desktop connection starts");
+    Ok(())
+}
+
+/// Explicit command words for set-encoder / set-codec. Empty and whitespace are illegal.
+pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() { return false; }
+    let value = value.to_ascii_lowercase();
+    match which {
+        "set-encoder" => matches!(value.as_str(), "auto" | "cpu" | "vaapi" | "nvenc"),
+        "set-codec" => matches!(value.as_str(), "auto" | "h264" | "h265" | "hevc"),
+        _ => false,
+    }
+}
+
+/// Unknown arguments and illegal set-encoder / set-codec values exit 2 (never start a second host).
+/// help / -h / --help exit 0 so main prints usage instead of starting the host.
+pub(crate) fn reject_cli(arg: Option<&str>, argc: usize, value_ok: bool) -> Option<i32> {
+    const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+        "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
+    if matches!(arg, Some("help" | "-h" | "--help")) { return Some(0); }
+    if arg.is_some_and(|a| !SUBCOMMANDS.contains(&a)) { return Some(2); }
+    if matches!(arg, Some("set-encoder" | "set-codec")) && (argc != 3 || !value_ok) { return Some(2); }
+    None
+}
+
+#[cfg(test)]
+mod cli_exit_tests {
+    #[test]
+    fn unknown_and_illegal_subcommand_exit_2() {
+        assert_eq!(super::reject_cli(Some("not-a-command"), 2, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 3, false), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 2, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-codec"), 4, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 3, true), None);
+        assert_eq!(super::reject_cli(Some("set-codec"), 3, true), None);
+        assert_eq!(super::reject_cli(Some("help"), 2, true), Some(0));
+        assert_eq!(super::reject_cli(Some("-h"), 2, true), Some(0));
+        assert_eq!(super::reject_cli(Some("--help"), 2, true), Some(0));
+        assert_eq!(super::reject_cli(None, 1, true), None);
+        assert!(!super::cli_pref_ok("set-encoder", ""));
+        assert!(!super::cli_pref_ok("set-encoder", "   "));
+        assert!(!super::cli_pref_ok("set-codec", ""));
+        assert!(!super::cli_pref_ok("set-codec", "\t"));
+        assert!(!super::cli_pref_ok("set-encoder", "bogus"));
+        assert!(super::cli_pref_ok("set-encoder", " NVENC "));
+        assert!(super::cli_pref_ok("set-codec", "hevc"));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 3, super::cli_pref_ok("set-encoder", "")), Some(2));
+        assert_eq!(super::reject_cli(Some("set-codec"), 3, super::cli_pref_ok("set-codec", "  ")), Some(2));
+    }
+}
 /// SIGUSR1 (`uuremote-server show`) opens the host window.
 fn present_on_usr1(ui: std::sync::Arc<assist::LocalUi>) {
     // Install the handler before publishing the pid: SIGUSR1's default action terminates the process.
@@ -226,16 +291,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_module("uuremote_server", log::LevelFilter::Info).init();
     } else { env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init(); }
     // An unknown argument must never fall through to starting a second full host server.
-    const SUBCOMMANDS: [&str; 15] = ["doctor", "show", "assist", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+    const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
         "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
-    if let Some(arg) = std::env::args().nth(1).filter(|a| !SUBCOMMANDS.contains(&a.as_str())) {
+    let arg1 = std::env::args().nth(1);
+    let value_ok = match arg1.as_deref() {
+        Some(which @ ("set-encoder" | "set-codec")) => cli_pref_ok(which, &std::env::args().nth(2).unwrap_or_default()),
+        _ => true,
+    };
+    if let Some(code) = reject_cli(arg1.as_deref(), std::env::args().len(), value_ok) {
         let usage = format!("usage: uuremote-server [{}]\n  (no argument: run the host)", SUBCOMMANDS.join(" | "));
-        if matches!(arg.as_str(), "help" | "-h" | "--help") { println!("{usage}"); return Ok(()); }
+        if code == 0 { println!("{usage}"); return Ok(()); }
         eprintln!("unknown argument\n{usage}");
-        std::process::exit(2);
+        std::process::exit(code);
     }
 
     if std::env::args().nth(1).as_deref() == Some("show") { return show_running_host(); }
+    if matches!(std::env::args().nth(1).as_deref(), Some("set-encoder") | Some("set-codec")) { return set_video_pref(); }
     if assist_enabled && !unified {
         if std::env::args().len() > 2 { return Err("assist accepts no additional arguments; configure it with a private UU_CONFIG".into()); }
         assist::configure()?;

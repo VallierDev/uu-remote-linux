@@ -129,8 +129,8 @@ pub fn handle_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, na
 /// times slower than libx264 (measured 15 vs 155 fps at 1080p on a 4-core ARM host, #59), so CPU
 /// hosts default to H.264. UU_VIDEO_CODEC=h264 / h265 overrides.
 pub fn preferred_codec(h264: bool, h265: bool) -> VideoCodec {
-    let forced = std::env::var("UU_VIDEO_CODEC").ok().map(|v| v.to_ascii_lowercase());
-    pick_codec(h264, h265, forced.as_deref(), crate::video::Encoder::requested() != crate::video::Encoder::Cpu)
+    let selection = crate::video_select::selection();
+    pick_codec(h264, h265, crate::video_select::codec_force(selection.codec_pref), crate::video_select::hardware(selection.encoder))
 }
 fn pick_codec(h264: bool, h265: bool, forced: Option<&str>, hardware: bool) -> VideoCodec {
     let wants_h265 = match forced { Some("h264") => false, Some("h265" | "hevc") => true, _ => hardware };

@@ -180,7 +180,7 @@ const RTP_CLOCK: u64 = 90_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Encoder { Cpu, Nvenc, Vaapi }
 impl Encoder {
-    pub(crate) fn requested() -> Self { Self::from_setting(std::env::var("UU_VIDEO_ENCODER").ok().as_deref(), nvidia_present()) }
+    pub(crate) fn requested() -> Self { crate::video_select::selection().encoder }
     /// Unset/auto tries NVENC only with an NVIDIA driver loaded: `ffmpeg -encoders` lists h264_nvenc
     /// on any machine, so without this every stream start first ran a doomed NVENC process (#10).
     fn from_setting(value: Option<&str>, nvidia: bool) -> Self {
@@ -195,13 +195,13 @@ impl Encoder {
         }
     }
 }
-fn nvidia_present() -> bool {
+pub(crate) fn nvidia_present() -> bool {
     std::path::Path::new("/proc/driver/nvidia/version").exists() || std::path::Path::new("/dev/nvidia0").exists()
 }
 /// 真彩 (4:4:4): NVENC (in-process or FFmpeg) and libx264; h264_vaapi is 4:2:0 only.
 /// A GPU without 4:4:4 NVENC falls back to libx264, which keeps 4:4:4.
 pub fn full_chroma_available() -> bool {
-    Encoder::requested() != Encoder::Vaapi
+    crate::video_select::selection().encoder != Encoder::Vaapi
 }
 
 /// (-profile:v, -pix_fmt) for NVENC / libx264 / libx265: 4:4:4 (真彩) needs a 4:4:4 profile.
@@ -645,8 +645,9 @@ async fn read_encoder_with(
             max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec, chroma: settings.chroma,
             vaapi: encoder == Encoder::Vaapi,
         };
-        log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} pipeline=in-process",
-            display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec));
+        log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} source={} pipeline=in-process",
+            display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec),
+            crate::video_select::encoder_source_label(crate::video_select::selection().encoder_source));
         return read_inprocess(config, latest, sequence, idr, budget).await;
     }
     let source_size = size;
@@ -658,7 +659,7 @@ async fn read_encoder_with(
     let cq = settings.cq().to_string();
     // x11grab delivers bgr0; the Wayland/portal/KMS pipe is bgra.
     let rgb = nvenc_rgb_input(&settings, encoder, if wayland { "bgra" } else { "bgr0" });
-    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} pix_fmt={} low_latency=true",display,size,settings.output,settings.fps,cq,maxrate,encoder.name_for(settings.codec),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
+    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.fps,cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(crate::video_select::selection().encoder_source),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
     // A bundled FFmpeg prefix (config ffmpeg_root / UU_FFMPEG_ROOT) or `ffmpeg` on PATH.
     let ffmpeg = ffmpeg_spec();
     let mut command = ffmpeg.command();
@@ -827,8 +828,8 @@ fn probe_settings() -> Result<VideoSettings,String> {
 /// The probe follows `UU_VIDEO_CODEC` so the HEVC path can be measured at all (H.264 otherwise),
 /// and its first access unit is then checked against that codec instead of always H.264.
 fn probe_codec() -> VideoCodec {
-    match std::env::var("UU_VIDEO_CODEC").ok().as_deref().map(str::to_ascii_lowercase).as_deref() {
-        Some("h265") | Some("hevc") => VideoCodec::H265,
+    match crate::video_select::codec_force(crate::video_select::selection().codec_pref) {
+        Some("h265") => VideoCodec::H265,
         _ => VideoCodec::H264,
     }
 }

@@ -114,7 +114,7 @@ viewer does not reconnect them automatically.
 | Item | Meaning |
 |---|---|
 | `~/.config/uuremote/config.json` | user_id, device_id, client_id, system_id, machine_guid, token, csrf; optional `sign_key`, `ffmpeg_root`. `$UU_CONFIG` overrides the path |
-| `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent |
+| `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent; optional `video_encoder` (`auto`/`cpu`/`vaapi`/`nvenc`) and `video_codec` (`auto`/`h264`/`h265`), written by `set-encoder` / `set-codec` (0600, merge write). Non-`auto` beats `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`. Applied on the next desktop stream |
 | `UU_DESKTOP_BACKEND` | `auto` (default) / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless: no display; desktop offers ignored; tool peers get a nominal 1920x1080 screen + Allow permissions, which the port-mapping viewer requires) |
 | `UU_DESKTOP_RESIZE=0` | X11: the viewer's 分辨率 choice scales the encoded stream instead of changing the display mode. Default: `src/desktop_mode.rs` switches the primary output via xrandr (adds a CVT-RB mode when missing, re-applies once if mutter resets it), restores the original mode for resolution_type 3 and 2 s after the last desktop stream ends |
 | `UU_NVENC_RGB=0` / `=1` | NVENC 4:2:0 without scaling takes packed BGRA/BGR0 directly (no CPU swscale). Default: on, except when a connected DRM connector belongs to an nvidia-bound card (desktop composited on the encoding GPU; #16 measured 82.6 vs 98 fps at 4K). `0` forces CPU conversion, `1` forces the direct path |
@@ -122,8 +122,8 @@ viewer does not reconnect them automatically.
 | Mac viewer Cmd | With 「使用 macOS 快捷键」 off the Mac viewer sends Cmd=VK_LWIN 0x5B, Option=0xA4, Ctrl=0xA2; connect header `controller_platform`=4 is macOS. For Mac controllers Cmd is held back: Cmd+C/V/A/F/X/Z → Ctrl+key (terminal: Cmd+C/V → Ctrl+Shift+C/V), other combos/alone → Super |
 | `UU_TERMINAL_SHORTCUTS=0` | disable Ctrl+V → Ctrl+Shift+V in focused X11 terminals (Mac Cmd and Ctrl both arrive as VK_LCONTROL) |
 | `contrib/virtual-desktop/` | Xvfb + session (`UU_VIRTUAL_SESSION`, `UU_VIRTUAL_BUS=user|private`) for monitorless hosts; serve it with `DISPLAY=:99` |
-| `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: explicit Intel/AMD; `nvenc`: force; unset: NVENC→CPU only if `/proc/driver/nvidia/version` or `/dev/nvidia0` exists, else CPU (#10) |
-| `UU_VIDEO_CODEC=h264` | force H.264 even when the viewer negotiated H.265 (default: H.265 when both sides support it) |
+| `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: explicit Intel/AMD; `nvenc`: force; unset/`auto`: NVENC only if `/proc/driver/nvidia/version` or `/dev/nvidia0` exists, else CPU (#10). Ignored when `host_settings.json` `video_encoder` is not `auto` |
+| `UU_VIDEO_CODEC=h264` | force H.264 even when the viewer negotiated H.265 (default: H.265 when both sides support it and the encoder is hardware). Same precedence as the encoder: setting file, then this variable, then auto |
 | `UU_FFMPEG_ROOT` | FFmpeg prefix (`bin/ffmpeg`, libs in `lib/x86_64-linux-gnu`) |
 | `UU_AUDIO=0`, `UU_AUDIO_SOURCE` | disable sound / choose the Pulse source (default `@DEFAULT_MONITOR@`) |
 | `UU_LOGIN_WINDOW=0` | don't auto-open the login window |
@@ -165,8 +165,7 @@ for a new QR login.
 | `src/viewer_main.rs`, `src/viewer/` | experimental viewer (`--features native-viewer,viewer-sdl`): cloud join, WebRTC offer side, SDL desktop window (ffmpeg CLI decode), files/terminal/portmap/power/assist tools, device removal (`POST /api/v1/device/{id}/unbind`, verified live; shared devices use `/api/v1/device/share/{id}/unbind`, strings only), GTK launcher |
 | `c_engine/viewer_window.c`, `c_engine/viewer_tools.c` | viewer GTK launcher and tool windows (files, port mapping, terminal list) |
 
-Diagnostic subcommands: `doctor` (paste-safe report: session, selected backend, engine plugins, uinput, encoders,
-default codec, sign-in/service state; booleans and names only), `login [--no-gui]`, `unlock-check` (password on stdin, prints only accepted/rejected),
+Diagnostic subcommands: `doctor` (paste-safe report: session, selected backend, engine plugins, uinput, encoder and codec with source, sign-in/service state; booleans and names only), `set-encoder auto|cpu|vaapi|nvenc`, `set-codec auto|h264|h265` (next desktop stream; illegal values exit 2), `login [--no-gui]`, `unlock-check` (password on stdin, prints only accepted/rejected),
 `desktop-probe [new.png]`, `desktop-video-probe` (`UU_PROBE_FPS`, `UU_PROBE_FRAMES`, `UU_PROBE_QUALITY` 1-5 = viewer bitrate preset, 5 auto; `UU_PROBE_CHROMA=444` 真彩; `UU_PROBE_INPUT` fixed video/image sequence, `UU_PROBE_LOOP=1` repeats), `wayland-input-probe`, `clipboard-acceptance`,
 `portal-acceptance`, `help`. Unknown arguments exit with code 2. Builds up to v0.1.0 did **not** reject them and
 started a second full host server instead, so check that a subcommand exists in the binary you run.
