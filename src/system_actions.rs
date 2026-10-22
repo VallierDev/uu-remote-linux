@@ -92,9 +92,9 @@ impl SettingsLock {
     fn acquire(path: &std::path::Path) -> Result<Self, String> {
         use std::os::unix::fs::OpenOptionsExt;
         let lock_path = path.with_file_name("host_settings.json.lock");
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(&lock_path).map_err(|e| e.to_string())?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(&lock_path).map_err(|e| e.kind().to_string())?;
         let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
-        if rc != 0 { return Err(std::io::Error::last_os_error().to_string()); }
+        if rc != 0 { return Err(std::io::Error::last_os_error().kind().to_string()); }
         Ok(Self { file })
     }
 }
@@ -109,8 +109,12 @@ impl Drop for SettingsLock {
 fn read_for_merge(path: &std::path::Path) -> Result<Settings, String> {
     match std::fs::read(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-        Err(e) => Err(format!("host settings unreadable: {e}")),
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| format!("host settings invalid: {e}")),
+        Err(e) => Err(format!("host settings unreadable: {}", e.kind())),
+        // serde_json::Error's Display quotes the offending value; the journal and set-* must not.
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| match (e.line(), e.column()) {
+            (0, 0) => "host_settings.json is not valid".to_owned(),
+            (line, column) => format!("host_settings.json is not valid (line {line}, column {column})"),
+        }),
     }
 }
 
@@ -118,15 +122,15 @@ fn merge_write(patch: impl FnOnce(&mut Settings)) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let path = settings_path();
-    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| e.kind().to_string())?; }
     let _lock = SettingsLock::acquire(&path)?;
     let mut disk = read_for_merge(&path)?;
     patch(&mut disk);
     let json = serde_json::to_vec_pretty(&disk).map_err(|e| e.to_string())?;
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(|e| e.to_string())?;
-    file.write_all(&json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(|e| e.kind().to_string())?;
+    file.write_all(&json).map_err(|e| e.kind().to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.kind().to_string())?;
     Ok(())
 }
 
@@ -399,12 +403,14 @@ mod tests {
         let malformed = br#"{"auto_lock":true, "keep_mute":"#;
         std::fs::write(&path, malformed).unwrap();
         let err = merge_write(|s| s.video_encoder = Some("cpu".into())).unwrap_err();
-        assert!(err.contains("invalid"), "{err}");
+        assert!(err.contains("not valid"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), malformed);
         let bad_type = br#"{"auto_lock":"yes","keep_mute":false,"mute_permanent":false}"#;
         std::fs::write(&path, bad_type).unwrap();
         let err = merge_write(|s| s.video_codec = Some("h265".into())).unwrap_err();
-        assert!(err.contains("invalid"), "{err}");
+        assert!(err.contains("not valid"), "{err}");
+        assert!(err.contains("line ") && err.contains("column "), "{err}");
+        assert!(!err.contains("yes"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), bad_type);
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
