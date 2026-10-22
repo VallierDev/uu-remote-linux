@@ -95,6 +95,17 @@ pub async fn run() -> Result<(), String> {
     let selection = crate::video_select::selection();
     let env_enc = std::env::var("UU_VIDEO_ENCODER").unwrap_or_else(|_| "unset".into());
     let codec = match selection.codec_pref { crate::video_select::CodecPref::Auto => "auto", crate::video_select::CodecPref::H264 => "h264", crate::video_select::CodecPref::H265 => "h265" };
+    let probe_text = if selection.encoder_source == crate::video_select::Source::Auto {
+        let probe = crate::video::run_auto_probe().await;
+        probe.order.iter().zip(probe.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect::<Vec<_>>().join(" ")
+    } else {
+        match crate::video_select::cached_probe() {
+            Some(probe) => probe.order.iter().zip(probe.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect::<Vec<_>>().join(" "),
+            None => "not yet run".to_owned(),
+        }
+    };
+    let selection = if selection.encoder_source == crate::video_select::Source::Auto { crate::video_select::selection() } else { selection };
+    line("encoder probe", probe_text);
     line("encoder", format!("{:?} (source={}; UU_VIDEO_ENCODER={env_enc})", selection.encoder, crate::video_select::encoder_source_label(selection.encoder_source)));
     line("codec", format!("{codec} (source={})", crate::video_select::source_label(selection.codec_source)));
     // Both codecs offered: hardware prefers H.265, CPU stays H.264 unless the preference forces one.

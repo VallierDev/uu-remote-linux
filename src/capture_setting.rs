@@ -131,7 +131,7 @@ pub fn handle_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, na
 /// hosts default to H.264. UU_VIDEO_CODEC=h264 / h265 overrides.
 #[cfg(test)]
 fn test_selection() -> crate::video_select::Selection {
-    crate::video_select::resolve_pair(Some("auto"), None, Some("auto"), None, false)
+    crate::video_select::resolve_pair(Some("auto"), None, Some("auto"), None, false, None)
 }
 
 #[cfg(test)]
@@ -159,6 +159,11 @@ pub fn handle_rpc_for(rpc: &[WireField], settings: &watch::Sender<VideoSettings>
 
 /// The resolution a capture/resolution RPC asks for, parsed like apply_rpc: X11 hosts apply it
 /// to the display mode itself (desktop_mode), as the official Windows host changes its resolution.
+/// Chroma the viewer asked for in this RPC (field 7), if it sent one.
+pub fn requested_chroma(rpc: &[WireField]) -> Option<u64> {
+    message(rpc, 2).and_then(|request| decode_wire(request).ok()).and_then(|fields| number(&fields, 7))
+}
+
 pub fn requested_resolution(rpc: &[WireField]) -> Option<crate::desktop_mode::Request> {
     use crate::desktop_mode::Request;
     if let Some(request) = message(rpc, 2) {

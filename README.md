@@ -306,7 +306,7 @@ systemctl --user restart uuremote-native.service
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
 | `UU_INPUT_BACKEND` | `auto`（默认，Wayland 下可用时用 uinput）/ `uinput` / `native` |
 | `UU_TERMINAL_SHORTCUTS=0` | 关闭终端窗口里的 Ctrl+V 粘贴转换 |
-| `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置或 `auto` 时检测到 NVIDIA 驱动才用 NVENC，否则用 CPU。优先级低于 `host_settings.json` 里非 `auto` 的 `video_encoder` |
+| `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置或 `auto` 时后台探测（每个候选编码一帧，限时 3 秒）。有 NVIDIA 驱动时顺序是 NVENC → CPU；没有 NVIDIA 时是 VAAPI → CPU。探测未完成就建流则沿用旧规则（有 NVIDIA 用 NVENC，否则 CPU）。优先级低于 `host_settings.json` 里非 `auto` 的 `video_encoder` |
 | `UU_VAAPI_BUFFER_MS` | VAAPI 的 VBV 缓冲（10–1000 ms，仅 `UU_VIDEO_ENCODER=vaapi` 时生效）；高分辨率下关键帧被压糊时用它换稳定画质 |
 | `UU_FFMPEG_ROOT` | 使用指定目录下的 FFmpeg |
 | `UU_AUDIO=0` | 关闭声音转发；`UU_AUDIO_SOURCE` 指定 PulseAudio 采集源 |
@@ -317,7 +317,7 @@ systemctl --user restart uuremote-native.service
 | `UU_WOL_HELPER=1` | 实验性：让这台主机像官方 Windows 被控端一样充当「远程开机」辅助设备——登录后向网易上报本机局域网信息，收到云端唤醒请求时向同一局域网发送唤醒包（未经端到端验证） |
 | `UU_USE_PROXY=1` | 使用环境变量里的 HTTP/SOCKS 代理；默认忽略代理、直连网易服务器 |
 
-「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到默认（有 NVIDIA 驱动用 NVENC，否则 CPU；codec 仍是硬件优先 H.265、CPU 用 H.264）。下次建立桌面连接时生效。显式 `vaapi` 不支持真彩，画面降为 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。
+「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto 探测（有 NVIDIA 时 NVENC 优先且不试 VAAPI，否则 VAAPI 再 CPU；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。下次建立桌面连接时生效。显式 `vaapi` 请求真彩时降为 4:2:0 并回 CaptureSettingSync，不改编码器；auto 选中 VAAPI 且请求真彩时，改用探测成功且支持 4:4:4 的下一候选，否则仍是 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。
 
 自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 

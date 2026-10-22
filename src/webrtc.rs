@@ -66,6 +66,8 @@ impl WebRtcSession {
         // Encoder, codec preference and 4:4:4 stay fixed for this peer (codec is negotiated at CONTROL open).
         // Read once before the HEVC probe so a concurrent set-encoder/set-codec cannot split capability from CONTROL.
         let video_selection = crate::video_select::selection();
+        // Probe visible at session start. A later warm-up must not change this peer.
+        let session_probe = crate::video_select::cached_probe();
         let hevc = desktop && crate::video::hevc_available(video_selection.encoder).await;
         if hevc { crate::video_track::register_hevc(&mut m).map_err(|e| format!("Register HEVC failed: {e}"))?; }
 
@@ -305,6 +307,7 @@ impl WebRtcSession {
         let portal=capture.portal.clone();
         let stream_desktop = portal_desktop.clone();
         let stream_selection = video_selection;
+        let stream_probe = session_probe.clone();
         // File/terminal/port-mapping connections carry no desktop video.
         let control_video_track = video_track.clone();
         let stream_settings = video_settings.clone();
@@ -330,7 +333,7 @@ impl WebRtcSession {
                 let (capture_size, capture_display, portal) = screen.as_ref().map_or(
                     (capture_size, capture_display, portal),
                     |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
-                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request, stream_selection).await {
+                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request, stream_selection, stream_probe).await {
                     // A send racing the viewer's close fails with a misleading track error.
                     if matches!(state_pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed) {
                         log::info!("Live desktop stream ended: peer connection closed ({})", e);
@@ -421,6 +424,7 @@ impl WebRtcSession {
             let peer_video_track = control_video_track.clone();
             let peer_actions = peer_actions.clone();
             let peer_selection = video_selection;
+            let peer_probe = session_probe.clone();
             if label == "FILE_DATA_CHANNEL" { *file_channel.lock().unwrap() = Some(d.clone()); }
 
             Box::pin(async move {
@@ -466,6 +470,7 @@ impl WebRtcSession {
                     let switch_owner=channel_input_session.clone();
                     let settings_serial=peer_settings_serial.clone();
                     let capture_selection = peer_selection;
+                    let capture_probe = peer_probe.clone();
                     tokio::spawn(async move {
                         let mut health = tokio::time::interval(std::time::Duration::from_millis(100));
                         loop {
@@ -582,6 +587,8 @@ impl WebRtcSession {
                                 }
                             } else { None };
                             let input_size = resized.unwrap_or(input_size);
+                            let asked = crate::capture_setting::requested_chroma(&rpc_fields).unwrap_or(settings.borrow().chroma);
+                            let capture_selection = crate::video_select::selection_for_chroma(capture_selection, asked, capture_probe.as_ref());
                             let before = *settings.borrow();
                             let output_before = before.output;
                             let revision = track.revision();

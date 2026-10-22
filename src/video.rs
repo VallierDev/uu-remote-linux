@@ -438,6 +438,55 @@ fn hevc_cell(cache: &HevcCache, spec: &FfmpegSpec, encoder: Encoder) -> Arc<toki
 /// passes the session's encoder so capability matches that snapshot. set-encoder
 /// changes the snapshot for the next session, so a process-wide bool would keep advertising
 /// the first session's result.
+const AUTO_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// One synthetic H.264 IDR. Failure reasons stay enum values: stderr and device paths are not logged.
+pub(crate) async fn probe_encoder_idr(encoder: Encoder) -> crate::video_select::ProbeOutcome {
+    use crate::video_select::{ProbeFail, ProbeOutcome};
+    let settings = VideoSettings { codec: VideoCodec::H264, ..Default::default() };
+    let mut command = ffmpeg_command();
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
+    command.args(["-f", "lavfi", "-i", "color=c=black:s=256x256:r=1", "-frames:v", "1", "-an"]);
+    if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
+    command.args(encoder_options(&settings, encoder, "30", None));
+    command.args(["-f", "h264", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
+    match tokio::time::timeout(AUTO_PROBE_BUDGET, command.output()).await {
+        Ok(Ok(output)) if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H264) => ProbeOutcome::Ok,
+        Ok(Ok(output)) if output.status.success() => ProbeOutcome::Fail(ProbeFail::NoIdr),
+        Ok(Ok(_)) => ProbeOutcome::Fail(ProbeFail::Exit),
+        Ok(Err(_)) => ProbeOutcome::Fail(ProbeFail::Spawn),
+        Err(_) => ProbeOutcome::Fail(ProbeFail::Timeout),
+    }
+}
+
+fn auto_probe_flight() -> &'static tokio::sync::Mutex<()> {
+    static FLIGHT: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    FLIGHT.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Start the auto probe if it is not cached. Returns immediately.
+pub fn warm_auto_probe() {
+    if crate::video_select::cached_probe().is_some() { return; }
+    tokio::spawn(async { let _ = run_auto_probe().await; });
+}
+
+/// Run the probe to completion (doctor, or the background warm-up). Cached for the process.
+pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
+    if let Some(cached) = crate::video_select::cached_probe() { return cached; }
+    let _flight = auto_probe_flight().lock().await;
+    if let Some(cached) = crate::video_select::cached_probe() { return cached; }
+    let order = crate::video_select::auto_order(nvidia_present());
+    let mut outcomes = Vec::with_capacity(order.len());
+    for encoder in &order { outcomes.push(probe_encoder_idr(*encoder).await); }
+    let chosen = crate::video_select::choose_from_probe(&order, &outcomes);
+    let report = crate::video_select::ProbeReport { order, outcomes, chosen };
+    let parts: Vec<String> = report.order.iter().zip(report.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect();
+    log::info!("Encoder probe: {}", parts.join(" "));
+    crate::video_select::store_probe(report.clone());
+    report
+}
+
 pub async fn hevc_available(requested: Encoder) -> bool {
     let spec = ffmpeg_spec();
     let cell = hevc_cell(hevc_cache(), &spec, requested);
@@ -527,12 +576,16 @@ impl Drop for StopOnDrop { fn drop(&mut self) { self.0.store(true, std::sync::at
 async fn read_encoder(
     size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     latest: mpsc::Sender<Arc<CompleteFrame>>,
-    settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+    mut settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
     selection: crate::video_select::Selection,
 ) -> Result<(), String> {
     // The sequence is shared so a CPU fallback or settings restart continues it (skip statistics stay correct).
     // `selection` is fixed for this desktop connection (taken where the codec is negotiated).
     let encoder = selection.encoder;
+    if settings.chroma == crate::capture_setting::CHROMA_444 && !full_chroma_for(encoder) {
+        settings.chroma = crate::capture_setting::CHROMA_420;
+        log::info!("Chroma 4:4:4 requested; encoder={} source={} encodes 4:2:0", format!("{encoder:?}").to_ascii_lowercase(), crate::video_select::encoder_source_label(selection.encoder_source));
+    }
     if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await; }
     #[cfg_attr(not(feature = "inproc-av"), allow(unused_mut))]
     let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,true,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
@@ -956,7 +1009,7 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
 
 pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, mut size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
-    selection: crate::video_select::Selection) -> Result<(), String> {
+    selection: crate::video_select::Selection, probe: Option<crate::video_select::ProbeReport>) -> Result<(), String> {
     let _desktop_mode = crate::desktop_mode::StreamGuard::new();
     loop {
         if transport_closed(&pc) { return Ok(()); }
@@ -978,7 +1031,21 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
         settings.borrow_and_update();
     }
     // Reader restarts reuse this snapshot, so set-encoder waits for the next desktop connection.
-    let mut reader = EncoderTask(tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone(), budget.clone(), selection)));
+    // Chroma can still move auto-VAAPI onto a 4:4:4 candidate from the probe this session saw.
+    let open = {
+        let display = display.clone();
+        let portal = portal.clone();
+        let latest = latest.clone();
+        let sequence = sequence.clone();
+        let idr = idr.clone();
+        let budget = budget.clone();
+        let probe = probe.clone();
+        move |size: (u32, u32), selection: crate::video_select::Selection, settings: VideoSettings| {
+            let selection = crate::video_select::selection_for_chroma(selection, settings.chroma, probe.as_ref());
+            read_encoder(size, display.clone(), portal.clone(), latest.clone(), settings, sequence.clone(), idr.clone(), budget.clone(), selection)
+        }
+    };
+    let mut reader = EncoderTask(tokio::spawn(open(size, selection, current)));
     let mut previous = None;
     let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
     let mut settings_open = true;
@@ -1004,9 +1071,9 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                 reader.0.abort();
                 let _ = (&mut reader.0).await;
                 while receiver.try_recv().is_ok() {}
-                reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone(), budget.clone(), selection));
+                reader.0 = tokio::spawn(open(size, selection, next));
             } else {
-                reader.restart(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone(), budget.clone(), selection)).await;
+                reader.restart(open(size, selection, next)).await;
             }
             send_interrupted=false;
         }
@@ -1017,7 +1084,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                     log::info!("Desktop geometry changed during the stream ({}x{} -> {}x{}); restarting capture", size.0, size.1, resized.0, resized.1);
                     size = resized;
                     while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone(), budget.clone(), selection));
+                    reader.0 = tokio::spawn(open(size, selection, current));
                     continue;
                 }
                 if let (Err(error), VideoCodec::H265, true) = (&result, current.codec, track.supports(VideoCodec::H264)) {
@@ -1025,7 +1092,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                     applied.send_modify(|value| value.codec = VideoCodec::H264);
                     current = *settings.borrow_and_update();
                     while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone(), budget.clone(), selection));
+                    reader.0 = tokio::spawn(open(size, selection, current));
                     continue;
                 }
                 if result.is_err() && !crate::wayland::outputs().is_empty() && !crate::wayland::input_ready() {
