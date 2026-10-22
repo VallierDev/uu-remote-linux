@@ -55,11 +55,12 @@ pub fn parse_codec(value: Option<&str>) -> Option<Option<CodecPref>> {
     }
 }
 
-fn file_field(name: &str) -> Option<String> {
+fn file_fields() -> (Option<String>, Option<String>) {
     let path = crate::system_actions::settings_path();
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value.get(name).and_then(|v| v.as_str()).map(str::to_owned)
+    let Ok(bytes) = std::fs::read(path) else { return (None, None) };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return (None, None) };
+    let field = |name: &str| value.get(name).and_then(|v| v.as_str()).map(str::to_owned);
+    (field("video_encoder"), field("video_codec"))
 }
 
 /// Unset/auto tries NVENC only with an NVIDIA driver loaded: `ffmpeg -encoders` lists h264_nvenc
@@ -70,8 +71,7 @@ fn legacy_auto(nvidia: bool) -> Encoder {
 
 /// Setting (non-auto) beats the environment, which beats the NVIDIA/CPU default.
 pub fn selection() -> Selection {
-    let file_enc = file_field("video_encoder");
-    let file_codec = file_field("video_codec");
+    let (file_enc, file_codec) = file_fields();
     let env_enc = std::env::var("UU_VIDEO_ENCODER").ok();
     let env_codec = std::env::var("UU_VIDEO_CODEC").ok();
     resolve_pair(

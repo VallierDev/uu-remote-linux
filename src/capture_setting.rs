@@ -130,8 +130,13 @@ pub fn handle_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, na
 /// times slower than libx264 (measured 15 vs 155 fps at 1080p on a 4-core ARM host, #59), so CPU
 /// hosts default to H.264. UU_VIDEO_CODEC=h264 / h265 overrides.
 #[cfg(test)]
+fn test_selection() -> crate::video_select::Selection {
+    crate::video_select::resolve_pair(Some("auto"), None, Some("auto"), None, false)
+}
+
+#[cfg(test)]
 pub fn preferred_codec(h264: bool, h265: bool) -> VideoCodec {
-    preferred_codec_for(h264, h265, crate::video_select::selection())
+    preferred_codec_for(h264, h265, test_selection())
 }
 
 pub fn preferred_codec_for(h264: bool, h265: bool, selection: crate::video_select::Selection) -> VideoCodec {
@@ -145,7 +150,7 @@ pub(crate) fn pick_codec(h264: bool, h265: bool, forced: Option<&str>, hardware:
 
 #[cfg(test)]
 pub fn handle_rpc_with_codecs(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool) -> Option<Vec<u8>> {
-    handle_rpc_for(rpc, settings, native, h264, h265, crate::video_select::selection())
+    handle_rpc_for(rpc, settings, native, h264, h265, test_selection())
 }
 
 pub fn handle_rpc_for(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool, selection: crate::video_select::Selection) -> Option<Vec<u8>> {
