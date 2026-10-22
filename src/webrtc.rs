@@ -168,12 +168,14 @@ impl WebRtcSession {
         let connected_signal = signaling_client.clone();
         let notified = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let connected_selection = video_selection;
+        let connected_probe = session_probe.clone();
         pc.on_peer_connection_state_change(Box::new(move |state| {
             let ctx = connected_context.clone();
             let input=connection_input.clone();
             let sig = connected_signal.clone();
             let notified = notified.clone();
             let video_selection = connected_selection;
+            let session_probe = connected_probe.clone();
             Box::pin(async move {
                 log::info!("PeerConnection State changed: {:?}", state);
                 if let Some(session)=input.as_ref() {
@@ -187,7 +189,7 @@ impl WebRtcSession {
                         let encoder = video_selection.encoder;
                         let codec_impl = if encoder == crate::video::Encoder::Nvenc { crate::capability::CODEC_IMPL_NVENC } else { 5 };
                         let payload = crate::capability::device_capability(client, ice, 0, crate::video::display_fps() as i32, codec_impl,
-                            hevc, crate::video::full_chroma_for(encoder));
+                            hevc, crate::video_select::advertise_full_chroma(video_selection, session_probe.as_ref()));
                         if let Err(e) = sig.emit_event(crate::capability::FORWARD_SETTING_EVENT, payload).await {
                             log::error!("Device capability notification failed: {}", e);
                         }

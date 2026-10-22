@@ -212,6 +212,13 @@ pub fn selection_for_chroma(mut selection: Selection, chroma: u64, probed: Optio
     selection
 }
 
+/// 4:4:4 to list in device_capability. The selected encoder, or (source auto only) a probed
+/// fallback that produced an IDR and can do 4:4:4. Explicit vaapi stays 4:2:0.
+pub fn advertise_full_chroma(selection: Selection, probed: Option<&ProbeReport>) -> bool {
+    let (encoder, drop_420) = encoder_for_chroma(selection, crate::capture_setting::CHROMA_444, probed);
+    !drop_420 && crate::video::full_chroma_for(encoder)
+}
+
 fn pick_codec(env: Option<&str>) -> (CodecPref, Source) {
     match parse_codec(env) {
         Some(Some(p)) => (p, Source::Env),
@@ -371,6 +378,13 @@ mod tests {
         let nvidia = report(true, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
         let nv = resolve_pair(None, None, None, None, true, Some(&nvidia));
         assert_eq!(encoder_for_chroma(nv, crate::capture_setting::CHROMA_444, Some(&nvidia)).0, Encoder::Nvenc);
+        assert!(advertise_full_chroma(auto, Some(&both)));
+        assert!(!advertise_full_chroma(auto, Some(&cpu_down)));
+        assert!(!advertise_full_chroma(pinned, Some(&both)));
+        assert!(!advertise_full_chroma(from_env, Some(&both)));
+        assert!(advertise_full_chroma(nv, Some(&nvidia)));
+        let early = resolve_pair(None, None, None, None, false, None);
+        assert!(advertise_full_chroma(early, None));
     }
 
     #[test]
