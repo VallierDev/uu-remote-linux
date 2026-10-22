@@ -188,7 +188,7 @@ cargo build --release --features wayland,portal   # + GNOME/KDE on Wayland
 ```
 
 The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config --modversion libavcodec` = 60.x); FFmpeg 7+ fails inside `ffmpeg-sys-next` with `avfft.h file not found` (#63).
-The host's optional `--features inproc-av` encodes with NVENC inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime and needs a driver with NVENC API 12.1 (530 or newer). When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy. CPU and VAAPI encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process NVENC session fails it falls back to FFmpeg's NVENC process pipeline, then to the CPU. The default build and the release packages need neither feature.
+The host's optional `--features inproc-av` encodes with hardware inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
 
 ### 3. Log in
 
@@ -427,11 +427,20 @@ sends about 12 kbit/s. `UU_VIDEO_CODEC=h265` selects H.265 explicitly for A/B di
 
 `UU_VIDEO_ENCODER=vaapi` selects Intel/AMD H.264 VAAPI; `UU_VAAPI_DEVICE` defaults to
 `/dev/dri/renderD128` (render-node permissions required). No automatic VAAPI selection.
-The FFmpeg process uploads NV12 frames to a VAAPI frame pool.
+The FFmpeg process uploads NV12 frames to a VAAPI frame pool; a self-built `--features inproc-av`
+binary instead runs VAAPI in process on X11 (a DRI3 DMA-BUF of the root window zero-copy, or XShm
+upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC).
 VBR uses the viewer bitrate preset and CQ-derived minimum QP, no B-frames, async depth 1,
 AUD and the existing GOP/VFR timing. Unsupported device/driver/initialization falls back to libx264
 with a warning. Accepted on Intel UHD 770 (iHD) with the default FFmpeg process pipeline and the official Mac
-viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). AMD is not hardware-verified.
+viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264 — a figure from the
+FFmpeg-process-pipeline era). AMD iGPUs are verified on
+the **in-process engine** (`--features inproc-av`): HawkPoint (Mesa 26.2.3) and Cezanne (Mesa 26.2.5) were
+accepted with the official Mac viewer for H.264/H.265, presets, fps and scaling, covering both the DRI3
+zero-copy and the XShm upload paths. Measured on one machine (1920x1200@60, Cezanne iGPU + RTX 3050 Ti):
+in-process VAAPI costs about **1/12** of the per-frame encode CPU of libx264 (FFmpeg pipeline, superfast)
+and about **1/5** of in-process NVENC. The FFmpeg process pipeline (what the release packages use) is not
+separately verified on AMD.
 
 The default VAAPI VBV buffer (100-500 kbit) squeezes keyframes hard at high resolution: on a 2560x1440
 H.264 VAAPI stream capped at 30 Mbit/s the first IDR measured 59,910 bytes and the picture blurred at

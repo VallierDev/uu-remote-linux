@@ -282,12 +282,16 @@ started a second full host server instead, so check that a subcommand exists in 
 The FFmpeg process pipeline uploads NV12 frames to a VAAPI frame pool. With `--features inproc-av` on X11, VAAPI
 H.264/HEVC Main runs in process: a DRI3 DMA-BUF of the root (XShm upload without DRI3) goes through VPP to NV12
 and VCN, with SPS/PPS(/VPS) and slice headers packed by the host as radeonsi (Mesa 26) needs; parameters follow
-FFmpeg's hevc_vaapi/h264_vaapi on that driver. Accepted on AMD HawkPoint1 (Mesa 26.2.3) with the official
-Mac viewer (presets, fps, scaling); Intel iHD is not verified.
+FFmpeg's hevc_vaapi/h264_vaapi on that driver. Accepted on AMD HawkPoint1 (Mesa 26.2.3) and Cezanne
+(Mesa 26.2.5; XShm-upload and DRI3 zero-copy probes plus a full HEVC Mac-viewer session) with the official
+Mac viewer (presets, fps, scaling); Intel iHD is not verified. Measured on Cezanne + RTX 3050 Ti
+(1920x1200, desktop-video-probe, 300 frames): in-process VAAPI ~1.5 ms CPU/frame vs in-process NVENC
+~7.1 ms vs libx264 process pipeline ~19 ms.
 VBR uses the viewer bitrate preset and CQ-derived minimum QP, no B-frames, async depth 1,
 AUD and the existing GOP/VFR timing. Unsupported device/driver/initialization falls back to libx264
 with a warning. Accepted on Intel UHD 770 (iHD) with the default FFmpeg process pipeline and the official Mac
-viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). AMD is not hardware-verified.
+viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). The process pipeline on
+AMD is not separately verified (AMD acceptance is the in-process engine above).
 
 ### Virtual audio / 虚拟声卡
 
