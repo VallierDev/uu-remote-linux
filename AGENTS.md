@@ -131,8 +131,9 @@ viewer does not reconnect them automatically.
 | `UU_USE_PROXY=1` | honor HTTP/SOCKS proxy env vars; cloud API clients bypass env proxies by default |
 | `UU_REMOTE_ASSIST=0`, `UU_ASSIST_ALLOW=1`, `UU_ASSIST_UI=tty`, `UU_ASSIST_DEBUG=1` | disable assistance / allow at start / terminal UI for `assist` / include the server's short error message in assist errors |
 
-Token has no expiry field; API code 1120 (HTTP 422) means invalid/expired → re-login. The config is re-read
-every 60 s.
+Token has no expiry field; API code 1120 (HTTP 422) means invalid/expired → re-login. `config.json` is parsed once
+(`config::file()`); only a `LoginExpired` room answer re-reads it from disk (`config::read_fresh()`) before waiting
+for a new QR login.
 
 ## 6. Code map
 
