@@ -83,9 +83,18 @@ pub fn auto_order(nvidia: bool) -> Vec<Encoder> {
 pub enum ProbeFail { Timeout, NoIdr, Spawn, Exit }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProbeOutcome { Ok, Fail(ProbeFail) }
+pub enum ProbeOutcome {
+    Ok,
+    Fail(ProbeFail),
+    /// inproc-av only: the FFmpeg process probe failed, but this session would try the native
+    /// engine first (`read_encoder_with`). Opening that engine needs a display, so the candidate
+    /// is not failed here; auto falls back to the pre-probe NVIDIA/CPU choice for it.
+    NativeUnprobed,
+}
 
 impl ProbeOutcome {
+    /// Counts as a successful probe for `choose_from_probe` and 真彩 fallback.
+    /// `NativeUnprobed` does not: that candidate was not shown to encode.
     pub fn ok(self) -> bool { matches!(self, Self::Ok) }
     pub fn label(self) -> &'static str {
         match self {
@@ -94,8 +103,29 @@ impl ProbeOutcome {
             Self::Fail(ProbeFail::NoIdr) => "no_idr",
             Self::Fail(ProbeFail::Spawn) => "spawn",
             Self::Fail(ProbeFail::Exit) => "exit",
+            Self::NativeUnprobed => "native_unprobed",
         }
     }
+}
+
+/// How a process-probe result becomes the stored outcome.
+/// `native_would_run` is true only on inproc-av when `inproc_encoder::selected` is true
+/// (hardware, not `UU_VIDEO_PIPELINE=process` / `UU_CAPTURE=grab` / a bundled FFmpeg).
+/// A process failure then becomes `NativeUnprobed` instead of disqualifying that candidate.
+/// Default builds pass `native_would_run = false`, so the process result is unchanged.
+pub fn outcome_for_candidate(process: ProbeOutcome, native_would_run: bool) -> ProbeOutcome {
+    if process.ok() || !native_would_run { process } else { ProbeOutcome::NativeUnprobed }
+}
+
+/// Encoder auto should use when a hardware candidate was left `NativeUnprobed`.
+/// That candidate is skipped by `choose_from_probe`; if it was the legacy pick (NVENC when
+/// NVIDIA is present), keep the legacy encoder. Otherwise use the probe choice.
+pub fn chosen_after_native(nvidia: bool, order: &[Encoder], outcomes: &[ProbeOutcome], probed: Encoder) -> Encoder {
+    let legacy = legacy_auto(nvidia);
+    let native_legacy = order.iter().zip(outcomes.iter()).any(|(e, o)| {
+        *e == legacy && matches!(o, ProbeOutcome::NativeUnprobed)
+    });
+    if native_legacy { legacy } else { probed }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -336,7 +366,46 @@ mod tests {
         );
     }
 
-    fn report(nvidia: bool, outcomes: &[ProbeOutcome]) -> ProbeReport {
+    #[test]
+    fn process_failure_keeps_native_candidate_unprobed() {
+        let exit = ProbeOutcome::Fail(ProbeFail::Exit);
+        assert_eq!(outcome_for_candidate(ProbeOutcome::Ok, true), ProbeOutcome::Ok);
+        assert_eq!(outcome_for_candidate(exit, false), exit, "default build keeps the process result");
+        assert_eq!(outcome_for_candidate(exit, true), ProbeOutcome::NativeUnprobed);
+        assert!(!ProbeOutcome::NativeUnprobed.ok());
+        assert_eq!(ProbeOutcome::NativeUnprobed.label(), "native_unprobed");
+    }
+
+    #[test]
+    fn native_unprobed_hardware_uses_legacy_choice() {
+        let order = auto_order(true);
+        let outcomes = [ProbeOutcome::NativeUnprobed, ProbeOutcome::Ok];
+        let probed = choose_from_probe(&order, &outcomes);
+        assert_eq!(probed, Encoder::Cpu);
+        assert_eq!(chosen_after_native(true, &order, &outcomes, probed), Encoder::Nvenc);
+        let vaapi = auto_order(false);
+        let va_out = [ProbeOutcome::NativeUnprobed, ProbeOutcome::Ok];
+        let va_probed = choose_from_probe(&vaapi, &va_out);
+        assert_eq!(chosen_after_native(false, &vaapi, &va_out, va_probed), Encoder::Cpu);
+        let both_ok = [ProbeOutcome::Ok, ProbeOutcome::Ok];
+        assert_eq!(chosen_after_native(true, &order, &both_ok, Encoder::Nvenc), Encoder::Nvenc);
+    }
+
+    #[test]
+    fn probe_chroma_request_moves_auto_vaapi_to_cpu() {
+        let report = probe_report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
+        let base = resolve_pair(None, None, None, None, false, Some(&report));
+        assert_eq!(base.encoder, Encoder::Vaapi);
+        let moved = selection_for_chroma(base, crate::capture_setting::CHROMA_444, Some(&report));
+        assert_eq!(moved.encoder, Encoder::Cpu);
+        let kept = selection_for_chroma(base, crate::capture_setting::CHROMA_420, Some(&report));
+        assert_eq!(kept.encoder, Encoder::Vaapi);
+        let only_vaapi = probe_report(false, &[ProbeOutcome::Ok, ProbeOutcome::Fail(ProbeFail::Exit)]);
+        let stuck = resolve_pair(None, None, None, None, false, Some(&only_vaapi));
+        assert_eq!(selection_for_chroma(stuck, crate::capture_setting::CHROMA_444, Some(&only_vaapi)).encoder, Encoder::Vaapi);
+    }
+
+    fn probe_report(nvidia: bool, outcomes: &[ProbeOutcome]) -> ProbeReport {
         let order = auto_order(nvidia);
         ProbeReport { chosen: choose_from_probe(&order, outcomes), outcomes: outcomes.to_vec(), order }
     }
@@ -351,13 +420,13 @@ mod tests {
 
     #[test]
     fn auto_falls_back_when_the_first_candidate_fails() {
-        let ok = report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
+        let ok = probe_report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
         assert_eq!(ok.chosen, Encoder::Vaapi);
-        let failed = report(false, &[ProbeOutcome::Fail(ProbeFail::Timeout), ProbeOutcome::Ok]);
+        let failed = probe_report(false, &[ProbeOutcome::Fail(ProbeFail::Timeout), ProbeOutcome::Ok]);
         assert_eq!(failed.chosen, Encoder::Cpu);
-        let both = report(true, &[ProbeOutcome::Fail(ProbeFail::NoIdr), ProbeOutcome::Fail(ProbeFail::Exit)]);
+        let both = probe_report(true, &[ProbeOutcome::Fail(ProbeFail::NoIdr), ProbeOutcome::Fail(ProbeFail::Exit)]);
         assert_eq!(both.chosen, Encoder::Cpu);
-        let nv = report(true, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
+        let nv = probe_report(true, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
         assert_eq!(resolve_pair(None, None, None, None, true, Some(&nv)).encoder, Encoder::Nvenc);
         assert_eq!(resolve_pair(None, None, None, None, false, Some(&ok)).encoder, Encoder::Vaapi);
         assert_eq!(resolve_pair(None, None, None, None, false, Some(&failed)).encoder, Encoder::Cpu);
@@ -365,17 +434,17 @@ mod tests {
 
     #[test]
     fn chroma_444_auto_vaapi_moves_only_to_a_probed_candidate() {
-        let both = report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
+        let both = probe_report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
         let auto = resolve_pair(None, None, None, None, false, Some(&both));
         assert_eq!(encoder_for_chroma(auto, crate::capture_setting::CHROMA_444, Some(&both)), (Encoder::Cpu, false));
-        let cpu_down = report(false, &[ProbeOutcome::Ok, ProbeOutcome::Fail(ProbeFail::Spawn)]);
+        let cpu_down = probe_report(false, &[ProbeOutcome::Ok, ProbeOutcome::Fail(ProbeFail::Spawn)]);
         assert_eq!(encoder_for_chroma(auto, crate::capture_setting::CHROMA_444, Some(&cpu_down)), (Encoder::Vaapi, true));
         assert_eq!(encoder_for_chroma(auto, crate::capture_setting::CHROMA_420, Some(&both)).0, Encoder::Vaapi);
         let pinned = resolve_pair(Some("vaapi"), None, None, None, false, Some(&both));
         assert_eq!(encoder_for_chroma(pinned, crate::capture_setting::CHROMA_444, Some(&both)), (Encoder::Vaapi, true));
         let from_env = resolve_pair(None, Some("vaapi"), None, None, false, Some(&both));
         assert_eq!(encoder_for_chroma(from_env, crate::capture_setting::CHROMA_444, Some(&both)).0, Encoder::Vaapi);
-        let nvidia = report(true, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
+        let nvidia = probe_report(true, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
         let nv = resolve_pair(None, None, None, None, true, Some(&nvidia));
         assert_eq!(encoder_for_chroma(nv, crate::capture_setting::CHROMA_444, Some(&nvidia)).0, Encoder::Nvenc);
         assert!(advertise_full_chroma(auto, Some(&both)));
@@ -389,7 +458,7 @@ mod tests {
 
     #[test]
     fn explicit_env_and_setting_ignore_the_probe() {
-        let va = report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
+        let va = probe_report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
         assert_eq!(resolve_pair(None, Some("nvenc"), None, None, false, Some(&va)).encoder, Encoder::Nvenc);
         assert_eq!(resolve_pair(None, Some("cpu"), None, None, true, Some(&va)).encoder, Encoder::Cpu);
         assert_eq!(resolve_pair(Some("vaapi"), Some("nvenc"), None, None, true, Some(&va)).encoder, Encoder::Vaapi);
@@ -406,7 +475,7 @@ mod tests {
         let early = resolve_pair(None, None, None, None, false, None);
         assert_eq!((early.encoder, early.encoder_source), (Encoder::Cpu, Source::Auto));
         assert_eq!(resolve_pair(None, None, None, None, true, None).encoder, Encoder::Nvenc);
-        store_probe(report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]));
+        store_probe(probe_report(false, &[ProbeOutcome::Ok, ProbeOutcome::Ok]));
         assert_eq!(cached_probe().unwrap().chosen, Encoder::Vaapi);
         assert_eq!(resolve_pair(None, None, None, None, false, cached_probe().as_ref()).encoder, Encoder::Vaapi);
         // A snapshot taken before the cache filled stays on the legacy encoder.

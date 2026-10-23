@@ -451,13 +451,25 @@ pub(crate) async fn probe_encoder_idr(encoder: Encoder) -> crate::video_select::
     if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
     command.args(encoder_options(&settings, encoder, "30", None));
     command.args(["-f", "h264", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
-    match tokio::time::timeout(AUTO_PROBE_BUDGET, command.output()).await {
+    let process = match tokio::time::timeout(AUTO_PROBE_BUDGET, command.output()).await {
         Ok(Ok(output)) if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H264) => ProbeOutcome::Ok,
         Ok(Ok(output)) if output.status.success() => ProbeOutcome::Fail(ProbeFail::NoIdr),
         Ok(Ok(_)) => ProbeOutcome::Fail(ProbeFail::Exit),
         Ok(Err(_)) => ProbeOutcome::Fail(ProbeFail::Spawn),
         Err(_) => ProbeOutcome::Fail(ProbeFail::Timeout),
-    }
+    };
+    // The native engine opens against a real X display, so a synthetic lavfi frame cannot
+    // exercise it. When this build would try that engine first, a process-only failure must
+    // not drop the candidate (NativeUnprobed → legacy auto for it).
+    crate::video_select::outcome_for_candidate(process, native_engine_would_run(encoder))
+}
+
+/// True when `read_encoder_with` would open the in-process engine for this candidate on X11.
+fn native_engine_would_run(encoder: Encoder) -> bool {
+    #[cfg(feature = "inproc-av")]
+    { crate::inproc_encoder::selected(encoder) }
+    #[cfg(not(feature = "inproc-av"))]
+    { let _ = encoder; false }
 }
 
 fn auto_probe_flight() -> &'static tokio::sync::Mutex<()> {
@@ -487,7 +499,8 @@ pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
     let order = crate::video_select::auto_order(nvidia_present());
     let mut outcomes = Vec::with_capacity(order.len());
     for encoder in &order { outcomes.push(probe_encoder_idr(*encoder).await); }
-    let chosen = crate::video_select::choose_from_probe(&order, &outcomes);
+    let probed = crate::video_select::choose_from_probe(&order, &outcomes);
+    let chosen = crate::video_select::chosen_after_native(nvidia_present(), &order, &outcomes, probed);
     let report = crate::video_select::ProbeReport { order, outcomes, chosen };
     let parts: Vec<String> = report.order.iter().zip(report.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect();
     log::info!("Encoder probe: {}", parts.join(" "));
@@ -883,7 +896,11 @@ pub(crate) fn transport_closed(pc: &RTCPeerConnection) -> bool {
         || pc.sctp().state() == webrtc::sctp_transport::sctp_transport_state::RTCSctpTransportState::Closed
 }
 
-fn probe_settings() -> Result<VideoSettings,String> {
+/// Encoder and settings for `desktop-video-probe` / `UU_PROBE_INPUT`.
+/// `UU_PROBE_CHROMA=444` is the viewer's 真彩 request: chroma and encoder both come from
+/// `selection_for_chroma` against the probe this process just finished, so auto-VAAPI moves
+/// to a probed 4:4:4 candidate the same way a desktop session does.
+pub(crate) fn probe_plan() -> Result<(crate::video_select::Selection, VideoSettings), String> {
     let fps=crate::wayland::capture_fps(std::env::var("UU_PROBE_FPS").ok().as_deref())?;
     // UU_PROBE_QUALITY selects a viewer preset (1 fast 1M, 2 general 2M, 3 HD 8M, 4 bluray 20M,
     // 5 auto); bitrate presets exercise the capped/ABR encoder path instead of CRF.
@@ -891,19 +908,16 @@ fn probe_settings() -> Result<VideoSettings,String> {
         None=>crate::capture_setting::QUALITY_AUTO,
         Some(v)=>v.parse::<u64>().ok().filter(|q|(1..=5).contains(q)).ok_or("UU_PROBE_QUALITY must be 1-5")?,
     };
-    let mut settings=VideoSettings {fps,quality,codec:probe_codec(),..VideoSettings::default()};
-    // UU_PROBE_CHROMA=444 requests 真彩 like the viewer does (only where full_chroma_available()).
-    if std::env::var("UU_PROBE_CHROMA").as_deref()==Ok("444") && full_chroma_for(crate::video_select::selection().encoder) { settings.chroma=crate::capture_setting::CHROMA_444; }
-    Ok(settings)
-}
-
-/// The probe follows `UU_VIDEO_CODEC` so the HEVC path can be measured at all (H.264 otherwise),
-/// and its first access unit is then checked against that codec instead of always H.264.
-fn probe_codec() -> VideoCodec {
-    match crate::video_select::codec_force(crate::video_select::selection().codec_pref) {
+    let mut settings=VideoSettings {fps,quality,..VideoSettings::default()};
+    let base = crate::video_select::selection();
+    let chroma = if std::env::var("UU_PROBE_CHROMA").as_deref()==Ok("444") { crate::capture_setting::CHROMA_444 } else { crate::capture_setting::CHROMA_420 };
+    let selection = crate::video_select::selection_for_chroma(base, chroma, crate::video_select::cached_probe().as_ref());
+    settings.codec = match crate::video_select::codec_force(selection.codec_pref) {
         Some("h265") => VideoCodec::H265,
         _ => VideoCodec::H264,
-    }
+    };
+    if chroma == crate::capture_setting::CHROMA_444 && full_chroma_for(selection.encoder) { settings.chroma = chroma; }
+    Ok((selection, settings))
 }
 
 fn probe_input_command(spec:&FfmpegSpec,input:&std::ffi::OsStr,loop_input:bool,settings:&VideoSettings,
@@ -940,12 +954,12 @@ async fn probe_input_size(spec:&FfmpegSpec,input:&std::ffi::OsStr)->Result<(u32,
 pub async fn probe_input(input:OsString,path:Option<String>)->Result<(),String> {
     ensure_auto_probed().await;
     use std::io::Write;
-    let settings=probe_settings()?;
+    let (selection, settings)=probe_plan()?;
     let wanted:u64=std::env::var("UU_PROBE_FRAMES").ok().and_then(|v|v.parse().ok()).unwrap_or(5);
     if wanted==0 { return Err("Fixed-input UU_PROBE_FRAMES must be positive".into()); }
     let spec=ffmpeg_spec();
     let size=probe_input_size(&spec,&input).await?;
-    let encoder = crate::video_select::selection().encoder;
+    let encoder = selection.encoder;
     let (maxrate,_)=rate_args(&settings,encoder);
     let output=settings.output.unwrap_or(size);
     println!("Fixed input probe: source={}x{} output={}x{} fps={} cq={} maxrate={} encoder={}",
@@ -997,8 +1011,7 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
     };
     let (tx,mut rx)=mpsc::channel(4);
     let sequence=Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let settings=probe_settings()?;
-    let selection = crate::video_select::selection();
+    let (selection, settings)=probe_plan()?;
     let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,settings,sequence,Arc::new(AtomicBool::new(false)),Arc::new(Semaphore::new(4)),selection)));
     let mut count=0;
     let mut bytes=0;
