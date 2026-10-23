@@ -22,6 +22,7 @@ typedef struct X264cConfig {
     uint32_t fps;
     uint32_t gop;
     uint32_t cq;
+    uint32_t abr;   // 1: viewer bitrate preset -> ABR + VBV; 0: 自动 -> capped CRF
     int64_t target_bps;
     int64_t max_bps;
     int64_t buffer_bits;
@@ -45,19 +46,37 @@ typedef struct X264cEngine {
 
 void x264c_destroy(X264cEngine *e);
 
+// x264c_create failure reasons, reported through the caller's `error` pointer.
+enum {
+    X264C_OK = 0,
+    X264C_ERR_DLOPEN = 1,   // neither libx264.so.<X264_BUILD> nor libx264.so could be loaded
+    X264C_ERR_SYMBOL = 2,   // loaded, but a versioned symbol is missing: X264_BUILD mismatch
+    X264C_ERR_OPEN = 3,     // parameter setup or x264_encoder_open failed
+};
+
 static void *x264c_sym(void *lib, const char *name) {
     void *p = dlsym(lib, name);
     return p;
 }
 
-void *x264c_create(const X264cConfig *cfg) {
+void *x264c_create(const X264cConfig *cfg, int *error) {
+    if (error) *error = X264C_OK;
     if (!cfg || cfg->width == 0 || cfg->height == 0 || cfg->fps == 0 || cfg->gop == 0) return NULL;
-    void *lib = dlopen("libx264.so", RTLD_NOW | RTLD_LOCAL);
-    if (!lib) lib = dlopen("libx264.so." X264C_STR(X264_BUILD), RTLD_NOW | RTLD_LOCAL);
-    if (!lib) return NULL;
+    // The compile-time X264_BUILD names the runtime major; the unversioned soname is the fallback
+    // for a dev symlink.
+    void *lib = dlopen("libx264.so." X264C_STR(X264_BUILD), RTLD_NOW | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libx264.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) {
+        if (error) *error = X264C_ERR_DLOPEN;
+        return NULL;
+    }
 
     X264cEngine *e = calloc(1, sizeof *e);
-    if (!e) { dlclose(lib); return NULL; }
+    if (!e) {
+        if (error) *error = X264C_ERR_OPEN;
+        dlclose(lib);
+        return NULL;
+    }
     e->lib = lib;
     e->encoder_open = (x264_t *(*)(x264_param_t *))x264c_sym(lib, X264C_STR(x264_encoder_open));
     e->encoder_encode = (int (*)(x264_t *, x264_nal_t **, int *, x264_picture_t *, x264_picture_t *))x264c_sym(lib, "x264_encoder_encode");
@@ -69,11 +88,12 @@ void *x264c_create(const X264cConfig *cfg) {
         (int (*)(x264_param_t *, const char *))x264c_sym(lib, "x264_param_apply_profile");
     if (!e->encoder_open || !e->encoder_encode || !e->encoder_close || !e->picture_init
         || !default_preset || !apply_profile) {
+        if (error) *error = X264C_ERR_SYMBOL;
         free(e); dlclose(lib); return NULL;
     }
 
     x264_param_t p;
-    if (default_preset(&p, "superfast", "zerolatency") != 0) { free(e); dlclose(lib); return NULL; }
+    if (default_preset(&p, "superfast", "zerolatency") != 0) { if (error) *error = X264C_ERR_OPEN; free(e); dlclose(lib); return NULL; }
     p.i_width = (int)cfg->width;
     p.i_height = (int)cfg->height;
     p.i_fps_num = (int)cfg->fps;
@@ -88,19 +108,23 @@ void *x264c_create(const X264cConfig *cfg) {
     p.b_aud = 1;               // the reader splits access units on AUD, like the child process
     p.b_repeat_headers = 1;    // SPS/PPS ahead of every IDR
     p.i_threads = 4;           // the child process ran -threads 4
-    if (cfg->max_bps > 0) {
+    // Same rate control as the FFmpeg child: a viewer preset is ABR at 3/4 of the cap, 自动 is
+    // CRF, and both set the same VBV bound.
+    if (cfg->abr) {
         p.rc.i_rc_method = X264_RC_ABR;
         p.rc.i_bitrate = (int)(cfg->target_bps / 1000);
-        p.rc.i_vbv_max_bitrate = (int)(cfg->max_bps / 1000);
-        p.rc.i_vbv_buffer_size = (int)(cfg->buffer_bits / 1000);
     } else {
         p.rc.i_rc_method = X264_RC_CRF;
         p.rc.f_rf_constant = (float)cfg->cq;
     }
-    if (apply_profile(&p, "baseline") != 0) { free(e); dlclose(lib); return NULL; }
+    if (cfg->max_bps > 0) {
+        p.rc.i_vbv_max_bitrate = (int)(cfg->max_bps / 1000);
+        p.rc.i_vbv_buffer_size = (int)(cfg->buffer_bits / 1000);
+    }
+    if (apply_profile(&p, "baseline") != 0) { if (error) *error = X264C_ERR_OPEN; free(e); dlclose(lib); return NULL; }
 
     e->encoder = e->encoder_open(&p);
-    if (!e->encoder) { free(e); dlclose(lib); return NULL; }
+    if (!e->encoder) { if (error) *error = X264C_ERR_OPEN; free(e); dlclose(lib); return NULL; }
 
     const size_t w = cfg->width, h = cfg->height;
     const size_t cw = (w + 1) / 2, ch = (h + 1) / 2;
@@ -111,7 +135,7 @@ void *x264c_create(const X264cConfig *cfg) {
     e->plane[0] = malloc(w * h);
     e->plane[1] = malloc(cw * ch);
     e->plane[2] = malloc(cw * ch);
-    if (!e->plane[0] || !e->plane[1] || !e->plane[2]) { x264c_destroy(e); return NULL; }
+    if (!e->plane[0] || !e->plane[1] || !e->plane[2]) { x264c_destroy(e); if (error) *error = X264C_ERR_OPEN; return NULL; }
 
     e->picture_init(&e->pic);
     e->pic.img.i_csp = X264_CSP_I420;

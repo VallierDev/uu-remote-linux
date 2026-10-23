@@ -70,6 +70,7 @@ struct X264cConfigFFI {
     fps: u32,
     gop: u32,
     cq: u32,
+    abr: u32,
     target_bps: i64,
     max_bps: i64,
     buffer_bits: i64,
@@ -110,7 +111,7 @@ extern "C" {
     fn dri3_capture_get_stride(cap: *mut Dri3CaptureOpaque) -> u32;
     fn dri3_capture_destroy(cap: *mut Dri3CaptureOpaque);
 
-    fn x264c_create(config: *const X264cConfigFFI) -> *mut X264cEngineOpaque;
+    fn x264c_create(config: *const X264cConfigFFI, error: *mut libc::c_int) -> *mut X264cEngineOpaque;
     fn x264c_encode_frame(
         engine: *mut X264cEngineOpaque,
         input_bgrx: *const u8,
@@ -175,6 +176,8 @@ pub struct Config {
     pub fps: u32,
     pub gop: u32,
     pub cq: u32,
+    /// Viewer bitrate preset: the x264 engine uses ABR + VBV; 自动 keeps CRF with the same VBV bound.
+    pub abr: bool,
     pub target_bps: i64,
     pub max_bps: i64,
     pub buffer_bits: i64,
@@ -261,6 +264,16 @@ pub fn run(
     }
 }
 
+/// x264c_create reports why it failed; the message carries the reason, never a library path.
+fn x264c_error(code: libc::c_int) -> &'static str {
+    match code {
+        1 => "libx264.so could not be dlopen'ed",
+        2 => "libx264 lacks the compile-time X264_BUILD symbols (x264.h / library mismatch)",
+        3 => "x264 encoder setup failed",
+        _ => "unknown failure",
+    }
+}
+
 /// In-process libx264 (H.264 only): XShm -> I420 on the CPU -> x264 in a dlopen'ed libx264.
 /// The same capture / keepalive / budget loop as the NVENC copy path, minus device upload.
 fn run_x264(
@@ -287,6 +300,7 @@ fn run_x264(
         fps: config.fps,
         gop: config.gop,
         cq: config.cq,
+        abr: u32::from(config.abr),
         target_bps: config.target_bps,
         max_bps: config.max_bps,
         buffer_bits: config.buffer_bits,
@@ -295,9 +309,10 @@ fn run_x264(
     let mut capture = DamageCapture::open(&config.display)
         .map_err(|e| format!("DamageCapture::open failed on {}: {e}", config.display))?;
 
-    let raw_engine = unsafe { x264c_create(&ffi_cfg) };
+    let mut reason = 0;
+    let raw_engine = unsafe { x264c_create(&ffi_cfg, &mut reason) };
     if raw_engine.is_null() {
-        return Err("Failed to create native x264 engine (libx264 unavailable or wrong X264_BUILD)".into());
+        return Err(format!("Failed to create native x264 engine: {}", x264c_error(reason)));
     }
     let engine = SafeX264Engine(raw_engine);
     let (cap_width, cap_height) = capture.size();
@@ -323,7 +338,6 @@ fn run_x264(
     let mut dirty = true;
     let mut next_tick = Instant::now();
     let mut last_send = Instant::now();
-    let mut permits = VecDeque::with_capacity(4);
     let mut frame_buf = Vec::new();
 
     let locked = crate::session_lock::watch_locked();
@@ -396,13 +410,10 @@ fn run_x264(
 
         if out_len > 0 && !out_data.is_null() {
             let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
-            permits.push_back(permit);
-            let send_permit = permits.pop_front().unwrap();
-
             if units
                 .blocking_send(EncodedUnit {
                     data,
-                    permit: send_permit,
+                    permit,
                     completed_at: Instant::now(),
                 })
                 .is_err()
@@ -1016,8 +1027,8 @@ mod frame_tests {
         let src = image(7, 5, |x, y| [(x * 37 + y * 11) as u8; 4]);
         let mut out = vec![0; 4 * 3 * 4];
         scale_bilinear_argb32(&src, 7, 5, &mut out, 4, 3);
-        for (d, &(x0, x1, fx)) in (0..4usize).zip(taps_for(4, 7)) {
-            for (r, &(y0, y1, fy)) in (0..3usize).zip(taps_for(3, 5)) {
+        for (d, (x0, x1, fx)) in (0..4usize).zip(taps_for(4, 7)) {
+            for (r, (y0, y1, fy)) in (0..3usize).zip(taps_for(3, 5)) {
                 for c in 0..4 {
                     let lerp = |row: usize| u32::from(src[row * 28 + x0 * 4 + c]) * (256 - fx) + u32::from(src[row * 28 + x1 * 4 + c]) * fx;
                     let expected = ((lerp(y0) * (256 - fy) + lerp(y1) * fy + 32768) >> 16) as u8;
