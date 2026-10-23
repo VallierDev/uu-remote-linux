@@ -46,6 +46,8 @@ pub enum SignalingEvent {
     Released(Value),
     Left(Value),
     Disconnected,
+    /// capture_desktop on this tool peer (ice_id); raised by the peer, not by signaling.
+    DesktopRequested(String),
 }
 
 pub struct SignalingClient {

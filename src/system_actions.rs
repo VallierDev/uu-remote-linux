@@ -12,6 +12,8 @@ pub const FF_SIMPLE_ACTION: u8 = 2;
 pub const FF_SYSTEM_METRICS: u8 = 2;
 
 pub const SHOW_DESKTOP: u64 = 2;
+/// Opens the desktop on an existing connection (the viewer's port mapping reuses its peer, #99).
+pub const CAPTURE_DESKTOP: u64 = 4;
 pub const REBOOT_SYSTEM: u64 = 9;
 pub const LOCK_SYSTEM: u64 = 10;
 pub const SHUTDOWN_SYSTEM: u64 = 12;
