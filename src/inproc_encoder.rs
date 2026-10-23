@@ -174,6 +174,7 @@ impl Drop for SafeX264Engine {
     }
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub display: String,
     pub input: (u32, u32),
@@ -237,8 +238,9 @@ pub struct EncodedUnit {
 fn acquire(
     budget: &Arc<Semaphore>,
     units: &mpsc::Sender<EncodedUnit>,
+    handle: &tokio::runtime::Handle,
 ) -> Option<OwnedSemaphorePermit> {
-    tokio::runtime::Handle::current().block_on(async {
+    handle.block_on(async {
         tokio::select! {
             permit = budget.clone().acquire_owned() => permit.ok(),
             _ = units.closed() => None,
@@ -279,8 +281,97 @@ fn x264c_error(code: libc::c_int) -> &'static str {
     }
 }
 
+/// One produced I420 frame waiting for the encoder thread.
+struct QueuedFrame {
+    planes: Planes,
+    force_idr: libc::c_int,
+    permit: OwnedSemaphorePermit,
+}
+
+/// Depth-1 hand-off to the encoder: only the newest frame is kept, so a slow encoder never
+/// builds a latency queue. A replaced frame's plane buffer goes back to the pool.
+struct FrameQueue {
+    state: std::sync::Mutex<(Option<QueuedFrame>, bool)>,
+    cv: std::sync::Condvar,
+}
+
+impl FrameQueue {
+    fn new() -> Self {
+        Self { state: std::sync::Mutex::new((None, false)), cv: std::sync::Condvar::new() }
+    }
+
+    fn push(&self, frame: QueuedFrame) -> Option<QueuedFrame> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let old = state.0.replace(frame);
+        drop(state);
+        self.cv.notify_one();
+        old
+    }
+
+    fn take(&self) -> Option<QueuedFrame> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(frame) = state.0.take() {
+                return Some(frame);
+            }
+            if state.1 {
+                return None;
+            }
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.1 = true;
+        drop(state);
+        self.cv.notify_all();
+    }
+}
+
+/// Double-buffered I420 planes shared by the capture and encoder threads. x264 copies the input
+/// picture during encoder_encode, so the encoder returns its buffer right after encoding.
+struct PlanePool {
+    state: std::sync::Mutex<(Vec<Planes>, usize)>,
+    cv: std::sync::Condvar,
+    max: usize,
+}
+
+impl PlanePool {
+    fn new(max: usize) -> Self {
+        Self { state: std::sync::Mutex::new((Vec::new(), 0)), cv: std::sync::Condvar::new(), max }
+    }
+
+    /// Waits for a free plane buffer; None when `stop` is set while waiting.
+    fn take(&self, w: u32, h: u32, stop: &AtomicBool) -> Option<Planes> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(planes) = state.0.pop() {
+                return Some(planes);
+            }
+            if state.1 < self.max {
+                state.1 += 1;
+                drop(state);
+                return Some(Planes::new(w, h));
+            }
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            state = self.cv.wait_timeout(state, Duration::from_millis(20)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    fn give(&self, planes: Planes) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.0.push(planes);
+        drop(state);
+        self.cv.notify_one();
+    }
+}
+
 /// In-process libx264 (H.264 only): XShm -> I420 on the CPU -> x264 in a dlopen'ed libx264.
-/// The same capture / keepalive / budget loop as the NVENC copy path, minus device upload.
+/// Capture/scale/convert and encode run on two threads with a depth-1 hand-off, so their serial
+/// per-frame work overlaps instead of adding up; the keepalive/budget/IDR policy is unchanged.
 fn run_x264(
     config: Config,
     units: mpsc::Sender<EncodedUnit>,
@@ -288,8 +379,8 @@ fn run_x264(
     idr: Arc<AtomicBool>,
     budget: Arc<Semaphore>,
 ) -> Result<(), String> {
-    let (width, height) = config.output.unwrap_or(config.input);
-    let (width, height) = (width + width % 2, height + height % 2);
+    let (width0, height0) = config.output.unwrap_or(config.input);
+    let (width, height) = (width0 + width0 % 2, height0 + height0 % 2);
     log::info!(
         "Initializing Native In-Process x264: {}x{}, {} fps, GOP {}, CQ {}",
         width,
@@ -298,28 +389,51 @@ fn run_x264(
         config.gop,
         config.cq
     );
-
-    let ffi_cfg = X264cConfigFFI {
-        width,
-        height,
-        fps: config.fps,
-        gop: config.gop,
-        cq: config.cq,
-        abr: u32::from(config.abr),
-        target_bps: config.target_bps,
-        max_bps: config.max_bps,
-        buffer_bits: config.buffer_bits,
+    let handle = tokio::runtime::Handle::current();
+    let queue = Arc::new(FrameQueue::new());
+    let pool = Arc::new(PlanePool::new(2));
+    let producer = {
+        let (config, queue, pool, units, stop, idr, budget, handle) = (
+            config.clone(), queue.clone(), pool.clone(), units.clone(), stop.clone(),
+            idr.clone(), budget.clone(), handle.clone(),
+        );
+        std::thread::Builder::new().name("x264-capture".into())
+            .spawn(move || produce_x264(config, queue, pool, units, stop, idr, budget, handle, width, height))
+            .map_err(|e| format!("x264 capture thread: {e}"))?
     };
+    let encoder = {
+        let (config, queue, pool, units, stop) = (config, queue.clone(), pool.clone(), units, stop.clone());
+        std::thread::Builder::new().name("x264-encode".into())
+            .spawn(move || encode_x264(config, queue, pool, units, stop, width, height))
+            .map_err(|e| format!("x264 encoder thread: {e}"))?
+    };
+    let producer = producer.join().unwrap_or_else(|_| Err("x264 capture thread panicked".into()));
+    if producer.is_err() {
+        stop.store(true, Ordering::Relaxed);
+        queue.close();
+    }
+    let encoder = encoder.join().unwrap_or_else(|_| Err("x264 encoder thread panicked".into()));
+    encoder.and(producer)
+}
 
+fn produce_x264(
+    config: Config, queue: Arc<FrameQueue>, pool: Arc<PlanePool>, units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>, handle: tokio::runtime::Handle,
+    width: u32, height: u32,
+) -> Result<(), String> {
+    let result = produce_x264_inner(&config, &queue, &pool, &units, &stop, &idr, &budget, &handle, width, height);
+    queue.close();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn produce_x264_inner(
+    config: &Config, queue: &FrameQueue, pool: &PlanePool, units: &mpsc::Sender<EncodedUnit>,
+    stop: &AtomicBool, idr: &AtomicBool, budget: &Arc<Semaphore>, handle: &tokio::runtime::Handle,
+    width: u32, height: u32,
+) -> Result<(), String> {
     let mut capture = DamageCapture::open(&config.display)
         .map_err(|e| format!("DamageCapture::open failed on {}: {e}", config.display))?;
-
-    let mut reason = 0;
-    let raw_engine = unsafe { x264c_create(&ffi_cfg, &mut reason) };
-    if raw_engine.is_null() {
-        return Err(format!("Failed to create native x264 engine: {}", x264c_error(reason)));
-    }
-    let engine = SafeX264Engine(raw_engine);
     let (cap_width, cap_height) = capture.size();
     if cap_width != width || cap_height != height {
         log::info!(
@@ -331,10 +445,8 @@ fn run_x264(
             if config.output.is_some() { "bilinear scaling" } else { "padding" }
         );
     }
-
     let bytes_per_line = cap_width as usize * 4;
     let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
-
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(1, |d| d.subsec_nanos())
@@ -343,28 +455,21 @@ fn run_x264(
     let mut dirty = true;
     let mut next_tick = Instant::now();
     let mut last_send = Instant::now();
-    let mut planes = Planes::new(width, height);
     let mut frame_buf = Vec::new();
-
     let locked = crate::session_lock::watch_locked();
     let mut last_locked = *locked.borrow();
+    // An IDR request on a frame that gets superseded before encoding is forwarded to the next one.
+    let mut pending_idr = false;
 
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-
-        let deadline = if dirty {
-            next_tick
-        } else {
-            last_send + keepalive
-        };
+        let deadline = if dirty { next_tick } else { last_send + keepalive };
         let wait = deadline.saturating_duration_since(Instant::now());
-
         if capture.wait(wait.max(Duration::from_millis(1)))? {
             dirty = true;
         }
-
         let now = Instant::now();
         if dirty && now < next_tick {
             continue;
@@ -372,28 +477,28 @@ fn run_x264(
         if !dirty && now < last_send + keepalive {
             continue;
         }
-
-        let Some(permit) = acquire(&budget, &units) else {
+        let Some(permit) = acquire(budget, units, handle) else {
             return Ok(());
         };
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-
         dirty |= capture.wait(Duration::ZERO)?;
         let state = *locked.borrow();
         if state != last_locked {
             dirty = true;
             last_locked = state;
         }
-
-        let force_idr = if idr.swap(false, Ordering::AcqRel) {
+        let force_idr = if idr.swap(false, Ordering::AcqRel) || pending_idr {
+            pending_idr = false;
             1
         } else {
             0
         };
-
         // Keepalive frames re-encode the current screen contents as a tiny P-frame.
+        let Some(mut planes) = pool.take(width, height, stop) else {
+            return Ok(());
+        };
         let source = capture.capture()?;
         if cap_width == width && cap_height == height {
             unsafe {
@@ -413,28 +518,11 @@ fn run_x264(
             }
         }
 
-        let mut out_data: *const u8 = std::ptr::null();
-        let mut out_len: u32 = 0;
-        let res = unsafe {
-            x264c_encode_i420(engine.0, planes.y.as_ptr(), planes.u.as_ptr(), planes.v.as_ptr(), force_idr,
-                              &mut out_data, &mut out_len)
-        };
-        if res != 0 {
-            return Err(format!("x264c_encode_frame failed with error {res}"));
-        }
-
-        if out_len > 0 && !out_data.is_null() {
-            let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
-            if units
-                .blocking_send(EncodedUnit {
-                    data,
-                    permit,
-                    completed_at: Instant::now(),
-                })
-                .is_err()
-            {
-                return Ok(());
+        if let Some(old) = queue.push(QueuedFrame { planes, force_idr, permit }) {
+            if old.force_idr != 0 {
+                pending_idr = true;
             }
+            pool.give(old.planes);
         }
 
         let now = Instant::now();
@@ -449,6 +537,66 @@ fn run_x264(
         }
         last_send = now;
         keepalive = random_keepalive(&mut seed);
+    }
+}
+
+fn encode_x264(
+    config: Config, queue: Arc<FrameQueue>, pool: Arc<PlanePool>, units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>, width: u32, height: u32,
+) -> Result<(), String> {
+    let result = encode_x264_inner(&config, &queue, &pool, &units, &stop, width, height);
+    queue.close();
+    result
+}
+
+fn encode_x264_inner(
+    config: &Config, queue: &FrameQueue, pool: &PlanePool, units: &mpsc::Sender<EncodedUnit>,
+    stop: &AtomicBool, width: u32, height: u32,
+) -> Result<(), String> {
+    let ffi_cfg = X264cConfigFFI {
+        width,
+        height,
+        fps: config.fps,
+        gop: config.gop,
+        cq: config.cq,
+        abr: u32::from(config.abr),
+        target_bps: config.target_bps,
+        max_bps: config.max_bps,
+        buffer_bits: config.buffer_bits,
+    };
+    let mut reason = 0;
+    let raw_engine = unsafe { x264c_create(&ffi_cfg, &mut reason) };
+    if raw_engine.is_null() {
+        return Err(format!("Failed to create native x264 engine: {}", x264c_error(reason)));
+    }
+    let engine = SafeX264Engine(raw_engine);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let Some(frame) = queue.take() else {
+            return Ok(());
+        };
+        let mut out_data: *const u8 = std::ptr::null();
+        let mut out_len: u32 = 0;
+        let res = unsafe {
+            x264c_encode_i420(engine.0, frame.planes.y.as_ptr(), frame.planes.u.as_ptr(),
+                              frame.planes.v.as_ptr(), frame.force_idr, &mut out_data, &mut out_len)
+        };
+        // x264 copied the input picture during encoder_encode; hand the buffer back immediately.
+        pool.give(frame.planes);
+        if res != 0 {
+            return Err(format!("x264c_encode_i420 failed with error {res}"));
+        }
+        if out_len > 0 && !out_data.is_null() {
+            let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
+            if units
+                .blocking_send(EncodedUnit { data, permit: frame.permit, completed_at: Instant::now() })
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -524,6 +672,7 @@ fn run_vaapi(
 
     let locked = crate::session_lock::watch_locked();
     let mut last_locked = *locked.borrow();
+    let handle = tokio::runtime::Handle::current();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -549,7 +698,7 @@ fn run_vaapi(
             continue;
         }
 
-        let Some(permit) = acquire(&budget, &units) else {
+        let Some(permit) = acquire(&budget, &units, &handle) else {
             return Ok(());
         };
         if stop.load(Ordering::Relaxed) {
@@ -726,6 +875,7 @@ fn run_nvenc(
 
     let locked = crate::session_lock::watch_locked();
     let mut last_locked = *locked.borrow();
+    let handle = tokio::runtime::Handle::current();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -751,7 +901,7 @@ fn run_nvenc(
             continue;
         }
 
-        let Some(permit) = acquire(&budget, &units) else {
+        let Some(permit) = acquire(&budget, &units, &handle) else {
             return Ok(());
         };
         if stop.load(Ordering::Relaxed) {
@@ -1001,7 +1151,7 @@ mod budget_tests {
     async fn closing_encoder_output_wakes_a_blocked_capture() {
         let budget = Arc::new(Semaphore::new(0));
         let (tx, rx) = mpsc::channel(1);
-        let worker = tokio::task::spawn_blocking(move || acquire(&budget, &tx));
+        let worker = tokio::task::spawn_blocking(move || acquire(&budget, &tx, &tokio::runtime::Handle::current()));
         tokio::task::yield_now().await;
         drop(rx);
         assert!(tokio::time::timeout(Duration::from_secs(1), worker).await.unwrap().unwrap().is_none());
