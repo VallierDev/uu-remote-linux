@@ -33,7 +33,8 @@ fn main() {
             x11_build.file("c_engine/nvenc_engine.c");
             x11_build.file("c_engine/vaapi_engine.c");
             x11_build.file("c_engine/dri3_capture.c");
-            for f in ["c_engine/vaapi_engine.c", "c_engine/vaapi_engine.h", "c_engine/dri3_capture.c", "c_engine/dri3_capture.h"] {
+            x11_build.file("c_engine/x264_engine.c");
+            for f in ["c_engine/vaapi_engine.c", "c_engine/vaapi_engine.h", "c_engine/dri3_capture.c", "c_engine/dri3_capture.h", "c_engine/x264_engine.c"] {
                 println!("cargo:rerun-if-changed={f}");
             }
             x11_build.include("vendor/ffnvcodec");

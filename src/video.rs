@@ -737,6 +737,19 @@ fn native_inproc(display: &str, portal: bool, encoder: Encoder) -> bool {
     native_engine_eligible(encoder, display_kind(display, portal))
 }
 
+/// Encoder::Cpu goes in-process for plain H.264 on X11: x264 cannot encode HEVC, and 真彩 4:4:4
+/// keeps the child process until a high444 CSP is wired in. Deliberately not part of
+/// `inproc_encoder::selected()`: the auto probe's native-unprobed semantics must not change.
+#[cfg(feature = "inproc-av")]
+fn cpu_inproc(display: &str, portal: bool, encoder: Encoder, settings: &VideoSettings) -> bool {
+    encoder == Encoder::Cpu
+        && settings.codec == VideoCodec::H264
+        && settings.chroma != crate::capture_setting::CHROMA_444
+        && display_kind(display, portal) == NativeDisplayKind::X11
+        && crate::inproc_encoder::damage_enabled()
+        && !crate::inproc_encoder::disabled()
+}
+
 #[cfg(feature = "inproc-av")]
 fn display_kind(display: &str, portal: bool) -> NativeDisplayKind {
     if portal { NativeDisplayKind::Portal }
@@ -828,7 +841,7 @@ async fn read_encoder_with(
         Some(Arc::new(capture))
     } else { None };
     #[cfg(feature = "inproc-av")]
-    if allow_inproc && x11_region.is_none() && native_inproc(&display, portal.is_some(), encoder) {
+    if allow_inproc && x11_region.is_none() && (native_inproc(&display, portal.is_some(), encoder) || cpu_inproc(&display, portal.is_some(), encoder, &settings)) {
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
@@ -836,6 +849,7 @@ async fn read_encoder_with(
             target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
             max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec, chroma: settings.chroma,
             vaapi: encoder == Encoder::Vaapi,
+            cpu: encoder == Encoder::Cpu,
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} source={} pipeline=in-process",
             display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec),

@@ -58,6 +58,23 @@ struct Dri3CaptureOpaque {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct X264cEngineOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct X264cConfigFFI {
+    width: u32,
+    height: u32,
+    fps: u32,
+    gop: u32,
+    cq: u32,
+    target_bps: i64,
+    max_bps: i64,
+    buffer_bits: i64,
+}
+
 extern "C" {
     fn nvenc_create(config: *const NvencConfigFFI) -> *mut NvencEngineOpaque;
     fn nvenc_register_host_buffer(
@@ -92,6 +109,17 @@ extern "C" {
     fn dri3_capture_get_dma_fd(cap: *mut Dri3CaptureOpaque) -> libc::c_int;
     fn dri3_capture_get_stride(cap: *mut Dri3CaptureOpaque) -> u32;
     fn dri3_capture_destroy(cap: *mut Dri3CaptureOpaque);
+
+    fn x264c_create(config: *const X264cConfigFFI) -> *mut X264cEngineOpaque;
+    fn x264c_encode_frame(
+        engine: *mut X264cEngineOpaque,
+        input_bgrx: *const u8,
+        pitch: u32,
+        force_idr: libc::c_int,
+        out_data: *mut *const u8,
+        out_len: *mut u32,
+    ) -> libc::c_int;
+    fn x264c_destroy(engine: *mut X264cEngineOpaque);
 }
 
 struct SafeNvencEngine(*mut NvencEngineOpaque);
@@ -129,6 +157,17 @@ impl Drop for SafeDri3Capture {
     }
 }
 
+struct SafeX264Engine(*mut X264cEngineOpaque);
+unsafe impl Send for SafeX264Engine {}
+impl Drop for SafeX264Engine {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { x264c_destroy(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
 pub struct Config {
     pub display: String,
     pub input: (u32, u32),
@@ -144,6 +183,8 @@ pub struct Config {
     pub chroma: u64,
     /// UU_VIDEO_ENCODER=vaapi: the VAAPI engine (H.264 / HEVC Main) instead of NVENC.
     pub vaapi: bool,
+    /// Encoder::Cpu with H.264 on X11: the in-process libx264 engine (no FFmpeg child).
+    pub cpu: bool,
 }
 
 pub fn disabled() -> bool {
@@ -213,8 +254,175 @@ pub fn run(
 ) -> Result<(), String> {
     if config.vaapi {
         run_vaapi(config, units, stop, idr, budget)
+    } else if config.cpu {
+        run_x264(config, units, stop, idr, budget)
     } else {
         run_nvenc(config, units, stop, idr, budget)
+    }
+}
+
+/// In-process libx264 (H.264 only): XShm -> I420 on the CPU -> x264 in a dlopen'ed libx264.
+/// The same capture / keepalive / budget loop as the NVENC copy path, minus device upload.
+fn run_x264(
+    config: Config,
+    units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>,
+    idr: Arc<AtomicBool>,
+    budget: Arc<Semaphore>,
+) -> Result<(), String> {
+    let (width, height) = config.output.unwrap_or(config.input);
+    let (width, height) = (width + width % 2, height + height % 2);
+    log::info!(
+        "Initializing Native In-Process x264: {}x{}, {} fps, GOP {}, CQ {}",
+        width,
+        height,
+        config.fps,
+        config.gop,
+        config.cq
+    );
+
+    let ffi_cfg = X264cConfigFFI {
+        width,
+        height,
+        fps: config.fps,
+        gop: config.gop,
+        cq: config.cq,
+        target_bps: config.target_bps,
+        max_bps: config.max_bps,
+        buffer_bits: config.buffer_bits,
+    };
+
+    let mut capture = DamageCapture::open(&config.display)
+        .map_err(|e| format!("DamageCapture::open failed on {}: {e}", config.display))?;
+
+    let raw_engine = unsafe { x264c_create(&ffi_cfg) };
+    if raw_engine.is_null() {
+        return Err("Failed to create native x264 engine (libx264 unavailable or wrong X264_BUILD)".into());
+    }
+    let engine = SafeX264Engine(raw_engine);
+    let (cap_width, cap_height) = capture.size();
+    if cap_width != width || cap_height != height {
+        log::info!(
+            "Capture size ({}x{}) != encoder size ({}x{}): {} on the CPU before x264",
+            cap_width,
+            cap_height,
+            width,
+            height,
+            if config.output.is_some() { "bilinear scaling" } else { "padding" }
+        );
+    }
+
+    let bytes_per_line = cap_width as usize * 4;
+    let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
+
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.subsec_nanos())
+        | 1;
+    let mut keepalive = random_keepalive(&mut seed);
+    let mut dirty = true;
+    let mut next_tick = Instant::now();
+    let mut last_send = Instant::now();
+    let mut permits = VecDeque::with_capacity(4);
+    let mut frame_buf = Vec::new();
+
+    let locked = crate::session_lock::watch_locked();
+    let mut last_locked = *locked.borrow();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let deadline = if dirty {
+            next_tick
+        } else {
+            last_send + keepalive
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+
+        if capture.wait(wait.max(Duration::from_millis(1)))? {
+            dirty = true;
+        }
+
+        let now = Instant::now();
+        if dirty && now < next_tick {
+            continue;
+        }
+        if !dirty && now < last_send + keepalive {
+            continue;
+        }
+
+        let Some(permit) = acquire(&budget, &units) else {
+            return Ok(());
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        dirty |= capture.wait(Duration::ZERO)?;
+        let state = *locked.borrow();
+        if state != last_locked {
+            dirty = true;
+            last_locked = state;
+        }
+
+        let force_idr = if idr.swap(false, Ordering::AcqRel) {
+            1
+        } else {
+            0
+        };
+
+        // Keepalive frames re-encode the current screen contents as a tiny P-frame.
+        let source = capture.capture()?;
+        let (target_ptr, pitch) = if cap_width == width && cap_height == height {
+            (source.as_ptr(), bytes_per_line as u32)
+        } else {
+            frame_buf.resize(width as usize * height as usize * 4, 0);
+            if config.output.is_some() {
+                scale_bilinear_argb32(source, cap_width, cap_height, &mut frame_buf, width, height);
+            } else {
+                pad_argb32(source, cap_width, cap_height, &mut frame_buf, width, height);
+            }
+            (frame_buf.as_ptr(), width * 4)
+        };
+
+        let mut out_data: *const u8 = std::ptr::null();
+        let mut out_len: u32 = 0;
+        let res = unsafe { x264c_encode_frame(engine.0, target_ptr, pitch, force_idr, &mut out_data, &mut out_len) };
+        if res != 0 {
+            return Err(format!("x264c_encode_frame failed with error {res}"));
+        }
+
+        if out_len > 0 && !out_data.is_null() {
+            let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
+            permits.push_back(permit);
+            let send_permit = permits.pop_front().unwrap();
+
+            if units
+                .blocking_send(EncodedUnit {
+                    data,
+                    permit: send_permit,
+                    completed_at: Instant::now(),
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+
+        let now = Instant::now();
+        if dirty {
+            let next = next_tick + frame_interval;
+            next_tick = if next > now {
+                next
+            } else {
+                now + frame_interval
+            };
+            dirty = false;
+        }
+        last_send = now;
+        keepalive = random_keepalive(&mut seed);
     }
 }
 
