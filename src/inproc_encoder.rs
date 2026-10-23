@@ -826,7 +826,11 @@ fn run_nvenc(
 }
 
 /// Bilinear ARGB32 scaling (the former swscale path used SWS_BILINEAR), with 8-bit fixed-point
-/// weights and pixel centers aligned.
+/// weights and pixel centers aligned. Separable two-pass form: the vertical pass writes an
+/// unrounded 16-bit intermediate (<= 255*256) with a row-uniform weight, the horizontal pass
+/// rounds once at the end — bit-identical to the fused scalar form. On x86-64 with SSE4.1 the
+/// horizontal pass runs one pixel (4 channels) per __m128i; mid is a thread-local buffer so a
+/// 4K frame does not allocate megabytes per call.
 fn scale_bilinear_argb32(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, dst_h: u32) {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return;
@@ -844,15 +848,77 @@ fn scale_bilinear_argb32(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst
     };
     let (columns, rows) = (taps(dst_w, src_w), taps(dst_h, src_h));
     let src_stride = src_w as usize * 4;
-    for (dst_row, &(y0, y1, fy)) in dst.chunks_exact_mut(dst_w as usize * 4).zip(&rows) {
-        let (top, bottom) = (&src[y0 * src_stride..], &src[y1 * src_stride..]);
-        for (pixel, &(x0, x1, fx)) in dst_row.chunks_exact_mut(4).zip(&columns) {
-            for c in 0..4 {
-                let lerp = |row: &[u8]| u32::from(row[x0 * 4 + c]) * (256 - fx) + u32::from(row[x1 * 4 + c]) * fx;
-                pixel[c] = ((lerp(top) * (256 - fy) + lerp(bottom) * fy + 32768) >> 16) as u8;
+    // Vertical pass. Weights stay in u32: a fy of 0 makes the top weight 256, which must not
+    // wrap in u16 before the single end rounding.
+    thread_local! {
+        static MID: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::new());
+    }
+    MID.with(|mid| {
+        let mut mid = mid.borrow_mut();
+        mid.resize(dst_h as usize * src_stride, 0);
+        for (d, &(y0, y1, fy)) in mid.chunks_mut(src_stride).zip(&rows) {
+            let top = &src[y0 * src_stride..];
+            let bottom = &src[y1 * src_stride..];
+            let (a, b) = (256 - fy, fy);
+            for (m, (t, bt)) in d.iter_mut().zip(top.iter().zip(bottom)).take(src_stride) {
+                *m = (u32::from(*t) * a + u32::from(*bt) * b) as u16;
             }
         }
+        let sse41 = sse41_available();
+        for (row, dst_row) in mid.chunks(src_stride).zip(dst.chunks_exact_mut(dst_w as usize * 4)) {
+            if sse41 {
+                // Safety: sse41_available() checked the CPU feature; rows come from live slices.
+                unsafe { horizontal_row_sse41(row, &columns, dst_row) };
+            } else {
+                horizontal_row_scalar(row, &columns, dst_row);
+            }
+        }
+    });
+}
+
+fn horizontal_row_scalar(row: &[u16], columns: &[(usize, usize, u32)], dst_row: &mut [u8]) {
+    for (pixel, &(x0, x1, fx)) in dst_row.chunks_exact_mut(4).zip(columns) {
+        let (a, b) = (256 - fx, fx);
+        for c in 0..4 {
+            let t = u32::from(row[x0 * 4 + c]) * a + u32::from(row[x1 * 4 + c]) * b;
+            pixel[c] = ((t + 32768) >> 16) as u8;
+        }
     }
+}
+
+fn sse41_available() -> bool {
+    static SSE41: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(target_arch = "x86_64")]
+    { *SSE41.get_or_init(|| std::arch::is_x86_feature_detected!("sse4.1")) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = &SSE41; false }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn horizontal_row_sse41(row: &[u16], columns: &[(usize, usize, u32)], dst_row: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let zero = _mm_setzero_si128();
+    let bias = _mm_set1_epi32(32768);
+    for (pixel, &(x0, x1, fx)) in dst_row.chunks_exact_mut(4).zip(columns) {
+        // Values fit u32 exactly like the scalar form: 255*256*256 max, no saturation bites.
+        let p0 = _mm_loadl_epi64(row.as_ptr().add(x0 * 4) as *const __m128i);
+        let p1 = _mm_loadl_epi64(row.as_ptr().add(x1 * 4) as *const __m128i);
+        let w0 = _mm_unpacklo_epi16(p0, zero);
+        let w1 = _mm_unpacklo_epi16(p1, zero);
+        let wa = _mm_set1_epi32((256 - fx) as i32);
+        let wb = _mm_set1_epi32(fx as i32);
+        let t = _mm_add_epi32(_mm_add_epi32(_mm_mullo_epi32(w0, wa), _mm_mullo_epi32(w1, wb)), bias);
+        let s = _mm_srli_epi32(t, 16);
+        let packed = _mm_packus_epi16(_mm_packs_epi32(s, s), zero);
+        let out = _mm_cvtsi128_si32(packed) as u32;
+        pixel.copy_from_slice(&out.to_ne_bytes());
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn horizontal_row_sse41(row: &[u16], columns: &[(usize, usize, u32)], dst_row: &mut [u8]) {
+    horizontal_row_scalar(row, columns, dst_row)
 }
 
 /// Copies the capture into the top-left corner of the larger encoder frame; the rest stays black.
@@ -932,5 +998,43 @@ mod frame_tests {
                 assert_eq!(out[(y * 4 + x) * 4], expected, "({x},{y})");
             }
         }
+    }
+
+    #[test]
+    fn vertical_weight_256_does_not_wrap() {
+        // 3 -> 1 rows lands on fy = 0, i.e. a top weight of 256; computing that weight in
+        // u16 wraps to zero and would emit a black frame. The middle row is the tap target.
+        let src = image(5, 3, |_, y| if y == 1 { [200; 4] } else { [100; 4] });
+        let mut out = vec![0; 5 * 4];
+        scale_bilinear_argb32(&src, 5, 3, &mut out, 5, 1);
+        assert!(out.chunks(4).all(|p| p == [200; 4]), "{out:?}");
+    }
+
+    #[test]
+    fn separable_scaling_matches_the_fused_form() {
+        // The two-pass form must round exactly once like the fused expression it replaced.
+        let src = image(7, 5, |x, y| [(x * 37 + y * 11) as u8; 4]);
+        let mut out = vec![0; 4 * 3 * 4];
+        scale_bilinear_argb32(&src, 7, 5, &mut out, 4, 3);
+        for (d, &(x0, x1, fx)) in (0..4usize).zip(taps_for(4, 7)) {
+            for (r, &(y0, y1, fy)) in (0..3usize).zip(taps_for(3, 5)) {
+                for c in 0..4 {
+                    let lerp = |row: usize| u32::from(src[row * 28 + x0 * 4 + c]) * (256 - fx) + u32::from(src[row * 28 + x1 * 4 + c]) * fx;
+                    let expected = ((lerp(y0) * (256 - fy) + lerp(y1) * fy + 32768) >> 16) as u8;
+                    assert_eq!(out[(r * 4 + d) * 4 + c], expected, "({d},{r},{c})");
+                }
+            }
+        }
+    }
+
+    fn taps_for(dst_len: u32, src_len: u32) -> Vec<(usize, usize, u32)> {
+        (0..dst_len)
+            .map(|d| {
+                let pos = ((2 * u64::from(d) + 1) * u64::from(src_len) * 128 / u64::from(dst_len)).saturating_sub(128);
+                let first = ((pos >> 8) as usize).min(src_len as usize - 1);
+                let second = (first + 1).min(src_len as usize - 1);
+                (first, second, (pos & 255) as u32)
+            })
+            .collect()
     }
 }
