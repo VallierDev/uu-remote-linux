@@ -182,6 +182,20 @@ pub fn probe_stale(report: &ProbeReport, now: std::time::Instant, nvidia: bool) 
     probe_expired(report, now) || report.nvidia != nvidia
 }
 
+/// Log suffix for a probe that replaces `previous`. `None` is a first probe.
+/// A failure deadline (`expires_at`) is "retry after failure". A presence
+/// mismatch without that deadline is "NVIDIA availability changed".
+pub fn reprobe_reason(previous: Option<&ProbeReport>, nvidia_now: bool) -> Option<&'static str> {
+    let previous = previous?;
+    if previous.expires_at.is_some() {
+        Some("retry after failure")
+    } else if previous.nvidia != nvidia_now {
+        Some("NVIDIA availability changed")
+    } else {
+        None
+    }
+}
+
 /// Empty cache, or the cached report is stale for `nvidia` at `now`.
 /// Callers still use the cached encoder until the replacement probe is stored.
 pub fn probe_needs_run(now: std::time::Instant, nvidia: bool) -> bool {
@@ -671,6 +685,40 @@ mod tests {
             "the connection that notices the presence change still uses the cached encoder"
         );
         clear_probe();
+    }
+
+    #[test]
+    fn reprobe_reason_follows_previous_state() {
+        let now = std::time::Instant::now();
+        assert_eq!(reprobe_reason(None, false), None);
+        assert_eq!(reprobe_reason(None, true), None);
+
+        let failed = ProbeReport::fresh(
+            auto_order(true),
+            vec![ProbeOutcome::Fail(ProbeFail::Exit), ProbeOutcome::Ok],
+            Encoder::Cpu,
+            now,
+            true,
+        );
+        assert!(failed.expires_at.is_some());
+        assert_eq!(reprobe_reason(Some(&failed), true), Some("retry after failure"));
+        assert_eq!(reprobe_reason(Some(&failed), false), Some("retry after failure"));
+
+        let nvenc_ok = ProbeReport::fresh(
+            auto_order(true),
+            vec![ProbeOutcome::Ok, ProbeOutcome::Ok],
+            Encoder::Nvenc,
+            now,
+            true,
+        );
+        assert_eq!(reprobe_reason(Some(&nvenc_ok), true), None);
+        assert_eq!(reprobe_reason(Some(&nvenc_ok), false), Some("NVIDIA availability changed"));
+
+        let skipped = ProbeReport::fresh(auto_order(false), vec![ProbeOutcome::NotProbed], Encoder::Cpu, now, false);
+        assert_eq!(reprobe_reason(Some(&skipped), false), None);
+        assert_eq!(reprobe_reason(Some(&skipped), true), Some("NVIDIA availability changed"));
+        assert_ne!(reprobe_reason(Some(&nvenc_ok), false), Some("retry after failure"));
+        assert_ne!(reprobe_reason(Some(&skipped), true), Some("retry after failure"));
     }
 
     #[test]

@@ -522,7 +522,7 @@ pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
     if let Some(cached) = crate::video_select::cached_probe() {
         if !crate::video_select::probe_stale(&cached, now, nvidia) { return cached; }
     }
-    let retry = crate::video_select::cached_probe().is_some();
+    let reason = crate::video_select::reprobe_reason(crate::video_select::cached_probe().as_ref(), nvidia);
     let nvidia = nvidia_present();
     let order = crate::video_select::auto_order(nvidia);
     // One candidate (CPU, no NVIDIA) has nothing to choose; skip the synthetic IDR.
@@ -536,8 +536,8 @@ pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
     let chosen = crate::video_select::chosen_after_native(nvidia, &order, &outcomes, probed);
     let report = crate::video_select::ProbeReport::fresh(order, outcomes, chosen, now, nvidia);
     let parts: Vec<String> = report.order.iter().zip(report.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect();
-    if retry {
-        log::info!("Encoder probe: retry after failure {}", parts.join(" "));
+    if let Some(reason) = reason {
+        log::info!("Encoder probe: {reason} {}", parts.join(" "));
     } else {
         log::info!("Encoder probe: {}", parts.join(" "));
     }
