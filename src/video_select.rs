@@ -143,12 +143,15 @@ pub struct ProbeReport {
     pub chosen: Encoder,
     /// `None` means the result does not expire (success, or CPU-only `NotProbed`).
     pub expires_at: Option<std::time::Instant>,
+    /// `nvidia_present()` at the time the report was stored. A later desktop
+    /// connection whose presence differs treats the report as stale.
+    pub nvidia: bool,
 }
 
 impl ProbeReport {
-    pub fn fresh(order: Vec<Encoder>, outcomes: Vec<ProbeOutcome>, chosen: Encoder, now: std::time::Instant) -> Self {
+    pub fn fresh(order: Vec<Encoder>, outcomes: Vec<ProbeOutcome>, chosen: Encoder, now: std::time::Instant, nvidia: bool) -> Self {
         let expires_at = probe_failure_deadline(&order, &outcomes, chosen, now);
-        Self { order, outcomes, chosen, expires_at }
+        Self { order, outcomes, chosen, expires_at, nvidia }
     }
 }
 
@@ -173,6 +176,27 @@ pub fn probe_expired(report: &ProbeReport, now: std::time::Instant) -> bool {
     report.expires_at.is_some_and(|at| now >= at)
 }
 
+/// Time-to-live elapsed, or NVIDIA presence no longer matches the report.
+/// Presence is `nvidia_present()` (proc version or `/dev/nvidia0`).
+pub fn probe_stale(report: &ProbeReport, now: std::time::Instant, nvidia: bool) -> bool {
+    probe_expired(report, now) || report.nvidia != nvidia
+}
+
+/// Empty cache, or the cached report is stale for `nvidia` at `now`.
+/// Callers still use the cached encoder until the replacement probe is stored.
+pub fn probe_needs_run(now: std::time::Instant, nvidia: bool) -> bool {
+    match cached_probe() {
+        None => true,
+        Some(report) => probe_stale(&report, now, nvidia),
+    }
+}
+
+/// Background warm-up (startup and each new desktop connection) runs only for auto.
+/// Setting or `UU_VIDEO_ENCODER` (non-auto) matches v0.2.23: no GPU probe.
+pub fn should_warm_auto_probe(source: Source) -> bool {
+    source == Source::Auto
+}
+
 /// First candidate that produced an IDR, else CPU.
 pub fn choose_from_probe(order: &[Encoder], outcomes: &[ProbeOutcome]) -> Encoder {
     order.iter().zip(outcomes.iter()).find_map(|(e, o)| o.ok().then_some(*e)).unwrap_or(Encoder::Cpu)
@@ -189,15 +213,6 @@ pub fn store_probe(report: ProbeReport) {
 
 pub fn cached_probe() -> Option<ProbeReport> {
     cache().lock().ok().and_then(|g| g.clone())
-}
-
-/// Empty cache, or a hardware failure whose TTL has passed. Callers still use the
-/// cached encoder until the replacement probe is stored.
-pub fn probe_needs_run(now: std::time::Instant) -> bool {
-    match cached_probe() {
-        None => true,
-        Some(report) => probe_expired(&report, now),
-    }
 }
 
 /// Tests that call `clear_probe` / `store_probe` share this lock. The probe
@@ -414,7 +429,7 @@ mod tests {
     fn probe_report(nvidia: bool, outcomes: &[ProbeOutcome]) -> ProbeReport {
         let order = auto_order(nvidia);
         let chosen = choose_from_probe(&order, outcomes);
-        ProbeReport::fresh(order, outcomes.to_vec(), chosen, std::time::Instant::now())
+        ProbeReport::fresh(order, outcomes.to_vec(), chosen, std::time::Instant::now(), nvidia)
     }
 
     #[test]
@@ -481,7 +496,7 @@ mod tests {
         let order = auto_order(true);
         let unprobed = [ProbeOutcome::NativeUnprobed, ProbeOutcome::Ok];
         let chosen = chosen_after_native(true, &order, &unprobed, choose_from_probe(&order, &unprobed));
-        let report = ProbeReport::fresh(order.clone(), unprobed.to_vec(), chosen, std::time::Instant::now());
+        let report = ProbeReport::fresh(order.clone(), unprobed.to_vec(), chosen, std::time::Instant::now(), true);
         let native = resolve_pair(None, None, None, None, true, Some(&report));
         assert_eq!(native.encoder, Encoder::Nvenc);
         assert_eq!(preferred_codec_for(true, true, native), VideoCodec::H265);
@@ -515,10 +530,10 @@ mod tests {
     fn success_and_not_probed_do_not_expire() {
         let now = std::time::Instant::now();
         let later = now + PROBE_FAILURE_TTL + std::time::Duration::from_secs(1);
-        let ok = ProbeReport::fresh(auto_order(true), vec![ProbeOutcome::Ok, ProbeOutcome::Ok], Encoder::Nvenc, now);
+        let ok = ProbeReport::fresh(auto_order(true), vec![ProbeOutcome::Ok, ProbeOutcome::Ok], Encoder::Nvenc, now, true);
         assert!(ok.expires_at.is_none());
         assert!(!probe_expired(&ok, later));
-        let skipped = ProbeReport::fresh(auto_order(false), vec![ProbeOutcome::NotProbed], Encoder::Cpu, now);
+        let skipped = ProbeReport::fresh(auto_order(false), vec![ProbeOutcome::NotProbed], Encoder::Cpu, now, false);
         assert!(skipped.expires_at.is_none());
         assert!(!probe_expired(&skipped, later));
         let native = ProbeReport::fresh(
@@ -526,6 +541,7 @@ mod tests {
             vec![ProbeOutcome::NativeUnprobed, ProbeOutcome::Ok],
             Encoder::Nvenc,
             now,
+            true,
         );
         assert!(native.expires_at.is_none(), "native_unprobed is not a recorded process failure");
         assert!(!probe_expired(&native, later));
@@ -539,6 +555,7 @@ mod tests {
             vec![ProbeOutcome::Fail(ProbeFail::Timeout), ProbeOutcome::Ok],
             Encoder::Cpu,
             now,
+            true,
         );
         assert!(!probe_expired(&failed, now + PROBE_FAILURE_TTL - std::time::Duration::from_secs(1)));
         assert!(probe_expired(&failed, now + PROBE_FAILURE_TTL));
@@ -556,6 +573,7 @@ mod tests {
             vec![ProbeOutcome::Ok, ProbeOutcome::Fail(ProbeFail::Exit)],
             Encoder::Nvenc,
             now,
+            true,
         );
         assert_eq!(report.chosen, Encoder::Nvenc);
         assert!(report.expires_at.is_none());
@@ -565,6 +583,7 @@ mod tests {
             vec![ProbeOutcome::Fail(ProbeFail::Exit)],
             Encoder::Cpu,
             now,
+            false,
         );
         assert!(cpu_only_fail.expires_at.is_none(), "a CPU-only Fail is not a hardware fallback");
     }
@@ -583,17 +602,18 @@ mod tests {
             vec![ProbeOutcome::Fail(ProbeFail::Exit), ProbeOutcome::Ok],
             Encoder::Cpu,
             t0,
+            true,
         );
         store_probe(failed);
         let before = t0 + PROBE_FAILURE_TTL - std::time::Duration::from_secs(1);
-        assert!(!probe_needs_run(before), "no re-probe before the failure expires");
+        assert!(!probe_needs_run(before, true), "no re-probe before the failure expires");
         assert_eq!(
             resolve_pair(None, None, None, None, true, cached_probe().as_ref()).encoder,
             Encoder::Cpu
         );
         let after = t0 + PROBE_FAILURE_TTL;
         assert!(probe_expired(cached_probe().as_ref().unwrap(), after));
-        assert!(probe_needs_run(after), "desktop connection starts one background re-probe");
+        assert!(probe_needs_run(after, true), "desktop connection starts one background re-probe");
         assert_eq!(
             resolve_pair(None, None, None, None, true, cached_probe().as_ref()).encoder,
             Encoder::Cpu,
@@ -604,22 +624,62 @@ mod tests {
             vec![ProbeOutcome::Ok, ProbeOutcome::Ok],
             Encoder::Nvenc,
             after,
+            true,
         );
         store_probe(retried);
         assert_eq!(
             resolve_pair(None, None, None, None, true, cached_probe().as_ref()).encoder,
             Encoder::Nvenc
         );
-        assert!(!probe_needs_run(after + PROBE_FAILURE_TTL + std::time::Duration::from_secs(1)));
+        assert!(!probe_needs_run(after + PROBE_FAILURE_TTL + std::time::Duration::from_secs(1), true));
         let failed_again = ProbeReport::fresh(
             auto_order(true),
             vec![ProbeOutcome::Fail(ProbeFail::Timeout), ProbeOutcome::Ok],
             Encoder::Cpu,
             after,
+            true,
         );
         store_probe(failed_again);
-        assert!(!probe_needs_run(after + PROBE_FAILURE_TTL - std::time::Duration::from_secs(1)));
-        assert!(probe_needs_run(after + PROBE_FAILURE_TTL));
+        assert!(!probe_needs_run(after + PROBE_FAILURE_TTL - std::time::Duration::from_secs(1), true));
+        assert!(probe_needs_run(after + PROBE_FAILURE_TTL, true));
         clear_probe();
+    }
+
+    /// A CPU-only `NotProbed` report does not expire by time. When NVIDIA appears
+    /// (module or device after the user service started), the next desktop
+    /// connection treats it as stale and `probe_needs_run` asks for one background
+    /// re-probe. The inverse (NVENC success, device gone) is stale the same way.
+    /// The connection that notices still selects the cached encoder.
+    #[test]
+    fn nvidia_presence_change_makes_probe_stale() {
+        let now = std::time::Instant::now();
+        let cpu_only = ProbeReport::fresh(auto_order(false), vec![ProbeOutcome::NotProbed], Encoder::Cpu, now, false);
+        assert!(!probe_stale(&cpu_only, now + PROBE_FAILURE_TTL + std::time::Duration::from_secs(1), false));
+        assert!(probe_stale(&cpu_only, now, true), "NVIDIA appeared after the CPU-only skip");
+        let nvenc_ok = ProbeReport::fresh(auto_order(true), vec![ProbeOutcome::Ok, ProbeOutcome::Ok], Encoder::Nvenc, now, true);
+        assert!(!probe_stale(&nvenc_ok, now, true));
+        assert!(probe_stale(&nvenc_ok, now, false), "NVIDIA gone after a successful NVENC probe");
+
+        let _guard = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_probe();
+        store_probe(cpu_only);
+        assert!(!probe_needs_run(now, false));
+        assert!(probe_needs_run(now, true));
+        assert_eq!(
+            resolve_pair(None, None, None, None, true, cached_probe().as_ref()).encoder,
+            Encoder::Cpu,
+            "the connection that notices the presence change still uses the cached encoder"
+        );
+        clear_probe();
+    }
+
+    #[test]
+    fn warm_probe_only_when_encoder_source_is_auto() {
+        assert!(should_warm_auto_probe(Source::Auto));
+        assert!(!should_warm_auto_probe(Source::Setting));
+        assert!(!should_warm_auto_probe(Source::Env));
+        assert_eq!(resolve_pair(Some("cpu"), None, None, None, true, None).encoder_source, Source::Setting);
+        assert_eq!(resolve_pair(None, Some("nvenc"), None, None, false, None).encoder_source, Source::Env);
+        assert_eq!(resolve_pair(None, Some("auto"), None, None, false, None).encoder_source, Source::Auto);
     }
 }

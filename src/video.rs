@@ -489,10 +489,13 @@ fn auto_probe_flight() -> &'static tokio::sync::Mutex<()> {
     FLIGHT.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Start the auto probe if it is not cached, or the cached hardware failure has expired.
-/// Returns immediately. One probe runs at a time; an in-flight probe is left alone.
+/// Start the auto probe when auto is selected and the cache is empty or stale
+/// (TTL, or NVIDIA presence changed since the report). Returns immediately.
+/// One probe runs at a time; an in-flight probe is left alone.
+/// Explicit encoder (setting or `UU_VIDEO_ENCODER`) does not spawn a probe.
 pub fn warm_auto_probe() {
-    if !crate::video_select::probe_needs_run(std::time::Instant::now()) { return; }
+    if !crate::video_select::should_warm_auto_probe(crate::video_select::selection().encoder_source) { return; }
+    if !crate::video_select::probe_needs_run(std::time::Instant::now(), nvidia_present()) { return; }
     tokio::spawn(async { let _ = run_auto_probe().await; });
 }
 
@@ -509,16 +512,19 @@ pub async fn ensure_auto_probed() {
 /// `PROBE_FAILURE_TTL`; the next `warm_auto_probe` starts one background retry.
 pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
     let now = std::time::Instant::now();
+    let nvidia = nvidia_present();
     if let Some(cached) = crate::video_select::cached_probe() {
-        if !crate::video_select::probe_expired(&cached, now) { return cached; }
+        if !crate::video_select::probe_stale(&cached, now, nvidia) { return cached; }
     }
     let _flight = auto_probe_flight().lock().await;
     let now = std::time::Instant::now();
+    let nvidia = nvidia_present();
     if let Some(cached) = crate::video_select::cached_probe() {
-        if !crate::video_select::probe_expired(&cached, now) { return cached; }
+        if !crate::video_select::probe_stale(&cached, now, nvidia) { return cached; }
     }
     let retry = crate::video_select::cached_probe().is_some();
-    let order = crate::video_select::auto_order(nvidia_present());
+    let nvidia = nvidia_present();
+    let order = crate::video_select::auto_order(nvidia);
     // One candidate (CPU, no NVIDIA) has nothing to choose; skip the synthetic IDR.
     let mut outcomes = Vec::with_capacity(order.len());
     if order.len() == 1 {
@@ -527,8 +533,8 @@ pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
         for encoder in &order { outcomes.push(probe_encoder_idr(*encoder).await); }
     }
     let probed = crate::video_select::choose_from_probe(&order, &outcomes);
-    let chosen = crate::video_select::chosen_after_native(nvidia_present(), &order, &outcomes, probed);
-    let report = crate::video_select::ProbeReport::fresh(order, outcomes, chosen, now);
+    let chosen = crate::video_select::chosen_after_native(nvidia, &order, &outcomes, probed);
+    let report = crate::video_select::ProbeReport::fresh(order, outcomes, chosen, now, nvidia);
     let parts: Vec<String> = report.order.iter().zip(report.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect();
     if retry {
         log::info!("Encoder probe: retry after failure {}", parts.join(" "));
