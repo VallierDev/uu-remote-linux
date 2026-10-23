@@ -51,12 +51,14 @@ pub struct DesktopRole {
     stream: std::sync::Mutex<Option<DesktopStream>>,
     /// Capture reinitialized at promotion; the peer's own capture was unavailable when offered.
     screen: std::sync::Mutex<Option<Arc<ScreenCapture>>>,
+    /// One session tracker per peer follows every promotion and demotion.
+    tracking: std::sync::atomic::AtomicBool,
     request: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 impl DesktopRole {
     fn new(desktop: bool) -> Self {
         Self { active: tokio::sync::watch::channel(desktop).0, input: Default::default(),
-            stream: Default::default(), screen: Default::default(), request: Default::default() }
+            stream: Default::default(), screen: Default::default(), tracking: Default::default(), request: Default::default() }
     }
     pub fn is_desktop(&self) -> bool { *self.active.borrow() }
     fn input(&self) -> Option<Arc<crate::input::DesktopInputSession>> { self.input.lock().unwrap().clone() }
@@ -108,22 +110,29 @@ pub struct WebRtcSession {
     actions: Arc<crate::system_actions::PeerActions>,
 }
 
-/// Counts a desktop session once it is connected (a failed offer is not a session),
-/// until the peer closes or a newer desktop demotes it.
-fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_actions::PeerActions>, active: tokio::sync::watch::Receiver<bool>) {
+/// Counts a desktop session once it is connected (a failed offer is not a session), while the
+/// peer is the desktop. Started once per peer, so a quick demote and re-promote cannot end the
+/// count of a session that is still streaming.
+fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_actions::PeerActions>, role: &DesktopRole) {
+    if role.tracking.swap(true, std::sync::atomic::Ordering::AcqRel) { return; }
+    let active = role.active.subscribe();
     tokio::spawn(async move {
         use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as State;
-        while end_pc.connection_state() != State::Connected {
-            if matches!(end_pc.connection_state(), State::Closed | State::Failed) || !*active.borrow() { return; }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        loop {
+            while end_pc.connection_state() != State::Connected || !*active.borrow() {
+                if matches!(end_pc.connection_state(), State::Closed | State::Failed) { return; }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let starting = actions.clone();
+            let _ = tokio::task::spawn_blocking(move || starting.session_started()).await;
+            while !matches!(end_pc.connection_state(), State::Closed | State::Failed) && *active.borrow() {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let closed = matches!(end_pc.connection_state(), State::Closed | State::Failed);
+            let ending = actions.clone();
+            let _ = tokio::task::spawn_blocking(move || ending.session_ended()).await;
+            if closed { return; }
         }
-        let starting = actions.clone();
-        let _ = tokio::task::spawn_blocking(move || starting.session_started()).await;
-        while !matches!(end_pc.connection_state(), State::Closed | State::Failed) && *active.borrow() {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        drop(end_pc);
-        let _ = tokio::task::spawn_blocking(move || actions.session_ended()).await;
     });
 }
 
@@ -431,7 +440,7 @@ impl WebRtcSession {
         let peer_actions = Arc::new(crate::system_actions::PeerActions::default());
         let session_actions = peer_actions.clone();
         let desktop_sound = desktop && crate::audio::enabled();
-        if desktop && !cfg!(test) { track_session(pc.clone(), peer_actions.clone(), role.active.subscribe()); }
+        if desktop && !cfg!(test) { track_session(pc.clone(), peer_actions.clone(), &role); }
         // Live encoder switch (SIGUSR2) sends CaptureSettingSync when chroma is downgraded.
         let (chroma_sync_tx, chroma_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let chroma_sync_rx = Arc::new(std::sync::Mutex::new((!cfg!(test)).then_some(chroma_sync_rx)));
@@ -1458,9 +1467,12 @@ impl WebRtcSession {
         self.role.active.send_replace(true);
         let stream = self.role.stream.lock().unwrap().clone();
         if let Some(stream) = stream { stream.spawn(self.role.screen.lock().unwrap().clone(), self.role.active.subscribe()); }
-        if !cfg!(test) { track_session(self.pc.clone(), self.actions.clone(), self.role.active.subscribe()); }
+        if !cfg!(test) { track_session(self.pc.clone(), self.actions.clone(), &self.role); }
         log::info!("Desktop started on an existing tool connection");
     }
+
+    /// The capture this peer's desktop uses: its own, or the one reinitialized at promotion.
+    pub fn desktop_capture(&self) -> Arc<ScreenCapture> { self.role.screen_or(&self.capture) }
 
     /// A newer desktop took over a promoted tool peer: stop its video, input and session count,
     /// keep the connection's tools. capture_desktop on it promotes it again.

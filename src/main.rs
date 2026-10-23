@@ -1055,8 +1055,12 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         continue;
                     }
                     let controller_mac = peer.controller_mac;
-                    // Same recovery as a desktop offer: the display may have come up after this peer.
-                    let screen = if peer.capture.init_error.is_some() {
+                    let current = peer.desktop_capture();
+                    // Same recovery as a desktop offer: the display may have come up or been resized after this peer.
+                    let resized = current.init_error.is_none() && current.backend == desktop_backend::DesktopBackend::X11
+                        && tokio::task::spawn_blocking(crate::capture::x11_size).await.ok().flatten().is_some_and(|size| size != (current.width, current.height));
+                    if resized { log::info!("Desktop geometry changed since this connection opened; reinitializing capture"); }
+                    let screen = if current.init_error.is_some() || resized {
                         match tokio::task::spawn_blocking(ScreenCapture::new).await {
                             Ok(Ok(screen)) => { capture = Arc::new(screen); Some(capture.clone()) },
                             Ok(Err(error)) => { log::info!("Desktop request on a tool connection ignored: {error}"); continue; },
