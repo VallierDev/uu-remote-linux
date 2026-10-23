@@ -132,11 +132,35 @@ pub fn chosen_after_native(nvidia: bool, order: &[Encoder], outcomes: &[ProbeOut
     if native_legacy { legacy } else { probed }
 }
 
+/// How long a hardware-candidate failure stays cached. A boot-time NVENC miss
+/// (module not ready, GPU busy, consumer session limit) must not stick until exit.
+pub const PROBE_FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeReport {
     pub order: Vec<Encoder>,
     pub outcomes: Vec<ProbeOutcome>,
     pub chosen: Encoder,
+    /// `None` means the result does not expire (success, or CPU-only `NotProbed`).
+    pub expires_at: Option<std::time::Instant>,
+}
+
+impl ProbeReport {
+    pub fn fresh(order: Vec<Encoder>, outcomes: Vec<ProbeOutcome>, chosen: Encoder, now: std::time::Instant) -> Self {
+        let expires_at = probe_failure_deadline(&outcomes, now);
+        Self { order, outcomes, chosen, expires_at }
+    }
+}
+
+/// Hardware probe failure (NVENC failed, chosen CPU) expires. `NotProbed` and `Ok`
+/// do not. `NativeUnprobed` keeps the legacy encoder and is not a failure cache.
+pub fn probe_failure_deadline(outcomes: &[ProbeOutcome], now: std::time::Instant) -> Option<std::time::Instant> {
+    let failed = outcomes.iter().any(|o| matches!(o, ProbeOutcome::Fail(_)));
+    failed.then_some(now + PROBE_FAILURE_TTL)
+}
+
+pub fn probe_expired(report: &ProbeReport, now: std::time::Instant) -> bool {
+    report.expires_at.is_some_and(|at| now >= at)
 }
 
 /// First candidate that produced an IDR, else CPU.
@@ -155,6 +179,15 @@ pub fn store_probe(report: ProbeReport) {
 
 pub fn cached_probe() -> Option<ProbeReport> {
     cache().lock().ok().and_then(|g| g.clone())
+}
+
+/// Empty cache, or a hardware failure whose TTL has passed. Callers still use the
+/// cached encoder until the replacement probe is stored.
+pub fn probe_needs_run(now: std::time::Instant) -> bool {
+    match cached_probe() {
+        None => true,
+        Some(report) => probe_expired(&report, now),
+    }
 }
 
 #[cfg(test)]
@@ -365,7 +398,8 @@ mod tests {
 
     fn probe_report(nvidia: bool, outcomes: &[ProbeOutcome]) -> ProbeReport {
         let order = auto_order(nvidia);
-        ProbeReport { chosen: choose_from_probe(&order, outcomes), outcomes: outcomes.to_vec(), order }
+        let chosen = choose_from_probe(&order, outcomes);
+        ProbeReport::fresh(order, outcomes.to_vec(), chosen, std::time::Instant::now())
     }
 
     #[test]
@@ -432,7 +466,7 @@ mod tests {
         let order = auto_order(true);
         let unprobed = [ProbeOutcome::NativeUnprobed, ProbeOutcome::Ok];
         let chosen = chosen_after_native(true, &order, &unprobed, choose_from_probe(&order, &unprobed));
-        let report = ProbeReport { order: order.clone(), outcomes: unprobed.to_vec(), chosen };
+        let report = ProbeReport::fresh(order.clone(), unprobed.to_vec(), chosen, std::time::Instant::now());
         let native = resolve_pair(None, None, None, None, true, Some(&report));
         assert_eq!(native.encoder, Encoder::Nvenc);
         assert_eq!(preferred_codec_for(true, true, native), VideoCodec::H265);
@@ -458,6 +492,93 @@ mod tests {
         // A snapshot taken before the cache filled stays on the legacy encoder.
         assert_eq!(early.encoder, Encoder::Cpu);
         assert_eq!(resolve_pair(None, None, None, None, true, None).encoder, Encoder::Nvenc);
+        clear_probe();
+    }
+
+    #[test]
+    fn success_and_not_probed_do_not_expire() {
+        let now = std::time::Instant::now();
+        let later = now + PROBE_FAILURE_TTL + std::time::Duration::from_secs(1);
+        let ok = ProbeReport::fresh(auto_order(true), vec![ProbeOutcome::Ok, ProbeOutcome::Ok], Encoder::Nvenc, now);
+        assert!(ok.expires_at.is_none());
+        assert!(!probe_expired(&ok, later));
+        let skipped = ProbeReport::fresh(auto_order(false), vec![ProbeOutcome::NotProbed], Encoder::Cpu, now);
+        assert!(skipped.expires_at.is_none());
+        assert!(!probe_expired(&skipped, later));
+        let native = ProbeReport::fresh(
+            auto_order(true),
+            vec![ProbeOutcome::NativeUnprobed, ProbeOutcome::Ok],
+            Encoder::Nvenc,
+            now,
+        );
+        assert!(native.expires_at.is_none(), "native_unprobed is not a recorded process failure");
+        assert!(!probe_expired(&native, later));
+    }
+
+    #[test]
+    fn hardware_failure_expires_after_ttl() {
+        let now = std::time::Instant::now();
+        let failed = ProbeReport::fresh(
+            auto_order(true),
+            vec![ProbeOutcome::Fail(ProbeFail::Timeout), ProbeOutcome::Ok],
+            Encoder::Cpu,
+            now,
+        );
+        assert!(!probe_expired(&failed, now + PROBE_FAILURE_TTL - std::time::Duration::from_secs(1)));
+        assert!(probe_expired(&failed, now + PROBE_FAILURE_TTL));
+        assert_eq!(failed.chosen, Encoder::Cpu);
+    }
+
+    /// Failed NVENC stays CPU until `PROBE_FAILURE_TTL`. After that a desktop connection
+    /// asks for one background re-probe (`probe_needs_run`, what `warm_auto_probe` checks)
+    /// and still selects the cached CPU encoder. A successful re-probe selects NVENC and
+    /// does not expire. A second failure restarts the TTL.
+    #[test]
+    fn failure_then_reprobe_success_selects_nvenc() {
+        clear_probe();
+        let t0 = std::time::Instant::now();
+        let failed = ProbeReport::fresh(
+            auto_order(true),
+            vec![ProbeOutcome::Fail(ProbeFail::Exit), ProbeOutcome::Ok],
+            Encoder::Cpu,
+            t0,
+        );
+        store_probe(failed);
+        let before = t0 + PROBE_FAILURE_TTL - std::time::Duration::from_secs(1);
+        assert!(!probe_needs_run(before), "no re-probe before the failure expires");
+        assert_eq!(
+            resolve_pair(None, None, None, None, true, cached_probe().as_ref()).encoder,
+            Encoder::Cpu
+        );
+        let after = t0 + PROBE_FAILURE_TTL;
+        assert!(probe_expired(cached_probe().as_ref().unwrap(), after));
+        assert!(probe_needs_run(after), "desktop connection starts one background re-probe");
+        assert_eq!(
+            resolve_pair(None, None, None, None, true, cached_probe().as_ref()).encoder,
+            Encoder::Cpu,
+            "the connection that notices expiry still uses the cached encoder"
+        );
+        let retried = ProbeReport::fresh(
+            auto_order(true),
+            vec![ProbeOutcome::Ok, ProbeOutcome::Ok],
+            Encoder::Nvenc,
+            after,
+        );
+        store_probe(retried);
+        assert_eq!(
+            resolve_pair(None, None, None, None, true, cached_probe().as_ref()).encoder,
+            Encoder::Nvenc
+        );
+        assert!(!probe_needs_run(after + PROBE_FAILURE_TTL + std::time::Duration::from_secs(1)));
+        let failed_again = ProbeReport::fresh(
+            auto_order(true),
+            vec![ProbeOutcome::Fail(ProbeFail::Timeout), ProbeOutcome::Ok],
+            Encoder::Cpu,
+            after,
+        );
+        store_probe(failed_again);
+        assert!(!probe_needs_run(after + PROBE_FAILURE_TTL - std::time::Duration::from_secs(1)));
+        assert!(probe_needs_run(after + PROBE_FAILURE_TTL));
         clear_probe();
     }
 }

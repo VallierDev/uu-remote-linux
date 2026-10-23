@@ -17,9 +17,10 @@ fn env_state(name: &str) -> String {
 fn line(key: &str, value: impl std::fmt::Display) { println!("{key:<22} {}", redact(&value.to_string())); }
 
 fn format_probe(probe: &crate::video_select::ProbeReport) -> String {
-    probe.order.iter().zip(probe.outcomes.iter())
+    let body = probe.order.iter().zip(probe.outcomes.iter())
         .map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label()))
-        .collect::<Vec<_>>().join(" ")
+        .collect::<Vec<_>>().join(" ");
+    if probe.expires_at.is_some() { format!("{body} (failure result, retried after 10 min)") } else { body }
 }
 
 fn glibc() -> String {
