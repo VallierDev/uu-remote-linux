@@ -286,7 +286,13 @@ struct QueuedFrame {
     planes: Planes,
     force_idr: libc::c_int,
     permit: OwnedSemaphorePermit,
+    /// Capture start → encoder finished, for the latency statistic (monotonic Instants only).
+    captured_at: Instant,
+    capture_us: u32,
+    convert_us: u32,
 }
+
+fn elapsed_us(since: Instant) -> u32 { u32::try_from(since.elapsed().as_micros()).unwrap_or(u32::MAX) }
 
 /// Depth-1 hand-off to the encoder: only the newest frame is kept, so a slow encoder never
 /// builds a latency queue. A replaced frame's plane buffer goes back to the pool.
@@ -499,7 +505,10 @@ fn produce_x264_inner(
         let Some(mut planes) = pool.take(width, height, stop) else {
             return Ok(());
         };
+        let captured_at = Instant::now();
         let source = capture.capture()?;
+        let capture_us = elapsed_us(captured_at);
+        let convert_started = Instant::now();
         if cap_width == width && cap_height == height {
             unsafe {
                 x264c_convert_bgrx_i420(source.as_ptr(), bytes_per_line as u32, planes.y.as_mut_ptr(),
@@ -517,8 +526,9 @@ fn produce_x264_inner(
                                         width as libc::c_int, height as libc::c_int);
             }
         }
+        let convert_us = elapsed_us(convert_started);
 
-        if let Some(old) = queue.push(QueuedFrame { planes, force_idr, permit }) {
+        if let Some(old) = queue.push(QueuedFrame { planes, force_idr, permit, captured_at, capture_us, convert_us }) {
             if old.force_idr != 0 {
                 pending_idr = true;
             }
@@ -570,6 +580,10 @@ fn encode_x264_inner(
         return Err(format!("Failed to create native x264 engine: {}", x264c_error(reason)));
     }
     let engine = SafeX264Engine(raw_engine);
+    // Stage means and the end-to-end latency median over one statistic window (2 s at 60 fps).
+    const STATS_FRAMES: u64 = 120;
+    let (mut frames, mut capture_sum, mut convert_sum, mut encode_sum) = (0u64, 0u64, 0u64, 0u64);
+    let mut latencies: Vec<u32> = Vec::with_capacity(STATS_FRAMES as usize);
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -579,10 +593,12 @@ fn encode_x264_inner(
         };
         let mut out_data: *const u8 = std::ptr::null();
         let mut out_len: u32 = 0;
+        let encode_started = Instant::now();
         let res = unsafe {
             x264c_encode_i420(engine.0, frame.planes.y.as_ptr(), frame.planes.u.as_ptr(),
                               frame.planes.v.as_ptr(), frame.force_idr, &mut out_data, &mut out_len)
         };
+        let encode_us = elapsed_us(encode_started);
         // x264 copied the input picture during encoder_encode; hand the buffer back immediately.
         pool.give(frame.planes);
         if res != 0 {
@@ -590,8 +606,30 @@ fn encode_x264_inner(
         }
         if out_len > 0 && !out_data.is_null() {
             let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
+            let completed_at = Instant::now();
+            frames += 1;
+            capture_sum += u64::from(frame.capture_us);
+            convert_sum += u64::from(frame.convert_us);
+            encode_sum += u64::from(encode_us);
+            latencies.push(elapsed_us(frame.captured_at));
+            if frames % STATS_FRAMES == 0 {
+                latencies.sort_unstable();
+                let ms = |total: u64| total as f64 / frames as f64 / 1000.0;
+                log::info!(
+                    "x264 pipeline stages: frames={} capture={:.2}ms convert={:.2}ms encode={:.2}ms latency_median={:.2}ms",
+                    STATS_FRAMES,
+                    ms(capture_sum),
+                    ms(convert_sum),
+                    ms(encode_sum),
+                    f64::from(latencies[latencies.len() / 2]) / 1000.0
+                );
+                capture_sum = 0;
+                convert_sum = 0;
+                encode_sum = 0;
+                latencies.clear();
+            }
             if units
-                .blocking_send(EncodedUnit { data, permit: frame.permit, completed_at: Instant::now() })
+                .blocking_send(EncodedUnit { data, permit: frame.permit, completed_at })
                 .is_err()
             {
                 return Ok(());
