@@ -1088,8 +1088,13 @@ fn scaled_row(src: &[u8], src_stride: usize, rows: &[(usize, usize, u32)], r: us
     let (y0, y1, fy) = rows[r];
     let (top, bottom) = (&src[y0 * src_stride..], &src[y1 * src_stride..]);
     let (a, b) = (256 - fy, fy);
-    for (m, (t, bt)) in mid.iter_mut().zip(top.iter().zip(bottom)) {
-        *m = (u32::from(*t) * a + u32::from(*bt) * b) as u16;
+    if avx2_available() {
+        // Safety: avx2_available() checked the CPU feature; slices are live and equally long.
+        unsafe { vertical_row_avx2(top, bottom, a as u16, b as u16, mid) };
+    } else {
+        for (m, (t, bt)) in mid.iter_mut().zip(top.iter().zip(bottom)) {
+            *m = (u32::from(*t) * a + u32::from(*bt) * b) as u16;
+        }
     }
     if sse41_available() {
         // Safety: sse41_available() checked the CPU feature; rows come from live slices.
@@ -1131,6 +1136,34 @@ fn horizontal_row_scalar(row: &[u16], columns: &[(usize, usize, u32)], dst_row: 
             pixel[c] = ((t + 32768) >> 16) as u8;
         }
     }
+}
+
+/// Vertical pass of the scaler: 16 pixels per AVX2 iteration (u16 arithmetic cannot overflow:
+/// top*a + bottom*b <= 255*256). Scalar tail and scalar fallback keep the same integers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vertical_row_avx2(top: &[u8], bottom: &[u8], a: u16, b: u16, mid: &mut [u16]) {
+    use std::arch::x86_64::*;
+    let (va, vb) = (_mm256_set1_epi16(a as i16), _mm256_set1_epi16(b as i16));
+    let mut i = 0;
+    while i + 16 <= mid.len() {
+        let t = _mm256_cvtepu8_epi16(_mm_loadu_si128(top.as_ptr().add(i) as *const __m128i));
+        let u = _mm256_cvtepu8_epi16(_mm_loadu_si128(bottom.as_ptr().add(i) as *const __m128i));
+        let m = _mm256_add_epi16(_mm256_mullo_epi16(t, va), _mm256_mullo_epi16(u, vb));
+        _mm256_storeu_si256(mid.as_mut_ptr().add(i) as *mut __m256i, m);
+        i += 16;
+    }
+    for (m, (t, u)) in mid[i..].iter_mut().zip(top[i..].iter().zip(bottom[i..].iter())) {
+        *m = (u32::from(*t) * u32::from(a) + u32::from(*u) * u32::from(b)) as u16;
+    }
+}
+
+fn avx2_available() -> bool {
+    static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(target_arch = "x86_64")]
+    { *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2")) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = &AVX2; false }
 }
 
 fn sse41_available() -> bool {
