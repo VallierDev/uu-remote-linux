@@ -408,6 +408,43 @@ mod tests {
         assert_eq!(resolve_pair(None, None, None, Some("h264"), false, Some(&va)).codec_pref, CodecPref::H264);
     }
 
+    /// Codec at CONTROL open is `preferred_codec_for` on the session snapshot.
+    /// Auto + CPU uses H.264 when both codecs are negotiated; auto + NVENC keeps H.265.
+    /// Forced codec ignores the encoder. 真彩 does not switch codec (true_color_keeps_codec_and_vaapi_reports_420).
+    #[test]
+    fn auto_codec_follows_the_encoder_chosen_at_session_setup() {
+        use crate::capture_setting::{preferred_codec_for, VideoCodec};
+
+        let cpu_fallback = probe_report(true, &[ProbeOutcome::Fail(ProbeFail::NoIdr), ProbeOutcome::Ok]);
+        let session = resolve_pair(None, None, None, None, true, Some(&cpu_fallback));
+        assert_eq!((session.encoder, session.encoder_source, session.codec_pref), (Encoder::Cpu, Source::Auto, CodecPref::Auto));
+        assert_eq!(preferred_codec_for(true, true, session), VideoCodec::H264);
+        // Not the H.265 an unfinished probe would pick for legacy NVENC.
+        let early_nvenc = resolve_pair(None, None, None, None, true, None);
+        assert_eq!(early_nvenc.encoder, Encoder::Nvenc);
+        assert_eq!(preferred_codec_for(true, true, early_nvenc), VideoCodec::H265);
+
+        let nvenc_ok = probe_report(true, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
+        let nvenc = resolve_pair(None, None, None, None, true, Some(&nvenc_ok));
+        assert_eq!(nvenc.encoder, Encoder::Nvenc);
+        assert_eq!(preferred_codec_for(true, true, nvenc), VideoCodec::H265);
+
+        let order = auto_order(true);
+        let unprobed = [ProbeOutcome::NativeUnprobed, ProbeOutcome::Ok];
+        let chosen = chosen_after_native(true, &order, &unprobed, choose_from_probe(&order, &unprobed));
+        let report = ProbeReport { order: order.clone(), outcomes: unprobed.to_vec(), chosen };
+        let native = resolve_pair(None, None, None, None, true, Some(&report));
+        assert_eq!(native.encoder, Encoder::Nvenc);
+        assert_eq!(preferred_codec_for(true, true, native), VideoCodec::H265);
+
+        let forced_h264 = resolve_pair(None, None, Some("h264"), None, true, Some(&nvenc_ok));
+        assert_eq!(forced_h264.encoder, Encoder::Nvenc);
+        assert_eq!(preferred_codec_for(true, true, forced_h264), VideoCodec::H264);
+        let forced_h265 = resolve_pair(None, None, None, Some("h265"), true, Some(&cpu_fallback));
+        assert_eq!(forced_h265.encoder, Encoder::Cpu);
+        assert_eq!(preferred_codec_for(true, true, forced_h265), VideoCodec::H265);
+    }
+
     #[test]
     fn session_before_probe_uses_legacy_auto() {
         clear_probe();

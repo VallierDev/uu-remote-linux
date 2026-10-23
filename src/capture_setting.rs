@@ -608,6 +608,13 @@ mod codec_tests {
         let (tx, rx) = watch::channel(VideoSettings { codec: VideoCodec::H265, ..Default::default() });
         apply_rpc(&request, &tx, (1920, 1080), true, true, true, None).unwrap();
         assert_eq!((rx.borrow().chroma, rx.borrow().codec), (CHROMA_444, VideoCodec::H265));
+        // NVENC session (full chroma) that already chose H.265 stays H.265 when 真彩 is requested.
+        let nvenc = crate::video_select::resolve_pair(None, None, None, None, true, None);
+        assert_eq!(nvenc.encoder, crate::video::Encoder::Nvenc);
+        let (tx, rx) = watch::channel(VideoSettings { codec: preferred_codec_for(true, true, nvenc), ..VideoSettings::default() });
+        assert_eq!(rx.borrow().codec, VideoCodec::H265);
+        handle_rpc_for(&request, &tx, (1920, 1080), true, true, nvenc).unwrap();
+        assert_eq!((rx.borrow().chroma, rx.borrow().codec), (CHROMA_444, VideoCodec::H265));
         let (tx, rx) = watch::channel(VideoSettings { codec: VideoCodec::H265, ..Default::default() });
         apply_rpc(&request, &tx, (1920, 1080), true, true, false, None).unwrap();
         assert_eq!((rx.borrow().chroma, rx.borrow().codec), (CHROMA_420, VideoCodec::H265));
