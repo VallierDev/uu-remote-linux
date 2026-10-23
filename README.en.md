@@ -360,7 +360,13 @@ stays cached until the process exits, except when NVIDIA presence (`/proc/driver
 or `/dev/nvidia0`) no longer matches the report: the next desktop connection then starts one
 background re-probe (`warm_auto_probe`) and still uses the cached encoder until the new result
 is stored. An NVENC failure is kept for 10 minutes, and the next desktop connection after that
-starts the same background re-probe while still using the cached encoder. They take effect the next time a desktop connection starts. Explicit `vaapi` with 真彩 stays on VAAPI,
+starts the same background re-probe while still using the cached encoder. `set-encoder` and
+`set-codec` both send `SIGUSR2` to the host in `host.pid` when that process is this program.
+An encoder change switches each live desktop stream without disconnecting and keeps the codec
+negotiated for that session. A failed start follows the existing fallback (in-process, then the
+FFmpeg process, then CPU). After a hand edit, `kill -USR2 $(cat ~/.config/uuremote/host.pid)`
+does the same. `SIGUSR2` does not re-probe. A codec change takes effect the next time a desktop
+connection starts; the running host only logs it. Explicit `vaapi` with 真彩 stays on VAAPI,
 encodes 4:2:0, and reports chroma 4:2:0 in CaptureSettingSync field 3. If the chosen encoder
 cannot start, the stream falls back to CPU and logs a warning. VAAPI is not an auto candidate
 until #33.

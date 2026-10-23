@@ -239,6 +239,87 @@ pub fn clear_probe() {
     if let Ok(mut slot) = cache().lock() { *slot = None; }
 }
 
+/// Why a live desktop encoder was asked to change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchReason {
+    /// Effective encoder differs. The log line uses `Selection::encoder_source`, not this variant.
+    Encoder,
+    /// Codec preference changed. The negotiated codec stays until the next stream.
+    CodecDeferred,
+}
+
+/// What SIGUSR2 should do to one live desktop stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchPlan {
+    /// Restart the encoder. None keeps the running encoder (codec-only or no change).
+    pub encoder: Option<Encoder>,
+    pub reason: SwitchReason,
+    /// Chroma the restarted encoder can actually produce. VAAPI has no 4:4:4.
+    pub chroma: u64,
+    /// True when the request was 4:4:4 and the new encoder must report 4:2:0.
+    pub chroma_downgraded: bool,
+}
+
+/// Compare the selection this stream is using with a freshly read one.
+/// Codec preference is the stored preference, not the negotiated m-line codec.
+pub fn plan_switch(active_encoder: Encoder, previous_codec: CodecPref, next: &Selection, active_chroma: u64) -> Option<SwitchPlan> {
+    if next.encoder != active_encoder {
+        let chroma = if active_chroma == crate::capture_setting::CHROMA_444 && !crate::video::full_chroma_for(next.encoder) {
+            crate::capture_setting::CHROMA_420
+        } else {
+            active_chroma
+        };
+        return Some(SwitchPlan {
+            encoder: Some(next.encoder),
+            reason: SwitchReason::Encoder,
+            chroma,
+            chroma_downgraded: chroma != active_chroma,
+        });
+    }
+    if next.codec_pref != previous_codec {
+        return Some(SwitchPlan {
+            encoder: None,
+            reason: SwitchReason::CodecDeferred,
+            chroma: active_chroma,
+            chroma_downgraded: false,
+        });
+    }
+    None
+}
+
+/// Monotonic generation bumped by SIGUSR2. Streams watch it and re-read `selection()`.
+fn reload_generation() -> &'static std::sync::atomic::AtomicU64 {
+    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &GEN
+}
+
+pub fn reload_generation_value() -> u64 {
+    reload_generation().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// SIGUSR2: ask live desktop streams to re-read host_settings. Does not clear the probe cache.
+pub fn notify_reload() {
+    reload_generation().fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn reload_watch() -> &'static tokio::sync::watch::Sender<u64> {
+    static WATCH: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> = std::sync::OnceLock::new();
+    WATCH.get_or_init(|| {
+        let (tx, _) = tokio::sync::watch::channel(reload_generation_value());
+        tx
+    })
+}
+
+pub fn subscribe_reload() -> tokio::sync::watch::Receiver<u64> {
+    reload_watch().subscribe()
+}
+
+/// Publish the generation so every subscribed desktop stream wakes.
+pub fn publish_reload() {
+    notify_reload();
+    let _ = reload_watch().send(reload_generation_value());
+}
+
 /// Setting (non-auto) beats the environment, which beats the NVIDIA/CPU default.
 pub fn selection() -> Selection {
     selection_with(cached_probe().as_ref())
@@ -484,6 +565,51 @@ mod tests {
         assert_eq!(resolve_pair(None, Some("cpu"), None, None, false, Some(&va)).encoder_source, Source::Env);
         assert_eq!(resolve_pair(Some("auto"), Some("vaapi"), None, None, false, None).encoder, Encoder::Vaapi);
         assert_eq!(resolve_pair(None, None, None, Some("h264"), false, Some(&va)).codec_pref, CodecPref::H264);
+    }
+
+    fn selection_of(encoder: Encoder, codec: CodecPref) -> Selection {
+        Selection { encoder, encoder_source: Source::Setting, codec_pref: codec, codec_source: Source::Setting }
+    }
+
+    #[test]
+    fn live_switch_restarts_encoder_and_defers_codec() {
+        let nv = selection_of(Encoder::Nvenc, CodecPref::Auto);
+        assert!(plan_switch(Encoder::Nvenc, CodecPref::Auto, &nv, crate::capture_setting::CHROMA_420).is_none());
+        let to_cpu = plan_switch(Encoder::Nvenc, CodecPref::Auto, &selection_of(Encoder::Cpu, CodecPref::Auto), crate::capture_setting::CHROMA_444).unwrap();
+        assert_eq!(to_cpu.encoder, Some(Encoder::Cpu));
+        assert_eq!(to_cpu.reason, SwitchReason::Encoder);
+        assert!(!to_cpu.chroma_downgraded);
+        assert_eq!(to_cpu.chroma, crate::capture_setting::CHROMA_444);
+        let to_vaapi = plan_switch(Encoder::Nvenc, CodecPref::H265, &selection_of(Encoder::Vaapi, CodecPref::H265), crate::capture_setting::CHROMA_444).unwrap();
+        assert_eq!(to_vaapi.encoder, Some(Encoder::Vaapi));
+        assert!(to_vaapi.chroma_downgraded);
+        assert_eq!(to_vaapi.chroma, crate::capture_setting::CHROMA_420);
+        let codec = plan_switch(Encoder::Nvenc, CodecPref::Auto, &selection_of(Encoder::Nvenc, CodecPref::H264), crate::capture_setting::CHROMA_420).unwrap();
+        assert_eq!(codec.encoder, None);
+        assert_eq!(codec.reason, SwitchReason::CodecDeferred);
+        let both = plan_switch(Encoder::Cpu, CodecPref::Auto, &selection_of(Encoder::Nvenc, CodecPref::H264), crate::capture_setting::CHROMA_420).unwrap();
+        assert_eq!(both.encoder, Some(Encoder::Nvenc));
+        assert_eq!(both.reason, SwitchReason::Encoder);
+        // The log reason is the source of the new selection (setting / env / auto), not a fixed word.
+        for (source, label) in [(Source::Setting, "setting"), (Source::Env, "env"), (Source::Auto, "auto")] {
+            let mut next = selection_of(Encoder::Vaapi, CodecPref::Auto);
+            next.encoder_source = source;
+            let plan = plan_switch(Encoder::Nvenc, CodecPref::Auto, &next, crate::capture_setting::CHROMA_420).unwrap();
+            assert!(plan.encoder.is_some());
+            assert_eq!(encoder_source_label(next.encoder_source), label);
+        }
+    }
+
+    #[test]
+    fn reload_does_not_clear_the_probe_cache() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let report = probe_report(true, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
+        store_probe(report.clone());
+        let before = reload_generation_value();
+        notify_reload();
+        assert_eq!(reload_generation_value(), before + 1);
+        assert_eq!(cached_probe(), Some(report));
+        clear_probe();
     }
 
     /// Codec at CONTROL open is `preferred_codec_for` on the session snapshot.

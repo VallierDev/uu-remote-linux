@@ -305,6 +305,10 @@ impl WebRtcSession {
         let portal=capture.portal.clone();
         let stream_desktop = portal_desktop.clone();
         let stream_selection = video_selection;
+        // Live encoder switch (SIGUSR2) sends CaptureSettingSync when chroma is downgraded.
+        let (chroma_sync_tx, chroma_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let chroma_sync = (desktop && !cfg!(test)).then_some(chroma_sync_tx);
+        let chroma_sync_rx = Arc::new(std::sync::Mutex::new((!cfg!(test)).then_some(chroma_sync_rx)));
         // File/terminal/port-mapping connections carry no desktop video.
         let control_video_track = video_track.clone();
         let stream_settings = video_settings.clone();
@@ -330,7 +334,7 @@ impl WebRtcSession {
                 let (capture_size, capture_display, portal) = screen.as_ref().map_or(
                     (capture_size, capture_display, portal),
                     |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
-                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request, stream_selection).await {
+                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request, stream_selection, chroma_sync.clone()).await {
                     // A send racing the viewer's close fails with a misleading track error.
                     if matches!(state_pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed) {
                         log::info!("Live desktop stream ended: peer connection closed ({})", e);
@@ -421,6 +425,7 @@ impl WebRtcSession {
             let peer_video_track = control_video_track.clone();
             let peer_actions = peer_actions.clone();
             let peer_selection = video_selection;
+            let chroma_sync_rx = chroma_sync_rx.clone();
             if label == "FILE_DATA_CHANNEL" { *file_channel.lock().unwrap() = Some(d.clone()); }
 
             Box::pin(async move {
@@ -443,6 +448,19 @@ impl WebRtcSession {
                 }
                 // Ordered outbound queue for protocol replies produced outside this callback.
                 let (outbound, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                if label == "CONTROL_DATA_CHANNEL" {
+                    if let Some(mut chroma_sync_rx) = chroma_sync_rx.lock().unwrap().take() {
+                        let sync_out = outbound.clone();
+                        let sync_seq = reply_sequence.clone();
+                        tokio::spawn(async move {
+                            while let Some(payload) = chroma_sync_rx.recv().await {
+                                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let seq = sync_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let _ = sync_out.send(crate::initialization::envelope(seq, timestamp, 25, &payload));
+                            }
+                        });
+                    }
+                }
                 {
                     let out_channel = d.clone();
                     let out_label = label.clone();

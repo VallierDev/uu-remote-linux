@@ -144,8 +144,24 @@ fn set_video_pref() -> Result<(), Box<dyn std::error::Error>> {
     let selection = video_select::selection();
     let codec = match selection.codec_pref { video_select::CodecPref::Auto => "auto", video_select::CodecPref::H264 => "h264", video_select::CodecPref::H265 => "h265" };
     println!("encoder={:?} source={} codec_pref={codec} source={}", selection.encoder, video_select::encoder_source_label(selection.encoder_source), video_select::source_label(selection.codec_source));
-    println!("takes effect the next time a desktop connection starts");
+    // Both subcommands wake the host. Encoder changes restart live desktop streams; codec changes are logged only.
+    match notify_host(libc::SIGUSR2) {
+        Ok(()) => println!("notified the running host"),
+        Err(_) => {}
+    }
+    if which == "set-codec" {
+        println!("takes effect the next time a desktop connection starts");
+    }
     Ok(())
+}
+
+/// Signal the host recorded in host.pid when its executable matches this one.
+fn notify_host(signal: i32) -> Result<(), ()> {
+    let pid = std::fs::read_to_string(host_pid_path()).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|p| *p > 1).ok_or(())?;
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let own = std::env::current_exe().ok();
+    if exe.as_ref().and_then(|p| p.file_name()) != own.as_ref().and_then(|p| p.file_name()) { return Err(()); }
+    if unsafe { libc::kill(pid, signal) } == 0 { Ok(()) } else { Err(()) }
 }
 
 /// Explicit command words for set-encoder / set-codec. Empty and whitespace are illegal.
@@ -198,11 +214,14 @@ mod cli_exit_tests {
     }
 }
 /// SIGUSR1 (`uuremote-server show`) opens the host window.
+/// SIGUSR2 (set-encoder, set-codec, or `kill -USR2`) re-reads host_settings. Encoder changes switch live desktop streams; codec changes are logged for the next connection.
 fn present_on_usr1(ui: std::sync::Arc<assist::LocalUi>) {
-    // Install the handler before publishing the pid: SIGUSR1's default action terminates the process.
+    // Install the handlers before publishing the pid: the default action of either signal terminates the process.
     let Ok(mut usr1) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) else { return };
+    let Ok(mut usr2) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) else { return };
     write_host_pid();
     tokio::spawn(async move { while usr1.recv().await.is_some() { ui.present(); } });
+    tokio::spawn(async move { while usr2.recv().await.is_some() { crate::video_select::publish_reload(); } });
 }
 
 fn host_pid_path() -> std::path::PathBuf { config::path().with_file_name("host.pid") }

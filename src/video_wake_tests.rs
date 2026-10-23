@@ -78,7 +78,7 @@ async fn exercise(fail_wake: usize, fail_capture: bool) {
         let (settings_tx, settings_rx) = tokio::sync::watch::channel(settings);
         let selection = crate::video_select::resolve_pair(Some("cpu"), None, Some("h264"), None, false, None);
         let mut task = tokio::spawn(stream_desktop(host.clone(), track.clone(), (640, 480),
-            DISPLAY.into(), None, settings_rx, Arc::new(settings_tx), Arc::new(AtomicBool::new(false)), selection));
+            DISPLAY.into(), None, settings_rx, Arc::new(settings_tx), Arc::new(AtomicBool::new(false)), selection, None));
         let result = if fail_capture {
             Some((&mut task).await.unwrap())
         } else {
