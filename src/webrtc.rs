@@ -49,6 +49,9 @@ pub struct DesktopRole {
     active: tokio::sync::watch::Sender<bool>,
     input: std::sync::Mutex<Option<Arc<crate::input::DesktopInputSession>>>,
     stream: std::sync::Mutex<Option<DesktopStream>>,
+    /// The running stream of a promoted peer; aborted on demotion so a quick re-promotion
+    /// never leaves two encoders on one track.
+    stream_task: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
     /// Capture reinitialized at promotion; the peer's own capture was unavailable when offered.
     screen: std::sync::Mutex<Option<Arc<ScreenCapture>>>,
     /// One session tracker per peer follows every promotion and demotion.
@@ -58,7 +61,7 @@ pub struct DesktopRole {
 impl DesktopRole {
     fn new(desktop: bool) -> Self {
         Self { active: tokio::sync::watch::channel(desktop).0, input: Default::default(),
-            stream: Default::default(), screen: Default::default(), tracking: Default::default(), request: Default::default() }
+            stream: Default::default(), stream_task: Default::default(), screen: Default::default(), tracking: Default::default(), request: Default::default() }
     }
     pub fn is_desktop(&self) -> bool { *self.active.borrow() }
     fn input(&self) -> Option<Arc<crate::input::DesktopInputSession>> { self.input.lock().unwrap().clone() }
@@ -163,13 +166,13 @@ fn replay_clipboard_echo(channel: Arc<RTCDataChannel>, sequence: Arc<std::sync::
 
 impl DesktopStream {
     /// Encode current frames only while the peer is connected and still the desktop.
-    fn spawn(self, screen: Option<Arc<ScreenCapture>>, mut active: tokio::sync::watch::Receiver<bool>) {
-        let Some(streaming_pc) = self.pc.upgrade() else { return; };
+    fn spawn(self, screen: Option<Arc<ScreenCapture>>, mut active: tokio::sync::watch::Receiver<bool>) -> Option<tokio::task::AbortHandle> {
+        let streaming_pc = self.pc.upgrade()?;
         let DesktopStream { track: video_track, portal_desktop, capture_size, capture_display, portal,
             settings_rx, settings, idr_request, selection, chroma_sync, reload_at_session, .. } = self;
         let (capture_size, capture_display, portal) = screen.map_or((capture_size, capture_display, portal),
             |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
-        tokio::spawn(async move { tokio::select! {
+        Some(tokio::spawn(async move { tokio::select! {
             _ = active.wait_for(|active| !*active) => log::info!("Live desktop stream stopped: a newer desktop took over"),
             _ = async move {
             let screen = if let Some(desktop) = portal_desktop {
@@ -201,7 +204,7 @@ impl DesktopStream {
                 }
             }
             } => {},
-        } });
+        } }).abort_handle())
     }
 }
 
@@ -454,7 +457,7 @@ impl WebRtcSession {
         };
         drop(streaming_pc);
         if cfg!(test) { drop(stream); }
-        else if desktop { stream.spawn(None, role.active.subscribe()); }
+        else if desktop { let _ = stream.spawn(None, role.active.subscribe()); }
         else { *role.stream.lock().unwrap() = Some(stream); }
         let input_clone = input.clone();
         let control_capture = capture.clone();
@@ -1466,7 +1469,10 @@ impl WebRtcSession {
         *self.role.input.lock().unwrap() = Some(session);
         self.role.active.send_replace(true);
         let stream = self.role.stream.lock().unwrap().clone();
-        if let Some(stream) = stream { stream.spawn(self.role.screen.lock().unwrap().clone(), self.role.active.subscribe()); }
+        if let Some(stream) = stream {
+            let task = stream.spawn(self.role.screen.lock().unwrap().clone(), self.role.active.subscribe());
+            if let Some(old) = std::mem::replace(&mut *self.role.stream_task.lock().unwrap(), task) { old.abort(); }
+        }
         if !cfg!(test) { track_session(self.pc.clone(), self.actions.clone(), &self.role); }
         log::info!("Desktop started on an existing tool connection");
     }
@@ -1479,6 +1485,7 @@ impl WebRtcSession {
     pub fn demote(&self) {
         if self.desktop || !self.role.is_desktop() { return; }
         self.role.active.send_replace(false);
+        if let Some(task) = self.role.stream_task.lock().unwrap().take() { task.abort(); }
         if let Some(session) = self.role.input.lock().unwrap().take() { session.disconnected(); }
         log::info!("Desktop on a tool connection stopped: a newer desktop took over");
     }
