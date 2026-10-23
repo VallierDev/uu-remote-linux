@@ -1049,3 +1049,56 @@ mod frame_tests {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+
+    extern "C" {
+        fn x264c_test_convert(src: *const u8, pitch: u32, y: *mut u8, u: *mut u8, v: *mut u8,
+                              w: libc::c_int, h: libc::c_int, force_scalar: libc::c_int) -> libc::c_int;
+    }
+
+    fn pixels(w: u32, h: u32, seed: u32) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut v = vec![0u8; w as usize * h as usize * 4];
+        for p in v.chunks_exact_mut(4) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            p.copy_from_slice(&[s as u8, (s >> 8) as u8, (s >> 16) as u8, 0xFF]);
+        }
+        v
+    }
+
+    /// (Y, U, V, whether the AVX2 path ran)
+    fn convert(src: &[u8], pitch: u32, w: u32, h: u32, force_scalar: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>, bool) {
+        let (mut y, mut u, mut v) = (
+            vec![0u8; (w * h) as usize],
+            vec![0u8; (w / 2 * (h / 2)) as usize],
+            vec![0u8; (w / 2 * (h / 2)) as usize],
+        );
+        let used = unsafe {
+            x264c_test_convert(src.as_ptr(), pitch, y.as_mut_ptr(), u.as_mut_ptr(), v.as_mut_ptr(),
+                               w as libc::c_int, h as libc::c_int, libc::c_int::from(force_scalar))
+        };
+        (y, u, v, used == 1)
+    }
+
+    #[test]
+    fn avx2_bgrx_to_i420_matches_scalar_byte_for_byte() {
+        // Widths that are not multiples of 16/32 exercise the vector tail; the heights give an
+        // odd number of row pairs, and 1920x1200 is the production size.
+        for (w, h) in [(1922u32, 10u32), (2560, 4), (1366, 6), (1920, 1200)] {
+            let src = pixels(w, h, 0x1234_5678 ^ w);
+            let (sy, su, sv, scalar_used) = convert(&src, w * 4, w, h, true);
+            assert!(!scalar_used, "force_scalar must run the scalar path");
+            let (ay, au, av, avx2_used) = convert(&src, w * 4, w, h, false);
+            if !avx2_used {
+                eprintln!("AVX2 not available; scalar output only for {w}x{h}");
+                continue;
+            }
+            assert!(sy == ay, "Y differs at {w}x{h}");
+            assert!(su == au, "U differs at {w}x{h}");
+            assert!(sv == av, "V differs at {w}x{h}");
+        }
+    }
+}
