@@ -78,6 +78,20 @@ extern "C" {
     fn uu_assist_ui_set(id: *const libc::c_char, code: *const libc::c_char, allowed: libc::c_int, verify: libc::c_int, refresh: libc::c_int, has_custom: libc::c_int);
     fn uu_assist_ui_take_command(arg: *mut libc::c_char, len: libc::size_t) -> libc::c_int;
     fn uu_assist_ui_close();
+    fn uu_ui_set_problem(summary: *const libc::c_char, text: *const libc::c_char, notify: libc::c_int) -> libc::c_int;
+}
+
+/// A problem only the person at the desktop can fix: a red line in the host window (`None` clears it)
+/// and, with `notify`, a desktop notification, or the host window opened when no notification daemon
+/// answers. Returns whether the person was told now.
+pub fn show_problem(summary: &str, text: Option<&str>, notify: bool) -> bool {
+    #[cfg(uu_gtk)] {
+        let summary = std::ffi::CString::new(summary).unwrap_or_default();
+        let text = text.map(|t| std::ffi::CString::new(t).unwrap_or_default());
+        let text = text.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+        unsafe { uu_ui_set_problem(summary.as_ptr(), text, i32::from(notify)) >= 0 }
+    }
+    #[cfg(not(uu_gtk))] { let _ = (summary, text, notify); false }
 }
 
 /// "243829726" -> "243 829 726", as the official client shows device IDs.

@@ -53,11 +53,11 @@ jobs:
           cp target/debug/uuremote-server target/debug/libuu-wayland.so packaging/tarball/install.sh "$pkg/"
           cp -r contrib "$pkg/"
           home=$(mktemp -d)
-          HOME=$home "$pkg/install.sh" --yes
+          HOME=$home XDG_CONFIG_HOME=$home/.config "$pkg/install.sh" --yes
           ffmpeg -hide_banner -encoders | grep -qw libx264
           test -x "$home/.local/bin/uuremote-server" && test -f "$home/.local/lib/uu-remote-linux/libuu-wayland.so"
           grep -q '^ExecStart=%h/.local/bin/uuremote-server$' "$home/.config/systemd/user/uuremote-native.service"
-          HOME=$home "$pkg/install.sh" --yes | grep -q 'Kept existing'
+          HOME=$home XDG_CONFIG_HOME=$home/.config "$pkg/install.sh" --yes | grep -q 'Kept existing'
 
   test-viewer:
     runs-on: ubuntu-22.04

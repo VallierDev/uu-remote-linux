@@ -152,7 +152,7 @@ cd uu-remote-linux-<version>-x86_64-linux
 The script installs the binaries and plugins under `~/.local`, writes the systemd user unit (an existing one is kept) and checks
 FFmpeg with libx264 (without it the viewer stays on 正在传输画面). A missing FFmpeg is installed through sudo with apt or pacman;
 Fedora needs RPM Fusion and openSUSE needs Packman first, and the script only prints the command instead of adding third-party repositories.
-The host also logs an error at startup when FFmpeg is not runnable.
+The host also checks FFmpeg at startup and on every desktop connection: when it is not runnable it logs an error and shows a desktop notification (without a notification daemon it opens its window with a red hint), at most every 5 minutes. Install it and reconnect; no restart is needed.
 
 One package covers X11, wlroots compositors (Hyprland, Sway, niri) and GNOME/KDE Wayland: the backend is chosen from the
 running session at startup, and the matching `libuu-*.so` is loaded only on Wayland, so X11 hosts need no Wayland libraries.

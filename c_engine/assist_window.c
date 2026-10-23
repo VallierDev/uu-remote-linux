@@ -57,6 +57,10 @@ static int suppress_tray;
 static int cur_verify, cur_refresh, cur_has_custom;
 static char current_id[64], current_code[64];
 static int code_visible = 1, suppress_switch, start_hidden, close_hides;
+// A problem only the person at the desktop can fix (e.g. FFmpeg missing): red line at the top.
+static GtkWidget *problem_label;
+static gchar *problem_text;
+static pthread_mutex_t problem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static GtkWidget *label(const char *text, const char *cls) {
     GtkWidget *l = gtk_label_new(text);
@@ -399,6 +403,11 @@ static void build_window(void) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_container_set_border_width(GTK_CONTAINER(root), 24);
     gtk_container_add(GTK_CONTAINER(window), root);
+    problem_label = label("", "status");
+    gtk_style_context_add_class(gtk_widget_get_style_context(problem_label), "error");
+    gtk_label_set_line_wrap(GTK_LABEL(problem_label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(problem_label), 40);
+    gtk_box_pack_start(GTK_BOX(root), problem_label, FALSE, FALSE, 0);
 
     GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_style_context_add_class(gtk_widget_get_style_context(card), "card");
@@ -509,6 +518,10 @@ static void build_window(void) {
     gtk_widget_set_visible(assist_card, show_assist);
     gtk_widget_set_visible(hint_label, show_assist);
     gtk_widget_set_visible(account_card, show_account);
+    pthread_mutex_lock(&problem_lock);
+    gtk_label_set_text(GTK_LABEL(problem_label), problem_text ? problem_text : "");
+    gtk_widget_set_visible(problem_label, problem_text != NULL);
+    pthread_mutex_unlock(&problem_lock);
     if (!start_hidden) gtk_widget_show(window);
 }
 
@@ -691,6 +704,50 @@ void uu_login_ui_offer_refresh(int visible) {
     g_idle_add(apply_qr_refresh, GINT_TO_POINTER(visible != 0));
 }
 int uu_login_ui_take_refresh(void) { return atomic_exchange(&qr_refresh_requested, 0); }
+
+static gboolean apply_problem(gpointer data) {
+    (void)data;
+    if (window && problem_label) {
+        pthread_mutex_lock(&problem_lock);
+        gtk_label_set_text(GTK_LABEL(problem_label), problem_text ? problem_text : "");
+        gtk_widget_set_visible(problem_label, problem_text != NULL);
+        pthread_mutex_unlock(&problem_lock);
+    }
+    return G_SOURCE_REMOVE;
+}
+// Freedesktop notification through the session bus (no GTK main loop needed). Returns 0 when delivered.
+static int notify_desktop(const char *summary, const char *body) {
+    GDBusConnection *bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
+    if (!bus) return -1;
+    GVariantBuilder actions, hints;
+    g_variant_builder_init(&actions, G_VARIANT_TYPE("as"));
+    g_variant_builder_init(&hints, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&hints, "{sv}", "urgency", g_variant_new_byte(2)); // critical: stays until dismissed
+    GVariant *reply = g_dbus_connection_call_sync(bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications", "Notify",
+        g_variant_new("(susssasa{sv}i)", "UU 远程 Linux 主机", 0u, "uu-remote-linux", summary, body, &actions, &hints, -1),
+        G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
+    g_object_unref(bus);
+    if (!reply) return -1;
+    g_variant_unref(reply);
+    return 0;
+}
+// text NULL clears the window line. notify: also tell the person now, by a desktop notification or,
+// without a notification daemon (e.g. bare Xfce), by opening the host window that shows the line.
+// Returns 0 notified, 1 window opened, -1 neither (no notify requested, or no daemon and no window).
+int uu_ui_set_problem(const char *summary, const char *text, int notify) {
+    pthread_mutex_lock(&problem_lock);
+    g_free(problem_text);
+    problem_text = text ? g_strdup(text) : NULL;
+    pthread_mutex_unlock(&problem_lock);
+    int window_ready = ui_started && init_state == 1 && !atomic_load(&closed);
+    if (window_ready) g_idle_add(apply_problem, NULL);
+    if (!notify || !text) return -1;
+    if (notify_desktop(summary ? summary : "", text) == 0) return 0;
+    if (!window_ready) return -1;
+    uu_assist_ui_present();
+    return 1;
+}
 void uu_login_ui_set_done(const char *text) { uu_ui_set_user(text); }
 int uu_login_ui_closed(void) { return atomic_load(&closed); }
 void uu_login_ui_close(void) { uu_assist_ui_close(); }

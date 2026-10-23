@@ -137,7 +137,7 @@ cd uu-remote-linux-<版本>-x86_64-linux
 
 脚本把程序和插件装到 `~/.local`，写入用户级 systemd 服务（已有则保留），并检查 FFmpeg（需带 libx264，否则客户端会一直停在「正在传输画面」）。
 缺 FFmpeg 时经 sudo 用 apt / pacman 安装；Fedora 需先启用 RPM Fusion，openSUSE 需 Packman 源，脚本只提示命令、不替你添加第三方源。
-服务启动时如果 FFmpeg 不可用，也会在日志里报错。
+服务启动时和每次有人连接桌面时都会检查 FFmpeg：不可用就记 error，并弹桌面通知（没有通知服务时打开主窗口，顶部红字提示安装方法，最多每 5 分钟一次）；装好后重新连接即可，不用重启服务。
 
 同一个包支持 X11、Hyprland 等 wlroots 合成器和 GNOME/KDE Wayland：程序启动时按当前会话自动选择后端，只在 Wayland 会话里
 才加载对应的 `libuu-*.so`，X11 用户不需要任何 Wayland 库。系统要求：

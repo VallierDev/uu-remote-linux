@@ -369,14 +369,37 @@ pub async fn ffmpeg_encoders() -> Option<Vec<&'static str>> {
 }
 
 /// Without FFmpeg the desktop stream fails after the viewer connects and it waits on
-/// 正在传输画面 with no message of its own, so say it once at startup.
-pub fn warn_if_ffmpeg_unusable() {
+/// 正在传输画面 with no message of its own. Checked at startup and on each desktop offer:
+/// logged, shown in the host window, and sent as a desktop notification (at most every 5 minutes).
+/// Installing FFmpeg clears the window line on the next check; no restart is needed.
+pub fn check_ffmpeg_usable() {
     if crate::desktop_backend::headless() { return; }
     tokio::spawn(async {
+        static LAST_NOTICE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        const SUMMARY: &str = "无法传输远程画面";
         match ffmpeg_encoders().await {
-            None => log::error!("FFmpeg is not runnable: desktop video cannot start and viewers stay on 正在传输画面. Install ffmpeg (Debian/Ubuntu: sudo apt install ffmpeg; Arch: sudo pacman -S ffmpeg; Fedora: ffmpeg from RPM Fusion), or set ffmpeg_root, then check `uuremote-server doctor`"),
-            Some(found) if !found.contains(&"libx264") => log::warn!("FFmpeg has no libx264: CPU encoding and the fallback after a hardware encoder failure are unavailable. Install a full ffmpeg build"),
-            Some(_) => {}
+            None => {
+                log::error!("FFmpeg is not runnable: desktop video cannot start and viewers stay on 正在传输画面. Install ffmpeg (Debian/Ubuntu: sudo apt install ffmpeg; Arch: sudo pacman -S ffmpeg; Fedora: ffmpeg from RPM Fusion), or set ffmpeg_root, then check `uuremote-server doctor`");
+                let text = "未找到可运行的 FFmpeg，客户端会一直停在「正在传输画面」。\n请安装后重新连接：sudo apt install ffmpeg（Arch：sudo pacman -S ffmpeg；Fedora 需先启用 RPM Fusion）";
+                let previous = {
+                    let mut last = LAST_NOTICE.lock().unwrap_or_else(|e| e.into_inner());
+                    let previous = *last;
+                    let due = previous.is_none_or(|at| at.elapsed() >= Duration::from_secs(300));
+                    if due { *last = Some(Instant::now()); }
+                    due.then_some(previous)
+                };
+                // The notification is a blocking D-Bus call (bounded to 3 s).
+                let told = tokio::task::spawn_blocking(move || crate::assist::show_problem(SUMMARY, Some(text), previous.is_some())).await.unwrap_or(false);
+                // Only a notice that reached the person starts the 5-minute quiet period.
+                if let (Some(previous), false) = (previous, told) {
+                    *LAST_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = previous;
+                    log::warn!("Missing FFmpeg: no desktop notification daemon and no host window to show it");
+                }
+            }
+            Some(found) => {
+                if !found.contains(&"libx264") { log::warn!("FFmpeg has no libx264: CPU encoding and the fallback after a hardware encoder failure are unavailable. Install a full ffmpeg build"); }
+                tokio::task::spawn_blocking(|| crate::assist::show_problem(SUMMARY, None, false));
+            }
         }
     });
 }

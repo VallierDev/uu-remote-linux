@@ -522,7 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _audio_cleanup=virtual_audio::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
     video::warm_auto_probe();
-    video::warn_if_ffmpeg_unusable();
+    video::check_ffmpeg_usable();
 
     if !desktop_backend::headless() && desktop_backend::detect()? == desktop_backend::DesktopBackend::X11 && desktop_backend::wayland_session_running() {
         // X11 capture inside a Wayland session reads XWayland's root window: all black, no error (#61).
@@ -853,7 +853,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         if desktop { input.set_mac_controller(controller_mac); }
                         log::info!("Offer for connection: capture_type={} desktop={} active_peers={}", capture_type, desktop, sessions.len());
                         // An expired NVENC failure is re-probed in the background. This offer keeps the cached encoder.
-                        if desktop { video::warm_auto_probe(); }
+                        if desktop { video::warm_auto_probe(); video::check_ffmpeg_usable(); }
                         // Replace only this ICE id or a previous desktop, never tool peers.
                         for id in superseded_peer_ids(&sessions, &ice, desktop) {
                             if let Some(old) = sessions.remove(&id) { let _ = old.pc.close().await; }
