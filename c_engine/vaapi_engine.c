@@ -732,7 +732,9 @@ int vaapi_encode_frame(
         rc.window_size = 1000;
         rc.initial_qp = 28;
         rc.min_qp = 16;
-        rc.max_qp = 44;
+        // The driver's VBR raises QP only up to max_qp; 44 blocked the capped presets from reaching
+        // the QP 51 hardware floor on hard content (2560x1600 testsrc2: 4.16 -> 2.60 Mbps, #33)
+        rc.max_qp = 51;
         rc.rc_flags.bits.disable_frame_skip = 1; // a remote desktop must not drop frames silently
         b.misc[b.misc_n++] = vaapi_create_misc_buffer(engine, VAEncMiscParameterTypeRateControl, &rc, sizeof(rc));
 
