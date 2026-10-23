@@ -323,7 +323,8 @@ pub fn reload_since_session(at_session: u64, current: u64) -> bool {
 /// Publish the generation so every subscribed desktop stream wakes.
 pub fn publish_reload() {
     notify_reload();
-    let _ = reload_watch().send(reload_generation_value());
+    // send() drops the value when nobody is subscribed (the gap between desktop connections).
+    reload_watch().send_replace(reload_generation_value());
 }
 
 /// Setting (non-auto) beats the environment, which beats the NVIDIA/CPU default.

@@ -147,7 +147,9 @@ fn set_video_pref() -> Result<(), Box<dyn std::error::Error>> {
     // Both subcommands wake the host. Encoder changes restart live desktop streams; codec changes are logged only.
     match notify_host(libc::SIGUSR2) {
         Ok(()) => println!("notified the running host"),
-        Err(_) => {}
+        Err(_) => println!(
+            "host not running, or the running host is not this binary: takes effect the next time a desktop connection starts, or after restarting the service"
+        ),
     }
     if which == "set-codec" {
         println!("takes effect the next time a desktop connection starts");
@@ -155,13 +157,31 @@ fn set_video_pref() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Signal the host recorded in host.pid when its executable matches this one.
+/// Signal the host recorded in host.pid only when `/proc/<pid>/exe` is exactly
+/// `canonicalize(current_exe())`. A filename match is not enough: an older host
+/// has no SIGUSR2 handler, and the default action terminates the process.
+/// A replaced binary reads back as `… (deleted)` and does not match.
 fn notify_host(signal: i32) -> Result<(), ()> {
-    let pid = std::fs::read_to_string(host_pid_path()).ok().and_then(|s| s.trim().parse::<i32>().ok()).filter(|p| *p > 1).ok_or(())?;
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-    let own = std::env::current_exe().ok();
-    if exe.as_ref().and_then(|p| p.file_name()) != own.as_ref().and_then(|p| p.file_name()) { return Err(()); }
-    if unsafe { libc::kill(pid, signal) } == 0 { Ok(()) } else { Err(()) }
+    let pid = std::fs::read_to_string(host_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|p| *p > 1)
+        .ok_or(())?;
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|_| ())?;
+    let own = std::fs::canonicalize(std::env::current_exe().map_err(|_| ())?).map_err(|_| ())?;
+    if !same_host_binary(&exe, &own) {
+        return Err(());
+    }
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// `/proc/<pid>/exe` must equal the canonical path of this binary. A trailing ` (deleted)` does not match.
+fn same_host_binary(proc_exe: &std::path::Path, own: &std::path::Path) -> bool {
+    proc_exe == own
 }
 
 /// Explicit command words for set-encoder / set-codec. Empty and whitespace are illegal.
@@ -213,26 +233,54 @@ mod cli_exit_tests {
         assert_eq!(super::reject_cli(Some("set-codec"), 3, super::cli_pref_ok("set-codec", "  ")), Some(2));
     }
 
-    /// SIGUSR2 is installed with no assist UI. `host.pid` is written only after that handler exists.
+    /// SIGUSR1 and SIGUSR2 are installed with no assist UI. `host.pid` is written only after both exist.
     #[test]
-    fn sigusr2_handler_installs_without_assist() {
+    fn signal_handlers_install_without_assist() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            let path = super::host_pid_path();
-            if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).unwrap(); }
+            let _guard = crate::config::test_env_lock().lock().unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("uuremote-signal-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::env::set_var("UU_CONFIG", dir.join("config.json"));
             assert!(super::install_host_signals(None));
-            let pid = std::fs::read_to_string(&path).unwrap();
+            let pid = std::fs::read_to_string(super::host_pid_path()).unwrap();
             assert_eq!(pid.trim(), std::process::id().to_string());
+            std::env::remove_var("UU_CONFIG");
+            let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    #[test]
+    fn sigusr2_requires_the_same_canonical_binary() {
+        let own = std::path::Path::new("/home/user/.local/bin/uuremote-server");
+        assert!(super::same_host_binary(own, own));
+        assert!(!super::same_host_binary(
+            std::path::Path::new("/tmp/unpack/uuremote-server"),
+            own
+        ));
+        assert!(!super::same_host_binary(
+            std::path::Path::new("/home/user/.local/bin/uuremote-server (deleted)"),
+            own
+        ));
     }
 }
 /// SIGUSR1 (`uuremote-server show`) opens the host window.
 /// SIGUSR2 (set-encoder, set-codec, or `kill -USR2`) re-reads host_settings. Encoder changes switch live desktop streams; codec changes are logged for the next connection.
 /// The default action of either signal terminates the process, so both handlers are installed before `host.pid` is written.
 /// SIGUSR2 is independent of remote assistance: `UU_REMOTE_ASSIST=0` and a failed assist setup still switch live encoders.
+/// SIGUSR1 is installed first as a no-op so `show` cannot terminate a host that has no assist window yet.
 fn install_host_signals(ui: Option<std::sync::Arc<assist::LocalUi>>) -> bool {
-    // Called again when assist attaches: SIGUSR2 is already installed, so only add SIGUSR1.
+    static USR1: std::sync::Once = std::sync::Once::new();
     static USR2: std::sync::Once = std::sync::Once::new();
+    let mut usr1_ok = true;
+    USR1.call_once(|| {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+            Ok(mut usr1) => { tokio::spawn(async move { while usr1.recv().await.is_some() {} }); }
+            Err(_) => usr1_ok = false,
+        }
+    });
+    if !usr1_ok { return false; }
     let mut usr2_ok = true;
     USR2.call_once(|| {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
@@ -241,6 +289,7 @@ fn install_host_signals(ui: Option<std::sync::Arc<assist::LocalUi>>) -> bool {
         }
     });
     if !usr2_ok { return false; }
+    // Assist attaches later and replaces the no-op with the window. A second registration replaces the first.
     if let Some(ui) = ui {
         if let Ok(mut usr1) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
             tokio::spawn(async move { while usr1.recv().await.is_some() { ui.present(); } });
@@ -259,7 +308,9 @@ fn host_pid_path() -> std::path::PathBuf { config::path().with_file_name("host.p
 fn write_host_pid() {
     use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(host_pid_path()) {
+    let path = host_pid_path();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path) {
         let _ = write!(f, "{}", std::process::id());
     }
 }
