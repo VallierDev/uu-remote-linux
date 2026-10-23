@@ -40,6 +40,8 @@ sudo apt install build-essential pkg-config \
     libx11-dev libxext-dev libxtst-dev libxfixes-dev libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev libgtk-3-dev ffmpeg
 # --features inproc-av:      X11 in-process capture + native NVENC/VAAPI. NVENC headers are vendored and
 #                            libcuda/libnvidia-encode dlopen'ed at runtime (NVENC API 12.1, driver >= 530).
+#                            The in-process libx264 engine compiles against libx264-dev's x264.h and
+#                            dlopen's libx264 at runtime (X264_BUILD must match the library).
 #                            The VAAPI/DRI3 engines compile against
 #                            libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage-dev;
 #                            libva/libva-drm themselves are dlopen'ed at runtime (no hard libva dependency)
