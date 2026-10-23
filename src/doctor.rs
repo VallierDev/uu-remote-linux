@@ -16,6 +16,12 @@ fn env_state(name: &str) -> String {
 
 fn line(key: &str, value: impl std::fmt::Display) { println!("{key:<22} {}", redact(&value.to_string())); }
 
+fn format_probe(probe: &crate::video_select::ProbeReport) -> String {
+    probe.order.iter().zip(probe.outcomes.iter())
+        .map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label()))
+        .collect::<Vec<_>>().join(" ")
+}
+
 fn glibc() -> String {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -96,13 +102,9 @@ pub async fn run() -> Result<(), String> {
     let env_enc = std::env::var("UU_VIDEO_ENCODER").unwrap_or_else(|_| "unset".into());
     let codec = match selection.codec_pref { crate::video_select::CodecPref::Auto => "auto", crate::video_select::CodecPref::H264 => "h264", crate::video_select::CodecPref::H265 => "h265" };
     let probe_text = if selection.encoder_source == crate::video_select::Source::Auto {
-        let probe = crate::video::run_auto_probe().await;
-        probe.order.iter().zip(probe.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect::<Vec<_>>().join(" ")
+        format_probe(&crate::video::run_auto_probe().await)
     } else {
-        match crate::video_select::cached_probe() {
-            Some(probe) => probe.order.iter().zip(probe.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect::<Vec<_>>().join(" "),
-            None => "not yet run".to_owned(),
-        }
+        crate::video_select::cached_probe().as_ref().map(format_probe).unwrap_or_else(|| "not yet run".to_owned())
     };
     let selection = if selection.encoder_source == crate::video_select::Source::Auto { crate::video_select::selection() } else { selection };
     line("encoder probe", probe_text);

@@ -403,6 +403,14 @@ mod tests {
         let only_vaapi = probe_report(false, &[ProbeOutcome::Ok, ProbeOutcome::Fail(ProbeFail::Exit)]);
         let stuck = resolve_pair(None, None, None, None, false, Some(&only_vaapi));
         assert_eq!(selection_for_chroma(stuck, crate::capture_setting::CHROMA_444, Some(&only_vaapi)).encoder, Encoder::Vaapi);
+        // CPU 4:4:4 fallback with codec auto uses the CPU rule (H.264 when negotiated).
+        assert_eq!(crate::capture_setting::preferred_codec_for(true, true, moved), crate::capture_setting::VideoCodec::H264);
+        assert_eq!(crate::capture_setting::preferred_codec_for(true, true, base), crate::capture_setting::VideoCodec::H265);
+        let forced = resolve_pair(None, None, Some("h265"), None, false, Some(&report));
+        let forced = selection_for_chroma(forced, crate::capture_setting::CHROMA_444, Some(&report));
+        assert_eq!(forced.encoder, Encoder::Cpu);
+        assert_eq!(crate::capture_setting::preferred_codec_for(true, true, forced), crate::capture_setting::VideoCodec::H265);
+        assert_eq!(crate::capture_setting::preferred_codec_for(false, true, moved), crate::capture_setting::VideoCodec::H265);
     }
 
     fn probe_report(nvidia: bool, outcomes: &[ProbeOutcome]) -> ProbeReport {

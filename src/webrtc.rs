@@ -590,6 +590,8 @@ impl WebRtcSession {
                             } else { None };
                             let input_size = resized.unwrap_or(input_size);
                             let asked = crate::capture_setting::requested_chroma(&rpc_fields).unwrap_or(settings.borrow().chroma);
+                            // Resolve before apply: auto VAAPI + 真彩 lands on CPU, and the codec
+                            // follows that encoder (CPU auto → H.264 when the track was negotiated).
                             let capture_selection = crate::video_select::selection_for_chroma(capture_selection, asked, capture_probe.as_ref());
                             let before = *settings.borrow();
                             let output_before = before.output;

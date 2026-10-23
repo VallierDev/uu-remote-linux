@@ -157,13 +157,13 @@ pub fn handle_rpc_for(rpc: &[WireField], settings: &watch::Sender<VideoSettings>
     apply_rpc(rpc, settings, native, h264, h265, crate::video::full_chroma_for(selection.encoder), crate::video_select::codec_force(selection.codec_pref))
 }
 
-/// The resolution a capture/resolution RPC asks for, parsed like apply_rpc: X11 hosts apply it
-/// to the display mode itself (desktop_mode), as the official Windows host changes its resolution.
 /// Chroma the viewer asked for in this RPC (field 7), if it sent one.
 pub fn requested_chroma(rpc: &[WireField]) -> Option<u64> {
     message(rpc, 2).and_then(|request| decode_wire(request).ok()).and_then(|fields| number(&fields, 7))
 }
 
+/// The resolution a capture/resolution RPC asks for, parsed like apply_rpc: X11 hosts apply it
+/// to the display mode itself (desktop_mode), as the official Windows host changes its resolution.
 pub fn requested_resolution(rpc: &[WireField]) -> Option<crate::desktop_mode::Request> {
     use crate::desktop_mode::Request;
     if let Some(request) = message(rpc, 2) {
@@ -177,7 +177,7 @@ pub fn requested_resolution(rpc: &[WireField]) -> Option<crate::desktop_mode::Re
     } else { None }
 }
 
-fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), _h264: bool, h265: bool, full_chroma: bool, forced: Option<&str>) -> Option<Vec<u8>> {
+fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native: (u32, u32), h264: bool, h265: bool, full_chroma: bool, forced: Option<&str>) -> Option<Vec<u8>> {
     let header = message(rpc, 1).unwrap_or(&[]);
     let mut next = *settings.borrow();
     if let Some(request) = message(rpc, 2) {
@@ -201,6 +201,13 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
             Some(CHROMA_444) => { log::info!("Chroma 4:4:4 requested; this encoder pipeline only supports 4:2:0"); next.chroma = CHROMA_420; }
             Some(CHROMA_420) => next.chroma = CHROMA_420,
             _ => {}
+        }
+        // Auto VAAPI + 真彩 restarts on CPU (4:4:4). The CPU probe validated H.264 only, so the
+        // same rule as stream start applies: auto prefers H.264 when that track was negotiated.
+        // Forced h264/h265 stays; an H.265-only offer keeps H.265 (pick_codec). A 4:2:0 drop
+        // stays on the hardware encoder and does not change the codec.
+        if next.chroma == CHROMA_444 && forced.is_none() {
+            next.codec = pick_codec(h264, h265, None, false);
         }
         // ChooseResolutionType 3 = follow remote (native); v4 uses pixels in both size pairs.
         if number(&fields, 10) == Some(3) { next.output = None; }
@@ -288,6 +295,9 @@ pub fn sync_payload(settings: &VideoSettings, native: (u32, u32)) -> Vec<u8> {
     put_varint(6, u64::from(size.1), &mut out);
     put_varint(9, u64::from(size.0), &mut out);
     put_varint(10, u64::from(size.1), &mut out);
+    // Same GvPb_CodecType as CaptureSettingRequest field 13. The viewer learns a host-side
+    // switch (真彩 moving auto-VAAPI onto CPU H.264) from this sync, the way field 13 informs it.
+    put_varint(13, settings.codec.wire(), &mut out);
     out
 }
 
@@ -605,6 +615,24 @@ mod codec_tests {
         let (tx, rx) = watch::channel(VideoSettings::default());
         apply_rpc(&request, &tx, (1920, 1080), true, true, false, Some("h265")).unwrap();
         assert_eq!(rx.borrow().codec, VideoCodec::H265);
+    }
+    #[test]
+    fn true_color_cpu_fallback_uses_h264_when_codec_is_auto() {
+        // Field 7 = 3 (真彩). full_chroma false is the VAAPI 4:2:0 drop; true is the CPU 4:4:4 path.
+        let request = decode_wire(&[18, 2, 56, 3]).unwrap();
+        let (tx, rx) = watch::channel(VideoSettings { codec: VideoCodec::H265, ..Default::default() });
+        apply_rpc(&request, &tx, (1920, 1080), true, true, true, None).unwrap();
+        assert_eq!((rx.borrow().chroma, rx.borrow().codec), (CHROMA_444, VideoCodec::H264));
+        assert_eq!(number(&decode_wire(&sync_payload(&rx.borrow(), (1920, 1080))).unwrap(), 13), Some(1));
+        let (tx, rx) = watch::channel(VideoSettings { codec: VideoCodec::H265, ..Default::default() });
+        apply_rpc(&request, &tx, (1920, 1080), true, true, true, Some("h265")).unwrap();
+        assert_eq!(rx.borrow().codec, VideoCodec::H265);
+        let (tx, rx) = watch::channel(VideoSettings { codec: VideoCodec::H265, ..Default::default() });
+        apply_rpc(&request, &tx, (1920, 1080), false, true, true, None).unwrap();
+        assert_eq!(rx.borrow().codec, VideoCodec::H265);
+        let (tx, rx) = watch::channel(VideoSettings { codec: VideoCodec::H265, ..Default::default() });
+        apply_rpc(&request, &tx, (1920, 1080), true, true, false, None).unwrap();
+        assert_eq!((rx.borrow().chroma, rx.borrow().codec), (CHROMA_420, VideoCodec::H265));
     }
 }
 
