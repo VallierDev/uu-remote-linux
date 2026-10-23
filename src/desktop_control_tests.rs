@@ -228,7 +228,7 @@ async fn capture_desktop_on_a_port_mapping_peer_promotes_it_once() {
         // The Mac viewer opens the desktop on its existing port-mapping peer (#99).
         send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(5, 0, 3, &[8, 4])).await;
         tokio::time::timeout(Duration::from_secs(5), requested.recv()).await.unwrap().unwrap();
-        host.promote();
+        host.promote(None);
         assert!(host.role.is_desktop());
         assert!(host.role.input().is_some_and(|session| session.is_current()));
         // CONTROL repeats the desktop initialization for the same viewer.
@@ -242,8 +242,18 @@ async fn capture_desktop_on_a_port_mapping_peer_promotes_it_once() {
         receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
         assert!(requested.try_recv().is_err());
         let lease = host.role.input().unwrap();
-        host.promote();
+        host.promote(None);
         assert!(lease.is_current());
+        // A newer desktop demotes it; the port mapping stays, and capture_desktop promotes it again.
+        host.demote();
+        assert!(!host.role.is_desktop() && host.role.input().is_none());
+        send(&viewer, "FILE_DATA_CHANNEL", mapping(2, b"after demotion")).await;
+        receive(&mut viewer.messages, "FILE_DATA_CHANNEL", 27).await;
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(8, 0, 3, &[8, 4])).await;
+        tokio::time::timeout(Duration::from_secs(5), requested.recv()).await.unwrap().unwrap();
+        host.promote(None);
+        assert!(host.role.is_desktop() && host.role.input().is_some_and(|session| session.is_current()));
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
         host.pc.close().await.unwrap();
         viewer.pc.close().await.unwrap();
         viewer.router.lock().await.stop().await.unwrap();

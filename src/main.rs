@@ -963,6 +963,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         for id in superseded_peer_ids(&sessions, &ice, desktop) {
                             if let Some(old) = sessions.remove(&id) { let _ = old.pc.close().await; }
                         }
+                        // A tool peer promoted by capture_desktop stops its desktop but keeps its tools.
+                        if desktop { for old in sessions.values() { old.demote(); } }
                         if desktop && desktop_backend::headless() {
                             log::info!("Desktop connection ignored: headless mode (terminal, file transfer and port mapping remain available)");
                             continue;
@@ -1052,19 +1054,27 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         log::info!("Desktop request on a tool connection not supported with the Portal backend; open the desktop before port mapping");
                         continue;
                     }
-                    if peer.capture.init_error.is_some() {
-                        log::info!("Desktop request on a tool connection ignored: desktop capture unavailable");
-                        continue;
-                    }
+                    let controller_mac = peer.controller_mac;
+                    // Same recovery as a desktop offer: the display may have come up after this peer.
+                    let screen = if peer.capture.init_error.is_some() {
+                        match tokio::task::spawn_blocking(ScreenCapture::new).await {
+                            Ok(Ok(screen)) => { capture = Arc::new(screen); Some(capture.clone()) },
+                            Ok(Err(error)) => { log::info!("Desktop request on a tool connection ignored: {error}"); continue; },
+                            Err(_) => { log::warn!("Desktop initialization worker failed"); continue; },
+                        }
+                    } else { None };
                     video::warm_auto_probe(); video::check_ffmpeg_usable();
-                    input.set_mac_controller(peer.controller_mac);
-                    input.bind_portal(peer.capture.portal.clone());
-                    // One desktop at a time, as for a new desktop offer. Only peers offered as
-                    // desktops close; this peer keeps its port mapping, files or terminal.
-                    let superseded: Vec<String> = sessions.iter().filter(|(id, old)| id.as_str() != ice && old.desktop)
+                    input.set_mac_controller(controller_mac);
+                    input.bind_portal(screen.as_ref().map_or_else(|| sessions[&ice].capture.portal.clone(), |screen| screen.portal.clone()));
+                    // One desktop at a time, as for a new desktop offer. Peers offered as desktops
+                    // close; a promoted tool peer only stops its desktop and keeps its tools.
+                    let superseded: Vec<String> = sessions.iter().filter(|(id, old)| id.as_str() != ice && old.role.is_desktop())
                         .map(|(id, _)| id.clone()).collect();
-                    for id in superseded { if let Some(old) = sessions.remove(&id) { let _ = old.pc.close().await; } }
-                    if let Some(peer) = sessions.get(&ice) { peer.promote(); }
+                    for id in superseded {
+                        if sessions[&id].desktop { if let Some(old) = sessions.remove(&id) { let _ = old.pc.close().await; } }
+                        else { sessions[&id].demote(); }
+                    }
+                    if let Some(peer) = sessions.get(&ice) { peer.promote(screen); }
                 }
                 SignalingEvent::Disconnected => {
                     capture_types.clear();

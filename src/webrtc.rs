@@ -47,17 +47,22 @@ pub struct SessionContext {
 /// capture_desktop instead of a new desktop offer (#99).
 pub struct DesktopRole {
     active: tokio::sync::watch::Sender<bool>,
-    input: std::sync::OnceLock<Arc<crate::input::DesktopInputSession>>,
+    input: std::sync::Mutex<Option<Arc<crate::input::DesktopInputSession>>>,
     stream: std::sync::Mutex<Option<DesktopStream>>,
+    /// Capture reinitialized at promotion; the peer's own capture was unavailable when offered.
+    screen: std::sync::Mutex<Option<Arc<ScreenCapture>>>,
     request: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 impl DesktopRole {
     fn new(desktop: bool) -> Self {
         Self { active: tokio::sync::watch::channel(desktop).0, input: Default::default(),
-            stream: Default::default(), request: Default::default() }
+            stream: Default::default(), screen: Default::default(), request: Default::default() }
     }
     pub fn is_desktop(&self) -> bool { *self.active.borrow() }
-    fn input(&self) -> Option<Arc<crate::input::DesktopInputSession>> { self.input.get().cloned() }
+    fn input(&self) -> Option<Arc<crate::input::DesktopInputSession>> { self.input.lock().unwrap().clone() }
+    fn screen_or(&self, screen: &Arc<ScreenCapture>) -> Arc<ScreenCapture> {
+        self.screen.lock().unwrap().clone().unwrap_or_else(|| screen.clone())
+    }
     /// Waits until this peer is a desktop; false once the channel closes first.
     async fn wait_desktop(&self, channel: &RTCDataChannel) -> bool {
         let mut active = self.active.subscribe();
@@ -75,6 +80,7 @@ impl DesktopRole {
 }
 
 /// Live desktop video for one peer; a tool peer keeps it unstarted until it becomes a desktop.
+#[derive(Clone)]
 struct DesktopStream {
     pc: std::sync::Weak<RTCPeerConnection>,
     track: Arc<crate::video_track::VideoTrack>,
@@ -102,17 +108,18 @@ pub struct WebRtcSession {
     actions: Arc<crate::system_actions::PeerActions>,
 }
 
-/// Counts a desktop session once it is connected (a failed offer is not a session).
-fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_actions::PeerActions>) {
+/// Counts a desktop session once it is connected (a failed offer is not a session),
+/// until the peer closes or a newer desktop demotes it.
+fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_actions::PeerActions>, active: tokio::sync::watch::Receiver<bool>) {
     tokio::spawn(async move {
         use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState as State;
         while end_pc.connection_state() != State::Connected {
-            if matches!(end_pc.connection_state(), State::Closed | State::Failed) { return; }
+            if matches!(end_pc.connection_state(), State::Closed | State::Failed) || !*active.borrow() { return; }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         let starting = actions.clone();
         let _ = tokio::task::spawn_blocking(move || starting.session_started()).await;
-        while !matches!(end_pc.connection_state(), State::Closed | State::Failed) {
+        while !matches!(end_pc.connection_state(), State::Closed | State::Failed) && *active.borrow() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         drop(end_pc);
@@ -121,12 +128,16 @@ fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_acti
 }
 
 impl DesktopStream {
-    /// Encode current frames only while the peer is connected.
-    fn spawn(self) {
+    /// Encode current frames only while the peer is connected and still the desktop.
+    fn spawn(self, screen: Option<Arc<ScreenCapture>>, mut active: tokio::sync::watch::Receiver<bool>) {
         let Some(streaming_pc) = self.pc.upgrade() else { return; };
         let DesktopStream { track: video_track, portal_desktop, capture_size, capture_display, portal,
             settings_rx, settings, idr_request, selection, chroma_sync, reload_at_session, .. } = self;
-        tokio::spawn(async move {
+        let (capture_size, capture_display, portal) = screen.map_or((capture_size, capture_display, portal),
+            |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
+        tokio::spawn(async move { tokio::select! {
+            _ = active.wait_for(|active| !*active) => log::info!("Live desktop stream stopped: a newer desktop took over"),
+            _ = async move {
             let screen = if let Some(desktop) = portal_desktop {
                 if let Err(error) = crate::locked_video::run(&streaming_pc, &video_track, &desktop, selection).await {
                     log::warn!("Locked desktop video unavailable: {error}");
@@ -155,7 +166,8 @@ impl DesktopStream {
                     log::error!("Live desktop stream stopped: {}", e);
                 }
             }
-        });
+            } => {},
+        } });
     }
 }
 
@@ -216,7 +228,7 @@ impl WebRtcSession {
         );
 
         let role = Arc::new(DesktopRole::new(desktop));
-        if desktop { let _ = role.input.set(input.desktop_session()); }
+        if desktop { *role.input.lock().unwrap() = Some(input.desktop_session()); }
         let context = Arc::new(Mutex::new(SessionContext::default()));
         crate::network_diagnostics::start(Arc::downgrade(&pc));
 
@@ -394,7 +406,7 @@ impl WebRtcSession {
         let peer_actions = Arc::new(crate::system_actions::PeerActions::default());
         let session_actions = peer_actions.clone();
         let desktop_sound = desktop && crate::audio::enabled();
-        if desktop && !cfg!(test) { track_session(pc.clone(), peer_actions.clone()); }
+        if desktop && !cfg!(test) { track_session(pc.clone(), peer_actions.clone(), role.active.subscribe()); }
         // Live encoder switch (SIGUSR2) sends CaptureSettingSync when chroma is downgraded.
         let (chroma_sync_tx, chroma_sync_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let chroma_sync_rx = Arc::new(std::sync::Mutex::new((!cfg!(test)).then_some(chroma_sync_rx)));
@@ -408,7 +420,7 @@ impl WebRtcSession {
         };
         drop(streaming_pc);
         if cfg!(test) { drop(stream); }
-        else if desktop { stream.spawn(); }
+        else if desktop { stream.spawn(None, role.active.subscribe()); }
         else { *role.stream.lock().unwrap() = Some(stream); }
         let input_clone = input.clone();
         let control_capture = capture.clone();
@@ -627,10 +639,10 @@ impl WebRtcSession {
                                         if channel.upgrade().is_none_or(|channel| channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open) { return; }
                                     }
                                 } else {
-                                    Some(initial_screen.clone())
+                                    Some(capture_role.screen_or(&initial_screen))
                                 }
                             } else {
-                                Some(initial_screen.clone())
+                                Some(capture_role.screen_or(&initial_screen))
                             };
                             let Some(active_screen) = active_screen else { continue; };
                             let input_size = if active_screen.init_error.is_none() {
@@ -922,7 +934,9 @@ impl WebRtcSession {
                             let next_seq = || sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             // Default file-transfer folder: the desktop user's home directory.
                             let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-                            let (mut desktop, mut promoted) = (desktop, false);
+                            let (mut desktop, mut promoted, mut lock_reported) = (desktop, false, desktop);
+                            let mut screen = screen;
+                            loop {
                             loop {
                                 let timestamp = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -968,18 +982,23 @@ impl WebRtcSession {
                                 // desktop initialization once the host has started its video and input.
                                 if !role.wait_desktop(&channel).await { return; }
                                 (desktop, promoted) = (true, true);
+                                screen = role.screen_or(&screen);
+                            }
+                            if !lock_reported {
+                                lock_reported = true;
                                 tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), crate::session_lock::watch_locked()));
                             }
                             // Mirror the Linux pointer shape; the video itself carries no pointer.
                             let mut shapes = crate::cursor::monitor(&screen.display);
                             let mut health = tokio::time::interval(std::time::Duration::from_millis(200));
                             let mut sent = 0usize;
-                            loop {
+                            let mut active = role.active.subscribe();
+                            'cursor: loop {
                                 let current = shapes.borrow_and_update().clone();
                                 if let Some(cursor) = current {
                                     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                     let message = crate::cursor::encode_cursor_shape(next_seq(), timestamp, &cursor);
-                                    if channel.send(&bytes::Bytes::from(message)).await.is_err() { break; }
+                                    if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
                                     sent += 1;
                                     if sent <= 3 || sent % 100 == 0 {
                                         log::info!("Cursor shape sent: count={} size={}x{} hotspot={},{} png_bytes={}", sent, cursor.width, cursor.height, cursor.hot_x, cursor.hot_y, cursor.png.len());
@@ -988,11 +1007,16 @@ impl WebRtcSession {
                                 loop {
                                     tokio::select! {
                                         changed = shapes.changed() => { if changed.is_err() { return; } break; },
+                                        _ = active.wait_for(|active| !*active) => break 'cursor,
                                         _ = health.tick() => {
                                             if channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { return; }
                                         },
                                     }
                                 }
+                            }
+                            // A newer desktop took over this promoted tool peer; wait for capture_desktop again.
+                            if !role.wait_desktop(&channel).await { return; }
+                            screen = role.screen_or(&screen);
                             }
                           });
                         })
@@ -1002,7 +1026,7 @@ impl WebRtcSession {
 
                 d.on_message(Box::new(move |msg: DataChannelMessage| {
                     // Keep the whole state: a cached screen waiting for a closed Portal is not ready for input.
-                    let (screen, desktop_ready) = portal_desktop.as_ref().map_or_else(|| (screen.clone(), true), |desktop| {
+                    let (screen, desktop_ready) = portal_desktop.as_ref().map_or_else(|| (channel_role.screen_or(&screen), true), |desktop| {
                         let state = desktop.snapshot();
                         let ready = state.ready();
                         (state.screen, ready)
@@ -1389,15 +1413,27 @@ impl WebRtcSession {
 
     /// Makes this tool peer the desktop: it takes the input lease, starts the video it negotiated
     /// (H.264; audio was never negotiated) and repeats the desktop CONTROL initialization.
-    pub fn promote(&self) {
+    /// `screen` replaces a capture that was unavailable when the peer was offered.
+    pub fn promote(&self, screen: Option<Arc<ScreenCapture>>) {
         if self.role.is_desktop() { return; }
+        if let Some(screen) = screen { *self.role.screen.lock().unwrap() = Some(screen); }
         let session = self.input.desktop_session();
         if self.pc.connection_state() == RTCPeerConnectionState::Connected { session.connected(); }
-        let _ = self.role.input.set(session);
-        if let Some(stream) = self.role.stream.lock().unwrap().take() { stream.spawn(); }
-        if !cfg!(test) { track_session(self.pc.clone(), self.actions.clone()); }
+        *self.role.input.lock().unwrap() = Some(session);
         self.role.active.send_replace(true);
+        let stream = self.role.stream.lock().unwrap().clone();
+        if let Some(stream) = stream { stream.spawn(self.role.screen.lock().unwrap().clone(), self.role.active.subscribe()); }
+        if !cfg!(test) { track_session(self.pc.clone(), self.actions.clone(), self.role.active.subscribe()); }
         log::info!("Desktop started on an existing tool connection");
+    }
+
+    /// A newer desktop took over a promoted tool peer: stop its video, input and session count,
+    /// keep the connection's tools. capture_desktop on it promotes it again.
+    pub fn demote(&self) {
+        if self.desktop || !self.role.is_desktop() { return; }
+        self.role.active.send_replace(false);
+        if let Some(session) = self.role.input.lock().unwrap().take() { session.disconnected(); }
+        log::info!("Desktop on a tool connection stopped: a newer desktop took over");
     }
 
     /// 应用远端 Offer，生成并返回 Answer
