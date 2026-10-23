@@ -147,16 +147,26 @@ pub struct ProbeReport {
 
 impl ProbeReport {
     pub fn fresh(order: Vec<Encoder>, outcomes: Vec<ProbeOutcome>, chosen: Encoder, now: std::time::Instant) -> Self {
-        let expires_at = probe_failure_deadline(&outcomes, now);
+        let expires_at = probe_failure_deadline(&order, &outcomes, chosen, now);
         Self { order, outcomes, chosen, expires_at }
     }
 }
 
-/// Hardware probe failure (NVENC failed, chosen CPU) expires. `NotProbed` and `Ok`
-/// do not. `NativeUnprobed` keeps the legacy encoder and is not a failure cache.
-pub fn probe_failure_deadline(outcomes: &[ProbeOutcome], now: std::time::Instant) -> Option<std::time::Instant> {
-    let failed = outcomes.iter().any(|o| matches!(o, ProbeOutcome::Fail(_)));
-    failed.then_some(now + PROBE_FAILURE_TTL)
+/// Expiry is only for the hardware candidate that caused the CPU fallback
+/// (NVENC `Fail` and `chosen == Cpu`). A `Fail` on CPU while NVENC is `Ok`
+/// does not expire, and doctor does not label that report a failure.
+/// `NotProbed` and `Ok` do not. `NativeUnprobed` keeps the legacy encoder
+/// and is not a failure cache.
+pub fn probe_failure_deadline(
+    order: &[Encoder],
+    outcomes: &[ProbeOutcome],
+    chosen: Encoder,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    let hardware_failed = order.iter().zip(outcomes).any(|(encoder, outcome)| {
+        *encoder != Encoder::Cpu && matches!(outcome, ProbeOutcome::Fail(_))
+    });
+    (hardware_failed && chosen == Encoder::Cpu).then_some(now + PROBE_FAILURE_TTL)
 }
 
 pub fn probe_expired(report: &ProbeReport, now: std::time::Instant) -> bool {
@@ -189,6 +199,11 @@ pub fn probe_needs_run(now: std::time::Instant) -> bool {
         Some(report) => probe_expired(&report, now),
     }
 }
+
+/// Tests that call `clear_probe` / `store_probe` share this lock. The probe
+/// cache is process-global and `cargo test` runs tests in parallel.
+#[cfg(test)]
+pub(crate) static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 pub fn clear_probe() {
@@ -481,6 +496,7 @@ mod tests {
 
     #[test]
     fn session_before_probe_uses_legacy_auto() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_probe();
         assert!(cached_probe().is_none());
         let early = resolve_pair(None, None, None, None, false, None);
@@ -529,12 +545,37 @@ mod tests {
         assert_eq!(failed.chosen, Encoder::Cpu);
     }
 
+    /// NVENC produced an IDR and CPU failed: the session uses NVENC, so this is
+    /// not the hardware-fallback cache. No TTL, and doctor (which keys off
+    /// `expires_at`) does not append the failure label.
+    #[test]
+    fn nvenc_ok_cpu_fail_does_not_expire() {
+        let now = std::time::Instant::now();
+        let report = ProbeReport::fresh(
+            auto_order(true),
+            vec![ProbeOutcome::Ok, ProbeOutcome::Fail(ProbeFail::Exit)],
+            Encoder::Nvenc,
+            now,
+        );
+        assert_eq!(report.chosen, Encoder::Nvenc);
+        assert!(report.expires_at.is_none());
+        assert!(!probe_expired(&report, now + PROBE_FAILURE_TTL + std::time::Duration::from_secs(1)));
+        let cpu_only_fail = ProbeReport::fresh(
+            auto_order(false),
+            vec![ProbeOutcome::Fail(ProbeFail::Exit)],
+            Encoder::Cpu,
+            now,
+        );
+        assert!(cpu_only_fail.expires_at.is_none(), "a CPU-only Fail is not a hardware fallback");
+    }
+
     /// Failed NVENC stays CPU until `PROBE_FAILURE_TTL`. After that a desktop connection
     /// asks for one background re-probe (`probe_needs_run`, what `warm_auto_probe` checks)
     /// and still selects the cached CPU encoder. A successful re-probe selects NVENC and
     /// does not expire. A second failure restarts the TTL.
     #[test]
     fn failure_then_reprobe_success_selects_nvenc() {
+        let _guard = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_probe();
         let t0 = std::time::Instant::now();
         let failed = ProbeReport::fresh(

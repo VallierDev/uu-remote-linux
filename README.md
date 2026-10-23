@@ -85,7 +85,7 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 
 锁屏黑帧使用 FFmpeg 的 libx264/libx265 编码器（按已协商的 H.264/H.265 选择），硬件编码器可用并不代表这些软件编码器已安装。编码失败会明确记录日志。黑帧不改变采集权限或上报的真实屏幕尺寸；解锁或锁状态未知时暂停，采集就绪、拒绝或连接关闭时结束，再由真实视频接续同一条视频轨。对照实验与验证范围见 [#29](../../issues/29)、[#34](../../pull/34)。
 
-原生 Wayland 后端需要合成器提供 `wlr-output-power-management` 才能唤醒已关闭的屏幕；缺少该协议不影响采集和编码。
+原生 Wayland 后端需要合成器提供 `wlr-output-power-management` 才能唤醒已关闭的屏幕；缺少该协议不影响采集和编码。视频启动及运行期间，屏幕保活失败仅记录警告并在下轮重试，不终止视频；实际采集、编码或发送错误仍按原逻辑处理。
 
 原生 Wayland 实验选项：`UU_WAYLAND_PIPELINE=0` 可关闭流水线做对照。`UU_WAYLAND_DMABUF=1` 显式尝试 dma-buf→GBM CPU 映射（默认关闭，需要运行时 libgbm；可用 `UU_WAYLAND_DMABUF_DEVICE` 指定 render node，默认 `/dev/dri/renderD128`）。仅支持显式线性修饰符、单平面 8-bit RGB，失败回退 SHM；virgl VM 中只验证了回退，成功导入/映射和硬件加速均未验证。这不是零拷贝 VAAPI 路径；选择 `UU_VIDEO_ENCODER=vaapi` 时仍由 FFmpeg 上传 CPU 帧。
 首次连接时，桌面会弹窗请求「远程桌面 / 屏幕共享」授权，同意后会记住授权。
@@ -487,6 +487,19 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
 - 命令行：`connect DEVICE false - echo legacy [--view-only]`（桌面）、`files DEVICE ls|get|put …`、`terminal DEVICE [SESSION]`、
   `terminal-ui DEVICE NAME`、`portmap DEVICE LOCAL_PORT HOST PORT`（只监听 127.0.0.1）、`power DEVICE reboot|shutdown`、`unbind DEVICE`（从账号删除设备，启动窗口「更多工具」里也有）、
   `assist CONNECT_ID`（验证码从 stdin 读取一行，不能作为参数传入）。`uuremote-viewer --help` 查看全部参数。
+- **安全输入 `type`**（向已打开的桌面会话注入键盘，适合锁屏 PIN / 密码；文本永不进 argv）：
+  ```sh
+  # 推荐：先 ui/connect 打开桌面，再 type（复用会话，不顶掉当前画面）
+  UU_INPUT_ENV=UU_SECRET UU_SECRET='……' \
+    uuremote-viewer type DEVICE [--delay-ms 40] [--omit-last 1] [--snapshot /path/out.png]
+  # 或：printf '%s' '……' | uuremote-viewer type DEVICE
+  # 只检查、不连网：uuremote-viewer type DEVICE --dry-run
+  # 没有正在运行的桌面会话时必须显式：--new-session（会新开连接，并顶掉已打开的桌面窗口，见上游 #30）
+  ```
+  特殊键用花括号：`{Enter}` `{Tab}` `{Esc}` `{Backspace}` `{Ctrl+Alt+Del}` 等；`{{` 表示字面 `{`。
+  **布局**：字符按 **US QWERTY** 物理键位映射（非美式布局的符号/字母可能对不上）。
+  **Windows 数字 PIN**：输满位数后系统常会自动提交，一般不必再发 `{Enter}`；若只想填入、不登录，用 `--omit-last N` 省略最后 N 个字符。
+  日志与 `--dry-run` 输出只含长度/事件数，不含明文。复用会话时，发送约 1 秒后会保存一帧 PNG（默认写在 `$XDG_RUNTIME_DIR/uu-viewer-type/`，权限 0600），路径打在日志并打印 `snapshot=…`。
 - 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
   `UU_VIEWER_VIEW_ONLY=1` 只看不控，`UU_VIEWER_FFMPEG` 指定 ffmpeg 路径。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。

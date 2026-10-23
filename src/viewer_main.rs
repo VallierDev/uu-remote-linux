@@ -13,7 +13,7 @@ use viewer::clipboard;
 #[cfg(test)] #[path="initialization.rs"] mod initialization;
 use viewer::{api::Api,rtc::ReadyPolicy,session::{Options,Session},wire::Shape};
 use std::time::Duration;
-const HELP:&str="Experimental native viewer.\n  uuremote-viewer ui   (GTK window: sign-in, devices, sessions) Desktop UI requires viewer-sdl (decodes with the ffmpeg CLI, or FFmpeg 6.x libraries with viewer-ffmpeg).\n  uuremote-viewer power DEVICE reboot|shutdown\n  uuremote-viewer unbind DEVICE [--shared]   (从账号删除设备 / remove a device from the account)\n  uuremote-viewer terminal DEVICE [SESSION]\n  uuremote-viewer files DEVICE ls PATH | get REMOTE LOCAL | put LOCAL REMOTE\n  uuremote-viewer portmap DEVICE LOCAL_PORT HOST PORT\n  uuremote-viewer files-ui|portmap-ui|terminal-ui DEVICE NAME   (GTK tool windows)\n  uuremote-viewer login [--no-gui]\n  uuremote-viewer devices METHOD ARRAY_POINTER ID_POINTER NAME_POINTER\n  uuremote-viewer assist CONNECT_ID   (验证码从 stdin 读取一行)\n  uuremote-viewer connect DEVICE true|false SHAPE_JSON echo|manual raw|legacy [--view-only]\nVideo: UU_VIEWER_CODEC=h264 forces H.264; UU_VIEWER_CHROMA=444 requests true color (default 4:2:0).\nAudio: UU_VIEWER_AUDIO=0 disables playback. UU_VIEWER_VIEW_ONLY=1 disables desktop input.\nDevice-list method/JSON pointers and compatibility shape require verified operator configuration.\nQR login reuses the sibling uuremote-server login command. Never run login in a captured log.\nEcho readiness is transport observation only; no sendVideoTrack RPC is emitted.";
+const HELP:&str="Experimental native viewer.\n  uuremote-viewer ui   (GTK window: sign-in, devices, sessions) Desktop UI requires viewer-sdl (decodes with the ffmpeg CLI, or FFmpeg 6.x libraries with viewer-ffmpeg).\n  uuremote-viewer power DEVICE reboot|shutdown\n  uuremote-viewer type DEVICE [options]   (secret from UU_INPUT_ENV or stdin; reuses running viewer)\n    options: --delay-ms MS --omit-last N --snapshot PATH --dry-run --new-session\n  uuremote-viewer unbind DEVICE [--shared]   (从账号删除设备 / remove a device from the account)\n  uuremote-viewer terminal DEVICE [SESSION]\n  uuremote-viewer files DEVICE ls PATH | get REMOTE LOCAL | put LOCAL REMOTE\n  uuremote-viewer portmap DEVICE LOCAL_PORT HOST PORT\n  uuremote-viewer files-ui|portmap-ui|terminal-ui DEVICE NAME   (GTK tool windows)\n  uuremote-viewer login [--no-gui]\n  uuremote-viewer devices METHOD ARRAY_POINTER ID_POINTER NAME_POINTER\n  uuremote-viewer assist CONNECT_ID   (验证码从 stdin 读取一行)\n  uuremote-viewer connect DEVICE true|false SHAPE_JSON echo|manual raw|legacy [--view-only]\nVideo: UU_VIEWER_CODEC=h264 forces H.264; UU_VIEWER_CHROMA=444 requests true color (default 4:2:0).\nAudio: UU_VIEWER_AUDIO=0 disables playback. UU_VIEWER_VIEW_ONLY=1 disables desktop input.\nDevice-list method/JSON pointers and compatibility shape require verified operator configuration.\nQR login reuses the sibling uuremote-server login command. Never run login in a captured log.\nEcho readiness is transport observation only; no sendVideoTrack RPC is emitted.";
 const DEFAULT_SHAPE:&str=r#"{"capture_type":1,"platform":3,"client_version":"4.42.0","width":1920,"height":1080,"fps":60,"chroma":1,
  "decoders":[{"fps":60,"codec":1,"width":3840,"height":2160,"chroma":1}],"display_modes":[[1920,1080,60]],
  "displays":[{"id":1,"fps":60,"type":0,"hdr":0}],
@@ -60,6 +60,7 @@ async fn run(args:&[String])->Result<(),String> {
             println!("已从账号删除设备");Ok(())
         }
         Some("power")=>power_command(args).await,
+        Some("type")=>type_command(args).await,
         Some("terminal-local") if args.len()==2 || args.len()==3=>{
             let session=if args.len()==3{Some(args[2].parse::<u32>().ok().filter(|n|*n!=0).ok_or("Invalid terminal session id")?)}else{None};
             viewer::tools::terminal_ipc::client(std::path::Path::new(&args[1]),session).await
@@ -111,11 +112,93 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     let options=Options{timeout:Duration::from_secs(12),legacy_prefix:legacy,ready_policy:policy,clipboard};
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
     #[cfg(feature="viewer-sdl")]
-    let result=if let Some((window,decoder))=desktop.as_mut(){viewer::sdl::run(&mut session,window,decoder.as_mut(),view_only).await}else{session.run().await};
+    let result=if let Some((window,decoder))=desktop.as_mut(){viewer::sdl::run(&mut session,window,decoder.as_mut(),view_only,&args[1]).await}else{session.run().await};
     #[cfg(not(feature="viewer-sdl"))]
     let result=session.run().await;
     session.close().await;result
 }
+async fn type_command(args:&[String])->Result<(),String>{
+    // type DEVICE [--delay-ms MS] [--omit-last N] [--snapshot PATH] [--dry-run] [--new-session]
+    if args.len()<2 || args[1].trim().is_empty() { return Err(HELP.into()) }
+    let device=&args[1];
+    let mut delay_ms:Option<&str>=None;
+    let mut omit_last:Option<&str>=None;
+    let mut snapshot:Option<String>=None;
+    let mut dry_run=false;
+    let mut new_session=false;
+    let mut i=2;
+    while i<args.len() {
+        match args[i].as_str() {
+            "--delay-ms" => {
+                i+=1; delay_ms=Some(args.get(i).map(String::as_str).ok_or_else(||HELP.to_string())?);
+            }
+            "--omit-last" => {
+                i+=1; omit_last=Some(args.get(i).map(String::as_str).ok_or_else(||HELP.to_string())?);
+            }
+            "--snapshot" => {
+                i+=1; snapshot=Some(args.get(i).cloned().ok_or_else(||HELP.to_string())?);
+            }
+            "--dry-run" => { dry_run=true; }
+            "--new-session" => { new_session=true; }
+            _ => return Err(HELP.into()),
+        }
+        i+=1;
+    }
+    let delay=viewer::secure_input::parse_delay_ms(delay_ms)?;
+    let omit=viewer::secure_input::parse_omit_last(omit_last)?;
+    let mut secret=viewer::secure_input::load_secret(std::io::stdin().lock())?;
+    if dry_run {
+        let report=viewer::secure_input::dry_run_report(&secret, omit, false)?;
+        drop(secret);
+        println!("{report}");
+        return Ok(());
+    }
+    secret.omit_last_chars(omit)?;
+    // Prefer a running desktop viewer (avoids force-replacing the live session, upstream #30).
+    match viewer::type_ipc::socket_path(device) {
+        Ok(path) if path.exists() && !new_session => {
+            let req=viewer::type_ipc::TypeRequest{
+                delay_ms: delay.as_millis() as u64,
+                omit_last: 0, // already applied locally
+                snapshot,
+                secret: secret.as_str().to_owned(),
+            };
+            drop(secret);
+            let response=viewer::type_ipc::send_to_viewer(device, req).await?;
+            if !response.ok {
+                return Err(response.error.unwrap_or_else(||"Secure input failed on running viewer".into()));
+            }
+            println!("安全输入已发送（{} 个按键事件，{} 字符）。", response.events, response.chars);
+            if let Some(path)=response.snapshot {
+                println!("snapshot={path}");
+                log::info!("Secure input snapshot: {path}");
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    if !new_session {
+        drop(secret);
+        return Err("No running desktop viewer for this device; open a connect/ui session first, or pass --new-session".into());
+    }
+    let mut shape:Shape=serde_json::from_str(DEFAULT_SHAPE).map_err(|_|"Invalid built-in type shape")?;
+    shape.capture_type=1;
+    let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),auth::BASE_URL);
+    let room=api.join(device,false,true).await.map_err(|e|e.to_string())?;
+    let mac=api.target_is_mac(&room,Some(device)).await.map_err(|e|e.to_string())?;
+    let actions=viewer::secure_input::expand(secret.as_str(),mac)?;
+    let event_count=actions.len();
+    let char_count=secret.chars_count();
+    drop(secret);
+    log::info!("Secure input prepared (new session): chars={} events={} delay_ms={} mac={}", char_count, event_count, delay.as_millis(), mac);
+    let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly,clipboard:clipboard::Bridge::new(false)};
+    let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
+    let result=viewer::secure_input::run_session(&mut session,actions.as_slice(),delay).await;
+    session.close().await;
+    if result.is_ok(){println!("安全输入已发送（{event_count} 个按键事件）；新会话路径无截图。");}
+    result
+}
+
 fn credentials()->Result<auth::Credentials,String> {auth::Credentials::load(config::read_fresh().map_err(|_|"Cannot read credential configuration")?.as_ref())}
 fn api()->Result<Api,String> {Ok(Api::new(auth::UUAuthClient::new(credentials()?),auth::BASE_URL))}
 
@@ -128,9 +211,32 @@ mod cli_tests {
     use super::*;
     #[tokio::test]
     async fn invalid_commands_never_fall_through_to_login_or_host_service() {
-        for args in [vec!["invalid"],vec!["power"],vec!["power","device","logout"],vec!["power","device","reboot","extra"],vec!["login","--invalid"],vec!["connect"],vec!["assist"],vec!["assist","id","forbidden-code-argument"],vec!["terminal"],vec!["terminal","device","extra"],vec!["terminal","device","0"],vec!["terminal","device","4294967296"],vec!["terminal-ui","device"],vec!["files","device","bad","path"],vec!["portmap","device","bad","host","80"],vec!["portmap","device","8000","host","0"],vec!["devices","DELETE","/data","/id","/name"],vec!["unbind"],vec!["unbind",""],vec!["unbind","device","--other"],vec!["unbind","device","--shared","extra"]] {
+        for args in [vec!["invalid"],vec!["power"],vec!["power","device","logout"],vec!["power","device","reboot","extra"],vec!["type"],vec!["type","device","--delay-ms"],vec!["type","device","--delay-ms","x"],vec!["type","device","extra"],vec!["type","device","--omit-last"],vec!["type","device","--snapshot"],vec!["login","--invalid"],vec!["connect"],vec!["assist"],vec!["assist","id","forbidden-code-argument"],vec!["terminal"],vec!["terminal","device","extra"],vec!["terminal","device","0"],vec!["terminal","device","4294967296"],vec!["terminal-ui","device"],vec!["files","device","bad","path"],vec!["portmap","device","bad","host","80"],vec!["portmap","device","8000","host","0"],vec!["devices","DELETE","/data","/id","/name"],vec!["unbind"],vec!["unbind",""],vec!["unbind","device","--other"],vec!["unbind","device","--shared","extra"]] {
             assert!(run(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).await.is_err());
         }
+    }
+    #[tokio::test]
+    async fn type_dry_run_and_no_viewer_paths_are_redacted() {
+        let _g = viewer::secure_input::ENV_LOCK.lock().unwrap();
+        std::env::set_var("UU_INPUT_ENV", "UU_TYPE_SENTINEL_ENV");
+        std::env::set_var("UU_TYPE_SENTINEL_ENV", "sentinel-SECRET-9f3a");
+        let out = {
+            // dry-run
+            let args: Vec<String> = ["type","missing-device-id","--dry-run"].into_iter().map(str::to_owned).collect();
+            // reload env for dry-run — previous load_secret removed the var
+            std::env::set_var("UU_INPUT_ENV", "UU_TYPE_SENTINEL_ENV");
+            std::env::set_var("UU_TYPE_SENTINEL_ENV", "sentinel-SECRET-9f3a");
+            run(&args).await
+        };
+        assert!(out.is_ok(), "{out:?}");
+        std::env::set_var("UU_INPUT_ENV", "UU_TYPE_SENTINEL_ENV");
+        std::env::set_var("UU_TYPE_SENTINEL_ENV", "sentinel-SECRET-9f3a");
+        let err = run(&["type".into(),"missing-device-id".into()]).await.unwrap_err();
+        assert!(err.contains("No running desktop viewer") || err.contains("--new-session"), "{err}");
+        assert!(!err.contains("sentinel"));
+        assert!(!err.contains("SECRET"));
+        std::env::remove_var("UU_INPUT_ENV");
+        std::env::remove_var("UU_TYPE_SENTINEL_ENV");
     }
     #[tokio::test]
     async fn login_reuses_companion_subcommand_with_a_local_process_mock() {

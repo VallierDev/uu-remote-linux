@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "video_wake_tests.rs"]
+mod wake_tests;
+
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -627,6 +631,8 @@ async fn read_encoder(
     mut settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
     selection: crate::video_select::Selection,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if display == wake_tests::DISPLAY { return wake_tests::encode(latest, settings, sequence, budget).await; }
     // The sequence is shared so a CPU fallback or settings restart continues it (skip statistics stay correct).
     // `selection` is fixed for this desktop connection (taken where the codec is negotiated).
     let encoder = selection.encoder;
@@ -1073,6 +1079,15 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
     Ok(())
 }
 
+fn keep_stream_display_awake() {
+    #[cfg(test)]
+    let result = wake_tests::wake().unwrap_or_else(crate::capture::keep_display_awake);
+    #[cfg(not(test))]
+    let result = crate::capture::keep_display_awake();
+    // Waking the output is optional; a transient failure does not mean capture failed.
+    if result.is_err() { log::warn!("Display wake failed; continuing desktop stream and retrying next interval"); }
+}
+
 pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, mut size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
     selection: crate::video_select::Selection) -> Result<(), String> {
@@ -1085,7 +1100,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
     }
     // Portal power/idle policy belongs to its CONTROL-scoped supervisor,
     // including when video has no frames or the user locks manually.
-    if portal.is_none() { crate::capture::keep_display_awake()?; }
+    if portal.is_none() { keep_stream_display_awake(); }
     let portal_stream = portal.is_some();
     let (latest, mut receiver) = mpsc::channel(4);
     let budget=Arc::new(Semaphore::new(4));
@@ -1210,8 +1225,10 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                 previous = Some(frame.sequence);
                 max_send_ms=max_send_ms.max(send_started.elapsed().as_millis());
                 frames += 1;
+                #[cfg(test)]
+                if wake_tests::active() { stats = Instant::now() - Duration::from_secs(30); }
                 if stats.elapsed() >= Duration::from_secs(30) {
-                    if !portal_stream { crate::capture::keep_display_awake()?; }
+                    if !portal_stream { keep_stream_display_awake(); }
                     log::info!("Desktop latest-frame stats: sent={} skipped={} latest_seq={} window_s={} window_sent={} window_skipped={} max_slot_age_ms={} max_send_ms={}",
                         frames, skipped, frame.sequence, stats.elapsed().as_secs(), frames - window_frames, skipped - window_skipped, max_age_ms, max_send_ms);
                     (window_frames, window_skipped) = (frames, skipped);

@@ -94,7 +94,7 @@ Existing screen-off and lock settings remain unchanged. Only capture recovery in
 
 Locked black video requires FFmpeg's libx264/libx265 encoder for the negotiated H.264/H.265 codec; hardware encoding support alone does not satisfy this dependency. Encoder failures are logged explicitly. Synthetic video does not change capture permissions or advertised monitor dimensions. It pauses on unlock or unknown lock state, ends when capture is ready/rejected or the connection closes, and then hands the same video track to real capture. See [#29](../../issues/29) and [#34](../../pull/34) for the controlled experiment and validation scope.
 
-The native Wayland backend needs `wlr-output-power-management` from the compositor to wake a turned-off screen; without it only wake is unavailable — capture and encoding are unaffected.
+The native Wayland backend needs `wlr-output-power-management` from the compositor to wake a turned-off screen; without it only wake is unavailable — capture and encoding are unaffected. Display-wake failures at video startup or during streaming are logged and retried at the next interval without ending the video stream; capture, encoder and send errors retain their existing handling.
 
 Native Wayland experiments: `UU_WAYLAND_PIPELINE=0` disables pipelining for comparison.
 `UU_WAYLAND_DMABUF=1` explicitly tries dma-buf → GBM CPU mapping (off by default;
@@ -553,6 +553,19 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
 - CLI: `connect DEVICE false - echo legacy [--view-only]` (desktop), `files DEVICE ls|get|put …`, `terminal DEVICE [SESSION]`,
   `terminal-ui DEVICE NAME`, `portmap DEVICE LOCAL_PORT HOST PORT` (listens on 127.0.0.1 only), `power DEVICE reboot|shutdown`, `unbind DEVICE` (remove a device from the account; also under "More tools" in the launcher),
   `assist CONNECT_ID` (the code is read from one stdin line, never an argument). See `uuremote-viewer --help`.
+- **Secure `type` input** (inject keystrokes into an open desktop session — lock-screen PIN/password; never put secrets on argv):
+  ```sh
+  # Preferred: open desktop via ui/connect first, then type (reuses the session; does not kick the live view)
+  UU_INPUT_ENV=UU_SECRET UU_SECRET='…' \
+    uuremote-viewer type DEVICE [--delay-ms 40] [--omit-last 1] [--snapshot /path/out.png]
+  # Or: printf '%s' '…' | uuremote-viewer type DEVICE
+  # Validate only, no network: uuremote-viewer type DEVICE --dry-run
+  # If no desktop viewer is running you must pass --new-session (opens a new peer and replaces any already-open desktop window; upstream #30)
+  ```
+  Brace tokens: `{Enter}` `{Tab}` `{Esc}` `{Backspace}` `{Ctrl+Alt+Del}` …; `{{` is a literal `{`.
+  **Layout**: characters are mapped for **US QWERTY** only (non-US layouts may mistype symbols/letters).
+  **Windows numeric PIN**: Windows often submits automatically once enough digits are entered — usually no `{Enter}` needed. Use `--omit-last N` to omit the last N characters when you want to fill without signing in.
+  Logs and `--dry-run` report lengths/event counts only. When reusing a session, about one second after sending, a PNG frame is saved (default under `$XDG_RUNTIME_DIR/uu-viewer-type/`, mode 0600); the path is logged and printed as `snapshot=…`.
 - Ctrl+Alt+F in the desktop window opens the files window on the same connection. `UU_VIEWER_AUDIO=0` disables sound,
   `UU_VIEWER_CLIPBOARD=0` the clipboard, `UU_VIEWER_VIEW_ONLY=1` input; `UU_VIEWER_FFMPEG` selects the ffmpeg binary.
 - Desktop offers H.264 / H.265; the host chooses the codec. `UU_VIEWER_CODEC=h264` limits both SDP and decoder capabilities to H.264.
