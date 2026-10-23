@@ -497,8 +497,13 @@ pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
     let _flight = auto_probe_flight().lock().await;
     if let Some(cached) = crate::video_select::cached_probe() { return cached; }
     let order = crate::video_select::auto_order(nvidia_present());
+    // One candidate (CPU, no NVIDIA) has nothing to choose; skip the synthetic IDR.
     let mut outcomes = Vec::with_capacity(order.len());
-    for encoder in &order { outcomes.push(probe_encoder_idr(*encoder).await); }
+    if order.len() == 1 {
+        outcomes.push(crate::video_select::ProbeOutcome::Ok);
+    } else {
+        for encoder in &order { outcomes.push(probe_encoder_idr(*encoder).await); }
+    }
     let probed = crate::video_select::choose_from_probe(&order, &outcomes);
     let chosen = crate::video_select::chosen_after_native(nvidia_present(), &order, &outcomes, probed);
     let report = crate::video_select::ProbeReport { order, outcomes, chosen };
@@ -897,9 +902,7 @@ pub(crate) fn transport_closed(pc: &RTCPeerConnection) -> bool {
 }
 
 /// Encoder and settings for `desktop-video-probe` / `UU_PROBE_INPUT`.
-/// `UU_PROBE_CHROMA=444` is the viewer's 真彩 request: chroma and encoder both come from
-/// `selection_for_chroma` against the probe this process just finished, so auto-VAAPI moves
-/// to a probed 4:4:4 candidate the same way a desktop session does.
+/// `UU_PROBE_CHROMA=444` is the viewer's 真彩 request, applied when the selected encoder can do 4:4:4.
 pub(crate) fn probe_plan() -> Result<(crate::video_select::Selection, VideoSettings), String> {
     let fps=crate::wayland::capture_fps(std::env::var("UU_PROBE_FPS").ok().as_deref())?;
     // UU_PROBE_QUALITY selects a viewer preset (1 fast 1M, 2 general 2M, 3 HD 8M, 4 bluray 20M,
@@ -909,9 +912,8 @@ pub(crate) fn probe_plan() -> Result<(crate::video_select::Selection, VideoSetti
         Some(v)=>v.parse::<u64>().ok().filter(|q|(1..=5).contains(q)).ok_or("UU_PROBE_QUALITY must be 1-5")?,
     };
     let mut settings=VideoSettings {fps,quality,..VideoSettings::default()};
-    let base = crate::video_select::selection();
+    let selection = crate::video_select::selection();
     let chroma = if std::env::var("UU_PROBE_CHROMA").as_deref()==Ok("444") { crate::capture_setting::CHROMA_444 } else { crate::capture_setting::CHROMA_420 };
-    let selection = crate::video_select::selection_for_chroma(base, chroma, crate::video_select::cached_probe().as_ref());
     settings.codec = match crate::video_select::codec_force(selection.codec_pref) {
         Some("h265") => VideoCodec::H265,
         _ => VideoCodec::H264,
@@ -1032,7 +1034,7 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
 
 pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, mut size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
-    selection: crate::video_select::Selection, probe: Option<crate::video_select::ProbeReport>) -> Result<(), String> {
+    selection: crate::video_select::Selection) -> Result<(), String> {
     let _desktop_mode = crate::desktop_mode::StreamGuard::new();
     loop {
         if transport_closed(&pc) { return Ok(()); }
@@ -1054,7 +1056,6 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
         settings.borrow_and_update();
     }
     // Reader restarts reuse this snapshot, so set-encoder waits for the next desktop connection.
-    // Chroma can still move auto-VAAPI onto a 4:4:4 candidate from the probe this session saw.
     let open = {
         let display = display.clone();
         let portal = portal.clone();
@@ -1062,9 +1063,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
         let sequence = sequence.clone();
         let idr = idr.clone();
         let budget = budget.clone();
-        let probe = probe.clone();
         move |size: (u32, u32), selection: crate::video_select::Selection, settings: VideoSettings| {
-            let selection = crate::video_select::selection_for_chroma(selection, settings.chroma, probe.as_ref());
             read_encoder(size, display.clone(), portal.clone(), latest.clone(), settings, sequence.clone(), idr.clone(), budget.clone(), selection)
         }
     };
