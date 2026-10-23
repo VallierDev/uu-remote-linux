@@ -314,6 +314,12 @@ pub fn subscribe_reload() -> tokio::sync::watch::Receiver<u64> {
     reload_watch().subscribe()
 }
 
+/// True when SIGUSR2 has bumped the generation since the session snapshot.
+/// A background auto probe that finishes during setup does not bump it.
+pub fn reload_since_session(at_session: u64, current: u64) -> bool {
+    current != at_session
+}
+
 /// Publish the generation so every subscribed desktop stream wakes.
 pub fn publish_reload() {
     notify_reload();
@@ -609,7 +615,31 @@ mod tests {
         notify_reload();
         assert_eq!(reload_generation_value(), before + 1);
         assert_eq!(cached_probe(), Some(report));
+        assert!(reload_since_session(before, reload_generation_value()));
+        assert!(!reload_since_session(reload_generation_value(), reload_generation_value()));
         clear_probe();
+    }
+
+    #[test]
+    fn probe_finish_is_not_a_reload_since_the_session_snapshot() {
+        let at_session = reload_generation_value();
+        // A finished background probe updates the cache only. It does not bump the generation.
+        assert!(!reload_since_session(at_session, reload_generation_value()));
+        notify_reload();
+        assert!(reload_since_session(at_session, reload_generation_value()));
+    }
+
+    #[test]
+    fn mark_reload_seen_clears_has_changed() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut watch = subscribe_reload();
+            let _ = watch.borrow_and_update();
+            publish_reload();
+            assert!(watch.has_changed().unwrap());
+            let _ = watch.borrow_and_update();
+            assert!(!watch.has_changed().unwrap());
+        });
     }
 
     /// Codec at CONTROL open is `preferred_codec_for` on the session snapshot.

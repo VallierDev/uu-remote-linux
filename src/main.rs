@@ -212,16 +212,46 @@ mod cli_exit_tests {
         assert_eq!(super::reject_cli(Some("set-encoder"), 3, super::cli_pref_ok("set-encoder", "")), Some(2));
         assert_eq!(super::reject_cli(Some("set-codec"), 3, super::cli_pref_ok("set-codec", "  ")), Some(2));
     }
+
+    /// SIGUSR2 is installed with no assist UI. `host.pid` is written only after that handler exists.
+    #[test]
+    fn sigusr2_handler_installs_without_assist() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let path = super::host_pid_path();
+            if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).unwrap(); }
+            assert!(super::install_host_signals(None));
+            let pid = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(pid.trim(), std::process::id().to_string());
+        });
+    }
 }
 /// SIGUSR1 (`uuremote-server show`) opens the host window.
 /// SIGUSR2 (set-encoder, set-codec, or `kill -USR2`) re-reads host_settings. Encoder changes switch live desktop streams; codec changes are logged for the next connection.
-fn present_on_usr1(ui: std::sync::Arc<assist::LocalUi>) {
-    // Install the handlers before publishing the pid: the default action of either signal terminates the process.
-    let Ok(mut usr1) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) else { return };
-    let Ok(mut usr2) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) else { return };
+/// The default action of either signal terminates the process, so both handlers are installed before `host.pid` is written.
+/// SIGUSR2 is independent of remote assistance: `UU_REMOTE_ASSIST=0` and a failed assist setup still switch live encoders.
+fn install_host_signals(ui: Option<std::sync::Arc<assist::LocalUi>>) -> bool {
+    // Called again when assist attaches: SIGUSR2 is already installed, so only add SIGUSR1.
+    static USR2: std::sync::Once = std::sync::Once::new();
+    let mut usr2_ok = true;
+    USR2.call_once(|| {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
+            Ok(mut usr2) => { tokio::spawn(async move { while usr2.recv().await.is_some() { crate::video_select::publish_reload(); } }); }
+            Err(_) => usr2_ok = false,
+        }
+    });
+    if !usr2_ok { return false; }
+    if let Some(ui) = ui {
+        if let Ok(mut usr1) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+            tokio::spawn(async move { while usr1.recv().await.is_some() { ui.present(); } });
+        }
+    }
     write_host_pid();
-    tokio::spawn(async move { while usr1.recv().await.is_some() { ui.present(); } });
-    tokio::spawn(async move { while usr2.recv().await.is_some() { crate::video_select::publish_reload(); } });
+    true
+}
+
+fn present_on_usr1(ui: std::sync::Arc<assist::LocalUi>) {
+    let _ = install_host_signals(Some(ui));
 }
 
 fn host_pid_path() -> std::path::PathBuf { config::path().with_file_name("host.pid") }
@@ -540,6 +570,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     virtual_audio::init();
     let _audio_cleanup=virtual_audio::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
+    // Before host.pid, and before assist: a missing or failed assist session must still handle SIGUSR2.
+    let _ = install_host_signals(None);
     video::warm_auto_probe();
 
     if !desktop_backend::headless() && desktop_backend::detect()? == desktop_backend::DesktopBackend::X11 && desktop_backend::wayland_session_running() {

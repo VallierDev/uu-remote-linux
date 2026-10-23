@@ -65,6 +65,8 @@ impl WebRtcSession {
 
         // Encoder, codec preference and 4:4:4 stay fixed for this peer (codec is negotiated at CONTROL open).
         // Read once before the HEVC probe so a concurrent set-encoder/set-codec cannot split capability from CONTROL.
+        // reload_at_session is the generation at that snapshot. A probe that finishes later is not a reload.
+        let reload_at_session = crate::video_select::reload_generation_value();
         let video_selection = crate::video_select::selection();
         let hevc = desktop && crate::video::hevc_available(video_selection.encoder).await;
         if hevc { crate::video_track::register_hevc(&mut m).map_err(|e| format!("Register HEVC failed: {e}"))?; }
@@ -334,7 +336,7 @@ impl WebRtcSession {
                 let (capture_size, capture_display, portal) = screen.as_ref().map_or(
                     (capture_size, capture_display, portal),
                     |screen| ((screen.width, screen.height), screen.display.clone(), screen.portal.clone()));
-                if let Err(e) = crate::video::stream_desktop(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request, stream_selection, chroma_sync.clone()).await {
+                if let Err(e) = crate::video::stream_desktop_at(streaming_pc, video_track, capture_size, capture_display, portal, video_settings_rx, stream_settings, idr_request, stream_selection, chroma_sync.clone(), reload_at_session).await {
                     // A send racing the viewer's close fails with a misleading track error.
                     if matches!(state_pc.connection_state(), RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed) {
                         log::info!("Live desktop stream ended: peer connection closed ({})", e);

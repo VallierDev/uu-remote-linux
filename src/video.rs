@@ -1095,9 +1095,15 @@ fn keep_stream_display_awake() {
 }
 
 /// `sync_tx` receives a Message 25 payload when a live encoder switch changes the encoded chroma.
-pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, mut size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
-    mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
+pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
+    settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
     selection: crate::video_select::Selection, sync_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>) -> Result<(), String> {
+    stream_desktop_at(pc, track, size, display, portal, settings, applied, idr, selection, sync_tx, crate::video_select::reload_generation_value()).await
+}
+
+pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, mut size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
+    mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
+    selection: crate::video_select::Selection, sync_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>, reload_at_session: u64) -> Result<(), String> {
     let _desktop_mode = crate::desktop_mode::StreamGuard::new();
     loop {
         if transport_closed(&pc) { return Ok(()); }
@@ -1122,9 +1128,10 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
     // The negotiated codec stays; a codec-only change is logged and applied on the next connection.
     let mut live_selection = selection;
     let mut seen_codec_pref = selection.codec_pref;
-    let reload = crate::video_select::subscribe_reload();
-    // A SIGUSR2 that arrived before this stream subscribed is still visible as a fresh selection().
-    let mut reload_pending = true;
+    let mut reload = crate::video_select::subscribe_reload();
+    // Only a SIGUSR2 since the session snapshot. A probe that finishes during setup is not a reload
+    // (sessions started before the probe keep the legacy encoder for their lifetime).
+    let mut reload_pending = crate::video_select::reload_since_session(reload_at_session, *reload.borrow());
     let open = {
         let display = display.clone();
         let portal = portal.clone();
@@ -1136,7 +1143,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
             read_encoder(size, display.clone(), portal.clone(), latest.clone(), settings, sequence.clone(), idr.clone(), budget.clone(), selection)
         }
     };
-    let mut reader = EncoderTask(tokio::spawn(open(size, selection, current)));
+    let mut reader = EncoderTask(tokio::spawn(open(size, live_selection, current)));
     let mut previous = None;
     let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
     let mut settings_open = true;
@@ -1153,6 +1160,8 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
     'stream: loop {
         if reload.has_changed().unwrap_or(false) || reload_pending {
             reload_pending = false;
+            // Mark the watch seen. An unconsumed has_changed stays true and restarts every frame.
+            let _ = reload.borrow_and_update();
             let fresh = crate::video_select::selection();
             let plan = crate::video_select::plan_switch(live_selection.encoder, seen_codec_pref, &fresh, current.chroma);
             if let Some(plan) = plan.filter(|plan| plan.encoder.is_some()) {
@@ -1196,9 +1205,9 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                 reader.0.abort();
                 let _ = (&mut reader.0).await;
                 while receiver.try_recv().is_ok() {}
-                reader.0 = tokio::spawn(open(size, selection, next));
+                reader.0 = tokio::spawn(open(size, live_selection, next));
             } else {
-                reader.restart(open(size, selection, next)).await;
+                reader.restart(open(size, live_selection, next)).await;
             }
             send_interrupted=false;
         }
@@ -1209,7 +1218,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                     log::info!("Desktop geometry changed during the stream ({}x{} -> {}x{}); restarting capture", size.0, size.1, resized.0, resized.1);
                     size = resized;
                     while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(open(size, selection, current));
+                    reader.0 = tokio::spawn(open(size, live_selection, current));
                     continue;
                 }
                 if let (Err(error), VideoCodec::H265, true) = (&result, current.codec, track.supports(VideoCodec::H264)) {
@@ -1217,7 +1226,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                     applied.send_modify(|value| value.codec = VideoCodec::H264);
                     current = *settings.borrow_and_update();
                     while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(open(size, selection, current));
+                    reader.0 = tokio::spawn(open(size, live_selection, current));
                     continue;
                 }
                 if result.is_err() && !crate::wayland::outputs().is_empty() && !crate::wayland::input_ready() {
