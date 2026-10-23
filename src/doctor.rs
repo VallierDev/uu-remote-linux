@@ -114,16 +114,9 @@ pub async fn run() -> Result<(), String> {
     // Both codecs offered: hardware prefers H.265, CPU stays H.264 unless the preference forces one.
     let resolved = crate::capture_setting::pick_codec(true, true, crate::video_select::codec_force(selection.codec_pref), crate::video_select::hardware(selection.encoder));
     line("resolved codec", format!("{resolved:?}"));
-    let mut ffmpeg = crate::video::ffmpeg_command();
-    ffmpeg.args(["-hide_banner", "-encoders"]).kill_on_drop(true);
-    match tokio::time::timeout(std::time::Duration::from_secs(5), ffmpeg.output()).await {
-        Ok(Ok(output)) => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let found: Vec<&str> = ["libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi"].into_iter()
-                .filter(|name| text.split_whitespace().any(|word| word == *name)).collect();
-            line("ffmpeg encoders", if found.is_empty() { "none of libx264/libx265/nvenc/vaapi".to_owned() } else { found.join(", ") });
-        }
-        _ => line("ffmpeg encoders", "ffmpeg not runnable (install ffmpeg or set ffmpeg_root)"),
+    match crate::video::ffmpeg_encoders().await {
+        Some(found) => line("ffmpeg encoders", if found.is_empty() { "none of libx264/libx265/nvenc/vaapi".to_owned() } else { found.join(", ") }),
+        None => line("ffmpeg encoders", "ffmpeg not runnable (install ffmpeg or set ffmpeg_root)"),
     }
     let mut version = crate::video::ffmpeg_command();
     version.arg("-version").kill_on_drop(true);

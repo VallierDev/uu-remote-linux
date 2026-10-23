@@ -125,15 +125,19 @@ uuremote-server login                                   # 用 UU 远程 App 扫�
 systemctl --user enable --now uuremote-native.service   # 随图形会话启动
 ```
 
-deb 会安装程序、插件、用户级 systemd 服务和应用菜单图标；uinput 权限不会自动开启（见第 5 步）。
+deb 会安装程序、插件、用户级 systemd 服务和应用菜单图标，并通过依赖自动装上 FFmpeg；uinput 权限不会自动开启（见第 5 步）。
 GNOME / KDE 会把显示环境自动传给服务；Xfce 等不传的桌面需按第 4 步补 `DISPLAY`。
 
-**其他发行版**：从 [Releases](../../releases/latest) 下载 `uu-remote-linux-<版本>-x86_64-linux.tar.gz`（ARM64 选 `aarch64-linux`），解压后：
+**其他发行版**：从 [Releases](../../releases/latest) 下载 `uu-remote-linux-<版本>-x86_64-linux.tar.gz`（ARM64 选 `aarch64-linux`），解压后用普通桌面用户（不要 root）运行：
 
 ```sh
-install -Dm755 uuremote-server ~/.local/bin/uuremote-server
-install -Dm644 libuu-wayland.so libuu-portal.so -t ~/.local/lib/uu-remote-linux/
+cd uu-remote-linux-<版本>-x86_64-linux
+./install.sh          # 加 --yes 不询问；--no-ffmpeg 只检查不安装
 ```
+
+脚本把程序和插件装到 `~/.local`，写入用户级 systemd 服务（已有则保留），并检查 FFmpeg（需带 libx264，否则客户端会一直停在「正在传输画面」）。
+缺 FFmpeg 时经 sudo 用 apt / pacman 安装；Fedora 需先启用 RPM Fusion，openSUSE 需 Packman 源，脚本只提示命令、不替你添加第三方源。
+服务启动时如果 FFmpeg 不可用，也会在日志里报错。
 
 同一个包支持 X11、Hyprland 等 wlroots 合成器和 GNOME/KDE Wayland：程序启动时按当前会话自动选择后端，只在 Wayland 会话里
 才加载对应的 `libuu-*.so`，X11 用户不需要任何 Wayland 库。系统要求：

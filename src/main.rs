@@ -522,6 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _audio_cleanup=virtual_audio::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
     video::warm_auto_probe();
+    video::warn_if_ffmpeg_unusable();
 
     if !desktop_backend::headless() && desktop_backend::detect()? == desktop_backend::DesktopBackend::X11 && desktop_backend::wayland_session_running() {
         // X11 capture inside a Wayland session reads XWayland's root window: all black, no error (#61).

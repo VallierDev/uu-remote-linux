@@ -358,6 +358,29 @@ fn ffmpeg_spec() -> FfmpegSpec {
 
 pub(crate) fn ffmpeg_command() -> Command { ffmpeg_spec().command() }
 
+/// Encoders of interest that the configured FFmpeg lists; `None` when it cannot run (bounded to 5 s).
+pub async fn ffmpeg_encoders() -> Option<Vec<&'static str>> {
+    let mut ffmpeg = ffmpeg_command();
+    ffmpeg.args(["-hide_banner", "-encoders"]).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), ffmpeg.output()).await.ok()?.ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(["libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi"].into_iter()
+        .filter(|name| text.split_whitespace().any(|word| word == *name)).collect())
+}
+
+/// Without FFmpeg the desktop stream fails after the viewer connects and it waits on
+/// 正在传输画面 with no message of its own, so say it once at startup.
+pub fn warn_if_ffmpeg_unusable() {
+    if crate::desktop_backend::headless() { return; }
+    tokio::spawn(async {
+        match ffmpeg_encoders().await {
+            None => log::error!("FFmpeg is not runnable: desktop video cannot start and viewers stay on 正在传输画面. Install ffmpeg (Debian/Ubuntu: sudo apt install ffmpeg; Arch: sudo pacman -S ffmpeg; Fedora: ffmpeg from RPM Fusion), or set ffmpeg_root, then check `uuremote-server doctor`"),
+            Some(found) if !found.contains(&"libx264") => log::warn!("FFmpeg has no libx264: CPU encoding and the fallback after a hardware encoder failure are unavailable. Install a full ffmpeg build"),
+            Some(_) => {}
+        }
+    });
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FfmpegTimingMode { Modern, Legacy }
 

@@ -139,15 +139,20 @@ uuremote-server login                                   # scan the QR code with 
 systemctl --user enable --now uuremote-native.service   # start with the graphical session
 ```
 
-The deb installs the binaries, plugins, a systemd user unit and menu entries; uinput access stays opt-in (step 5).
+The deb installs the binaries, plugins, a systemd user unit and menu entries, and pulls in FFmpeg as a dependency; uinput access stays opt-in (step 5).
 GNOME and KDE pass the display environment to the unit; on desktops that don't (e.g. Xfce) add `DISPLAY` as in step 4.
 
-**Other distributions**: download `uu-remote-linux-<version>-x86_64-linux.tar.gz` (ARM64: `aarch64-linux`) from [Releases](../../releases/latest), extract it, then:
+**Other distributions**: download `uu-remote-linux-<version>-x86_64-linux.tar.gz` (ARM64: `aarch64-linux`) from [Releases](../../releases/latest), extract it, then run as your desktop user (not root):
 
 ```sh
-install -Dm755 uuremote-server ~/.local/bin/uuremote-server
-install -Dm644 libuu-wayland.so libuu-portal.so -t ~/.local/lib/uu-remote-linux/
+cd uu-remote-linux-<version>-x86_64-linux
+./install.sh          # --yes: don't ask; --no-ffmpeg: check only
 ```
+
+The script installs the binaries and plugins under `~/.local`, writes the systemd user unit (an existing one is kept) and checks
+FFmpeg with libx264 (without it the viewer stays on 正在传输画面). A missing FFmpeg is installed through sudo with apt or pacman;
+Fedora needs RPM Fusion and openSUSE needs Packman first, and the script only prints the command instead of adding third-party repositories.
+The host also logs an error at startup when FFmpeg is not runnable.
 
 One package covers X11, wlroots compositors (Hyprland, Sway, niri) and GNOME/KDE Wayland: the backend is chosen from the
 running session at startup, and the matching `libuu-*.so` is loaded only on Wayland, so X11 hosts need no Wayland libraries.
