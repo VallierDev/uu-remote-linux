@@ -234,6 +234,10 @@ pub fn cached_probe() -> Option<ProbeReport> {
 #[cfg(test)]
 pub(crate) static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Tests that read or bump the process-global reload generation share this lock.
+#[cfg(test)]
+pub(crate) static RELOAD_TEST_LOCK:std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 pub fn clear_probe() {
     if let Ok(mut slot) = cache().lock() { *slot = None; }
@@ -609,6 +613,7 @@ mod tests {
 
     #[test]
     fn reload_does_not_clear_the_probe_cache() {
+        let _reload = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let report = probe_report(true, &[ProbeOutcome::Ok, ProbeOutcome::Ok]);
         store_probe(report.clone());
@@ -623,6 +628,7 @@ mod tests {
 
     #[test]
     fn probe_finish_is_not_a_reload_since_the_session_snapshot() {
+        let _reload = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let at_session = reload_generation_value();
         // A finished background probe updates the cache only. It does not bump the generation.
         assert!(!reload_since_session(at_session, reload_generation_value()));
@@ -632,6 +638,7 @@ mod tests {
 
     #[test]
     fn mark_reload_seen_clears_has_changed() {
+        let _reload = RELOAD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let mut watch = subscribe_reload();

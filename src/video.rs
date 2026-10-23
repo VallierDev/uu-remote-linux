@@ -1225,7 +1225,8 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                         current.chroma = plan.chroma;
                         settings.borrow_and_update();
                         if let Some(sync) = sync_tx.as_ref() {
-                            let native = x11_resized(&display, portal_stream, size).unwrap_or(size);
+                            // Wayland: x11_resized is None, and the connection size can be a previous output.
+                            let native = x11_resized(&display, portal_stream, size).unwrap_or_else(|| crate::wayland::sync_native(&display, current.source_id, size));
                             let payload = crate::capture_setting::sync_payload(&current, native);
                             let _ = sync.send(payload);
                         }

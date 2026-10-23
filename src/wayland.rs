@@ -255,6 +255,25 @@ pub fn selection()->(usize,u64) {let s=SELECTION.lock().unwrap();(s.id,s.generat
 pub fn selected()->usize {selection().0}
 pub fn source(id:usize)->Option<&'static Output> {outputs().get(id)}
 pub fn input_size(fallback:(u32,u32))->(u32,u32) {source(selected()).map_or(fallback,|s|(s.width,s.height))}
+/// Pixel size of one advertised output. Unknown ids keep `fallback` (connection size).
+pub fn source_size(id:usize,fallback:(u32,u32))->(u32,u32) {
+    #[cfg(test)]
+    if let Some(outputs)=*test_outputs().lock().unwrap_or_else(|e|e.into_inner()) {
+        return outputs.get(id).map_or(fallback,|s|(s.width,s.height));
+    }
+    source(id).map_or(fallback,|s|(s.width,s.height))
+}
+#[cfg(test)]
+fn test_outputs()->&'static std::sync::Mutex<Option<&'static [Output]>> {
+    static SLOT:std::sync::OnceLock<std::sync::Mutex<Option<&'static [Output]>>>=std::sync::OnceLock::new();
+    SLOT.get_or_init(||std::sync::Mutex::new(None))
+}
+/// Native size written into CaptureSettingSync. Wayland uses the output the encoder is reading
+/// (`source_id`), which can differ from the size captured when the connection opened. X11, portal
+/// and KMS keep the connection size (X11 mode changes go through `x11_resized`).
+pub fn sync_native(display:&str,source_id:usize,connection:(u32,u32))->(u32,u32) {
+    if display.starts_with("wayland:") {source_size(source_id,connection)} else {connection}
+}
 pub fn input_ready()->bool {outputs().is_empty() || SELECTION.lock().unwrap().ready()}
 pub fn switch_failed()->bool {SELECTION.lock().unwrap().failed}
 pub fn presented(id:usize,generation:u64) {SELECTION.lock().unwrap().sent(id,generation);}
@@ -352,5 +371,21 @@ mod selection_regressions {
         let outputs=parse_outputs(json,"").unwrap();
         assert_eq!(outputs.len(),1);assert_eq!(outputs[0].name,"normal");
         assert!(parse_outputs(b"not JSON","").is_err());
+    }
+    #[test]
+    fn sync_native_follows_the_wayland_source_id() {
+        assert_eq!(sync_native(":0",1,(1920,1080)),(1920,1080));
+        assert_eq!(sync_native("kms:/dev/dri/card0",1,(1920,1080)),(1920,1080));
+        let inventory:&'static [Output]=Box::leak(vec![
+            Output {name:"eDP-1".into(),width:1920,height:1080,fps:60},
+            Output {name:"HDMI-A-1".into(),width:2560,height:1440,fps:75},
+        ].into_boxed_slice());
+        *test_outputs().lock().unwrap()=Some(inventory);
+        // Connection opened on the first output; the encoder is reading the second.
+        assert_eq!(sync_native("wayland:wayland-0",1,(1920,1080)),(2560,1440));
+        assert_eq!(source_size(0,(800,600)),(1920,1080));
+        assert_eq!(sync_native("wayland:wayland-0",9,(800,600)),(800,600));
+        assert_eq!(sync_native(":0",1,(1920,1080)),(1920,1080));
+        *test_outputs().lock().unwrap()=None;
     }
 }
