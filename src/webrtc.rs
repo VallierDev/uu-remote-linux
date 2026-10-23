@@ -449,7 +449,13 @@ impl WebRtcSession {
                     }));
                 }
                 // Ordered outbound queue for protocol replies produced outside this callback.
-                let (outbound, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                // webrtc-rs announces the channel before handle_open (ready_state Connecting);
+                // send() returns ErrClosedPipe until Open. Draining CONTROL here would drop
+                // Message 25 and every later reply. Start CONTROL from the on_open below
+                // (one handler; a second on_open replaces it). Receiver taken once.
+                let mut control_drain: Option<Box<dyn (FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) + Send + Sync>> = None;
+                let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                let outbound_rx = Arc::new(tokio::sync::Mutex::new(Some(outbound_rx)));
                 if label == "CONTROL_DATA_CHANNEL" {
                     if let Some(mut chroma_sync_rx) = chroma_sync_rx.lock().unwrap().take() {
                         let sync_out = outbound.clone();
@@ -466,13 +472,24 @@ impl WebRtcSession {
                 {
                     let out_channel = d.clone();
                     let out_label = label.clone();
-                    tokio::spawn(async move {
-                        while let Some(message) = outbound_rx.recv().await {
-                            if let Err(e) = out_channel.send(&bytes::Bytes::from(message)).await {
-                                log::warn!("{} send failed: {}", out_label, e); break;
-                            }
-                        }
-                    });
+                    let outbound_rx = outbound_rx.clone();
+                    let start_drain = move || {
+                        let out_channel = out_channel.clone();
+                        let out_label = out_label.clone();
+                        let outbound_rx = outbound_rx.clone();
+                        Box::pin(async move {
+                            let Some(mut outbound_rx) = take_outbound_once(&outbound_rx).await else { return; };
+                            tokio::spawn(async move {
+                                while let Some(message) = outbound_rx.recv().await {
+                                    if let Err(e) = out_channel.send(&bytes::Bytes::from(message)).await {
+                                        log::warn!("{} send failed: {}", out_label, e); break;
+                                    }
+                                }
+                            });
+                        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                    };
+                    if label != "CONTROL_DATA_CHANNEL" { tokio::spawn(start_drain()); }
+                    else { control_drain = Some(Box::new(start_drain)); }
                 }
                 let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
                 if matches!(label.as_str(),"CONTROL_DATA_CHANNEL"|"TEXT_DATA_CHANNEL") {
@@ -660,6 +677,7 @@ impl WebRtcSession {
                     let open_screen = screen.clone();
                     let open_selection = peer_selection;
                     d.on_open(Box::new(move || {
+                        if let Some(start_drain) = control_drain { tokio::spawn(start_drain()); }
                         let init_actions = open_actions.clone();
                         let init_video = open_video.clone();
                         let init_track = open_track.clone();
@@ -1442,6 +1460,11 @@ fn negotiated_bundle_media(sdp: &str) -> Option<(String, u16)> {
     None
 }
 
+/// First drain owns the outbound receiver; a later open must not start another.
+async fn take_outbound_once<T>(slot: &tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<T>>>) -> Option<tokio::sync::mpsc::UnboundedReceiver<T>> {
+    slot.lock().await.take()
+}
+
 #[cfg(test)]
 mod tests {
     use super::negotiated_bundle_media;
@@ -1463,6 +1486,16 @@ mod tests {
     fn follows_bundle_order_not_first_media() {
         let sdp = "a=group:BUNDLE data video\nm=video 9 RTP 98\na=mid:video\nm=application 9 SCTP 0\na=mid:data\n";
         assert_eq!(negotiated_bundle_media(sdp), Some(("data".into(), 1)));
+    }
+    #[tokio::test]
+    async fn outbound_receiver_is_taken_once() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let slot = std::sync::Arc::new(tokio::sync::Mutex::new(Some(rx)));
+        let first = super::take_outbound_once(&slot).await;
+        let second = super::take_outbound_once(&slot).await;
+        assert!(first.is_some());
+        assert!(second.is_none());
+        drop(tx);
     }
 }
 
