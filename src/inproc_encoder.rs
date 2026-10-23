@@ -112,10 +112,15 @@ extern "C" {
     fn dri3_capture_destroy(cap: *mut Dri3CaptureOpaque);
 
     fn x264c_create(config: *const X264cConfigFFI, error: *mut libc::c_int) -> *mut X264cEngineOpaque;
-    fn x264c_encode_frame(
+    fn x264c_convert_bgrx_i420(src: *const u8, pitch: u32, y: *mut u8, u: *mut u8, v: *mut u8,
+                               width: libc::c_int, height: libc::c_int);
+    fn x264c_convert_row_pair(top: *const u8, bottom: *const u8, y_top: *mut u8, y_bottom: *mut u8,
+                              u: *mut u8, v: *mut u8, width: libc::c_int);
+    fn x264c_encode_i420(
         engine: *mut X264cEngineOpaque,
-        input_bgrx: *const u8,
-        pitch: u32,
+        y: *const u8,
+        u: *const u8,
+        v: *const u8,
         force_idr: libc::c_int,
         out_data: *mut *const u8,
         out_len: *mut u32,
@@ -338,6 +343,7 @@ fn run_x264(
     let mut dirty = true;
     let mut next_tick = Instant::now();
     let mut last_send = Instant::now();
+    let mut planes = Planes::new(width, height);
     let mut frame_buf = Vec::new();
 
     let locked = crate::session_lock::watch_locked();
@@ -389,21 +395,30 @@ fn run_x264(
 
         // Keepalive frames re-encode the current screen contents as a tiny P-frame.
         let source = capture.capture()?;
-        let (target_ptr, pitch) = if cap_width == width && cap_height == height {
-            (source.as_ptr(), bytes_per_line as u32)
+        if cap_width == width && cap_height == height {
+            unsafe {
+                x264c_convert_bgrx_i420(source.as_ptr(), bytes_per_line as u32, planes.y.as_mut_ptr(),
+                                        planes.u.as_mut_ptr(), planes.v.as_mut_ptr(),
+                                        width as libc::c_int, height as libc::c_int);
+            }
+        } else if config.output.is_some() {
+            scale_convert_bgrx_i420(source, cap_width, cap_height, &mut planes.y, &mut planes.u, &mut planes.v, width, height);
         } else {
             frame_buf.resize(width as usize * height as usize * 4, 0);
-            if config.output.is_some() {
-                scale_bilinear_argb32(source, cap_width, cap_height, &mut frame_buf, width, height);
-            } else {
-                pad_argb32(source, cap_width, cap_height, &mut frame_buf, width, height);
+            pad_argb32(source, cap_width, cap_height, &mut frame_buf, width, height);
+            unsafe {
+                x264c_convert_bgrx_i420(frame_buf.as_ptr(), width * 4, planes.y.as_mut_ptr(),
+                                        planes.u.as_mut_ptr(), planes.v.as_mut_ptr(),
+                                        width as libc::c_int, height as libc::c_int);
             }
-            (frame_buf.as_ptr(), width * 4)
-        };
+        }
 
         let mut out_data: *const u8 = std::ptr::null();
         let mut out_len: u32 = 0;
-        let res = unsafe { x264c_encode_frame(engine.0, target_ptr, pitch, force_idr, &mut out_data, &mut out_len) };
+        let res = unsafe {
+            x264c_encode_i420(engine.0, planes.y.as_ptr(), planes.u.as_ptr(), planes.v.as_ptr(), force_idr,
+                              &mut out_data, &mut out_len)
+        };
         if res != 0 {
             return Err(format!("x264c_encode_frame failed with error {res}"));
         }
@@ -836,55 +851,88 @@ fn run_nvenc(
     }
 }
 
+/// One I420 frame owned by the encoder pipeline. x264 copies the input picture during
+/// encoder_encode, so a plane buffer is reusable as soon as x264c_encode_i420 returns.
+struct Planes { y: Vec<u8>, u: Vec<u8>, v: Vec<u8> }
+impl Planes {
+    fn new(w: u32, h: u32) -> Self {
+        let (cw, ch) = (w as usize / 2, h as usize / 2);
+        Self { y: vec![0; w as usize * h as usize], u: vec![0; cw * ch], v: vec![0; cw * ch] }
+    }
+}
+
+/// Source position in 1/256 pixel units: (d + 0.5) * src / dst - 0.5, clamped to the image.
+fn taps_for(dst_len: u32, src_len: u32) -> Vec<(usize, usize, u32)> {
+    (0..dst_len)
+        .map(|d| {
+            let pos = ((2 * u64::from(d) + 1) * u64::from(src_len) * 128 / u64::from(dst_len)).saturating_sub(128);
+            let first = ((pos >> 8) as usize).min(src_len as usize - 1);
+            let second = (first + 1).min(src_len as usize - 1);
+            (first, second, (pos & 255) as u32)
+        })
+        .collect()
+}
+
 /// Bilinear ARGB32 scaling (the former swscale path used SWS_BILINEAR), with 8-bit fixed-point
 /// weights and pixel centers aligned. Separable two-pass form: the vertical pass writes an
 /// unrounded 16-bit intermediate (<= 255*256) with a row-uniform weight, the horizontal pass
 /// rounds once at the end — bit-identical to the fused scalar form. On x86-64 with SSE4.1 the
-/// horizontal pass runs one pixel (4 channels) per __m128i; mid is a thread-local buffer so a
-/// 4K frame does not allocate megabytes per call.
+/// horizontal pass runs one pixel (4 channels) per __m128i. The in-process x264 path uses the
+/// fused scale+convert instead; this stays for the NVENC copy path and as the fused path test
+/// reference.
 fn scale_bilinear_argb32(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, dst_h: u32) {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return;
     }
-    // Source position in 1/256 pixel units: (d + 0.5) * src / dst - 0.5, clamped to the image.
-    let taps = |dst_len: u32, src_len: u32| -> Vec<(usize, usize, u32)> {
-        (0..dst_len)
-            .map(|d| {
-                let pos = ((2 * u64::from(d) + 1) * u64::from(src_len) * 128 / u64::from(dst_len)).saturating_sub(128);
-                let first = ((pos >> 8) as usize).min(src_len as usize - 1);
-                let second = (first + 1).min(src_len as usize - 1);
-                (first, second, (pos & 255) as u32)
-            })
-            .collect()
-    };
-    let (columns, rows) = (taps(dst_w, src_w), taps(dst_h, src_h));
+    let (columns, rows) = (taps_for(dst_w, src_w), taps_for(dst_h, src_h));
     let src_stride = src_w as usize * 4;
-    // Vertical pass. Weights stay in u32: a fy of 0 makes the top weight 256, which must not
-    // wrap in u16 before the single end rounding.
-    thread_local! {
-        static MID: std::cell::RefCell<Vec<u16>> = std::cell::RefCell::new(Vec::new());
+    let mut mid = vec![0u16; src_stride];
+    for (r, dst_row) in dst.chunks_exact_mut(dst_w as usize * 4).enumerate() {
+        scaled_row(src, src_stride, &rows, r, &columns, &mut mid, dst_row);
     }
-    MID.with(|mid| {
-        let mut mid = mid.borrow_mut();
-        mid.resize(dst_h as usize * src_stride, 0);
-        for (d, &(y0, y1, fy)) in mid.chunks_mut(src_stride).zip(&rows) {
-            let top = &src[y0 * src_stride..];
-            let bottom = &src[y1 * src_stride..];
-            let (a, b) = (256 - fy, fy);
-            for (m, (t, bt)) in d.iter_mut().zip(top.iter().zip(bottom)).take(src_stride) {
-                *m = (u32::from(*t) * a + u32::from(*bt) * b) as u16;
-            }
+}
+
+/// One destination BGRX row of the separable scaler: vertical lerp into a u16 row, then the
+/// SSE4.1/scalar horizontal pass. Weights stay in u32 in the vertical pass: a fy of 0 makes the
+/// top weight 256, which must not wrap in u16 before the single end rounding.
+fn scaled_row(src: &[u8], src_stride: usize, rows: &[(usize, usize, u32)], r: usize,
+              columns: &[(usize, usize, u32)], mid: &mut [u16], dst_row: &mut [u8]) {
+    let (y0, y1, fy) = rows[r];
+    let (top, bottom) = (&src[y0 * src_stride..], &src[y1 * src_stride..]);
+    let (a, b) = (256 - fy, fy);
+    for (m, (t, bt)) in mid.iter_mut().zip(top.iter().zip(bottom)) {
+        *m = (u32::from(*t) * a + u32::from(*bt) * b) as u16;
+    }
+    if sse41_available() {
+        // Safety: sse41_available() checked the CPU feature; rows come from live slices.
+        unsafe { horizontal_row_sse41(mid, columns, dst_row) };
+    } else {
+        horizontal_row_scalar(mid, columns, dst_row);
+    }
+}
+
+/// Scale and convert to I420 two destination rows at a time: the scaled rows live in two row
+/// buffers and go straight into Y/U/V, so a scaled BGRX frame is never materialised.
+fn scale_convert_bgrx_i420(src: &[u8], src_w: u32, src_h: u32, y: &mut [u8], u: &mut [u8], v: &mut [u8],
+                           dst_w: u32, dst_h: u32) {
+    debug_assert!(dst_w % 2 == 0 && dst_h % 2 == 0);
+    let src_stride = src_w as usize * 4;
+    let dst_stride = dst_w as usize * 4;
+    let (columns, rows) = (taps_for(dst_w, src_w), taps_for(dst_h, src_h));
+    let mut mid = vec![0u16; src_stride];
+    let mut top = vec![0u8; dst_stride];
+    let mut bottom = vec![0u8; dst_stride];
+    let (dw, cw) = (dst_w as usize, dst_w as usize / 2);
+    for pair in 0..dst_h as usize / 2 {
+        scaled_row(src, src_stride, &rows, pair * 2, &columns, &mut mid, &mut top);
+        scaled_row(src, src_stride, &rows, pair * 2 + 1, &columns, &mut mid, &mut bottom);
+        let (y_row, c_row) = (pair * 2 * dw, pair * cw);
+        unsafe {
+            x264c_convert_row_pair(top.as_ptr(), bottom.as_ptr(), y[y_row..].as_mut_ptr(),
+                                   y[y_row + dw..].as_mut_ptr(), u[c_row..].as_mut_ptr(),
+                                   v[c_row..].as_mut_ptr(), dst_w as libc::c_int);
         }
-        let sse41 = sse41_available();
-        for (row, dst_row) in mid.chunks(src_stride).zip(dst.chunks_exact_mut(dst_w as usize * 4)) {
-            if sse41 {
-                // Safety: sse41_available() checked the CPU feature; rows come from live slices.
-                unsafe { horizontal_row_sse41(row, &columns, dst_row) };
-            } else {
-                horizontal_row_scalar(row, &columns, dst_row);
-            }
-        }
-    });
+    }
 }
 
 fn horizontal_row_scalar(row: &[u16], columns: &[(usize, usize, u32)], dst_row: &mut [u8]) {
@@ -1099,6 +1147,23 @@ mod convert_tests {
             assert!(sy == ay, "Y differs at {w}x{h}");
             assert!(su == au, "U differs at {w}x{h}");
             assert!(sv == av, "V differs at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn fused_scale_convert_matches_scale_then_convert_byte_for_byte() {
+        // Production size, a source whose width is not a multiple of the vector width, and an
+        // odd number of destination row pairs.
+        for (sw, sh, dw, dh) in [(2560u32, 1600u32, 1920u32, 1200u32), (1922, 1000, 1366, 710), (1920, 1200, 1280, 800)] {
+            let src = pixels(sw, sh, 0x9E37_79B9 ^ sw);
+            let mut scaled = vec![0u8; (dw * dh * 4) as usize];
+            scale_bilinear_argb32(&src, sw, sh, &mut scaled, dw, dh);
+            let (sy, su, sv, _) = convert(&scaled, dw * 4, dw, dh, true);
+            let mut planes = Planes::new(dw, dh);
+            scale_convert_bgrx_i420(&src, sw, sh, &mut planes.y, &mut planes.u, &mut planes.v, dw, dh);
+            assert!(sy == planes.y, "Y differs at {sw}x{sh} -> {dw}x{dh}");
+            assert!(su == planes.u, "U differs at {sw}x{sh} -> {dw}x{dh}");
+            assert!(sv == planes.v, "V differs at {sw}x{sh} -> {dw}x{dh}");
         }
     }
 }
