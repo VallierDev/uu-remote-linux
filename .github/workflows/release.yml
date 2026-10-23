@@ -65,7 +65,7 @@ jobs:
           name=uu-remote-linux-${GITHUB_REF_NAME}-${{ matrix.arch }}-linux
           mkdir -p "$name"
           cp target/release/uuremote-server target/release/uuremote-viewer target/release/libuu-wayland.so target/release/libuu-portal.so \
-            LICENSE README.md README.en.md config.example.json "$name/"
+            packaging/tarball/install.sh LICENSE README.md README.en.md config.example.json "$name/"
           cp -r contrib "$name/"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"

@@ -73,6 +73,9 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
    X11 → default build. Hyprland → `--features wayland`. GNOME/KDE on Wayland → `--features wayland,portal`
    (or advise the user to pick the "on Xorg" session at the login screen, which is the best-supported path).
 2. Install dependencies and build (section 3). Copy the binary: `install -Dm755 target/release/uuremote-server ~/.local/bin/uuremote-server`.
+   From a release tarball run its `./install.sh` as the desktop user instead: it installs into `~/.local`, writes the user unit
+   (keeps an existing one) and installs FFmpeg with libx264 via sudo apt/pacman when missing (Fedora/openSUSE: prints the command).
+   The .deb depends on `ffmpeg`. Without FFmpeg the viewer waits on 正在传输画面; the host checks at startup and on each desktop offer, logs an error and tells the desktop user (freedesktop notification, else opens its window with a red line; `assist::show_problem`).
 3. **Login (needs the human).** Run `uuremote-server login` inside the graphical session. A GTK window shows a QR
    code; the user scans it with the UU Remote mobile app and confirms. Without a display use
    `uuremote-server login --no-gui` (terminal QR). Credentials are written to `~/.config/uuremote/config.json`
