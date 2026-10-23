@@ -127,6 +127,31 @@ fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_acti
     });
 }
 
+type EchoReplay = (Arc<std::sync::atomic::AtomicU64>, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicBool>);
+
+/// A promoted tool peer starts its TEXT clipboard after the viewer's echo was answered without
+/// ff_clipboard; declare it again on CONTROL once the bridge is ready, as the Portal path does.
+fn replay_clipboard_echo(channel: Arc<RTCDataChannel>, sequence: Arc<std::sync::atomic::AtomicU64>,
+    (echo_request, echo_seen, clipboard_ready): EchoReplay, role: Arc<DesktopRole>) {
+    tokio::spawn(async move {
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !role.is_desktop() || channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { return; }
+            if !clipboard_ready.load(std::sync::atomic::Ordering::Acquire) { continue; }
+            // echo_seen is published after the request seq, so reading it first gives a current seq.
+            if echo_seen.load(std::sync::atomic::Ordering::Acquire) {
+                let request_seq = echo_request.load(std::sync::atomic::Ordering::Acquire);
+                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let response = crate::control_protocol::encode_echo_response_with_clipboard(
+                    sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), timestamp, request_seq, true);
+                let _ = channel.send(&bytes::Bytes::from(response)).await;
+                log::info!("CONTROL clipboard capability declared after capture_desktop");
+            }
+            return;
+        }
+    });
+}
+
 impl DesktopStream {
     /// Encode current frames only while the peer is connected and still the desktop.
     fn spawn(self, screen: Option<Arc<ScreenCapture>>, mut active: tokio::sync::watch::Receiver<bool>) {
@@ -775,76 +800,84 @@ impl WebRtcSession {
                           // channel-open callback or delay CONTROL message dispatch.
                           tokio::spawn(async move {
                           if channel.label() == "TEXT_DATA_CHANNEL" {
-                            if !desktop && !role.wait_desktop(&channel).await { return; }
-                            let screen = if let Some(desktop) = &portal_desktop {
-                                let mut updates = desktop.subscribe();
-                                let Some(_) = crate::desktop_session::wait_ready(&mut updates, &channel).await else { return; };
-                                let mut locked = desktop.lock_state();
-                                loop {
-                                    let state = desktop.snapshot();
-                                    if !state.waiting && state.screen.init_error.is_some() { return; }
-                                    if let Some(session) = state.screen.portal.as_ref() {
-                                        if session.is_alive() && *locked.borrow() == Some(false) {
-                                            break state.screen;
-                                        }
-                                    }
-                                    tokio::select! {
-                                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
-                                        changed = locked.changed() => if changed.is_err() { return; },
-                                        _ = async {
-                                            loop {
-                                                if matches!(channel.ready_state(), webrtc::data_channel::data_channel_state::RTCDataChannelState::Closing
-                                                    | webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed) { return; }
-                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                            }
-                                        } => return,
-                                    }
-                                }
-                            } else { screen };
-                            let bridge = if let Some(session)=screen.portal.clone() { crate::clipboard::start_portal(session) } else { crate::clipboard::start(screen.display.clone()) };
-                            *clipboard_sink.lock().unwrap() = Some(bridge.incoming);
-                            let clipboard_channel = channel.clone();
-                            let clipboard_sequence = sequence.clone();
-                            let clipboard_cleanup = clipboard_sink.clone();
-                            let ready = bridge.ready.await.unwrap_or(false);
-                            clipboard_ready.store(ready,std::sync::atomic::Ordering::Relaxed);
-                            tokio::spawn(async move {
-                                if !ready {
-                                    *clipboard_cleanup.lock().unwrap() = None;
-                                    log::warn!("Native text clipboard unavailable"); return;
-                                }
-                                log::info!("Native text clipboard bridge ready");
-                                let mut updates = bridge.outgoing;
-                                let mut health = tokio::time::interval(std::time::Duration::from_millis(200));
-                                loop {
-                                    tokio::select! {
-                                        _ = health.tick() => {
-                                            if clipboard_channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { break; }
-                                        },
-                                        changed = updates.changed() => {
-                                            if changed.is_err() { break; }
-                                            let text = updates.borrow_and_update().clone();
-                                            let Some(text) = text else { continue; };
-                                            {
-                                                let request_id=clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
-                                                let payload = match rich_outgoing.lock().unwrap().offer(request_id,text.clone()) {
-                                                    Ok(payload)=>payload,Err(reason)=>{log::warn!("Clipboard offer rejected: {}",reason);continue;}
-                                                };
-                                                let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                                let message = crate::initialization::envelope(clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),timestamp,21,&payload);
-                                                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2),clipboard_channel.send(&bytes::Bytes::from(message))).await,Ok(Ok(_))) {
-                                                    log::warn!("Native clipboard RPC send failed"); break;
-                                                }
-                                            }
-                                            log::info!("Native clipboard text format offered: bytes={}",text.len());
-                                        }
-                                    }
-                                }
-                                *clipboard_cleanup.lock().unwrap() = None;
-                                clipboard_ready.store(false,std::sync::atomic::Ordering::Relaxed);
-                            });
-                            return;
+                            loop {
+                              if !role.is_desktop() && !role.wait_desktop(&channel).await { return; }
+                              let screen = if let Some(desktop) = &portal_desktop {
+                                  let mut updates = desktop.subscribe();
+                                  let Some(_) = crate::desktop_session::wait_ready(&mut updates, &channel).await else { return; };
+                                  let mut locked = desktop.lock_state();
+                                  loop {
+                                      let state = desktop.snapshot();
+                                      if !state.waiting && state.screen.init_error.is_some() { return; }
+                                      if let Some(session) = state.screen.portal.as_ref() {
+                                          if session.is_alive() && *locked.borrow() == Some(false) {
+                                              break state.screen;
+                                          }
+                                      }
+                                      tokio::select! {
+                                          _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                                          changed = locked.changed() => if changed.is_err() { return; },
+                                          _ = async {
+                                              loop {
+                                                  if matches!(channel.ready_state(), webrtc::data_channel::data_channel_state::RTCDataChannelState::Closing
+                                                      | webrtc::data_channel::data_channel_state::RTCDataChannelState::Closed) { return; }
+                                                  tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                              }
+                                          } => return,
+                                      }
+                                  }
+                              } else { role.screen_or(&screen) };
+                              let bridge = if let Some(session)=screen.portal.clone() { crate::clipboard::start_portal(session) } else { crate::clipboard::start(screen.display.clone()) };
+                              *clipboard_sink.lock().unwrap() = Some(bridge.incoming);
+                              let clipboard_channel = channel.clone();
+                              let clipboard_sequence = sequence.clone();
+                              let clipboard_cleanup = clipboard_sink.clone();
+                              let rich_outgoing = rich_outgoing.clone();
+                              let ready = bridge.ready.await.unwrap_or(false);
+                              clipboard_ready.store(ready,std::sync::atomic::Ordering::Relaxed);
+                              {
+                                  if !ready {
+                                      *clipboard_cleanup.lock().unwrap() = None;
+                                      log::warn!("Native text clipboard unavailable"); return;
+                                  }
+                                  log::info!("Native text clipboard bridge ready");
+                                  let mut updates = bridge.outgoing;
+                                  let mut health = tokio::time::interval(std::time::Duration::from_millis(200));
+                                  let mut active = role.active.subscribe();
+                                  loop {
+                                      tokio::select! {
+                                          _ = health.tick() => {
+                                              if clipboard_channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { break; }
+                                          },
+                                          _ = async { let _ = active.wait_for(|active| !*active).await; } => break,
+                                          changed = updates.changed() => {
+                                              if changed.is_err() { break; }
+                                              let text = updates.borrow_and_update().clone();
+                                              let Some(text) = text else { continue; };
+                                              {
+                                                  let request_id=clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                                                  let payload = match rich_outgoing.lock().unwrap().offer(request_id,text.clone()) {
+                                                      Ok(payload)=>payload,Err(reason)=>{log::warn!("Clipboard offer rejected: {}",reason);continue;}
+                                                  };
+                                                  let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                  let message = crate::initialization::envelope(clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),timestamp,21,&payload);
+                                                  if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2),clipboard_channel.send(&bytes::Bytes::from(message))).await,Ok(Ok(_))) {
+                                                      log::warn!("Native clipboard RPC send failed"); break;
+                                                  }
+                                              }
+                                              log::info!("Native clipboard text format offered: bytes={}",text.len());
+                                          }
+                                      }
+                                  }
+                                  *clipboard_cleanup.lock().unwrap() = None;
+                                  clipboard_ready.store(false,std::sync::atomic::Ordering::Relaxed);
+                              }
+                              if channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { return; }
+                              // A newer desktop took over this promoted tool peer; capture_desktop restarts the clipboard.
+                              log::info!("Native text clipboard stopped: a newer desktop took over");
+                            }
                           }
+                            let replay = (last_echo_request.clone(), echo_seen.clone(), clipboard_ready.clone());
                             let early_desktop_selection = desktop && portal_desktop.is_some();
                             if early_desktop_selection {
                                 // Android 4.43.0's unlock presenter requires CaptureChange
@@ -983,6 +1016,7 @@ impl WebRtcSession {
                                 if !role.wait_desktop(&channel).await { return; }
                                 (desktop, promoted) = (true, true);
                                 screen = role.screen_or(&screen);
+                                replay_clipboard_echo(channel.clone(), sequence.clone(), replay.clone(), role.clone());
                             }
                             if !lock_reported {
                                 lock_reported = true;
@@ -1017,6 +1051,7 @@ impl WebRtcSession {
                             // A newer desktop took over this promoted tool peer; wait for capture_desktop again.
                             if !role.wait_desktop(&channel).await { return; }
                             screen = role.screen_or(&screen);
+                            replay_clipboard_echo(channel.clone(), sequence.clone(), replay.clone(), role.clone());
                             }
                           });
                         })
