@@ -90,11 +90,13 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 原生 Wayland 实验选项：`UU_WAYLAND_PIPELINE=0` 可关闭流水线做对照。`UU_WAYLAND_DMABUF=1` 显式尝试 dma-buf→GBM CPU 映射（默认关闭，需要运行时 libgbm；可用 `UU_WAYLAND_DMABUF_DEVICE` 指定 render node，默认 `/dev/dri/renderD128`）。仅支持显式线性修饰符、单平面 8-bit RGB，失败回退 SHM；virgl VM 中只验证了回退，成功导入/映射和硬件加速均未验证。这不是零拷贝 VAAPI 路径；选择 `UU_VIDEO_ENCODER=vaapi` 时仍由 FFmpeg 上传 CPU 帧。
 首次连接时，桌面会弹窗请求「远程桌面 / 屏幕共享」授权，同意后会记住授权。
 
-### Hyprland 多显示器切换（实验性）
+### 多显示器切换（实验性）
 
 原生 Wayland 的绝对鼠标定位默认绑定正在采集的输出，修复双屏桌面下的点击偏移。uinput 可继续用于键盘、按键和相对移动。
 
 设置 `UU_WAYLAND_MULTISCREEN=1` 后，手机端可选择并切换物理显示器；`UU_WAYLAND_OUTPUT` 指定默认屏幕。画面与绝对鼠标定位同步切换，支持不同分辨率、缩放和桌面位置。
+
+X11 会话默认把所有显示器拼成一张画面。设置 `UU_X11_MULTISCREEN=1` 后，主机按 `xrandr --listmonitors` 列出各个显示器，控制端可选择其中一块，只采集该区域，绝对鼠标坐标加上该屏幕在桌面中的偏移；默认屏幕为主显示器，`UU_X11_OUTPUT` 可指定其他屏幕（如 `HDMI-1`）。显示器布局在主机启动时读取，改动后需重启服务。此模式下控制端的「分辨率」改为缩放画面，不再修改显示模式。实验性：目前只有单元测试与 Xvfb 虚拟显示器实测，尚未经官方客户端实机验收。
 
 切屏复用同一条视频轨道，过渡期间暂停输入，发送新屏首帧后恢复；采集或编码失败、等待首帧超时会请求恢复原屏。当前通过 `hyprctl` 枚举未旋转的显示器，显示器插拔或布局变化后需重启服务。已在 Omarchy / Hyprland 上用官方手机客户端实测 2560×1440（125%）与 1920×1080（133.33%）双屏切换及点击。
 
@@ -102,7 +104,7 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 
 | 功能 | 状态 |
 |---|---|
-| 多显示器切换 | Hyprland 原生 Wayland 后端实验性支持，见上文 |
+| 多显示器切换 | Hyprland 原生 Wayland 后端与 X11（`UU_X11_MULTISCREEN=1`）实验性支持，见上文 |
 | 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；`inproc-av` 原生 NVENC 输出 H.264 High 4:4:4 / HEVC FRExt；VAAPI 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
@@ -307,6 +309,8 @@ systemctl --user restart uuremote-native.service
 | `UU_NVENC_RGB=0` / `=1` | NVENC 直接编码 BGRA（省 CPU）。显示器接在 NVIDIA 卡上时默认关闭（同卡合成时直吃反而更慢），`0` 强制关，`1` 强制开 |
 | `UU_WAYLAND_MULTISCREEN=1` | 启用 Hyprland 物理显示器切换（默认关闭） |
 | `UU_WAYLAND_OUTPUT` | 原生 Wayland 默认采集输出名称，例如 `HDMI-A-1` |
+| `UU_X11_MULTISCREEN=1` | X11 下按显示器分别选择和采集（实验性，默认关闭，需要 `xrandr`） |
+| `UU_X11_OUTPUT` | X11 默认采集的显示器名称（`xrandr --listmonitors`），默认主显示器 |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
 | `UU_INPUT_BACKEND` | `auto`（默认，Wayland 下可用时用 uinput）/ `uinput` / `native` |
 | `UU_TERMINAL_SHORTCUTS=0` | 关闭终端窗口里的 Ctrl+V 粘贴转换 |

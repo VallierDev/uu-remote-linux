@@ -56,6 +56,12 @@ pub fn x11_size() -> Option<(u32, u32)> {
 }
 
 /// The root size from the last refresh, without an X round trip (pointer mapping).
+/// Display the X11 engine opened, once a capture has initialized it.
+pub fn x11_display() -> Option<String> {
+    let name = unsafe { x11_display_name() };
+    if name.is_null() { None } else { Some(unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned()) }
+}
+
 pub fn x11_last_size() -> Option<(u32, u32)> {
     let (mut w, mut h): (libc::c_int, libc::c_int) = (0, 0);
     if unsafe { x11_get_dimensions(&mut w, &mut h) } != 0 || w <= 0 || h <= 0 { return None; }

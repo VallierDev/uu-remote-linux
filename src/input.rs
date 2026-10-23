@@ -334,9 +334,12 @@ impl InputInjector {
             let result=crate::wayland::move_pointer(x,y,false);
             if result!=-2 { return result; }
         }
+        // X11 multi-screen: the point is inside the selected monitor; XTest and uinput span the root.
+        let placement=if relative || self.backend!=crate::desktop_backend::DesktopBackend::X11 {None} else {crate::wayland::x11_placement()};
+        let (x,y)=placement.map_or((x,y),|(ox,oy)|(x+ox,y+oy));
         if let Some(uinput)=&self.uinput {
             if relative { return Self::uinput_result(uinput.move_relative(x,y)); }
-            let (w,h)=*self.screen.lock().unwrap();
+            let (w,h)=placement.and_then(|_|crate::capture::x11_last_size()).unwrap_or(*self.screen.lock().unwrap());
             if w > 1 && h > 1 {
                 let scale = |v: i32, extent: u32| (i64::from(v) * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
                 return Self::uinput_result(uinput.move_absolute(scale(x,w),scale(y,h)));
@@ -698,5 +701,30 @@ mod output_pointer_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test,target_os="linux"))]
+mod x11_monitor_pointer_tests {
+    use super::*;
+    #[test]
+    #[ignore="requires an X11 display with two or more RandR monitors and UU_X11_MULTISCREEN=1; moves pointer only"]
+    fn absolute_pointer_lands_on_the_selected_x11_monitor() {
+        let _capture=crate::capture::ScreenCapture::new().unwrap();
+        let input=InputInjector::new();
+        assert_eq!(input.backend,crate::desktop_backend::DesktopBackend::X11);
+        let outputs=crate::wayland::outputs();assert!(crate::wayland::x11_multiscreen() && outputs.len()>=2,"needs two X11 monitors");
+        for (id,output) in outputs.iter().enumerate().chain(outputs.iter().enumerate().rev()) {
+            crate::wayland::select(id).unwrap();
+            for (x,y) in [(0.0,0.0),(0.5,0.5),(0.999,0.999),(0.1,0.9)] {
+                let size=(output.width,output.height);
+                let pixels=crate::input_mapping::normalized_pointer(x,y,size.0,size.1).unwrap();
+                input.mouse_absolute_normalized(x,y,size);input.flush_pointer();
+                let (mut ax,mut ay,mut mask)=(0,0,0);
+                assert_eq!(unsafe {x11_pointer_state(&mut ax,&mut ay,&mut mask)},0);
+                assert_eq!((ax,ay),(output.x+pixels.0,output.y+pixels.1),"monitor={} normalized=({x},{y})",output.name);
+            }
+        }
+        crate::wayland::select(0).unwrap();
     }
 }

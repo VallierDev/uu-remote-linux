@@ -104,11 +104,13 @@ failure falls back to SHM. The virgl VM verified fallback only: successful impor
 mapping and hardware acceleration remain unverified. This is not zero-copy VAAPI;
 `UU_VIDEO_ENCODER=vaapi` still uploads CPU frames through FFmpeg.
 
-### Hyprland monitor switching (experimental)
+### Monitor switching (experimental)
 
 Native Wayland absolute pointer motion now targets the captured output by default, fixing multi-monitor click offsets. uinput may still handle keyboard, buttons and relative motion.
 
 Set `UU_WAYLAND_MULTISCREEN=1` to select physical monitors from the phone client. `UU_WAYLAND_OUTPUT` chooses the initial output. Capture and absolute pointer targeting switch together across different resolutions, scales and desktop positions.
+
+X11 sessions send all monitors as one combined picture by default. With `UU_X11_MULTISCREEN=1` the host lists the monitors from `xrandr --listmonitors`; the viewer selects one, only that region is captured, and absolute pointer positions are offset to that monitor. The primary monitor is the default; `UU_X11_OUTPUT` picks another (e.g. `HDMI-1`). The layout is read when the host starts; restart the service after changing it. In this mode the viewer's resolution setting scales the stream instead of changing the display mode. Experimental: unit tests and Xvfb virtual monitors only, not yet accepted with the official clients.
 
 Switching reuses one video track and pauses input until the new source sends a frame. Capture/encoder failure or a first-frame timeout requests restoration of the previous source. The inventory uses `hyprctl` and supports unrotated outputs; restart the host after monitor hotplug or layout changes. Phone-side switching and clicks were tested on Omarchy / Hyprland with 2560×1440 at 125% and 1920×1080 at 133.33%.
 
@@ -116,7 +118,7 @@ Switching reuses one video track and pauses input until the new source sends a f
 
 | Feature | Status |
 |---|---|
-| Switching between multiple monitors | Experimental on native Hyprland Wayland; see above |
+| Switching between multiple monitors | Experimental on native Hyprland Wayland and on X11 (`UU_X11_MULTISCREEN=1`); see above |
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
@@ -339,6 +341,8 @@ Common environment variables:
 | `UU_NVENC_RGB=0` / `=1` | NVENC encodes BGRA directly (saves CPU). Off by default when a monitor is connected to the NVIDIA card (slower when the desktop is composited on the same GPU); `0` forces off, `1` forces on |
 | `UU_WAYLAND_MULTISCREEN=1` | Enable Hyprland physical monitor switching (off by default) |
 | `UU_WAYLAND_OUTPUT` | Initial native Wayland output name, e.g. `HDMI-A-1` |
+| `UU_X11_MULTISCREEN=1` | Select and capture X11 monitors separately (experimental, off by default, needs `xrandr`) |
+| `UU_X11_OUTPUT` | Initial X11 monitor name (`xrandr --listmonitors`); default: the primary |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | Native Wayland skips the virtual keyboard (e.g. Denial reserves it for its input method); keys go through uinput. Without wlr-virtual-pointer the pointer also uses uinput (#72) |
 | `UU_INPUT_BACKEND` | `auto` (default: uinput on Wayland when accessible) / `uinput` / `native` |
 | `UU_TERMINAL_SHORTCUTS=0` | Disable the Ctrl+V paste rewrite in terminal windows |

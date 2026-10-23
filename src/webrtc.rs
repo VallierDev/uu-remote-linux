@@ -606,9 +606,11 @@ impl WebRtcSession {
                             }) else { continue; };
                             let Ok(rpc_fields) = crate::protocol::decode_wire(rpc) else { continue; };
                             // X11: 分辨率 changes the display mode itself, like the official Windows host; the stream
-                            // then carries the new native size instead of a scaled one (desktop_mode).
+                            // then carries the new native size instead of a scaled one (desktop_mode). With
+                            // UU_X11_MULTISCREEN the monitor layout stays as it is and the stream is scaled.
                             let resized = if desktop && active_screen.init_error.is_none() && active_screen.portal.is_none()
-                                && active_screen.backend == crate::desktop_backend::DesktopBackend::X11 && crate::desktop_mode::enabled() {
+                                && active_screen.backend == crate::desktop_backend::DesktopBackend::X11 && crate::desktop_mode::enabled()
+                                && !crate::wayland::x11_multiscreen() {
                                 match crate::capture_setting::requested_resolution(&rpc_fields) {
                                     Some(request) => {
                                         let display = active_screen.display.clone();

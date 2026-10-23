@@ -814,10 +814,12 @@ async fn read_encoder_with(
     settings: VideoSettings, #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
     selection: crate::video_select::Selection,
 )->Result<(),String>{
-    let selected_output=if display.starts_with("wayland:") {crate::wayland::source(settings.source_id)} else {None};
+    let selected_output=crate::wayland::capture_source(&display,portal.is_some(),settings.source_id);
     let size=selected_output.map_or(size,|s|(s.width,s.height));
     let kms=display.starts_with("kms:");
     let wayland=kms || display.starts_with("wayland:");
+    // X11 multi-screen: x11grab reads only the selected monitor's region of the root.
+    let x11_region=selected_output.filter(|_|!wayland);
     let (permits_tx,mut permits_rx)=mpsc::channel::<OwnedSemaphorePermit>(4);
     let kms_capture=if kms {
         let capture=tokio::task::spawn_blocking(crate::kms::Capture::open).await.map_err(|_|"KMS worker failed")??;
@@ -825,7 +827,7 @@ async fn read_encoder_with(
         Some(Arc::new(capture))
     } else { None };
     #[cfg(feature = "inproc-av")]
-    if allow_inproc && native_inproc(&display, portal.is_some(), encoder) {
+    if allow_inproc && x11_region.is_none() && native_inproc(&display, portal.is_some(), encoder) {
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
@@ -859,8 +861,9 @@ async fn read_encoder_with(
             "-framerate",&fps,"-i","pipe:0","-an"]);
     } else {
         // The viewer draws its local pointer; do not bake a second into video.
+        let input=x11_region.map_or_else(||display.clone(),|o|format!("{display}+{},{}",o.x,o.y));
         command.args(["-f","x11grab","-draw_mouse","0","-framerate",&fps,
-            "-video_size",&size,"-i",&display,"-an"]);
+            "-video_size",&size,"-i",&input,"-an"]);
     }
     // 其他分辨率: scale the captured desktop (the host display mode is left untouched).
     command.args(scale_options(&settings, encoder, Some(source_size)));
