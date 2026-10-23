@@ -464,12 +464,20 @@ pub(crate) async fn probe_encoder_idr(encoder: Encoder) -> crate::video_select::
     crate::video_select::outcome_for_candidate(process, native_engine_would_run(encoder))
 }
 
-/// True when `read_encoder_with` would open the in-process engine for this candidate on X11.
+/// True when `read_encoder_with` would open the in-process engine for this candidate
+/// on the selected desktop backend (X11 only; not Wayland, portal, KMS, or headless).
 fn native_engine_would_run(encoder: Encoder) -> bool {
-    #[cfg(feature = "inproc-av")]
-    { crate::inproc_encoder::selected(encoder) }
-    #[cfg(not(feature = "inproc-av"))]
-    { let _ = encoder; false }
+    native_engine_eligible(encoder, native_display_kind())
+}
+
+fn native_display_kind() -> NativeDisplayKind {
+    if crate::desktop_backend::headless() { return NativeDisplayKind::None; }
+    match crate::desktop_backend::detect() {
+        Ok(crate::desktop_backend::DesktopBackend::Wayland) => NativeDisplayKind::Wayland,
+        Ok(crate::desktop_backend::DesktopBackend::Kms) => NativeDisplayKind::Kms,
+        Ok(crate::desktop_backend::DesktopBackend::Portal) => NativeDisplayKind::Portal,
+        _ => NativeDisplayKind::X11,
+    }
 }
 
 fn auto_probe_flight() -> &'static tokio::sync::Mutex<()> {
@@ -500,7 +508,7 @@ pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
     // One candidate (CPU, no NVIDIA) has nothing to choose; skip the synthetic IDR.
     let mut outcomes = Vec::with_capacity(order.len());
     if order.len() == 1 {
-        outcomes.push(crate::video_select::ProbeOutcome::Ok);
+        outcomes.push(crate::video_select::ProbeOutcome::NotProbed);
     } else {
         for encoder in &order { outcomes.push(probe_encoder_idr(*encoder).await); }
     }
@@ -640,10 +648,29 @@ fn x11_resized(display: &str, portal: bool, size: (u32, u32)) -> Option<(u32, u3
     crate::capture::x11_size().filter(|current| *current != size)
 }
 
+/// Same predicate `native_inproc` uses: X11 only, and the in-process engine is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeDisplayKind { X11, Wayland, Portal, Kms, None }
+
+pub(crate) fn native_engine_eligible(encoder: Encoder, kind: NativeDisplayKind) -> bool {
+    #[cfg(feature = "inproc-av")]
+    { kind == NativeDisplayKind::X11 && crate::inproc_encoder::selected(encoder) }
+    #[cfg(not(feature = "inproc-av"))]
+    { let _ = (encoder, kind); false }
+}
+
 /// The native in-process NVENC path serves X11 only (not Wayland/KMS capture or a portal session).
 #[cfg(feature = "inproc-av")]
 fn native_inproc(display: &str, portal: bool, encoder: Encoder) -> bool {
-    !display.starts_with("wayland:") && !display.starts_with("kms:") && !portal && crate::inproc_encoder::selected(encoder)
+    native_engine_eligible(encoder, display_kind(display, portal))
+}
+
+#[cfg(feature = "inproc-av")]
+fn display_kind(display: &str, portal: bool) -> NativeDisplayKind {
+    if portal { NativeDisplayKind::Portal }
+    else if display.starts_with("wayland:") { NativeDisplayKind::Wayland }
+    else if display.starts_with("kms:") { NativeDisplayKind::Kms }
+    else { NativeDisplayKind::X11 }
 }
 
 /// Capture and encode inside this process; each packet is one access unit.
@@ -1325,6 +1352,26 @@ mod tests {
             vec!["-fps_mode", "vfr", "-enc_time_base", "1/60"]);
         assert_eq!(timing_args(FfmpegTimingMode::Legacy, 30), vec!["-vsync", "0"]);
         assert!(!timing_args(FfmpegTimingMode::Modern, 60).contains(&"-r".to_owned()));
+    }
+
+    #[test]
+    fn native_unprobed_only_when_x11_inproc_is_eligible() {
+        use crate::video_select::{outcome_for_candidate, ProbeFail, ProbeOutcome};
+        let exit = ProbeOutcome::Fail(ProbeFail::Exit);
+        for kind in [NativeDisplayKind::Wayland, NativeDisplayKind::Portal, NativeDisplayKind::Kms, NativeDisplayKind::None] {
+            assert!(!native_engine_eligible(Encoder::Nvenc, kind), "{kind:?}");
+            assert_eq!(outcome_for_candidate(exit, native_engine_eligible(Encoder::Nvenc, kind)), exit);
+        }
+        assert!(!native_engine_eligible(Encoder::Cpu, NativeDisplayKind::X11));
+        let x11 = native_engine_eligible(Encoder::Nvenc, NativeDisplayKind::X11);
+        let stored = outcome_for_candidate(exit, x11);
+        if cfg!(feature = "inproc-av") && native_engine_eligible(Encoder::Nvenc, NativeDisplayKind::X11) {
+            assert!(x11);
+            assert_eq!(stored, ProbeOutcome::NativeUnprobed);
+        } else {
+            assert!(!x11);
+            assert_eq!(stored, exit);
+        }
     }
 
     #[test]

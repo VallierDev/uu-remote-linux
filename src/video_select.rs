@@ -87,9 +87,12 @@ pub enum ProbeOutcome {
     Ok,
     Fail(ProbeFail),
     /// inproc-av only: the FFmpeg process probe failed, but this session would try the native
-    /// engine first (`read_encoder_with`). Opening that engine needs a display, so the candidate
-    /// is not failed here; auto falls back to the pre-probe NVIDIA/CPU choice for it.
+    /// engine first (`read_encoder_with`) on an X11 display (not Wayland, portal, or KMS).
+    /// Opening that engine needs a display, so the candidate is not failed here; auto falls
+    /// back to the pre-probe NVIDIA/CPU choice for it.
     NativeUnprobed,
+    /// Single auto candidate (CPU, no NVIDIA): the synthetic IDR is skipped.
+    NotProbed,
 }
 
 impl ProbeOutcome {
@@ -104,6 +107,7 @@ impl ProbeOutcome {
             Self::Fail(ProbeFail::Spawn) => "spawn",
             Self::Fail(ProbeFail::Exit) => "exit",
             Self::NativeUnprobed => "native_unprobed",
+            Self::NotProbed => "not probed (only candidate)",
         }
     }
 }
@@ -385,6 +389,11 @@ mod tests {
         let cpu = probe_report(false, &[ProbeOutcome::Ok]);
         assert_eq!(cpu.chosen, Encoder::Cpu);
         assert_eq!(resolve_pair(None, None, None, None, false, Some(&cpu)).encoder, Encoder::Cpu);
+        let skipped = probe_report(false, &[ProbeOutcome::NotProbed]);
+        assert_eq!(skipped.chosen, Encoder::Cpu);
+        assert_eq!(ProbeOutcome::NotProbed.label(), "not probed (only candidate)");
+        assert!(!ProbeOutcome::NotProbed.ok());
+        assert_eq!(resolve_pair(None, None, None, None, false, Some(&skipped)).encoder, Encoder::Cpu);
     }
 
     #[test]
