@@ -604,6 +604,11 @@ fn produce_x264_inner(
     }
 }
 
+/// Mean of a per-window microsecond sum in milliseconds; an empty window is zero.
+fn window_mean_ms(sum_us: u64, window_frames: u64) -> f64 {
+    if window_frames == 0 { 0.0 } else { sum_us as f64 / window_frames as f64 / 1000.0 }
+}
+
 fn encode_x264(
     config: Config, engine: SafeX264Engine, queue: Arc<FrameQueue>, pool: Arc<PlanePool>,
     units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, width: u32, height: u32,
@@ -622,7 +627,7 @@ fn encode_x264_inner(
 
     // Stage means and the end-to-end latency median over one statistic window (2 s at 60 fps).
     const STATS_FRAMES: u64 = 120;
-    let (mut frames, mut capture_sum, mut convert_sum, mut encode_sum) = (0u64, 0u64, 0u64, 0u64);
+    let (mut window_frames, mut capture_sum, mut convert_sum, mut encode_sum) = (0u64, 0u64, 0u64, 0u64);
     let mut latencies: Vec<u32> = Vec::with_capacity(STATS_FRAMES as usize);
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -647,22 +652,22 @@ fn encode_x264_inner(
         if out_len > 0 && !out_data.is_null() {
             let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
             let completed_at = Instant::now();
-            frames += 1;
+            window_frames += 1;
             capture_sum += u64::from(frame.capture_us);
             convert_sum += u64::from(frame.convert_us);
             encode_sum += u64::from(encode_us);
             latencies.push(elapsed_us(frame.captured_at));
-            if frames % STATS_FRAMES == 0 {
+            if window_frames == STATS_FRAMES {
                 latencies.sort_unstable();
-                let ms = |total: u64| total as f64 / frames as f64 / 1000.0;
                 log::info!(
                     "x264 pipeline stages: frames={} capture={:.2}ms convert={:.2}ms encode={:.2}ms latency_median={:.2}ms",
-                    STATS_FRAMES,
-                    ms(capture_sum),
-                    ms(convert_sum),
-                    ms(encode_sum),
+                    window_frames,
+                    window_mean_ms(capture_sum, window_frames),
+                    window_mean_ms(convert_sum, window_frames),
+                    window_mean_ms(encode_sum, window_frames),
                     f64::from(latencies[latencies.len() / 2]) / 1000.0
                 );
+                window_frames = 0;
                 capture_sum = 0;
                 convert_sum = 0;
                 encode_sum = 0;
@@ -1481,5 +1486,17 @@ mod pipeline_tests {
         stop.store(true, Ordering::Relaxed);
         assert!(done_rx.recv_timeout(Duration::from_secs(2)).is_ok(), "capture side must exit");
         capture.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn stage_mean_divides_by_the_window_frame_count() {
+        assert_eq!(window_mean_ms(120 * 5_000, 120), 5.0);
+        assert_eq!(window_mean_ms(60 * 2_500, 60), 2.5);
+        assert_eq!(window_mean_ms(0, 0), 0.0);
     }
 }
