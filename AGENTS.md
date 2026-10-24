@@ -43,7 +43,7 @@ sudo apt install build-essential pkg-config \
 #                            The in-process libx264 engine compiles against libx264-dev's x264.h and
 #                            dlopen's libx264 at runtime (X264_BUILD must match the library).
 #                            The VAAPI/DRI3 engines compile against
-#                            libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage-dev;
+#                            libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev;
 #                            libva/libva-drm themselves are dlopen'ed at runtime (no hard libva dependency)
 # --features viewer-ffmpeg:  libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev
 #                            (FFmpeg 6.x only. FFmpeg >= 7 fails in ffmpeg-sys-next with "avfft.h file not found")
