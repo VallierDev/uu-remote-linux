@@ -294,8 +294,16 @@ struct QueuedFrame {
 
 fn elapsed_us(since: Instant) -> u32 { u32::try_from(since.elapsed().as_micros()).unwrap_or(u32::MAX) }
 
-/// Depth-1 hand-off to the encoder: only the newest frame is kept, so a slow encoder never
-/// builds a latency queue. A replaced frame's plane buffer goes back to the pool.
+/// A frame handed to the encoder side, or the frame back when that side is already gone.
+enum PushOutcome {
+    /// Stored; a superseded frame is returned so its plane buffer can be recycled.
+    Stored(Option<QueuedFrame>),
+    Closed(QueuedFrame),
+}
+
+/// Depth-1 hand-off to the encoder. The producer waits for a free plane buffer, so the slot is
+/// normally empty and a frame goes straight through; when the encoder is briefly behind, the
+/// newest frame replaces the waiting one and the old plane buffer goes back to the pool.
 struct FrameQueue {
     state: std::sync::Mutex<(Option<QueuedFrame>, bool)>,
     cv: std::sync::Condvar,
@@ -306,12 +314,15 @@ impl FrameQueue {
         Self { state: std::sync::Mutex::new((None, false)), cv: std::sync::Condvar::new() }
     }
 
-    fn push(&self, frame: QueuedFrame) -> Option<QueuedFrame> {
+    fn push(&self, frame: QueuedFrame) -> PushOutcome {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.1 {
+            return PushOutcome::Closed(frame);
+        }
         let old = state.0.replace(frame);
         drop(state);
         self.cv.notify_one();
-        old
+        PushOutcome::Stored(old)
     }
 
     fn take(&self) -> Option<QueuedFrame> {
@@ -333,6 +344,12 @@ impl FrameQueue {
         drop(state);
         self.cv.notify_all();
     }
+}
+
+/// Closes the queue when a pipeline thread unwinds, so a panic cannot leave its peer waiting.
+struct CloseOnDrop<'a>(&'a FrameQueue);
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) { self.0.close(); }
 }
 
 /// Double-buffered I420 planes shared by the capture and encoder threads. x264 copies the input
@@ -395,6 +412,25 @@ fn run_x264(
         config.gop,
         config.cq
     );
+    // Fail before spawning anything, so read_encoder_cpu can fall back to the FFmpeg child
+    // immediately (a missing libx264.so or X264_BUILD mismatch is not a stream error).
+    let ffi_cfg = X264cConfigFFI {
+        width,
+        height,
+        fps: config.fps,
+        gop: config.gop,
+        cq: config.cq,
+        abr: u32::from(config.abr),
+        target_bps: config.target_bps,
+        max_bps: config.max_bps,
+        buffer_bits: config.buffer_bits,
+    };
+    let mut reason = 0;
+    let raw_engine = unsafe { x264c_create(&ffi_cfg, &mut reason) };
+    if raw_engine.is_null() {
+        return Err(format!("Failed to create native x264 engine: {}", x264c_error(reason)));
+    }
+    let engine = SafeX264Engine(raw_engine);
     let handle = tokio::runtime::Handle::current();
     let queue = Arc::new(FrameQueue::new());
     let pool = Arc::new(PlanePool::new(2));
@@ -409,16 +445,26 @@ fn run_x264(
     };
     let encoder = {
         let (config, queue, pool, units, stop) = (config, queue.clone(), pool.clone(), units, stop.clone());
+        let engine = engine;
         std::thread::Builder::new().name("x264-encode".into())
-            .spawn(move || encode_x264(config, queue, pool, units, stop, width, height))
-            .map_err(|e| format!("x264 encoder thread: {e}"))?
+            .spawn(move || encode_x264(config, engine, queue, pool, units, stop, width, height))
     };
-    let producer = producer.join().unwrap_or_else(|_| Err("x264 capture thread panicked".into()));
-    if producer.is_err() {
+    let encoder = match encoder {
+        Ok(thread) => thread,
+        Err(e) => {
+            stop.store(true, Ordering::Relaxed);
+            queue.close();
+            let _ = producer.join();
+            return Err(format!("x264 encoder thread: {e}"));
+        }
+    };
+    let encoder = encoder.join().unwrap_or_else(|_| Err("x264 encoder thread panicked".into()));
+    if encoder.is_err() {
+        // The capture thread checks `stop` and pushes into a closed queue; wake it before joining.
         stop.store(true, Ordering::Relaxed);
         queue.close();
     }
-    let encoder = encoder.join().unwrap_or_else(|_| Err("x264 encoder thread panicked".into()));
+    let producer = producer.join().unwrap_or_else(|_| Err("x264 capture thread panicked".into()));
     encoder.and(producer)
 }
 
@@ -427,9 +473,8 @@ fn produce_x264(
     stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>, handle: tokio::runtime::Handle,
     width: u32, height: u32,
 ) -> Result<(), String> {
-    let result = produce_x264_inner(&config, &queue, &pool, &units, &stop, &idr, &budget, &handle, width, height);
-    queue.close();
-    result
+    let _close_on_drop = CloseOnDrop(&queue);
+    produce_x264_inner(&config, &queue, &pool, &units, &stop, &idr, &budget, &handle, width, height)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -528,11 +573,20 @@ fn produce_x264_inner(
         }
         let convert_us = elapsed_us(convert_started);
 
-        if let Some(old) = queue.push(QueuedFrame { planes, force_idr, permit, captured_at, capture_us, convert_us }) {
-            if old.force_idr != 0 {
-                pending_idr = true;
+        let frame = QueuedFrame { planes, force_idr, permit, captured_at, capture_us, convert_us };
+        match queue.push(frame) {
+            PushOutcome::Stored(old) => {
+                if let Some(old) = old {
+                    if old.force_idr != 0 {
+                        pending_idr = true;
+                    }
+                    pool.give(old.planes);
+                }
             }
-            pool.give(old.planes);
+            PushOutcome::Closed(frame) => {
+                pool.give(frame.planes);
+                return Ok(());
+            }
         }
 
         let now = Instant::now();
@@ -551,35 +605,21 @@ fn produce_x264_inner(
 }
 
 fn encode_x264(
-    config: Config, queue: Arc<FrameQueue>, pool: Arc<PlanePool>, units: mpsc::Sender<EncodedUnit>,
-    stop: Arc<AtomicBool>, width: u32, height: u32,
+    config: Config, engine: SafeX264Engine, queue: Arc<FrameQueue>, pool: Arc<PlanePool>,
+    units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, width: u32, height: u32,
 ) -> Result<(), String> {
-    let result = encode_x264_inner(&config, &queue, &pool, &units, &stop, width, height);
-    queue.close();
+    let _close_on_drop = CloseOnDrop(&queue);
+    let result = encode_x264_inner(&config, &engine, &queue, &pool, &units, &stop, width, height);
+    // Any encoder exit must also stop the capture side, otherwise the session hangs in run_x264.
+    stop.store(true, Ordering::Relaxed);
     result
 }
 
 fn encode_x264_inner(
-    config: &Config, queue: &FrameQueue, pool: &PlanePool, units: &mpsc::Sender<EncodedUnit>,
-    stop: &AtomicBool, width: u32, height: u32,
+    config: &Config, engine: &SafeX264Engine, queue: &FrameQueue, pool: &PlanePool,
+    units: &mpsc::Sender<EncodedUnit>, stop: &AtomicBool, width: u32, height: u32,
 ) -> Result<(), String> {
-    let ffi_cfg = X264cConfigFFI {
-        width,
-        height,
-        fps: config.fps,
-        gop: config.gop,
-        cq: config.cq,
-        abr: u32::from(config.abr),
-        target_bps: config.target_bps,
-        max_bps: config.max_bps,
-        buffer_bits: config.buffer_bits,
-    };
-    let mut reason = 0;
-    let raw_engine = unsafe { x264c_create(&ffi_cfg, &mut reason) };
-    if raw_engine.is_null() {
-        return Err(format!("Failed to create native x264 engine: {}", x264c_error(reason)));
-    }
-    let engine = SafeX264Engine(raw_engine);
+
     // Stage means and the end-to-end latency median over one statistic window (2 s at 60 fps).
     const STATS_FRAMES: u64 = 120;
     let (mut frames, mut capture_sum, mut convert_sum, mut encode_sum) = (0u64, 0u64, 0u64, 0u64);
@@ -1386,5 +1426,60 @@ mod convert_tests {
             assert!(su == planes.u, "U differs at {sw}x{sh} -> {dw}x{dh}");
             assert!(sv == planes.v, "V differs at {sw}x{sh} -> {dw}x{dh}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    fn frame(planes: Planes, sem: &Arc<Semaphore>) -> QueuedFrame {
+        let permit = sem.clone().try_acquire_owned().expect("permit");
+        QueuedFrame { planes, force_idr: 0, permit, captured_at: Instant::now(), capture_us: 0, convert_us: 0 }
+    }
+
+    #[test]
+    fn push_after_the_encoder_side_is_gone_reports_closed() {
+        let queue = FrameQueue::new();
+        queue.close();
+        let sem = Arc::new(Semaphore::new(8));
+        assert!(matches!(queue.push(frame(Planes::new(2, 2), &sem)), PushOutcome::Closed(_)));
+    }
+
+    #[test]
+    fn capture_side_exits_when_the_encoder_side_is_gone() {
+        // Simulated encoder: exits after a short delay, closing the queue and raising `stop`.
+        let queue = Arc::new(FrameQueue::new());
+        let pool = Arc::new(PlanePool::new(2));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (cap_queue, cap_pool, cap_stop) = (queue.clone(), pool.clone(), stop.clone());
+        let capture = std::thread::spawn(move || {
+            let sem = Arc::new(Semaphore::new(8));
+            loop {
+                if cap_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Some(planes) = cap_pool.take(2, 2, &cap_stop) else { break; };
+                match cap_queue.push(frame(planes, &sem)) {
+                    PushOutcome::Stored(old) => {
+                        if let Some(old) = old {
+                            cap_pool.give(old.planes);
+                        }
+                    }
+                    PushOutcome::Closed(frame) => {
+                        cap_pool.give(frame.planes);
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = done_tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        queue.close();
+        stop.store(true, Ordering::Relaxed);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).is_ok(), "capture side must exit");
+        capture.join().unwrap();
     }
 }
