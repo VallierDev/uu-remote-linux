@@ -35,6 +35,15 @@ pub fn mac_keycode(scan:i32)->Option<i32>{
         _=>return None,
     })
 }
+/// The content rectangle inside a decoder canvas padded to a fixed size (ffmpeg's scale+pad).
+/// Mirrors `force_original_aspect_ratio=decrease,pad=…:(ow-iw)/2:(oh-ih)/2` so pointer input
+/// ignores the padding instead of compressing the valid area.
+pub fn content_rect(canvas:(u32,u32),content:(u32,u32))->Option<(f64,f64,f64,f64)> {
+    if canvas.0==0||canvas.1==0||content.0==0||content.1==0 {return None}
+    let scale=(canvas.0 as f64/content.0 as f64).min(canvas.1 as f64/content.1 as f64);
+    let(w,h)=(content.0 as f64*scale,content.1 as f64*scale);
+    Some(((canvas.0 as f64-w)/2.,(canvas.1 as f64-h)/2.,w,h))
+}
 #[derive(Clone,Copy,Debug,PartialEq)]
 pub struct Viewport { pub x:f64, pub y:f64, pub width:f64, pub height:f64 }
 impl Viewport {
@@ -137,5 +146,22 @@ assert!(i.release_all().is_empty());
         assert_eq!(v.motion(-10.,0.).unwrap()["abs_y"],0.0);
         assert_eq!(v.motion(1010.,1000.).unwrap()["abs_x"],1.0);
         assert!(v.motion(f64::NAN,0.).is_none());
+    }
+    #[test] fn padded_canvas_maps_only_its_content_rectangle(){
+        // 16:10 picture inside the default 16:9 canvas: 1728x1080 centred, 96 px pillarbox each side.
+        assert_eq!(content_rect((1920,1080),(1280,800)),Some((96.,0.,1728.,1080.)));
+        assert_eq!(content_rect((1920,1080),(1920,1080)),Some((0.,0.,1920.,1080.)));
+        // 4:3 picture: 1440x1080 centred, 240 px each side.
+        assert_eq!(content_rect((1920,1080),(640,480)),Some((240.,0.,1440.,1080.)));
+        assert_eq!(content_rect((0,1080),(640,480)),None);
+        // The content rectangle's edges are the screen edges, not the canvas edges.
+        let (x,y,w,h)=content_rect((1920,1080),(1280,800)).unwrap();
+        let v=Viewport::fit((1920,1080),(1280,800));
+        assert_eq!((x,y,w,h),(v.x,v.y,v.width,v.height));
+        let abs=|px:f64|v.motion(px,540.).unwrap();
+        assert_eq!(abs(96.)["abs_x"],0.0);
+        assert_eq!(abs(960.)["abs_x"],0.5);
+        assert_eq!(abs(1824.)["abs_x"],1.0);
+        assert_eq!(abs(0.)["abs_x"],0.0); // padding is clamped to the screen edge
     }
 }

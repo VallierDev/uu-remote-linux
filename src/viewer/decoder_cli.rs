@@ -1,13 +1,16 @@
 //! H.264/H.265 decoding through an external `ffmpeg` process, like the host's encoder pipeline.
 //! Needs only the ffmpeg CLI, not FFmpeg development libraries.
-//! Output is scaled into a fixed letterboxed size so every frame has a known byte length.
+//! Output is scaled into a fixed letterboxed canvas so every frame has a known byte length; the
+//! source size from ffmpeg's stream line tells the window which sub-rectangle is picture content.
 use super::desktop::{Decoder,Frame};
 use super::media::Codec;
-use std::io::{Read,Write};
+use std::io::{BufRead,Read,Write};
 use std::process::{Child,ChildStdin,Command,Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64,Ordering};
 use std::sync::mpsc::{Receiver,TryRecvError};
 
-pub struct Cli { child:Child, input:Option<ChildStdin>, codec:Codec, frames:Receiver<Vec<u8>>, width:u32, height:u32 }
+pub struct Cli { child:Child, input:Option<ChildStdin>, codec:Codec, frames:Receiver<Vec<u8>>, width:u32, height:u32, source:Arc<AtomicU64> }
 
 impl Cli {
     /// `UU_VIEWER_SIZE=WxH` picks the decoded size (default 1920x1080); `UU_VIEWER_FFMPEG` the binary.
@@ -23,16 +26,27 @@ impl Cli {
         let filter=format!("scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2");
         let passthrough=passthrough_args(&ffmpeg);
         let mut child=Command::new(&ffmpeg)
-            .args(["-hide_banner","-loglevel","error","-nostdin","-threads","1","-probesize","32","-analyzeduration","0",
+            .args(["-hide_banner","-loglevel","info","-nostats","-nostdin","-threads","1","-probesize","32","-analyzeduration","0",
                 "-fflags","nobuffer","-flags","low_delay","-f",codec.demuxer(),"-i","pipe:0","-an","-vf",&filter,
                 "-pix_fmt","rgb24",
                 // Raw H.264/H.265 carries no timestamps; constant-rate output dropped almost every frame of
                 // the official Mac host's stream (270 → 2). Pass frames through unchanged.
                 passthrough.0,passthrough.1,"-f","rawvideo","pipe:1"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
             .spawn().map_err(|e|format!("Start ffmpeg decoder: {e}"))?;
         let input=child.stdin.take().ok_or("ffmpeg stdin missing")?;
         let mut output=child.stdout.take().ok_or("ffmpeg stdout missing")?;
+        // Source picture size from the one-time stream line; 0 until parsed. Only the numbers are kept.
+        let source=Arc::new(AtomicU64::new(0));
+        if let Some(stderr)=child.stderr.take() {
+            let source=source.clone();
+            let _=std::thread::Builder::new().name("uu-viewer-ffmpeg-info".into()).spawn(move||{
+                for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if source.load(Ordering::Relaxed)!=0 {continue}
+                    if let Some((w,h))=parse_video_size(&line) {source.store((u64::from(w)<<32)|u64::from(h),Ordering::Relaxed);}
+                }
+            });
+        }
         let size=width as usize*height as usize*3;
         // Bounded: a slow window drops decoded frames instead of growing memory.
         let (tx,frames)=std::sync::mpsc::sync_channel(2);
@@ -43,8 +57,21 @@ impl Cli {
                 match tx.try_send(frame) { Ok(())|Err(std::sync::mpsc::TrySendError::Full(_))=>{}, Err(_)=>break }
             }
         }).map_err(|e|format!("Decoder reader: {e}"))?;
-        Ok(Self{child,input:Some(input),codec,frames,width,height})
+        Ok(Self{child,input:Some(input),codec,frames,width,height,source})
     }
+}
+
+/// `30000/1001`-style or display strings are irrelevant here: the first WxH on a `Video:` line is the
+/// coded picture size, which is the aspect the scale+pad filter letterboxes into the canvas.
+fn parse_video_size(line:&str)->Option<(u32,u32)> {
+    let rest=line.split_once("Video:")?.1;
+    rest.split(|c:char|c==','||c==' '||c=='('||c==')'||c=='['||c==']').find_map(|token|{
+        let token=token.trim_matches(|c:char|!c.is_ascii_digit()&&c!='x');
+        let (w,h)=token.split_once('x')?;
+        if w.is_empty()||h.is_empty()||!w.bytes().all(|b|b.is_ascii_digit())||!h.bytes().all(|b|b.is_ascii_digit()) {return None}
+        let (w,h)=(w.parse::<u32>().ok()?,h.parse::<u32>().ok()?);
+        ((16..=16384).contains(&w)&&(16..=16384).contains(&h)).then_some((w,h))
+    })
 }
 
 /// FFmpeg ≥ 5.1 has `-fps_mode`; FFmpeg 8+ removed `-vsync`, and Ubuntu 22.04's 4.4 lacks `-fps_mode`.
@@ -75,7 +102,11 @@ impl Decoder for Cli {
         let mut out=Vec::new();
         loop {
             match self.frames.try_recv() {
-                Ok(rgb)=>out.push(Frame{width:self.width,height:self.height,rgb}),
+                Ok(rgb)=>{
+                    let source=self.source.load(Ordering::Relaxed);
+                    let content=(source!=0).then(||((source>>32) as u32,source as u32));
+                    out.push(Frame{width:self.width,height:self.height,rgb,content})
+                },
                 Err(TryRecvError::Empty)=>break,
                 Err(TryRecvError::Disconnected)=>return Err("ffmpeg decoder exited".into()),
             }
@@ -115,7 +146,7 @@ impl Drop for Cli { fn drop(&mut self) { let _=self.child.kill(); let _=self.chi
             // Exercise the same streaming process and RGB conversion as SDL, then drain at EOF.
             let mut frames=cli.decode(data).unwrap();drop(cli.input.take());
             loop {match cli.frames.recv_timeout(std::time::Duration::from_secs(5)) {
-                Ok(rgb)=>frames.push(Frame{width:32,height:32,rgb}),
+                Ok(rgb)=>frames.push(Frame{width:32,height:32,rgb,content:None}),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected)=>break,
                 Err(e)=>panic!("{codec:?} decoder did not finish: {e}"),
             }}
@@ -127,5 +158,12 @@ impl Drop for Cli { fn drop(&mut self) { let _=self.child.kill(); let _=self.chi
                 assert!(frame.rgb.chunks_exact(3).all(|p|p[0]>220 && p[1]<30 && p[2]<30),"{codec:?}: RGB conversion");
             }
         }
+    }
+    #[test] fn source_size_is_read_from_the_ffmpeg_stream_line(){
+        assert_eq!(super::parse_video_size("  Stream #0:0: Video: h264 (High), yuv420p(progressive), 3024x1964, 25 fps"),Some((3024,1964)));
+        assert_eq!(super::parse_video_size("Stream #0:0: Video: hevc, yuv420p, 1920x1080 [SAR 1:1 DAR 16:9]"),Some((1920,1080)));
+        assert_eq!(super::parse_video_size("Stream #0:0: Audio: opus, 48000 Hz, stereo"),None);
+        assert_eq!(super::parse_video_size("frame= 1 fps=0.0 q=0.0"),None);
+        assert_eq!(super::parse_video_size("Stream #0:0: Video: h264, 1920xsynth"),None);
     }
 }

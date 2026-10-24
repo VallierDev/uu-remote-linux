@@ -89,12 +89,17 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
 fn button(b:MouseButton)->Option<i32>{match b{MouseButton::Left=>Some(1),MouseButton::Right=>Some(2),MouseButton::Middle=>Some(4),_=>None}}
 impl FrameSink for Window {
     fn present(&mut self,frame:&Frame)->Result<(),String>{
-        self.last_frame=Some(Frame{width:frame.width,height:frame.height,rgb:frame.rgb.clone()});
-        self.frame=(frame.width,frame.height);let v=self.viewport();let creator=self.canvas.texture_creator();
+        self.last_frame=Some(Frame{width:frame.width,height:frame.height,rgb:frame.rgb.clone(),content:frame.content});
+        // Pad bars belong to the decoded canvas, not the remote picture: viewport and input use the
+        // content aspect, and only the content sub-rectangle of the texture is drawn.
+        let content=frame.content.unwrap_or((frame.width,frame.height));
+        self.frame=content;let v=self.viewport();let creator=self.canvas.texture_creator();
         let mut texture=creator.create_texture_streaming(PixelFormatEnum::RGB24,frame.width,frame.height).map_err(|_|"Texture creation failed")?;
         texture.update(None,&frame.rgb,frame.width as usize*3).map_err(|_|"Texture update failed")?;
         self.canvas.set_draw_color(sdl2::pixels::Color::BLACK);self.canvas.clear();
-        self.canvas.copy(&texture,None,Some(Rect::new(v.x as i32,v.y as i32,v.width as u32,v.height as u32)))?;self.canvas.present();Ok(())
+        let src=super::input::content_rect((frame.width,frame.height),content)
+            .map(|(x,y,w,h)|Rect::new(x.round() as i32,y.round() as i32,w.round().max(1.) as u32,h.round().max(1.) as u32));
+        self.canvas.copy(&texture,src,Some(Rect::new(v.x.round() as i32,v.y.round() as i32,v.width.round().max(1.) as u32,v.height.round().max(1.) as u32)))?;self.canvas.present();Ok(())
     }
 }
 pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super::desktop::Decoder,view_only:bool,device:&str)->Result<(),String>{
