@@ -37,15 +37,20 @@ fn main() {
                 println!("cargo:rerun-if-changed={f}");
             }
             x11_build.include("vendor/ffnvcodec");
-            // libva/libva-drm are dlopen'ed at runtime (like NVENC's libcuda); these are
-            // link-time-only deps of the DRI3/VAAPI engines and must stay out of default builds.
+        }
+        x11_build.compile("x11_engine");
+        // libva/libva-drm are dlopen'ed at runtime (like NVENC's libcuda); these are
+        // link-time-only deps of the DRI3/VAAPI engines and must stay out of default builds.
+        if std::env::var_os("CARGO_FEATURE_INPROC_AV").is_some() {
+            // Emit them after the static C archive: GNU ld --as-needed would otherwise
+            // discard the shared libraries before libx11_engine.a references their symbols.
             println!("cargo:rustc-link-lib=gbm");
             println!("cargo:rustc-link-lib=X11-xcb");
             println!("cargo:rustc-link-lib=xcb");
             println!("cargo:rustc-link-lib=xcb-dri3");
             println!("cargo:rustc-link-lib=xcb-damage");
         }
-        x11_build.compile("x11_engine");
+
 
         println!("cargo:rustc-link-lib=X11");
         println!("cargo:rustc-link-lib=Xext");
