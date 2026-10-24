@@ -75,15 +75,18 @@ fn xrandr_refresh(text: &str) -> Option<f64> {
 /// Keyframe interval. All-intra 60fps measured 30 Mbit/s on the real desktop (saturating the
 /// viewer's Wi-Fi: 3-6 fps received). On a static desktop with NVENC CQ18 a 0.5s GOP measured
 /// 7.7 Mbit/s and a 2s GOP 1.9 Mbit/s. A broken prediction chain freezes until the next IDR or
-/// a PLI. Only the in-process encoder answers PLI/FIR with an IDR, so the child-process path
-/// keeps the short 0.5s GOP and the longer 2s GOP is used only where an on-demand IDR exists.
+/// a PLI. CPU and child-process encoders default to 0.5s for recovery; native hardware
+/// encoders retain 2s and can answer PLI/FIR with an IDR.
 const GOP_SECONDS_PROCESS: f64 = 0.5;
 const GOP_SECONDS_IN_PROCESS: f64 = 2.0;
 
 /// Keyframe interval in frames at the nominal rate. `UU_VIDEO_GOP_SECONDS` overrides the default for both paths.
 fn gop_frames(fps: u32, in_process: bool) -> u64 {
+    gop_frames_with_override(fps, in_process, std::env::var("UU_VIDEO_GOP_SECONDS").ok().as_deref())
+}
+fn gop_frames_with_override(fps: u32, in_process: bool, value: Option<&str>) -> u64 {
     let default = if in_process { GOP_SECONDS_IN_PROCESS } else { GOP_SECONDS_PROCESS };
-    let seconds = std::env::var("UU_VIDEO_GOP_SECONDS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(default);
+    let seconds = value.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0 && *v <= 10.0).unwrap_or(default);
     ((f64::from(fps) * seconds).round() as u64).max(1)
 }
 const MAX_ACCESS_UNIT: usize = 8 * 1024 * 1024;
@@ -692,13 +695,14 @@ async fn read_encoder(
         settings.chroma = crate::capture_setting::CHROMA_420;
         log::info!("Chroma 4:4:4 requested; encoder={} source={} encodes 4:2:0", format!("{encoder:?}").to_ascii_lowercase(), crate::video_select::encoder_source_label(selection.encoder_source));
     }
-    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await; }
+    if encoder == Encoder::Cpu { return read_encoder_cpu(size,display,portal,latest,sequence,settings,idr,budget,selection).await; }
     #[cfg_attr(not(feature = "inproc-av"), allow(unused_mut))]
     let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,true,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
     // A failed native NVENC session (old driver, unsupported mode) still leaves FFmpeg's NVENC process pipeline.
     #[cfg(feature = "inproc-av")]
     if let Err(error) = &result {
-        if !latest.is_closed() && native_inproc(&display, portal.is_some(), encoder) && x11_resized(&display, portal.is_some(), size).is_none() {
+        let inproc = native_inproc(&display, portal.is_some(), encoder);
+        if inproc_fallback_allowed(inproc, latest.is_closed(), x11_resized(&display, portal.is_some(), size)) {
             log::warn!("In-process {} stream unavailable; switching to the FFmpeg process pipeline: {}",encoder.name_for(settings.codec),error);
             result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
         }
@@ -707,10 +711,33 @@ async fn read_encoder(
         Ok(())=>Ok(()),
         Err(error) if !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none()=>{
             log::warn!("{} stream unavailable; switching scoped encoder to CPU: {}",encoder.name_for(settings.codec),error);
-            read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await
+            read_encoder_cpu(size,display,portal,latest,sequence,settings,idr,budget,selection).await
         },
         Err(error)=>Err(error),
     }
+}
+
+/// Encoder::Cpu opens the in-process libx264 engine first on X11; a failed in-process session
+/// (no libx264.so, X264_BUILD mismatch) still leaves FFmpeg's libx264 process pipeline.
+async fn read_encoder_cpu(
+    size: (u32, u32), display: String, portal: Option<Arc<crate::portal::PortalSession>>, latest: mpsc::Sender<Arc<CompleteFrame>>,
+    sequence: Arc<std::sync::atomic::AtomicU64>, settings: VideoSettings, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+    selection: crate::video_select::Selection,
+) -> Result<(), String> {
+    #[cfg(feature = "inproc-av")]
+    {
+        let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),Encoder::Cpu,true,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+        if let Err(error) = &result {
+            let inproc = cpu_inproc(&display, portal.is_some(), Encoder::Cpu, &settings);
+            if inproc_fallback_allowed(inproc, latest.is_closed(), x11_resized(&display, portal.is_some(), size)) {
+                log::warn!("In-process libx264 stream unavailable; switching to the FFmpeg process pipeline: {error}");
+                result = read_encoder_with(size,display,portal,latest,Encoder::Cpu,false,sequence,settings,idr,budget,selection).await;
+            }
+        }
+        result
+    }
+    #[cfg(not(feature = "inproc-av"))]
+    read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await
 }
 
 /// A resized X11 root fails every encoder alike (x11grab BadMatch on the old size);
@@ -718,6 +745,13 @@ async fn read_encoder(
 fn x11_resized(display: &str, portal: bool, size: (u32, u32)) -> Option<(u32, u32)> {
     if portal || display.starts_with("wayland:") || display.starts_with("kms:") { return None; }
     crate::capture::x11_size().filter(|current| *current != size)
+}
+
+/// An in-process session that failed may retry the FFmpeg child only while the viewer still
+/// reads this stream and a resized root is not the real reason (that restarts capture instead).
+#[cfg(feature = "inproc-av")]
+fn inproc_fallback_allowed(inproc: bool, latest_closed: bool, resized: Option<(u32, u32)>) -> bool {
+    inproc && !latest_closed && resized.is_none()
 }
 
 /// Same predicate `native_inproc` uses: X11 only, and the in-process engine is selected.
@@ -735,6 +769,19 @@ pub(crate) fn native_engine_eligible(encoder: Encoder, kind: NativeDisplayKind) 
 #[cfg(feature = "inproc-av")]
 fn native_inproc(display: &str, portal: bool, encoder: Encoder) -> bool {
     native_engine_eligible(encoder, display_kind(display, portal))
+}
+
+/// Encoder::Cpu goes in-process for plain H.264 on X11: x264 cannot encode HEVC, and 真彩 4:4:4
+/// keeps the child process until a high444 CSP is wired in. Deliberately not part of
+/// `inproc_encoder::selected()`: the auto probe's native-unprobed semantics must not change.
+#[cfg(feature = "inproc-av")]
+fn cpu_inproc(display: &str, portal: bool, encoder: Encoder, settings: &VideoSettings) -> bool {
+    encoder == Encoder::Cpu
+        && settings.codec == VideoCodec::H264
+        && settings.chroma != crate::capture_setting::CHROMA_444
+        && display_kind(display, portal) == NativeDisplayKind::X11
+        && crate::inproc_encoder::damage_enabled()
+        && !crate::inproc_encoder::disabled()
 }
 
 #[cfg(feature = "inproc-av")]
@@ -804,6 +851,23 @@ fn buffer_for(settings: &VideoSettings, encoder: Encoder) -> u32 {
     } else { buffer_kbits(settings.max_kbps().unwrap_or(30_000), encoder) }
 }
 
+/// The in-process engines take the same rate-control mapping as the FFmpeg child: a viewer
+/// bitrate preset uses ABR at 3/4 of the cap, 自动 keeps CRF (the `abr` flag), and both set the
+/// same VBV bound. Without the flag every session was ABR at the 16M target and CRF never ran.
+#[cfg(feature = "inproc-av")]
+struct InprocRateControl { abr: bool, target_bps: i64, max_bps: i64, buffer_bits: i64 }
+
+#[cfg(feature = "inproc-av")]
+fn inproc_rate_control(settings: &VideoSettings, encoder: Encoder) -> InprocRateControl {
+    let max_kbps = i64::from(settings.max_kbps().unwrap_or(30_000));
+    InprocRateControl {
+        abr: settings.max_kbps().is_some(),
+        target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
+        max_bps: max_kbps * 1000,
+        buffer_bits: i64::from(buffer_for(settings, encoder)) * 1000,
+    }
+}
+
 fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
     let max_kbps = settings.max_kbps().unwrap_or(30_000);
     (format!("{max_kbps}k"), format!("{}k", buffer_for(settings, encoder)))
@@ -828,24 +892,24 @@ async fn read_encoder_with(
         Some(Arc::new(capture))
     } else { None };
     #[cfg(feature = "inproc-av")]
-    if allow_inproc && x11_region.is_none() && native_inproc(&display, portal.is_some(), encoder) {
-        let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
+    if allow_inproc && x11_region.is_none() && (native_inproc(&display, portal.is_some(), encoder) || cpu_inproc(&display, portal.is_some(), encoder, &settings)) {
+        let rate = inproc_rate_control(&settings, encoder);
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
-            gop: gop_frames(settings.fps, true) as u32, cq: settings.cq() as u32,
-            target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
-            max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec, chroma: settings.chroma,
+            gop: gop_frames(settings.fps, encoder != Encoder::Cpu) as u32, cq: settings.cq() as u32,
+            abr: rate.abr, target_bps: rate.target_bps, max_bps: rate.max_bps, buffer_bits: rate.buffer_bits, codec: settings.codec, chroma: settings.chroma,
             vaapi: encoder == Encoder::Vaapi,
+            cpu: encoder == Encoder::Cpu,
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} source={} pipeline=in-process",
-            display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec),
+            display,size.0,size.1,settings.output,settings.fps,config.cq,rate.max_bps / 1000,encoder.name_for(settings.codec),
             crate::video_select::encoder_source_label(selection.encoder_source));
         return read_inprocess(config, latest, sequence, idr, budget).await;
     }
     let source_size = size;
     let size = format!("{}x{}", size.0, size.1);
     let fps = settings.fps.to_string();
-    // Keep the IDR interval at 2 s whatever the frame rate.
+    // Keep the process pipeline IDR interval at the configured duration.
     let gop = gop_frames(settings.fps, false).to_string();
     let (maxrate, _) = rate_args(&settings, encoder);
     let cq = settings.cq().to_string();
@@ -1351,6 +1415,24 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
 #[cfg(test)]
 mod tests {
     #[test]
+    fn cpu_gop_defaults_to_half_a_second() {
+        assert_eq!(super::gop_frames_with_override(60, false, None), 30);
+    }
+    #[test]
+    fn explicit_gop_can_select_two_seconds() {
+        assert_eq!(super::gop_frames_with_override(60, false, Some("2")), 120);
+    }
+    #[test]
+    fn invalid_gop_uses_default() {
+        for value in ["NaN", "inf", "0", "-1", "11", "bad"] {
+            assert_eq!(super::gop_frames_with_override(60, false, Some(value)), 30);
+        }
+    }
+    #[test]
+    fn hardware_inprocess_gop_is_unchanged() {
+        assert_eq!(super::gop_frames_with_override(60, true, None), 120);
+    }
+    #[test]
     fn nvidia_display_is_detected_from_connected_connectors() {
         use std::os::unix::fs::symlink;
         let root = std::env::temp_dir().join(format!("uu-drm-test-{}", std::process::id()));
@@ -1813,6 +1895,31 @@ mod tests {
         let idr=[0,0,0,1,9,16,0,0,0,1,7,66,0,0,0,1,8,206,0,0,1,5,136];
         assert!(is_independent_frame(&idr));
         assert!(!is_independent_frame(&[0,0,0,1,9,48,0,0,1,1,154]));
+    }
+    #[cfg(feature = "inproc-av")]
+    #[test]
+    fn inproc_fallback_needs_a_live_stream_and_a_stable_root() {
+        assert!(inproc_fallback_allowed(true, false, None));
+        // Not an in-process candidate: the FFmpeg child failed for another reason, so retrying is moot.
+        assert!(!inproc_fallback_allowed(false, false, None));
+        // The viewer already dropped the stream.
+        assert!(!inproc_fallback_allowed(true, true, None));
+        // A resized X11 root fails x11grab for every encoder; the stream restarts capture instead.
+        assert!(!inproc_fallback_allowed(true, false, Some((1920, 1080))));
+    }
+    #[cfg(feature = "inproc-av")]
+    #[test]
+    fn inproc_x264_keeps_crf_for_auto_and_uses_abr_for_bitrate_presets() {
+        // 自动 has no cap in settings but still gets the 30M VBV bound; it must not turn into ABR 16M.
+        let auto = VideoSettings::default();
+        let rate = inproc_rate_control(&auto, Encoder::Cpu);
+        assert!(!rate.abr);
+        assert_eq!((rate.target_bps, rate.max_bps, rate.buffer_bits), (16_000_000, 30_000_000, 8_000_000));
+        // 超清 8M: ABR at 3/4 of the cap, the same numbers the FFmpeg child receives.
+        let hd = VideoSettings { quality: crate::capture_setting::QUALITY_HD, ..Default::default() };
+        let rate = inproc_rate_control(&hd, Encoder::Cpu);
+        assert!(rate.abr);
+        assert_eq!((rate.target_bps, rate.max_bps, rate.buffer_bits), (6_000_000, 8_000_000, 8_000_000));
     }
 }
 

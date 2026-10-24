@@ -58,6 +58,24 @@ struct Dri3CaptureOpaque {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct X264cEngineOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct X264cConfigFFI {
+    width: u32,
+    height: u32,
+    fps: u32,
+    gop: u32,
+    cq: u32,
+    abr: u32,
+    target_bps: i64,
+    max_bps: i64,
+    buffer_bits: i64,
+}
+
 extern "C" {
     fn nvenc_create(config: *const NvencConfigFFI) -> *mut NvencEngineOpaque;
     fn nvenc_register_host_buffer(
@@ -92,6 +110,22 @@ extern "C" {
     fn dri3_capture_get_dma_fd(cap: *mut Dri3CaptureOpaque) -> libc::c_int;
     fn dri3_capture_get_stride(cap: *mut Dri3CaptureOpaque) -> u32;
     fn dri3_capture_destroy(cap: *mut Dri3CaptureOpaque);
+
+    fn x264c_create(config: *const X264cConfigFFI, error: *mut libc::c_int) -> *mut X264cEngineOpaque;
+    fn x264c_convert_bgrx_i420(src: *const u8, pitch: u32, y: *mut u8, u: *mut u8, v: *mut u8,
+                               width: libc::c_int, height: libc::c_int);
+    fn x264c_convert_row_pair(top: *const u8, bottom: *const u8, y_top: *mut u8, y_bottom: *mut u8,
+                              u: *mut u8, v: *mut u8, width: libc::c_int);
+    fn x264c_encode_i420(
+        engine: *mut X264cEngineOpaque,
+        y: *const u8,
+        u: *const u8,
+        v: *const u8,
+        force_idr: libc::c_int,
+        out_data: *mut *const u8,
+        out_len: *mut u32,
+    ) -> libc::c_int;
+    fn x264c_destroy(engine: *mut X264cEngineOpaque);
 }
 
 struct SafeNvencEngine(*mut NvencEngineOpaque);
@@ -129,6 +163,18 @@ impl Drop for SafeDri3Capture {
     }
 }
 
+struct SafeX264Engine(*mut X264cEngineOpaque);
+unsafe impl Send for SafeX264Engine {}
+impl Drop for SafeX264Engine {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { x264c_destroy(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub display: String,
     pub input: (u32, u32),
@@ -136,6 +182,8 @@ pub struct Config {
     pub fps: u32,
     pub gop: u32,
     pub cq: u32,
+    /// Viewer bitrate preset: the x264 engine uses ABR + VBV; 自动 keeps CRF with the same VBV bound.
+    pub abr: bool,
     pub target_bps: i64,
     pub max_bps: i64,
     pub buffer_bits: i64,
@@ -144,6 +192,8 @@ pub struct Config {
     pub chroma: u64,
     /// UU_VIDEO_ENCODER=vaapi: the VAAPI engine (H.264 / HEVC Main) instead of NVENC.
     pub vaapi: bool,
+    /// Encoder::Cpu with H.264 on X11: the in-process libx264 engine (no FFmpeg child).
+    pub cpu: bool,
 }
 
 pub fn disabled() -> bool {
@@ -188,8 +238,9 @@ pub struct EncodedUnit {
 fn acquire(
     budget: &Arc<Semaphore>,
     units: &mpsc::Sender<EncodedUnit>,
+    handle: &tokio::runtime::Handle,
 ) -> Option<OwnedSemaphorePermit> {
-    tokio::runtime::Handle::current().block_on(async {
+    handle.block_on(async {
         tokio::select! {
             permit = budget.clone().acquire_owned() => permit.ok(),
             _ = units.closed() => None,
@@ -213,8 +264,422 @@ pub fn run(
 ) -> Result<(), String> {
     if config.vaapi {
         run_vaapi(config, units, stop, idr, budget)
+    } else if config.cpu {
+        run_x264(config, units, stop, idr, budget)
     } else {
         run_nvenc(config, units, stop, idr, budget)
+    }
+}
+
+/// x264c_create reports why it failed; the message carries the reason, never a library path.
+fn x264c_error(code: libc::c_int) -> &'static str {
+    match code {
+        1 => "libx264.so could not be dlopen'ed",
+        2 => "libx264 lacks the compile-time X264_BUILD symbols (x264.h / library mismatch)",
+        3 => "x264 encoder setup failed",
+        _ => "unknown failure",
+    }
+}
+
+/// One produced I420 frame waiting for the encoder thread.
+struct QueuedFrame {
+    planes: Planes,
+    force_idr: libc::c_int,
+    permit: OwnedSemaphorePermit,
+    /// Capture start → encoder finished, for the latency statistic (monotonic Instants only).
+    captured_at: Instant,
+    capture_us: u32,
+    convert_us: u32,
+}
+
+fn elapsed_us(since: Instant) -> u32 { u32::try_from(since.elapsed().as_micros()).unwrap_or(u32::MAX) }
+
+/// A frame handed to the encoder side, or the frame back when that side is already gone.
+enum PushOutcome {
+    /// Stored; a superseded frame is returned so its plane buffer can be recycled.
+    Stored(Option<QueuedFrame>),
+    Closed(QueuedFrame),
+}
+
+/// Depth-1 hand-off to the encoder. The producer waits for a free plane buffer, so the slot is
+/// normally empty and a frame goes straight through; when the encoder is briefly behind, the
+/// newest frame replaces the waiting one and the old plane buffer goes back to the pool.
+struct FrameQueue {
+    state: std::sync::Mutex<(Option<QueuedFrame>, bool)>,
+    cv: std::sync::Condvar,
+}
+
+impl FrameQueue {
+    fn new() -> Self {
+        Self { state: std::sync::Mutex::new((None, false)), cv: std::sync::Condvar::new() }
+    }
+
+    fn push(&self, frame: QueuedFrame) -> PushOutcome {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.1 {
+            return PushOutcome::Closed(frame);
+        }
+        let old = state.0.replace(frame);
+        drop(state);
+        self.cv.notify_one();
+        PushOutcome::Stored(old)
+    }
+
+    fn take(&self) -> Option<QueuedFrame> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(frame) = state.0.take() {
+                return Some(frame);
+            }
+            if state.1 {
+                return None;
+            }
+            state = self.cv.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.1 = true;
+        drop(state);
+        self.cv.notify_all();
+    }
+}
+
+/// Closes the queue when a pipeline thread unwinds, so a panic cannot leave its peer waiting.
+struct CloseOnDrop<'a>(&'a FrameQueue);
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) { self.0.close(); }
+}
+
+/// Double-buffered I420 planes shared by the capture and encoder threads. x264 copies the input
+/// picture during encoder_encode, so the encoder returns its buffer right after encoding.
+struct PlanePool {
+    state: std::sync::Mutex<(Vec<Planes>, usize)>,
+    cv: std::sync::Condvar,
+    max: usize,
+}
+
+impl PlanePool {
+    fn new(max: usize) -> Self {
+        Self { state: std::sync::Mutex::new((Vec::new(), 0)), cv: std::sync::Condvar::new(), max }
+    }
+
+    /// Waits for a free plane buffer; None when `stop` is set while waiting.
+    fn take(&self, w: u32, h: u32, stop: &AtomicBool) -> Option<Planes> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(planes) = state.0.pop() {
+                return Some(planes);
+            }
+            if state.1 < self.max {
+                state.1 += 1;
+                drop(state);
+                return Some(Planes::new(w, h));
+            }
+            if stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            state = self.cv.wait_timeout(state, Duration::from_millis(20)).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
+    fn give(&self, planes: Planes) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.0.push(planes);
+        drop(state);
+        self.cv.notify_one();
+    }
+}
+
+/// In-process libx264 (H.264 only): XShm -> I420 on the CPU -> x264 in a dlopen'ed libx264.
+/// Capture/scale/convert and encode run on two threads with a depth-1 hand-off, so their serial
+/// per-frame work overlaps instead of adding up; the keepalive/budget/IDR policy is unchanged.
+fn run_x264(
+    config: Config,
+    units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>,
+    idr: Arc<AtomicBool>,
+    budget: Arc<Semaphore>,
+) -> Result<(), String> {
+    let (width0, height0) = config.output.unwrap_or(config.input);
+    let (width, height) = (width0 + width0 % 2, height0 + height0 % 2);
+    log::info!(
+        "Initializing Native In-Process x264: {}x{}, {} fps, GOP {}, CQ {}",
+        width,
+        height,
+        config.fps,
+        config.gop,
+        config.cq
+    );
+    // Fail before spawning anything, so read_encoder_cpu can fall back to the FFmpeg child
+    // immediately (a missing libx264.so or X264_BUILD mismatch is not a stream error).
+    let ffi_cfg = X264cConfigFFI {
+        width,
+        height,
+        fps: config.fps,
+        gop: config.gop,
+        cq: config.cq,
+        abr: u32::from(config.abr),
+        target_bps: config.target_bps,
+        max_bps: config.max_bps,
+        buffer_bits: config.buffer_bits,
+    };
+    let mut reason = 0;
+    let raw_engine = unsafe { x264c_create(&ffi_cfg, &mut reason) };
+    if raw_engine.is_null() {
+        return Err(format!("Failed to create native x264 engine: {}", x264c_error(reason)));
+    }
+    let engine = SafeX264Engine(raw_engine);
+    let handle = tokio::runtime::Handle::current();
+    let queue = Arc::new(FrameQueue::new());
+    let pool = Arc::new(PlanePool::new(2));
+    let producer = {
+        let (config, queue, pool, units, stop, idr, budget, handle) = (
+            config.clone(), queue.clone(), pool.clone(), units.clone(), stop.clone(),
+            idr.clone(), budget.clone(), handle.clone(),
+        );
+        std::thread::Builder::new().name("x264-capture".into())
+            .spawn(move || produce_x264(config, queue, pool, units, stop, idr, budget, handle, width, height))
+            .map_err(|e| format!("x264 capture thread: {e}"))?
+    };
+    let encoder = {
+        let (config, queue, pool, units, stop) = (config, queue.clone(), pool.clone(), units, stop.clone());
+        let engine = engine;
+        std::thread::Builder::new().name("x264-encode".into())
+            .spawn(move || encode_x264(config, engine, queue, pool, units, stop, width, height))
+    };
+    let encoder = match encoder {
+        Ok(thread) => thread,
+        Err(e) => {
+            stop.store(true, Ordering::Relaxed);
+            queue.close();
+            let _ = producer.join();
+            return Err(format!("x264 encoder thread: {e}"));
+        }
+    };
+    let encoder = encoder.join().unwrap_or_else(|_| Err("x264 encoder thread panicked".into()));
+    if encoder.is_err() {
+        // The capture thread checks `stop` and pushes into a closed queue; wake it before joining.
+        stop.store(true, Ordering::Relaxed);
+        queue.close();
+    }
+    let producer = producer.join().unwrap_or_else(|_| Err("x264 capture thread panicked".into()));
+    encoder.and(producer)
+}
+
+fn produce_x264(
+    config: Config, queue: Arc<FrameQueue>, pool: Arc<PlanePool>, units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>, handle: tokio::runtime::Handle,
+    width: u32, height: u32,
+) -> Result<(), String> {
+    let _close_on_drop = CloseOnDrop(&queue);
+    produce_x264_inner(&config, &queue, &pool, &units, &stop, &idr, &budget, &handle, width, height)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn produce_x264_inner(
+    config: &Config, queue: &FrameQueue, pool: &PlanePool, units: &mpsc::Sender<EncodedUnit>,
+    stop: &AtomicBool, idr: &AtomicBool, budget: &Arc<Semaphore>, handle: &tokio::runtime::Handle,
+    width: u32, height: u32,
+) -> Result<(), String> {
+    let mut capture = DamageCapture::open(&config.display)
+        .map_err(|e| format!("DamageCapture::open failed on {}: {e}", config.display))?;
+    let (cap_width, cap_height) = capture.size();
+    if cap_width != width || cap_height != height {
+        log::info!(
+            "Capture size ({}x{}) != encoder size ({}x{}): {} on the CPU before x264",
+            cap_width,
+            cap_height,
+            width,
+            height,
+            if config.output.is_some() { "bilinear scaling" } else { "padding" }
+        );
+    }
+    let bytes_per_line = cap_width as usize * 4;
+    let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.subsec_nanos())
+        | 1;
+    let mut keepalive = random_keepalive(&mut seed);
+    let mut dirty = true;
+    let mut next_tick = Instant::now();
+    let mut last_send = Instant::now();
+    let mut frame_buf = Vec::new();
+    let locked = crate::session_lock::watch_locked();
+    let mut last_locked = *locked.borrow();
+    // An IDR request on a frame that gets superseded before encoding is forwarded to the next one.
+    let mut pending_idr = false;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let deadline = if dirty { next_tick } else { last_send + keepalive };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if capture.wait(wait.max(Duration::from_millis(1)))? {
+            dirty = true;
+        }
+        let now = Instant::now();
+        if dirty && now < next_tick {
+            continue;
+        }
+        if !dirty && now < last_send + keepalive {
+            continue;
+        }
+        let Some(permit) = acquire(budget, units, handle) else {
+            return Ok(());
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        dirty |= capture.wait(Duration::ZERO)?;
+        let state = *locked.borrow();
+        if state != last_locked {
+            dirty = true;
+            last_locked = state;
+        }
+        let force_idr = if idr.swap(false, Ordering::AcqRel) || pending_idr {
+            pending_idr = false;
+            1
+        } else {
+            0
+        };
+        // Keepalive frames re-encode the current screen contents as a tiny P-frame.
+        let Some(mut planes) = pool.take(width, height, stop) else {
+            return Ok(());
+        };
+        let captured_at = Instant::now();
+        let source = capture.capture()?;
+        let capture_us = elapsed_us(captured_at);
+        let convert_started = Instant::now();
+        if cap_width == width && cap_height == height {
+            unsafe {
+                x264c_convert_bgrx_i420(source.as_ptr(), bytes_per_line as u32, planes.y.as_mut_ptr(),
+                                        planes.u.as_mut_ptr(), planes.v.as_mut_ptr(),
+                                        width as libc::c_int, height as libc::c_int);
+            }
+        } else if config.output.is_some() {
+            scale_convert_bgrx_i420(source, cap_width, cap_height, &mut planes.y, &mut planes.u, &mut planes.v, width, height);
+        } else {
+            frame_buf.resize(width as usize * height as usize * 4, 0);
+            pad_argb32(source, cap_width, cap_height, &mut frame_buf, width, height);
+            unsafe {
+                x264c_convert_bgrx_i420(frame_buf.as_ptr(), width * 4, planes.y.as_mut_ptr(),
+                                        planes.u.as_mut_ptr(), planes.v.as_mut_ptr(),
+                                        width as libc::c_int, height as libc::c_int);
+            }
+        }
+        let convert_us = elapsed_us(convert_started);
+
+        let frame = QueuedFrame { planes, force_idr, permit, captured_at, capture_us, convert_us };
+        match queue.push(frame) {
+            PushOutcome::Stored(old) => {
+                if let Some(old) = old {
+                    if old.force_idr != 0 {
+                        pending_idr = true;
+                    }
+                    pool.give(old.planes);
+                }
+            }
+            PushOutcome::Closed(frame) => {
+                pool.give(frame.planes);
+                return Ok(());
+            }
+        }
+
+        let now = Instant::now();
+        if dirty {
+            let next = next_tick + frame_interval;
+            next_tick = if next > now {
+                next
+            } else {
+                now + frame_interval
+            };
+            dirty = false;
+        }
+        last_send = now;
+        keepalive = random_keepalive(&mut seed);
+    }
+}
+
+/// Mean of a per-window microsecond sum in milliseconds; an empty window is zero.
+fn window_mean_ms(sum_us: u64, window_frames: u64) -> f64 {
+    if window_frames == 0 { 0.0 } else { sum_us as f64 / window_frames as f64 / 1000.0 }
+}
+
+fn encode_x264(
+    config: Config, engine: SafeX264Engine, queue: Arc<FrameQueue>, pool: Arc<PlanePool>,
+    units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, width: u32, height: u32,
+) -> Result<(), String> {
+    let _close_on_drop = CloseOnDrop(&queue);
+    let result = encode_x264_inner(&config, &engine, &queue, &pool, &units, &stop, width, height);
+    // Any encoder exit must also stop the capture side, otherwise the session hangs in run_x264.
+    stop.store(true, Ordering::Relaxed);
+    result
+}
+
+fn encode_x264_inner(
+    config: &Config, engine: &SafeX264Engine, queue: &FrameQueue, pool: &PlanePool,
+    units: &mpsc::Sender<EncodedUnit>, stop: &AtomicBool, width: u32, height: u32,
+) -> Result<(), String> {
+
+    // Stage means and the end-to-end latency median over one statistic window (2 s at 60 fps).
+    const STATS_FRAMES: u64 = 120;
+    let (mut window_frames, mut capture_sum, mut convert_sum, mut encode_sum) = (0u64, 0u64, 0u64, 0u64);
+    let mut latencies: Vec<u32> = Vec::with_capacity(STATS_FRAMES as usize);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let Some(frame) = queue.take() else {
+            return Ok(());
+        };
+        let mut out_data: *const u8 = std::ptr::null();
+        let mut out_len: u32 = 0;
+        let encode_started = Instant::now();
+        let res = unsafe {
+            x264c_encode_i420(engine.0, frame.planes.y.as_ptr(), frame.planes.u.as_ptr(),
+                              frame.planes.v.as_ptr(), frame.force_idr, &mut out_data, &mut out_len)
+        };
+        let encode_us = elapsed_us(encode_started);
+        // x264 copied the input picture during encoder_encode; hand the buffer back immediately.
+        pool.give(frame.planes);
+        if res != 0 {
+            return Err(format!("x264c_encode_i420 failed with error {res}"));
+        }
+        if out_len > 0 && !out_data.is_null() {
+            let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
+            let completed_at = Instant::now();
+            window_frames += 1;
+            capture_sum += u64::from(frame.capture_us);
+            convert_sum += u64::from(frame.convert_us);
+            encode_sum += u64::from(encode_us);
+            latencies.push(elapsed_us(frame.captured_at));
+            if window_frames == STATS_FRAMES {
+                latencies.sort_unstable();
+                log::info!(
+                    "x264 pipeline stages: frames={} capture={:.2}ms convert={:.2}ms encode={:.2}ms latency_median={:.2}ms",
+                    window_frames,
+                    window_mean_ms(capture_sum, window_frames),
+                    window_mean_ms(convert_sum, window_frames),
+                    window_mean_ms(encode_sum, window_frames),
+                    f64::from(latencies[latencies.len() / 2]) / 1000.0
+                );
+                window_frames = 0;
+                capture_sum = 0;
+                convert_sum = 0;
+                encode_sum = 0;
+                latencies.clear();
+            }
+            if units
+                .blocking_send(EncodedUnit { data, permit: frame.permit, completed_at })
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -290,6 +755,7 @@ fn run_vaapi(
 
     let locked = crate::session_lock::watch_locked();
     let mut last_locked = *locked.borrow();
+    let handle = tokio::runtime::Handle::current();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -315,7 +781,7 @@ fn run_vaapi(
             continue;
         }
 
-        let Some(permit) = acquire(&budget, &units) else {
+        let Some(permit) = acquire(&budget, &units, &handle) else {
             return Ok(());
         };
         if stop.load(Ordering::Relaxed) {
@@ -492,6 +958,7 @@ fn run_nvenc(
 
     let locked = crate::session_lock::watch_locked();
     let mut last_locked = *locked.borrow();
+    let handle = tokio::runtime::Handle::current();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -517,7 +984,7 @@ fn run_nvenc(
             continue;
         }
 
-        let Some(permit) = acquire(&budget, &units) else {
+        let Some(permit) = acquire(&budget, &units, &handle) else {
             return Ok(());
         };
         if stop.load(Ordering::Relaxed) {
@@ -617,34 +1084,174 @@ fn run_nvenc(
     }
 }
 
+/// One I420 frame owned by the encoder pipeline. x264 copies the input picture during
+/// encoder_encode, so a plane buffer is reusable as soon as x264c_encode_i420 returns.
+struct Planes { y: Vec<u8>, u: Vec<u8>, v: Vec<u8> }
+impl Planes {
+    fn new(w: u32, h: u32) -> Self {
+        let (cw, ch) = (w as usize / 2, h as usize / 2);
+        Self { y: vec![0; w as usize * h as usize], u: vec![0; cw * ch], v: vec![0; cw * ch] }
+    }
+}
+
+/// Source position in 1/256 pixel units: (d + 0.5) * src / dst - 0.5, clamped to the image.
+fn taps_for(dst_len: u32, src_len: u32) -> Vec<(usize, usize, u32)> {
+    (0..dst_len)
+        .map(|d| {
+            let pos = ((2 * u64::from(d) + 1) * u64::from(src_len) * 128 / u64::from(dst_len)).saturating_sub(128);
+            let first = ((pos >> 8) as usize).min(src_len as usize - 1);
+            let second = (first + 1).min(src_len as usize - 1);
+            (first, second, (pos & 255) as u32)
+        })
+        .collect()
+}
+
 /// Bilinear ARGB32 scaling (the former swscale path used SWS_BILINEAR), with 8-bit fixed-point
-/// weights and pixel centers aligned.
+/// weights and pixel centers aligned. Separable two-pass form: the vertical pass writes an
+/// unrounded 16-bit intermediate (<= 255*256) with a row-uniform weight, the horizontal pass
+/// rounds once at the end — bit-identical to the fused scalar form. On x86-64 with SSE4.1 the
+/// horizontal pass runs one pixel (4 channels) per __m128i. The in-process x264 path uses the
+/// fused scale+convert instead; this stays for the NVENC copy path and as the fused path test
+/// reference.
 fn scale_bilinear_argb32(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, dst_h: u32) {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return;
     }
-    // Source position in 1/256 pixel units: (d + 0.5) * src / dst - 0.5, clamped to the image.
-    let taps = |dst_len: u32, src_len: u32| -> Vec<(usize, usize, u32)> {
-        (0..dst_len)
-            .map(|d| {
-                let pos = ((2 * u64::from(d) + 1) * u64::from(src_len) * 128 / u64::from(dst_len)).saturating_sub(128);
-                let first = ((pos >> 8) as usize).min(src_len as usize - 1);
-                let second = (first + 1).min(src_len as usize - 1);
-                (first, second, (pos & 255) as u32)
-            })
-            .collect()
-    };
-    let (columns, rows) = (taps(dst_w, src_w), taps(dst_h, src_h));
+    let (columns, rows) = (taps_for(dst_w, src_w), taps_for(dst_h, src_h));
     let src_stride = src_w as usize * 4;
-    for (dst_row, &(y0, y1, fy)) in dst.chunks_exact_mut(dst_w as usize * 4).zip(&rows) {
-        let (top, bottom) = (&src[y0 * src_stride..], &src[y1 * src_stride..]);
-        for (pixel, &(x0, x1, fx)) in dst_row.chunks_exact_mut(4).zip(&columns) {
-            for c in 0..4 {
-                let lerp = |row: &[u8]| u32::from(row[x0 * 4 + c]) * (256 - fx) + u32::from(row[x1 * 4 + c]) * fx;
-                pixel[c] = ((lerp(top) * (256 - fy) + lerp(bottom) * fy + 32768) >> 16) as u8;
-            }
+    let mut mid = vec![0u16; src_stride];
+    for (r, dst_row) in dst.chunks_exact_mut(dst_w as usize * 4).enumerate() {
+        scaled_row(src, src_stride, &rows, r, &columns, &mut mid, dst_row);
+    }
+}
+
+/// One destination BGRX row of the separable scaler: vertical lerp into a u16 row, then the
+/// SSE4.1/scalar horizontal pass. Weights stay in u32 in the vertical pass: a fy of 0 makes the
+/// top weight 256, which must not wrap in u16 before the single end rounding.
+fn scaled_row(src: &[u8], src_stride: usize, rows: &[(usize, usize, u32)], r: usize,
+              columns: &[(usize, usize, u32)], mid: &mut [u16], dst_row: &mut [u8]) {
+    let (y0, y1, fy) = rows[r];
+    let (top, bottom) = (&src[y0 * src_stride..], &src[y1 * src_stride..]);
+    let (a, b) = (256 - fy, fy);
+    if avx2_available() {
+        // Safety: avx2_available() checked the CPU feature; slices are live and equally long.
+        unsafe { vertical_row_avx2(top, bottom, a as u16, b as u16, mid) };
+    } else {
+        vertical_row_scalar(top, bottom, a as u16, b as u16, mid);
+    }
+    if sse41_available() {
+        // Safety: sse41_available() checked the CPU feature; rows come from live slices.
+        unsafe { horizontal_row_sse41(mid, columns, dst_row) };
+    } else {
+        horizontal_row_scalar(mid, columns, dst_row);
+    }
+}
+
+/// Scale and convert to I420 two destination rows at a time: the scaled rows live in two row
+/// buffers and go straight into Y/U/V, so a scaled BGRX frame is never materialised.
+fn scale_convert_bgrx_i420(src: &[u8], src_w: u32, src_h: u32, y: &mut [u8], u: &mut [u8], v: &mut [u8],
+                           dst_w: u32, dst_h: u32) {
+    debug_assert!(dst_w % 2 == 0 && dst_h % 2 == 0);
+    let src_stride = src_w as usize * 4;
+    let dst_stride = dst_w as usize * 4;
+    let (columns, rows) = (taps_for(dst_w, src_w), taps_for(dst_h, src_h));
+    let mut mid = vec![0u16; src_stride];
+    let mut top = vec![0u8; dst_stride];
+    let mut bottom = vec![0u8; dst_stride];
+    let (dw, cw) = (dst_w as usize, dst_w as usize / 2);
+    for pair in 0..dst_h as usize / 2 {
+        scaled_row(src, src_stride, &rows, pair * 2, &columns, &mut mid, &mut top);
+        scaled_row(src, src_stride, &rows, pair * 2 + 1, &columns, &mut mid, &mut bottom);
+        let (y_row, c_row) = (pair * 2 * dw, pair * cw);
+        unsafe {
+            x264c_convert_row_pair(top.as_ptr(), bottom.as_ptr(), y[y_row..].as_mut_ptr(),
+                                   y[y_row + dw..].as_mut_ptr(), u[c_row..].as_mut_ptr(),
+                                   v[c_row..].as_mut_ptr(), dst_w as libc::c_int);
         }
     }
+}
+
+fn horizontal_row_scalar(row: &[u16], columns: &[(usize, usize, u32)], dst_row: &mut [u8]) {
+    for (pixel, &(x0, x1, fx)) in dst_row.chunks_exact_mut(4).zip(columns) {
+        let (a, b) = (256 - fx, fx);
+        for c in 0..4 {
+            let t = u32::from(row[x0 * 4 + c]) * a + u32::from(row[x1 * 4 + c]) * b;
+            pixel[c] = ((t + 32768) >> 16) as u8;
+        }
+    }
+}
+
+fn vertical_row_scalar(top: &[u8], bottom: &[u8], a: u16, b: u16, mid: &mut [u16]) {
+    for (m, (t, u)) in mid.iter_mut().zip(top.iter().zip(bottom.iter())) {
+        *m = (u32::from(*t) * u32::from(a) + u32::from(*u) * u32::from(b)) as u16;
+    }
+}
+
+/// Vertical pass of the scaler: 16 pixels per AVX2 iteration (u16 arithmetic cannot overflow:
+/// top*a + bottom*b <= 255*256). Scalar tail and scalar fallback keep the same integers.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vertical_row_avx2(top: &[u8], bottom: &[u8], a: u16, b: u16, mid: &mut [u16]) {
+    use std::arch::x86_64::*;
+    let (va, vb) = (_mm256_set1_epi16(a as i16), _mm256_set1_epi16(b as i16));
+    let mut i = 0;
+    while i + 16 <= mid.len() {
+        let t = _mm256_cvtepu8_epi16(_mm_loadu_si128(top.as_ptr().add(i) as *const __m128i));
+        let u = _mm256_cvtepu8_epi16(_mm_loadu_si128(bottom.as_ptr().add(i) as *const __m128i));
+        let m = _mm256_add_epi16(_mm256_mullo_epi16(t, va), _mm256_mullo_epi16(u, vb));
+        _mm256_storeu_si256(mid.as_mut_ptr().add(i) as *mut __m256i, m);
+        i += 16;
+    }
+    vertical_row_scalar(&top[i..], &bottom[i..], a, b, &mut mid[i..]);
+}
+
+fn avx2_available() -> bool {
+    static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(target_arch = "x86_64")]
+    { *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2")) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = &AVX2; false }
+}
+
+fn sse41_available() -> bool {
+    static SSE41: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(target_arch = "x86_64")]
+    { *SSE41.get_or_init(|| std::arch::is_x86_feature_detected!("sse4.1")) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = &SSE41; false }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+unsafe fn horizontal_row_sse41(row: &[u16], columns: &[(usize, usize, u32)], dst_row: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let zero = _mm_setzero_si128();
+    let bias = _mm_set1_epi32(32768);
+    for (pixel, &(x0, x1, fx)) in dst_row.chunks_exact_mut(4).zip(columns) {
+        // Values fit u32 exactly like the scalar form: 255*256*256 max, no saturation bites.
+        let p0 = _mm_loadl_epi64(row.as_ptr().add(x0 * 4) as *const __m128i);
+        let p1 = _mm_loadl_epi64(row.as_ptr().add(x1 * 4) as *const __m128i);
+        let w0 = _mm_unpacklo_epi16(p0, zero);
+        let w1 = _mm_unpacklo_epi16(p1, zero);
+        let wa = _mm_set1_epi32((256 - fx) as i32);
+        let wb = _mm_set1_epi32(fx as i32);
+        let t = _mm_add_epi32(_mm_add_epi32(_mm_mullo_epi32(w0, wa), _mm_mullo_epi32(w1, wb)), bias);
+        let s = _mm_srli_epi32(t, 16);
+        let packed = _mm_packus_epi16(_mm_packs_epi32(s, s), zero);
+        let out = _mm_cvtsi128_si32(packed) as u32;
+        pixel.copy_from_slice(&out.to_ne_bytes());
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn horizontal_row_sse41(row: &[u16], columns: &[(usize, usize, u32)], dst_row: &mut [u8]) {
+    horizontal_row_scalar(row, columns, dst_row)
+}
+
+/// Non-x86-64 fallback for the vertical pass: same integers as the AVX2 kernel.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn vertical_row_avx2(top: &[u8], bottom: &[u8], a: u16, b: u16, mid: &mut [u16]) {
+    vertical_row_scalar(top, bottom, a, b, mid);
 }
 
 /// Copies the capture into the top-left corner of the larger encoder frame; the rest stays black.
@@ -668,7 +1275,7 @@ mod budget_tests {
     async fn closing_encoder_output_wakes_a_blocked_capture() {
         let budget = Arc::new(Semaphore::new(0));
         let (tx, rx) = mpsc::channel(1);
-        let worker = tokio::task::spawn_blocking(move || acquire(&budget, &tx));
+        let worker = tokio::task::spawn_blocking(move || acquire(&budget, &tx, &tokio::runtime::Handle::current()));
         tokio::task::yield_now().await;
         drop(rx);
         assert!(tokio::time::timeout(Duration::from_secs(1), worker).await.unwrap().unwrap().is_none());
@@ -724,5 +1331,180 @@ mod frame_tests {
                 assert_eq!(out[(y * 4 + x) * 4], expected, "({x},{y})");
             }
         }
+    }
+
+    #[test]
+    fn vertical_weight_256_does_not_wrap() {
+        // 3 -> 1 rows lands on fy = 0, i.e. a top weight of 256; computing that weight in
+        // u16 wraps to zero and would emit a black frame. The middle row is the tap target.
+        let src = image(5, 3, |_, y| if y == 1 { [200; 4] } else { [100; 4] });
+        let mut out = vec![0; 5 * 4];
+        scale_bilinear_argb32(&src, 5, 3, &mut out, 5, 1);
+        assert!(out.chunks(4).all(|p| p == [200; 4]), "{out:?}");
+    }
+
+    #[test]
+    fn separable_scaling_matches_the_fused_form() {
+        // The two-pass form must round exactly once like the fused expression it replaced.
+        let src = image(7, 5, |x, y| [(x * 37 + y * 11) as u8; 4]);
+        let mut out = vec![0; 4 * 3 * 4];
+        scale_bilinear_argb32(&src, 7, 5, &mut out, 4, 3);
+        for (d, (x0, x1, fx)) in (0..4usize).zip(taps_for(4, 7)) {
+            for (r, (y0, y1, fy)) in (0..3usize).zip(taps_for(3, 5)) {
+                for c in 0..4 {
+                    let lerp = |row: usize| u32::from(src[row * 28 + x0 * 4 + c]) * (256 - fx) + u32::from(src[row * 28 + x1 * 4 + c]) * fx;
+                    let expected = ((lerp(y0) * (256 - fy) + lerp(y1) * fy + 32768) >> 16) as u8;
+                    assert_eq!(out[(r * 4 + d) * 4 + c], expected, "({d},{r},{c})");
+                }
+            }
+        }
+    }
+
+    fn taps_for(dst_len: u32, src_len: u32) -> Vec<(usize, usize, u32)> {
+        (0..dst_len)
+            .map(|d| {
+                let pos = ((2 * u64::from(d) + 1) * u64::from(src_len) * 128 / u64::from(dst_len)).saturating_sub(128);
+                let first = ((pos >> 8) as usize).min(src_len as usize - 1);
+                let second = (first + 1).min(src_len as usize - 1);
+                (first, second, (pos & 255) as u32)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+
+    extern "C" {
+        fn x264c_test_convert(src: *const u8, pitch: u32, y: *mut u8, u: *mut u8, v: *mut u8,
+                              w: libc::c_int, h: libc::c_int, force_scalar: libc::c_int) -> libc::c_int;
+    }
+
+    fn pixels(w: u32, h: u32, seed: u32) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut v = vec![0u8; w as usize * h as usize * 4];
+        for p in v.chunks_exact_mut(4) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            p.copy_from_slice(&[s as u8, (s >> 8) as u8, (s >> 16) as u8, 0xFF]);
+        }
+        v
+    }
+
+    /// (Y, U, V, whether the AVX2 path ran)
+    fn convert(src: &[u8], pitch: u32, w: u32, h: u32, force_scalar: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>, bool) {
+        let (mut y, mut u, mut v) = (
+            vec![0u8; (w * h) as usize],
+            vec![0u8; (w / 2 * (h / 2)) as usize],
+            vec![0u8; (w / 2 * (h / 2)) as usize],
+        );
+        let used = unsafe {
+            x264c_test_convert(src.as_ptr(), pitch, y.as_mut_ptr(), u.as_mut_ptr(), v.as_mut_ptr(),
+                               w as libc::c_int, h as libc::c_int, libc::c_int::from(force_scalar))
+        };
+        (y, u, v, used == 1)
+    }
+
+    #[test]
+    fn avx2_bgrx_to_i420_matches_scalar_byte_for_byte() {
+        // Widths that are not multiples of 16/32 exercise the vector tail; the heights give an
+        // odd number of row pairs, and 1920x1200 is the production size.
+        for (w, h) in [(1922u32, 10u32), (2560, 4), (1366, 6), (1920, 1200)] {
+            let src = pixels(w, h, 0x1234_5678 ^ w);
+            let (sy, su, sv, scalar_used) = convert(&src, w * 4, w, h, true);
+            assert!(!scalar_used, "force_scalar must run the scalar path");
+            let (ay, au, av, avx2_used) = convert(&src, w * 4, w, h, false);
+            if !avx2_used {
+                eprintln!("AVX2 not available; scalar output only for {w}x{h}");
+                continue;
+            }
+            assert!(sy == ay, "Y differs at {w}x{h}");
+            assert!(su == au, "U differs at {w}x{h}");
+            assert!(sv == av, "V differs at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn fused_scale_convert_matches_scale_then_convert_byte_for_byte() {
+        // Production size, a source whose width is not a multiple of the vector width, and an
+        // odd number of destination row pairs.
+        for (sw, sh, dw, dh) in [(2560u32, 1600u32, 1920u32, 1200u32), (1922, 1000, 1366, 710), (1920, 1200, 1280, 800)] {
+            let src = pixels(sw, sh, 0x9E37_79B9 ^ sw);
+            let mut scaled = vec![0u8; (dw * dh * 4) as usize];
+            scale_bilinear_argb32(&src, sw, sh, &mut scaled, dw, dh);
+            let (sy, su, sv, _) = convert(&scaled, dw * 4, dw, dh, true);
+            let mut planes = Planes::new(dw, dh);
+            scale_convert_bgrx_i420(&src, sw, sh, &mut planes.y, &mut planes.u, &mut planes.v, dw, dh);
+            assert!(sy == planes.y, "Y differs at {sw}x{sh} -> {dw}x{dh}");
+            assert!(su == planes.u, "U differs at {sw}x{sh} -> {dw}x{dh}");
+            assert!(sv == planes.v, "V differs at {sw}x{sh} -> {dw}x{dh}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    fn frame(planes: Planes, sem: &Arc<Semaphore>) -> QueuedFrame {
+        let permit = sem.clone().try_acquire_owned().expect("permit");
+        QueuedFrame { planes, force_idr: 0, permit, captured_at: Instant::now(), capture_us: 0, convert_us: 0 }
+    }
+
+    #[test]
+    fn push_after_the_encoder_side_is_gone_reports_closed() {
+        let queue = FrameQueue::new();
+        queue.close();
+        let sem = Arc::new(Semaphore::new(8));
+        assert!(matches!(queue.push(frame(Planes::new(2, 2), &sem)), PushOutcome::Closed(_)));
+    }
+
+    #[test]
+    fn capture_side_exits_when_the_encoder_side_is_gone() {
+        // Simulated encoder: exits after a short delay, closing the queue and raising `stop`.
+        let queue = Arc::new(FrameQueue::new());
+        let pool = Arc::new(PlanePool::new(2));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (cap_queue, cap_pool, cap_stop) = (queue.clone(), pool.clone(), stop.clone());
+        let capture = std::thread::spawn(move || {
+            let sem = Arc::new(Semaphore::new(8));
+            loop {
+                if cap_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Some(planes) = cap_pool.take(2, 2, &cap_stop) else { break; };
+                match cap_queue.push(frame(planes, &sem)) {
+                    PushOutcome::Stored(old) => {
+                        if let Some(old) = old {
+                            cap_pool.give(old.planes);
+                        }
+                    }
+                    PushOutcome::Closed(frame) => {
+                        cap_pool.give(frame.planes);
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let _ = done_tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        queue.close();
+        stop.store(true, Ordering::Relaxed);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).is_ok(), "capture side must exit");
+        capture.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn stage_mean_divides_by_the_window_frame_count() {
+        assert_eq!(window_mean_ms(120 * 5_000, 120), 5.0);
+        assert_eq!(window_mean_ms(60 * 2_500, 60), 2.5);
+        assert_eq!(window_mean_ms(0, 0), 0.0);
     }
 }
