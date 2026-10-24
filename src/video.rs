@@ -75,15 +75,18 @@ fn xrandr_refresh(text: &str) -> Option<f64> {
 /// Keyframe interval. All-intra 60fps measured 30 Mbit/s on the real desktop (saturating the
 /// viewer's Wi-Fi: 3-6 fps received). On a static desktop with NVENC CQ18 a 0.5s GOP measured
 /// 7.7 Mbit/s and a 2s GOP 1.9 Mbit/s. A broken prediction chain freezes until the next IDR or
-/// a PLI. Only the in-process encoder answers PLI/FIR with an IDR, so the child-process path
-/// keeps the short 0.5s GOP and the longer 2s GOP is used only where an on-demand IDR exists.
+/// a PLI. CPU and child-process encoders default to 0.5s for recovery; native hardware
+/// encoders retain 2s and can answer PLI/FIR with an IDR.
 const GOP_SECONDS_PROCESS: f64 = 0.5;
 const GOP_SECONDS_IN_PROCESS: f64 = 2.0;
 
 /// Keyframe interval in frames at the nominal rate. `UU_VIDEO_GOP_SECONDS` overrides the default for both paths.
 fn gop_frames(fps: u32, in_process: bool) -> u64 {
+    gop_frames_with_override(fps, in_process, std::env::var("UU_VIDEO_GOP_SECONDS").ok().as_deref())
+}
+fn gop_frames_with_override(fps: u32, in_process: bool, value: Option<&str>) -> u64 {
     let default = if in_process { GOP_SECONDS_IN_PROCESS } else { GOP_SECONDS_PROCESS };
-    let seconds = std::env::var("UU_VIDEO_GOP_SECONDS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(default);
+    let seconds = value.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0 && *v <= 10.0).unwrap_or(default);
     ((f64::from(fps) * seconds).round() as u64).max(1)
 }
 const MAX_ACCESS_UNIT: usize = 8 * 1024 * 1024;
@@ -893,7 +896,7 @@ async fn read_encoder_with(
         let rate = inproc_rate_control(&settings, encoder);
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
-            gop: gop_frames(settings.fps, true) as u32, cq: settings.cq() as u32,
+            gop: gop_frames(settings.fps, encoder != Encoder::Cpu) as u32, cq: settings.cq() as u32,
             abr: rate.abr, target_bps: rate.target_bps, max_bps: rate.max_bps, buffer_bits: rate.buffer_bits, codec: settings.codec, chroma: settings.chroma,
             vaapi: encoder == Encoder::Vaapi,
             cpu: encoder == Encoder::Cpu,
@@ -906,7 +909,7 @@ async fn read_encoder_with(
     let source_size = size;
     let size = format!("{}x{}", size.0, size.1);
     let fps = settings.fps.to_string();
-    // Keep the IDR interval at 2 s whatever the frame rate.
+    // Keep the process pipeline IDR interval at the configured duration.
     let gop = gop_frames(settings.fps, false).to_string();
     let (maxrate, _) = rate_args(&settings, encoder);
     let cq = settings.cq().to_string();
@@ -1411,6 +1414,24 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_gop_defaults_to_half_a_second() {
+        assert_eq!(super::gop_frames_with_override(60, false, None), 30);
+    }
+    #[test]
+    fn explicit_gop_can_select_two_seconds() {
+        assert_eq!(super::gop_frames_with_override(60, false, Some("2")), 120);
+    }
+    #[test]
+    fn invalid_gop_uses_default() {
+        for value in ["NaN", "inf", "0", "-1", "11", "bad"] {
+            assert_eq!(super::gop_frames_with_override(60, false, Some(value)), 30);
+        }
+    }
+    #[test]
+    fn hardware_inprocess_gop_is_unchanged() {
+        assert_eq!(super::gop_frames_with_override(60, true, None), 120);
+    }
     #[test]
     fn nvidia_display_is_detected_from_connected_connectors() {
         use std::os::unix::fs::symlink;

@@ -199,6 +199,8 @@ cargo build --release --features wayland,portal   # + GNOME/KDE on Wayland
 The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config --modversion libavcodec` = 60.x); FFmpeg 7+ fails inside `ffmpeg-sys-next` with `avfft.h file not found` (#63).
 The host's optional `--features inproc-av` provides in-process encoding on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU H.264 encoding (except 4:4:4 and `UU_CAPTURE=grab`) also uses in-process libx264: building requires `libx264-dev`, libx264 is loaded with dlopen at runtime, and initialization failure falls back to the FFmpeg process. Other CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
 
+CPU H.264 defaults to a 0.5-second GOP; `UU_VIDEO_GOP_SECONDS=2` selects 2 seconds to reduce keyframe overhead, with potentially slower packet-loss recovery. This variable overrides all encoder paths, accepts finite seconds greater than 0 and at most 10, and uses each path’s default for invalid values.
+
 ### 3. Log in
 
 Run inside your graphical session:
