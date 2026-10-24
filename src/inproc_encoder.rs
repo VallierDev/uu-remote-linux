@@ -1137,9 +1137,7 @@ fn scaled_row(src: &[u8], src_stride: usize, rows: &[(usize, usize, u32)], r: us
         // Safety: avx2_available() checked the CPU feature; slices are live and equally long.
         unsafe { vertical_row_avx2(top, bottom, a as u16, b as u16, mid) };
     } else {
-        for (m, (t, bt)) in mid.iter_mut().zip(top.iter().zip(bottom)) {
-            *m = (u32::from(*t) * a + u32::from(*bt) * b) as u16;
-        }
+        vertical_row_scalar(top, bottom, a as u16, b as u16, mid);
     }
     if sse41_available() {
         // Safety: sse41_available() checked the CPU feature; rows come from live slices.
@@ -1183,6 +1181,12 @@ fn horizontal_row_scalar(row: &[u16], columns: &[(usize, usize, u32)], dst_row: 
     }
 }
 
+fn vertical_row_scalar(top: &[u8], bottom: &[u8], a: u16, b: u16, mid: &mut [u16]) {
+    for (m, (t, u)) in mid.iter_mut().zip(top.iter().zip(bottom.iter())) {
+        *m = (u32::from(*t) * u32::from(a) + u32::from(*u) * u32::from(b)) as u16;
+    }
+}
+
 /// Vertical pass of the scaler: 16 pixels per AVX2 iteration (u16 arithmetic cannot overflow:
 /// top*a + bottom*b <= 255*256). Scalar tail and scalar fallback keep the same integers.
 #[cfg(target_arch = "x86_64")]
@@ -1198,9 +1202,7 @@ unsafe fn vertical_row_avx2(top: &[u8], bottom: &[u8], a: u16, b: u16, mid: &mut
         _mm256_storeu_si256(mid.as_mut_ptr().add(i) as *mut __m256i, m);
         i += 16;
     }
-    for (m, (t, u)) in mid[i..].iter_mut().zip(top[i..].iter().zip(bottom[i..].iter())) {
-        *m = (u32::from(*t) * u32::from(a) + u32::from(*u) * u32::from(b)) as u16;
-    }
+    vertical_row_scalar(&top[i..], &bottom[i..], a, b, &mut mid[i..]);
 }
 
 fn avx2_available() -> bool {
@@ -1244,6 +1246,12 @@ unsafe fn horizontal_row_sse41(row: &[u16], columns: &[(usize, usize, u32)], dst
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn horizontal_row_sse41(row: &[u16], columns: &[(usize, usize, u32)], dst_row: &mut [u8]) {
     horizontal_row_scalar(row, columns, dst_row)
+}
+
+/// Non-x86-64 fallback for the vertical pass: same integers as the AVX2 kernel.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn vertical_row_avx2(top: &[u8], bottom: &[u8], a: u16, b: u16, mid: &mut [u16]) {
+    vertical_row_scalar(top, bottom, a, b, mid);
 }
 
 /// Copies the capture into the top-left corner of the larger encoder frame; the rest stays black.

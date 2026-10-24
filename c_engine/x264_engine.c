@@ -11,7 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
 #include <x264.h>
 
 #define X264C_STR2(x) #x
@@ -151,7 +153,8 @@ void *x264c_create(const X264cConfig *cfg, int *error) {
 // BT.601 limited range, the integer coefficients swscale uses for bgr0 -> yuv420p.
 static inline uint8_t x264c_clip8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v); }
 
-// Runtime AVX2 dispatch: one cached CPU-feature check, scalar stays as the fallback.
+// Runtime AVX2 dispatch on x86-64: one cached CPU-feature check, scalar stays as the fallback.
+#if defined(__x86_64__)
 #define X264C_AVX2 __attribute__((target("avx2")))
 
 static int x264c_avx2(void) {
@@ -159,6 +162,9 @@ static int x264c_avx2(void) {
     if (supported < 0) supported = __builtin_cpu_supports("avx2") ? 1 : 0;
     return supported;
 }
+#else
+static int x264c_avx2(void) { return 0; }
+#endif
 
 static inline void x264c_y_row_scalar(const uint8_t *row, uint8_t *yp, int w) {
     for (int x = 0; x < w; x++) {
@@ -167,6 +173,7 @@ static inline void x264c_y_row_scalar(const uint8_t *row, uint8_t *yp, int w) {
     }
 }
 
+#if defined(__x86_64__)
 // Eight pixels per iteration in 32-bit lanes; the sum plus rounding fits u16 and the range
 // (16..235) needs no clamp, so a saturating pack writes the eight luma bytes directly.
 X264C_AVX2 static void x264c_y_row_avx2(const uint8_t *row, uint8_t *yp, int w) {
@@ -232,6 +239,8 @@ X264C_AVX2 static void x264c_uv_row_avx2(const uint8_t *r0, const uint8_t *r1, u
     }
 }
 
+#endif // __x86_64__
+
 static void x264c_uv_row_scalar(const uint8_t *r0, const uint8_t *r1, uint8_t *up, uint8_t *vp, int w) {
     const int cw = w / 2;
     for (int cx = 0; cx < cw; cx++) {
@@ -251,14 +260,20 @@ static void x264c_convert_i420(const uint8_t *src, uint32_t pitch, uint8_t *y, u
     const int cw = w / 2;
     for (int row = 0; row < h; row++) {
         const uint8_t *src_row = src + (size_t)row * pitch;
-        if (avx2) x264c_y_row_avx2(src_row, y + (size_t)row * w, w);
-        else x264c_y_row_scalar(src_row, y + (size_t)row * w, w);
+#if defined(__x86_64__)
+        if (avx2) { x264c_y_row_avx2(src_row, y + (size_t)row * w, w); continue; }
+#else
+        (void)avx2;
+#endif
+        x264c_y_row_scalar(src_row, y + (size_t)row * w, w);
     }
     for (int row = 0; row + 1 < h; row += 2) {
         const uint8_t *r0 = src + (size_t)row * pitch, *r1 = src + (size_t)(row + 1) * pitch;
         uint8_t *up = u + (size_t)(row / 2) * cw, *vp = v + (size_t)(row / 2) * cw;
-        if (avx2) x264c_uv_row_avx2(r0, r1, up, vp, w);
-        else x264c_uv_row_scalar(r0, r1, up, vp, w);
+#if defined(__x86_64__)
+        if (avx2) { x264c_uv_row_avx2(r0, r1, up, vp, w); continue; }
+#endif
+        x264c_uv_row_scalar(r0, r1, up, vp, w);
     }
 }
 
@@ -282,15 +297,17 @@ int x264c_test_convert(const uint8_t *src, uint32_t pitch, uint8_t *y, uint8_t *
 void x264c_convert_row_pair(const uint8_t *top, const uint8_t *bottom, uint8_t *y_top, uint8_t *y_bottom,
                             uint8_t *u, uint8_t *v, int w) {
     if (!top || !bottom || !y_top || !y_bottom || !u || !v || w <= 0) return;
+#if defined(__x86_64__)
     if (x264c_avx2()) {
         x264c_y_row_avx2(top, y_top, w);
         x264c_y_row_avx2(bottom, y_bottom, w);
         x264c_uv_row_avx2(top, bottom, u, v, w);
-    } else {
-        x264c_y_row_scalar(top, y_top, w);
-        x264c_y_row_scalar(bottom, y_bottom, w);
-        x264c_uv_row_scalar(top, bottom, u, v, w);
+        return;
     }
+#endif
+    x264c_y_row_scalar(top, y_top, w);
+    x264c_y_row_scalar(bottom, y_bottom, w);
+    x264c_uv_row_scalar(top, bottom, u, v, w);
 }
 
 static int x264c_pic_encode(X264cEngine *e, int force_idr, const uint8_t **out_data, uint32_t *out_len) {
