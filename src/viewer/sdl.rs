@@ -81,6 +81,11 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
                 Event::MouseMotion{x,y,..}=>viewport.motion(x as f64,y as f64),
                 Event::MouseButtonDown{mouse_btn,..}=>button(mouse_btn).and_then(|b|input.button(b,true)),
                 Event::MouseButtonUp{mouse_btn,..}=>button(mouse_btn).and_then(|b|input.button(b,false)),
+                Event::MouseWheel{x,y,precise_x,precise_y,direction,..}=>{
+                    let(dx,dy)=if precise_x!=0.||precise_y!=0.{(f64::from(precise_x),f64::from(precise_y))}else{(f64::from(x),f64::from(y))};
+                    let(dx,dy)=match direction{sdl2::mouse::MouseWheelDirection::Flipped=>(-dx,-dy),_=>(dx,dy)};
+                    input.scroll(dx,dy)
+                },
                 _=>None,
             };if let Some(m)=message{messages.push(m);}
         } (quit,messages)
@@ -431,6 +436,24 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             assert!(files);assert!(out.iter().all(|v|v["action"]=="kbd_release"));
             assert!(input.release_all().is_empty());
         }
+    }
+    #[test] fn wheel_events_become_scroll_messages(){
+        use sdl2::mouse::MouseWheelDirection;
+        let mut input=Input::default();let mut focused=true;
+        let v=Viewport::fit((800,600),(1920,1080));
+        let wheel=|direction,x,y|Event::MouseWheel{timestamp:0,window_id:1,which:0,mouse_x:0,mouse_y:0,x,y,precise_x:0.,precise_y:0.,direction};
+        let(_,out)=translate([wheel(MouseWheelDirection::Normal,0,1),wheel(MouseWheelDirection::Flipped,0,1),wheel(MouseWheelDirection::Normal,0,0)],&mut input,v,&mut focused);
+        assert_eq!(out.len(),2);
+        assert_eq!(out[0]["action"],"mouse_scroll");
+        assert_eq!(out[0]["delta_y"],120);
+        assert_eq!(out[1]["delta_y"],-120);
+        // Trackpads report fractional precise deltas; a quarter notch is 30 wire units.
+        let precise=Event::MouseWheel{timestamp:0,window_id:1,which:0,mouse_x:0,mouse_y:0,x:0,y:0,precise_x:0.,precise_y:-0.25,direction:MouseWheelDirection::Normal};
+        let(_,out)=translate([precise],&mut input,v,&mut focused);
+        assert_eq!(out[0]["delta_y"],-30);
+        let mut watch=Input::new(true);let mut watching=true;
+        let(_,out)=translate([wheel(MouseWheelDirection::Normal,0,1)],&mut watch,v,&mut watching);
+        assert!(out.is_empty());
     }
     #[test] fn watch_events_never_emit_input_and_still_close(){
         let mut input=Input::new(true);let mut focused=true;

@@ -75,6 +75,14 @@ impl Input {
         let changed=if down{self.buttons.insert(button)}else{self.buttons.remove(&button)};
         changed.then(||json!({"action":if down{"mouse_press"}else{"mouse_release"},"button":button}))
     }
+    /// SDL wheel units are notches; the wire uses the Mac convention (one notch = 120).
+    /// Positive y is wheel-up, matching the host's `mouse_scroll` (button 4).
+    pub fn scroll(&mut self,x:f64,y:f64)->Option<Value> {
+        if self.view_only {return None}
+        let(dx,dy)=((x*120.).round() as i32,(y*120.).round() as i32);
+        if dx==0&&dy==0 {return None}
+        Some(json!({"action":"mouse_scroll","delta_x":dx,"delta_y":dy}))
+    }
     pub fn release_all(&mut self)->Vec<Value> {
         let mut out=Vec::new();
         for key in std::mem::take(&mut self.keys).into_values().collect::<BTreeSet<_>>() {out.push(json!({"action":"kbd_release","key":key}));}
@@ -116,6 +124,15 @@ impl Input {
         assert!(!view_only(None,None).unwrap());assert!(!view_only(None,Some("0")).unwrap());
         assert!(view_only(None,Some("1")).unwrap());assert!(view_only(Some("--view-only"),Some("0")).unwrap());
         assert!(view_only(Some("invalid"),None).is_err());
+    }
+    #[test] fn wheel_notches_use_mac_wire_units(){
+        let mut i=Input::default();
+        assert_eq!(i.scroll(0.,1.).unwrap(),json!({"action":"mouse_scroll","delta_x":0,"delta_y":120}));
+        assert_eq!(i.scroll(0.,-1.).unwrap()["delta_y"],-120);
+        assert_eq!(i.scroll(1.,-2.).unwrap(),json!({"action":"mouse_scroll","delta_x":120,"delta_y":-240}));
+        assert_eq!(i.scroll(0.,0.1).unwrap()["delta_y"],12); // precise trackpad deltas
+        assert!(i.scroll(0.,0.).is_none());
+        assert!(Input::new(true).scroll(0.,1.).is_none());
     }
     #[test] fn mappings_encoding_and_focus() {
         for (scan,vk) in [(4,65),(29,90),(39,48),(58,112),(80,37),(224,162),(230,165),(52,222)] {assert_eq!(windows_vk(scan),Some(vk));}
