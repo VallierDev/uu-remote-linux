@@ -12,4 +12,4 @@ Categories=Network;RemoteAccess;
 Keywords=remote;assist;UU;远程;协助;
 StartupNotify=false
 # Matches the GTK window class so docks/taskbars show this icon for the host window (#13).
-StartupWMClass=uu-remote-linux
+StartupWMClass=uuremote-server
