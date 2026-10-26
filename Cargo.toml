@@ -64,6 +64,11 @@ sdl2 = { version = "0.37", optional = true, features = ["use-pkgconfig"] }
 cc = "1.0"
 
 [patch.crates-io]
+# LoongArch: nix 0.26 predates loongarch64; webrtc-util pins nix 0.26.
+nix = { path = "vendor/nix-0.26" }
+# LoongArch: ring 0.17 is the first ring release with a loongarch64 backend.
+rcgen = { path = "vendor/rcgen-0.11" }
+x509-parser = { path = "vendor/x509-parser-0.15" }
 # RTP rollover counter survives delayed NACK retransmissions (vendor/webrtc-srtp/PATCHES.md).
 webrtc-srtp = { path = "vendor/webrtc-srtp" }
 webrtc-dtls = { path = "vendor/webrtc-dtls" }
