@@ -211,10 +211,13 @@ fn chroma_args(settings: &VideoSettings, encoder: Encoder) -> (&'static str, &'s
 }
 pub(crate) fn vaapi_device() -> String { std::env::var("UU_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".into()) }
 
-/// NV12 conversion must precede upload; scaling runs on software frames, before hwupload.
+/// Upload software frames and convert/scale to NV12 in VPP on the GPU; swscale here
+/// costs ~2 cores at 1080p60 on the Loongson and starves capture and networking.
 fn vaapi_filter(output: Option<(u32, u32)>) -> String {
-    let scale = output.map_or(String::new(), |(w,h)| format!("scale={w}:{h}:flags=bilinear,"));
-    format!("{scale}format=nv12,hwupload")
+    output.map_or_else(
+        || "hwupload,scale_vaapi=format=nv12".to_string(),
+        |(w,h)| format!("hwupload,scale_vaapi=w={w}:h={h}:format=nv12"),
+    )
 }
 fn vaapi_options(settings: &VideoSettings, gop: &str) -> Vec<String> {
     let (maxrate, buffer) = rate_args(settings, Encoder::Vaapi);
@@ -1386,9 +1389,9 @@ mod tests {
             assert!(scale_options(&native, encoder, None).is_empty());
         }
         assert_eq!(scale_options(&native, Encoder::Vaapi, Some((2560, 2507))),
-            vec!["-vf".to_string(), format!("{pad},format=nv12,hwupload")]);
+            vec!["-vf".to_string(), format!("{pad},hwupload,scale_vaapi=format=nv12")]);
         assert_eq!(scale_options(&native, Encoder::Vaapi, Some((2560, 2508))),
-            vec!["-vf".to_string(), "format=nv12,hwupload".to_string()]);
+            vec!["-vf".to_string(), "hwupload,scale_vaapi=format=nv12".to_string()]);
         let scaled = VideoSettings { output: Some((1280, 720)), ..Default::default() };
         assert_eq!(scale_options(&scaled, Encoder::Cpu, Some((2560, 2507))),
             vec!["-vf".to_string(), "scale=1280:720:flags=bilinear".to_string()]);
@@ -1585,9 +1588,9 @@ mod tests {
     }
 
     #[test]
-    fn vaapi_is_explicit_and_upload_follows_scale() {
-        assert_eq!(vaapi_filter(None), "format=nv12,hwupload");
-        assert_eq!(vaapi_filter(Some((1280,720))), "scale=1280:720:flags=bilinear,format=nv12,hwupload");
+    fn vaapi_is_explicit_and_scales_on_gpu() {
+        assert_eq!(vaapi_filter(None), "hwupload,scale_vaapi=format=nv12");
+        assert_eq!(vaapi_filter(Some((1280,720))), "hwupload,scale_vaapi=w=1280:h=720:format=nv12");
         let options = vaapi_options(&VideoSettings::default(), "30");
         for pair in [["-g","30"], ["-bf","0"], ["-async_depth","1"], ["-aud","1"]] {
             assert!(options.windows(2).any(|w| w[0] == pair[0] && w[1] == pair[1]));
