@@ -378,53 +378,43 @@ impl InputInjector {
         if text.is_empty() || text.len() > crate::clipboard::MAX_TEXT {
             return false;
         }
-        // 1. Try Portal clipboard if session is bound and active
-        if let Some(portal) = self.portal.lock().unwrap().as_ref() {
-            if portal.clipboard_set(text).is_ok() {
-                return true;
-            }
+        // In unit tests, never invoke external clipboard binaries (wl-copy)
+        // or alter the system clipboard to prevent side effects on developer desktops.
+        #[cfg(test)]
+        {
+            let _ = text;
+            false
         }
-        // 2. Try wl-copy in Wayland session
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            if let Ok(mut child) = std::process::Command::new("wl-copy")
-                .args(["--type", "text/plain;charset=utf-8"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                if let Some(mut stdin) = child.stdin.take() {
-                    use std::io::Write;
-                    let _ = stdin.write_all(text.as_bytes());
+        #[cfg(not(test))]
+        {
+            // 1. Try Portal clipboard if session is bound and active
+            if let Some(portal) = self.portal.lock().unwrap().as_ref() {
+                if portal.clipboard_set(text).is_ok() {
+                    return true;
                 }
-                if let Ok(status) = child.wait() {
-                    if status.success() {
-                        return true;
+            }
+            // 2. Try wl-copy in Wayland session
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                if let Ok(mut child) = std::process::Command::new("wl-copy")
+                    .args(["--type", "text/plain;charset=utf-8"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    if let Ok(status) = child.wait() {
+                        if status.success() {
+                            return true;
+                        }
                     }
                 }
             }
+            false
         }
-        // 3. Fallback to xclip if in X11
-        if std::env::var_os("DISPLAY").is_some() {
-            if let Ok(mut child) = std::process::Command::new("xclip")
-                .args(["-selection", "clipboard"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                if let Some(mut stdin) = child.stdin.take() {
-                    use std::io::Write;
-                    let _ = stdin.write_all(text.as_bytes());
-                }
-                if let Ok(status) = child.wait() {
-                    if status.success() {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 
     /// Injects text by copying it to the clipboard and simulating a paste shortcut.
@@ -468,7 +458,7 @@ impl InputInjector {
 
     /// Mobile input-method text (`text_input`). X11 types it directly; Wayland re-maps a spare
     /// keycode in the virtual keyboard's keymap. Portal and other Wayland environments inject
-    /// via clipboard paste (Shift+Insert).
+    /// via clipboard paste (Shift+Insert). Set UU_WAYLAND_TEXT=0 to disable Wayland text injection.
     pub fn text_input(&self, text: &str) {
         let _serial=self.serial.lock().unwrap();
         let Ok(c_text)=std::ffi::CString::new(text.replace('\0',"")) else { return };
@@ -476,7 +466,7 @@ impl InputInjector {
             let typed=unsafe { x11_type_utf8(c_text.as_ptr()) };
             log::info!("Desktop text input: chars={} result={}", text.chars().count(), typed);
         } else if self.backend==crate::desktop_backend::DesktopBackend::Wayland {
-            // Escape hatch: keep the old behaviour without rebuilding.
+            // Escape hatch: disable Wayland text typing/pasting entirely without rebuilding.
             if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
             let typed=crate::wayland::type_utf8(text);
             if typed>=0 {
@@ -493,6 +483,7 @@ impl InputInjector {
                 log::warn!("Mobile text input unavailable on the Wayland backend (native and clipboard fallback failed)");
             }
         } else if self.backend==crate::desktop_backend::DesktopBackend::Portal {
+            if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
             if self.paste_text_via_clipboard(text) {
                 log::info!("Desktop text input (Portal clipboard paste): chars={} result=ok", text.chars().count());
                 return;
@@ -502,10 +493,6 @@ impl InputInjector {
                 log::warn!("Portal clipboard text paste failed: ensure clipboard permission or wl-copy is available");
             }
         } else {
-            if self.paste_text_via_clipboard(text) {
-                log::info!("Desktop text input (generic clipboard paste): chars={} result=ok", text.chars().count());
-                return;
-            }
             static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true,std::sync::atomic::Ordering::Relaxed) {
                 log::warn!("Mobile text input is not supported on the {:?} backend yet", self.backend);
@@ -854,10 +841,20 @@ mod clipboard_paste_text_tests {
     }
 
     #[test]
-    fn text_input_handles_portal_backend_safely() {
+    fn text_input_handles_portal_backend_safely_without_side_effects() {
         let mut input = InputInjector::new();
         input.backend = crate::desktop_backend::DesktopBackend::Portal;
-        // Should not panic even if no Portal session is bound
+        // In unit tests, set_clipboard_text avoids external commands so this
+        // will not mutate the host's actual clipboard.
         input.text_input("测试输入法文字");
+    }
+
+    #[test]
+    fn text_input_respects_disable_env() {
+        let mut input = InputInjector::new();
+        input.backend = crate::desktop_backend::DesktopBackend::Portal;
+        std::env::set_var("UU_WAYLAND_TEXT", "0");
+        input.text_input("测试输入法文字");
+        std::env::remove_var("UU_WAYLAND_TEXT");
     }
 }
