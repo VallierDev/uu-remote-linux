@@ -6,6 +6,9 @@ pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl
     pub last_frame:Option<Frame> }
 impl Window {
     pub fn new()->Result<Self,String>{
+        // SDL's default nearest-neighbour scaling makes remote text uneven whenever the window size
+        // differs from the stream; filter instead. Set before the renderer/textures exist.
+        sdl2::hint::set_with_priority("SDL_RENDER_SCALE_QUALITY","linear",&sdl2::hint::Hint::Default);
         let sdl=sdl2::init()?;let video=sdl.video()?;
         let window=video.window("Native viewer (experimental)",1280,720).position_centered().resizable().build().map_err(|_|"Window creation failed")?;
         let mut canvas=window.into_canvas().build().map_err(|_|"Renderer creation failed")?;
