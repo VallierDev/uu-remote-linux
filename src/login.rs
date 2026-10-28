@@ -272,7 +272,26 @@ pub fn prepare_identity() -> Result<(Value, Credentials), String> {
     Ok((cfg, creds))
 }
 
+/// Holds an exclusive lock beside config.json while a device identity is created: the host's own QR
+/// window and the viewer's sign-in can run at once, and two `device/windows/init` calls would leave the
+/// account bound to one device while config.json keeps the other (the host then shows as offline).
+struct IdentityLock(std::fs::File);
+impl IdentityLock {
+    fn acquire() -> Result<Self, String> {
+        use std::os::unix::io::AsRawFd;
+        let path = crate::config::path().with_extension("lock");
+        if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+        let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(|_| "Cannot open the identity lock")?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 { return Err("Cannot lock the device identity".into()) }
+        Ok(Self(file))
+    }
+}
+impl Drop for IdentityLock { fn drop(&mut self) { use std::os::unix::io::AsRawFd; unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); } } }
+
 pub async fn prepare_device() -> Result<(Value, Credentials), String> {
+    // Read the configuration only after taking the lock, so a waiting process sees the device the
+    // first one registered instead of creating its own.
+    let _lock = tokio::task::spawn_blocking(IdentityLock::acquire).await.map_err(|_| "Identity lock task failed")??;
     let (mut cfg, mut creds) = prepare_identity()?;
     let get = |cfg: &Value, k: &str| std::env::var(format!("UU_{}", k.to_uppercase())).ok().filter(|v| !v.is_empty())
         .or_else(|| cfg.get(k).and_then(|v| v.as_str()).map(str::to_owned)).unwrap_or_default();
