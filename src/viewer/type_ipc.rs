@@ -392,7 +392,10 @@ mod tests {
 
     fn tempfile_dir() -> PathBuf {
         use std::os::unix::fs::DirBuilderExt;
-        let dir = std::env::temp_dir().join(format!("uu-type-ipc-test-{}", std::process::id()));
+        // One directory per call: tests run in parallel and must not remove each other's files.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("uu-type-ipc-test-{}-{}", std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -404,6 +407,8 @@ mod tests {
     #[tokio::test]
     async fn server_client_roundtrip_and_uid_gate() {
         let device = format!("ipc-test-{}", uuidish());
+        // XDG_RUNTIME_DIR is process-wide; another test points it at a planted directory.
+        let _env = crate::viewer::secure_input::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = Server::bind(&device).await.unwrap();
         let path = server.path.clone();
         let (tx, mut rx) = mpsc::channel::<PendingType>(4);
@@ -463,6 +468,8 @@ mod tests {
     #[tokio::test]
     async fn oversized_frame_rejected() {
         let device = format!("oversize-{}", uuidish());
+        // XDG_RUNTIME_DIR is process-wide; another test points it at a planted directory.
+        let _env = crate::viewer::secure_input::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = Server::bind(&device).await.unwrap();
         let path = server.path.clone();
         let (tx, mut rx) = mpsc::channel::<PendingType>(1);

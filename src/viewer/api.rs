@@ -22,13 +22,28 @@ fn device_platform(data:&Value,device:&str)->Option<i64>{
         .find(|d|d.get("device_id").and_then(Value::as_str)==Some(device))
         .and_then(|d|d.get("platform")).and_then(Value::as_i64)
 }
+/// English for server messages observed in assistance and connection replies.
+fn english_message(msg: &str) -> Option<&'static str> {
+    Some(match msg {
+        "验证码错误" => "Wrong verification code",
+        "对方未开启协助" => "The partner has not turned on remote assistance",
+        "无法对同账号的设备发起远程协助" => "Remote assistance between devices of the same account is not possible",
+        "被控端正在被远控中，无法发起连接" => "This computer is already being controlled from another device",
+        _ => return None,
+    })
+}
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error { AuthenticationExpired, Api(i32, String), InvalidResponse, Transport, MissingRoom, InvalidDevice, InvalidAssist, UnknownKeyboardPlatform }
 impl std::fmt::Display for Error {
     // The server's short message is user-facing (e.g. 2002 「被控端正在被远控中，无法发起连接」).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Api(code, msg) if !msg.is_empty() => write!(f, "{msg} (code {code})"),
+            // Observed 2002: the target already has a controller (another viewer, a phone).
+            Error::Api(2002, _) => f.write_str(crate::i18n::s("被控端正在被远控中，无法发起连接（错误码 2002）",
+                "This computer is already being controlled from another device; disconnect there and try again (error 2002)")),
+            // Server messages are Chinese only: the English UI translates the known ones.
+            Error::Api(code, msg) if !msg.is_empty() && !crate::i18n::english() => write!(f, "{msg} (code {code})"),
+            Error::Api(code, msg) if english_message(msg).is_some() => write!(f, "{} (code {code})", english_message(msg).unwrap_or_default()),
             Error::AuthenticationExpired => f.write_str(crate::i18n::s("登录已过期，请重新登录","Sign-in expired, please sign in again")),
             Error::Transport => f.write_str(crate::i18n::s("网络连接失败","Network connection failed")),
             Error::InvalidAssist => f.write_str(crate::i18n::s("请输入对方的设备 ID 和有效验证码","Enter the partner's device ID and a valid code")),
@@ -237,7 +252,8 @@ mod tests {
             assert_eq!(parse_share(200,v,&[]).err().unwrap(),Error::MissingRoom);
         }
         for msg in ["验证码错误","对方未开启协助","无法对同账号的设备发起远程协助"] {
-            assert_eq!(parse_share(422,json!({"code":9876,"msg":msg}),&[]).err().unwrap().to_string(),format!("{msg} (code 9876)"));
+            let shown=if crate::i18n::english() {english_message(msg).unwrap()} else {msg};
+            assert_eq!(parse_share(422,json!({"code":9876,"msg":msg}),&[]).err().unwrap().to_string(),format!("{shown} (code 9876)"));
         }
         assert_eq!(parse_share(422,json!({"code":9876,"msg":"fixture-code\nfixture-token"}),&["fixture-code","fixture-token",""]).err().unwrap(),Error::Api(9876,"[已隐藏][已隐藏]".into()));
         assert_eq!(parse_share(422,json!({"code":1120,"msg":"expired"}),&[]).err().unwrap(),Error::AuthenticationExpired);
@@ -405,7 +421,8 @@ mod http_tests {
         for msg in ["验证码错误","对方未开启协助","无法对同账号的设备发起远程协助"] {
             let(url,job)=server(vec![(422,json!({"code":9876,"msg":msg}))]).await;
             let error=Api::new(signer(),&url).join_share("synthetic-id","synthetic-code").await.err().unwrap();
-            assert_eq!(error.to_string(),format!("{msg} (code 9876)"));assert_eq!(job.await.unwrap().len(),1);
+            let shown=if crate::i18n::english() {english_message(msg).unwrap()} else {msg};
+            assert_eq!(error.to_string(),format!("{shown} (code 9876)"));assert_eq!(job.await.unwrap().len(),1);
         }
         for (status,body,expected) in [
             (200,json!({"code":405,"msg":"业务拒绝"}),Error::Api(405,"业务拒绝".into())),
