@@ -65,8 +65,7 @@ static const char *CSS =
     ".secondary:hover { background-color: #f6f8fa; }\n"
     ".qrbox { background-color: #ffffff; border-radius: 12px; border: 1px solid #dce1e7; padding: 14px; }\n"
     ".status { font-size: 13px; color: #0b7a5c; }\n"
-    ".toast { background-color: #1b2430; color: #ffffff; border-radius: 10px; padding: 10px 18px; font-size: 14px; }\n"
-    "button:focus { outline: 2px solid #0f9d76; outline-offset: 1px; }\n";
+    ".toast { background-color: #1b2430; color: #ffffff; border-radius: 10px; padding: 10px 18px; font-size: 14px; }\n";
 
 typedef struct { char id[64]; char name[128]; int platform, online, current; char thumb[512]; } Device;
 static Device devices[64];
