@@ -105,7 +105,7 @@ impl Window {
         let hit=|x:i32,y:i32|->Option<hud::Hit>{
             let (lx,ly)=(x as f32-origin.0,y as f32-origin.1);
             if tab.contains(x as f32,y as f32) {return Some(hud::Hit::Tab)}
-            if lx<0.||ly<0.||lx>=lay.w||ly>=lay.h {return None}
+            if !lay.panels.iter().any(|p|p.contains(lx,ly)) {return None}
             Some(lay.items.iter().find(|(r,_)|r.contains(lx,ly)).map_or(hud::Hit::Panel,|(_,h)|*h))
         };
         match *event {
@@ -168,7 +168,9 @@ impl Window {
     fn menu_layout(&self)->(hud::Layer,hud::Layout){hud::menu_layer(self.chrome.font.as_ref(),&self.chrome.state,&self.chrome.menu,self.chrome.scale)}
     fn menu_origin(&self,lay:&hud::Layout)->(f32,f32){
         let size=self.canvas.window().size();
-        (((size.0 as f32-lay.w)/2.).max(4.).round(),(hud::TAB_H*self.chrome.scale+6.).round())
+        // The category list sits centered under the tab; the cascade card grows to its right.
+        let shadow=14.*self.chrome.scale;let main=lay.panels.first().map_or(lay.w,|p|p.w);
+        (((size.0 as f32-main)/2.-shadow).max(-shadow).min(size.0 as f32-lay.w+shadow).round(),(hud::TAB_H*self.chrome.scale+4.-shadow).round())
     }
     pub fn redraw(&mut self){
         if let Some(frame)=self.last_frame.take(){if let Err(e)=self.draw(&frame){log::warn!("Viewer redraw failed: {e}");}self.last_frame=Some(frame);}

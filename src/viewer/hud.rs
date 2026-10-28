@@ -6,8 +6,8 @@ use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use crate::i18n::s;
 
 pub type Rgba = [u8; 4];
-const PANEL: Rgba = [24, 26, 31, 238];
-const HOVER: Rgba = [255, 255, 255, 22];
+const PANEL: Rgba = [32, 34, 40, 255];
+const HOVER: Rgba = [255, 255, 255, 16];
 const TEXT: Rgba = [240, 242, 245, 255];
 const DIM: Rgba = [160, 166, 176, 255];
 const ACCENT: Rgba = [59, 130, 246, 255];
@@ -50,7 +50,7 @@ impl Layer {
             caret += scaled.h_advance(id);
             if let Some(outline) = font.outline_glyph(glyph) {
                 let b = outline.px_bounds();
-                outline.draw(|gx, gy, v| self.blend(b.min.x as i32 + gx as i32, b.min.y as i32 + gy as i32, c, v));
+                outline.draw(|gx, gy, v| self.blend(b.min.x.floor() as i32 + gx as i32, b.min.y.floor() as i32 + gy as i32, c, v));
             }
         }
         caret - x
@@ -166,7 +166,7 @@ fn options(cat: usize, st: &State) -> Vec<Opt> {
                   Header(s("色彩", "Color")), Radio(s("真彩 4:4:4", "True color 4:4:4"), st.chroma == 3, Command::Chroma(3)),
                   Radio(s("常规色彩", "Standard color"), st.chroma != 3, Command::Chroma(1))],
         2 => vec![Radio(s("自适应", "Fit to window"), !st.one_to_one, Command::OneToOne(false)), Radio(s("实际大小 1:1", "Actual size 1:1"), st.one_to_one, Command::OneToOne(true))],
-        3 => vec![Header(s("音量", "Volume")), Slider],
+        3 => vec![Slider],
         4 => vec![Check(s("远程结束后，被控端自动锁屏", "Lock the remote when the session ends"), st.auto_lock, Command::AutoLock(!st.auto_lock)),
                   Check(s("被控端静音运行", "Mute the remote while connected"), st.host_mute, Command::HostMute(!st.host_mute))],
         5 => vec![Header(s("键盘", "Keyboard")), Check(s("发送系统快捷键到被控端", "Send system shortcuts (Alt+Tab)"), st.grab_keys, Command::GrabKeys(!st.grab_keys))],
@@ -201,70 +201,111 @@ pub fn tab_layer(font: Option<&FontVec>, scale: f32, hover: bool) -> Layer {
 }
 
 /// Menu geometry relative to its own layer; the same list drives drawing and hit testing.
-pub struct Layout { pub w: f32, pub h: f32, pub items: Vec<(Rect, Hit)> }
-const ROW: f32 = 34.; const LEFT: f32 = 172.; const RIGHT: f32 = 300.; const PAD: f32 = 8.;
-pub fn layout(st: &State, menu: &Menu, scale: f32) -> Layout {
-    let k = |v: f32| v * scale;
-    let mut items = Vec::new();
-    for i in 0..categories().len() { items.push((Rect { x: k(PAD), y: k(PAD + ROW * i as f32), w: k(LEFT - PAD * 2.), h: k(ROW) }, Hit::Category(i))); }
-    let mut y = k(PAD);
-    for (i, opt) in options(menu.category, st).iter().enumerate() {
-        let h = match opt { Opt::Header(_) => k(26.), Opt::Slider => k(40.), _ => k(ROW) };
-        let r = Rect { x: k(LEFT), y, w: k(RIGHT - PAD), h };
-        match opt { Opt::Header(_) => {}, Opt::Slider => items.push((r, Hit::Slider(k(LEFT + 16.), k(RIGHT - 80.)))), _ => items.push((r, Hit::Option(menu.category, i))) }
-        y += h;
+/// Cascading like the official client: a narrow category list and, beside the hovered row,
+/// a card sized to the selected category's options.
+pub struct Layout { pub w: f32, pub h: f32, pub items: Vec<(Rect, Hit)>, pub panels: Vec<Rect> }
+const ROW: f32 = 30.; const HEADER: f32 = 22.; const SLIDER: f32 = 36.; const PAD: f32 = 6.; const SHADOW: f32 = 14.;
+const MAIN_W: f32 = 150.; const GAP: f32 = 6.; const TEXT_SIZE: f32 = 13.;
+fn option_height(opt: &Opt) -> f32 { match opt { Opt::Header(_) => HEADER, Opt::Slider => SLIDER, _ => ROW } }
+fn option_width(font: Option<&FontVec>, opt: &Opt, scale: f32) -> f32 {
+    let text = |t: &str, size: f32| measure(font, t, size * scale);
+    match opt {
+        Opt::Header(t) => text(t, 11.) + 28. * scale,
+        Opt::Radio(t, ..) | Opt::Check(t, ..) => text(t, TEXT_SIZE) + 52. * scale,
+        Opt::Action(t, _, key) => text(t, TEXT_SIZE) + text(key, 11.) + 72. * scale,
+        Opt::Slider => 210. * scale,
     }
-    let left_h = k(PAD * 2. + ROW * categories().len() as f32);
-    let right = !options(menu.category, st).is_empty();
-    Layout { w: if right { k(LEFT + RIGHT) } else { k(LEFT) }, h: left_h.max(y + k(PAD)), items }
+}
+pub fn layout(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -> Layout {
+    let k = |v: f32| v * scale;
+    let cats = categories().len();
+    let main = Rect { x: k(SHADOW), y: k(SHADOW), w: k(MAIN_W), h: k(PAD * 2. + ROW * cats as f32) };
+    let mut items: Vec<(Rect, Hit)> = (0..cats).map(|i| (Rect { x: main.x + k(PAD), y: main.y + k(PAD + ROW * i as f32), w: main.w - k(PAD * 2.), h: k(ROW) }, Hit::Category(i))).collect();
+    let mut panels = vec![Rect { x: main.x, y: main.y, w: main.w, h: main.h }];
+    let opts = options(menu.category, st);
+    let (mut w, mut h) = (main.x + main.w + k(SHADOW), main.y + main.h + k(SHADOW));
+    if !opts.is_empty() {
+        let sub_w = opts.iter().map(|o| option_width(font, o, scale)).fold(k(180.), f32::max);
+        let sub_h = k(PAD * 2.) + opts.iter().map(|o| k(option_height(o))).sum::<f32>();
+        // Aligned with the selected category row, kept inside the main panel's height when possible.
+        let row_y = main.y + k(PAD + ROW * menu.category as f32) - k(PAD);
+        let sub = Rect { x: main.x + main.w + k(GAP), y: row_y.min((main.y + main.h - sub_h).max(main.y)), w: sub_w, h: sub_h };
+        let mut y = sub.y + k(PAD);
+        for (i, opt) in opts.iter().enumerate() {
+            let r = Rect { x: sub.x + k(PAD), y, w: sub.w - k(PAD * 2.), h: k(option_height(opt)) };
+            match opt {
+                Opt::Header(_) => {}
+                Opt::Slider => items.push((r, Hit::Slider(sub.x + k(18.), sub.w - k(70.)))),
+                _ => items.push((r, Hit::Option(menu.category, i))),
+            }
+            y += k(option_height(opt));
+        }
+        w = sub.x + sub.w + k(SHADOW); h = h.max(sub.y + sub.h + k(SHADOW));
+        panels.push(sub);
+    }
+    Layout { w, h, items, panels }
+}
+fn card(l: &mut Layer, r: &Rect, scale: f32) {
+    // Soft drop shadow, then an opaque card with a hairline border.
+    for i in (1..=6).rev() {
+        let e = i as f32 * 2. * scale;
+        l.round_rect(r.x - e / 2., r.y - e / 2. + 3. * scale, r.w + e, r.h + e, 10. * scale + e / 2., [0, 0, 0, 9]);
+    }
+    l.round_rect(r.x - 1., r.y - 1., r.w + 2., r.h + 2., 10. * scale + 1., [255, 255, 255, 26]);
+    l.round_rect(r.x, r.y, r.w, r.h, 10. * scale, PANEL);
 }
 pub fn menu_layer(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -> (Layer, Layout) {
-    let lay = layout(st, menu, scale);
+    let lay = layout(font, st, menu, scale);
     let k = |v: f32| v * scale;
     let mut l = Layer::new(lay.w.ceil() as u32, lay.h.ceil() as u32);
-    l.round_rect(0., 0., lay.w, lay.h, k(12.), PANEL);
-    let size = k(14.);
+    for p in &lay.panels { card(&mut l, p, scale); }
+    let size = k(TEXT_SIZE);
+    let mid = |r: &Rect, size: f32| r.y + (r.h - size * 1.25) / 2.;
     let opts = options(menu.category, st);
-    if !opts.is_empty() { l.round_rect(k(LEFT) - 1., k(10.), 1., lay.h - k(20.), 0., [255, 255, 255, 30]); }
     for (i, name) in categories().iter().enumerate() {
         let r = &lay.items[i].0;
-        if menu.category == i && !opts.is_empty() { l.round_rect(r.x, r.y + 2., r.w, r.h - 4., k(7.), [255, 255, 255, 34]); }
-        else if menu.hover == Some(Hit::Category(i)) { l.round_rect(r.x, r.y + 2., r.w, r.h - 4., k(7.), HOVER); }
-        l.text(font, r.x + k(12.), r.y + (r.h - size * 1.25) / 2., name, size, if i == 9 { DANGER } else { TEXT });
-        if !options(i, st).is_empty() { l.text(font, r.x + r.w - k(18.), r.y + (r.h - size * 1.25) / 2., "›", size, DIM); }
+        let selected = menu.category == i && !opts.is_empty();
+        if selected { l.round_rect(r.x, r.y + 1., r.w, r.h - 2., k(6.), [255, 255, 255, 30]); }
+        else if menu.hover == Some(Hit::Category(i)) { l.round_rect(r.x, r.y + 1., r.w, r.h - 2., k(6.), HOVER); }
+        if i == 9 { l.round_rect(r.x + k(4.), r.y - k(1.), r.w - k(8.), 1., 0., [255, 255, 255, 22]); }
+        l.text(font, r.x + k(10.), mid(r, size), name, size, if i == 9 { DANGER } else { TEXT });
+        if !options(i, st).is_empty() { l.text(font, r.x + r.w - k(14.), mid(r, size), "›", size, if selected { TEXT } else { DIM }); }
     }
-    let mut y = k(PAD);
-    for (i, opt) in opts.iter().enumerate() {
-        let h = match opt { Opt::Header(_) => k(26.), Opt::Slider => k(40.), _ => k(ROW) };
-        let (x, w) = (k(LEFT), k(RIGHT - PAD));
-        let hovered = menu.hover == Some(Hit::Option(menu.category, i));
-        if hovered { l.round_rect(x + k(4.), y + 2., w - k(8.), h - 4., k(7.), HOVER); }
-        let ty = y + (h - size * 1.25) / 2.;
-        match opt {
-            Opt::Header(t) => { l.text(font, x + k(14.), y + k(8.), t, k(12.), DIM); }
-            Opt::Radio(t, on, _) => {
-                if *on { l.circle(x + k(20.), y + h / 2., k(3.5), ACCENT); }
-                l.text(font, x + k(34.), ty, t, size, TEXT);
+    if let Some(sub) = lay.panels.get(1) {
+        let mut y = sub.y + k(PAD);
+        for (i, opt) in opts.iter().enumerate() {
+            let r = Rect { x: sub.x + k(PAD), y, w: sub.w - k(PAD * 2.), h: k(option_height(opt)) };
+            if menu.hover == Some(Hit::Option(menu.category, i)) { l.round_rect(r.x, r.y + 1., r.w, r.h - 2., k(6.), HOVER); }
+            match opt {
+                Opt::Header(t) => { l.text(font, r.x + k(10.), r.y + k(6.), t, k(11.), DIM); }
+                Opt::Radio(t, on, _) => {
+                    if *on { l.circle(r.x + k(16.), r.y + r.h / 2., k(3.), ACCENT); }
+                    l.text(font, r.x + k(30.), mid(&r, size), t, size, if *on { TEXT } else { [214, 218, 224, 255] });
+                }
+                Opt::Check(t, on, _) => {
+                    // Drawn check mark: fonts without U+2713 would show a box.
+                    if *on { let (cx, cy) = (r.x + k(16.), r.y + r.h / 2.);
+                        for j in 0..8 { let f = j as f32 / 7.; l.circle(cx - k(4.) + f * k(3.), cy + f * k(3.), k(1.1), ACCENT); l.circle(cx - k(1.) + f * k(6.), cy + k(3.) - f * k(7.), k(1.1), ACCENT); } }
+                    l.text(font, r.x + k(30.), mid(&r, size), t, size, if *on { TEXT } else { [214, 218, 224, 255] });
+                }
+                Opt::Action(t, _, key) => {
+                    l.text(font, r.x + k(30.), mid(&r, size), t, size, TEXT);
+                    let kw = measure(font, key, k(11.));
+                    l.text(font, r.x + r.w - kw - k(10.), mid(&r, k(11.)), key, k(11.), DIM);
+                }
+                Opt::Slider => {
+                    let (a, len) = (sub.x + k(18.), sub.w - k(70.));
+                    let v = st.volume as f32 / 100.; let cy = r.y + r.h / 2.;
+                    l.round_rect(a, cy - k(2.), len, k(4.), k(2.), [255, 255, 255, 40]);
+                    l.round_rect(a, cy - k(2.), (len * v).max(k(4.)), k(4.), k(2.), ACCENT);
+                    l.circle(a + len * v, cy, k(7.), [0, 0, 0, 60]);
+                    l.circle(a + len * v, cy, k(6.), [255, 255, 255, 255]);
+                    let label = format!("{}%", st.volume);
+                    l.text(font, sub.x + sub.w - k(14.) - measure(font, &label, k(12.)), mid(&r, k(12.)), &label, k(12.), DIM);
+                }
             }
-            Opt::Check(t, on, _) => {
-                if *on { l.text(font, x + k(13.), ty, "✓", size, ACCENT); }
-                l.text(font, x + k(34.), ty, t, size, TEXT);
-            }
-            Opt::Action(t, _, key) => {
-                l.text(font, x + k(34.), ty, t, size, TEXT);
-                let kw = measure(font, key, k(12.));
-                l.text(font, x + w - kw - k(14.), y + (h - k(12.) * 1.25) / 2., key, k(12.), DIM);
-            }
-            Opt::Slider => {
-                let (a, len) = (k(LEFT + 16.), k(RIGHT - 80.));
-                let v = st.volume as f32 / 100.;
-                l.round_rect(a, y + h / 2. - k(2.), len, k(4.), k(2.), [255, 255, 255, 50]);
-                l.round_rect(a, y + h / 2. - k(2.), len * v, k(4.), k(2.), ACCENT);
-                l.circle(a + len * v, y + h / 2., k(7.), [255, 255, 255, 255]);
-                l.text(font, a + len + k(12.), ty, &format!("{}", st.volume), k(13.), DIM);
-            }
+            y += r.h;
         }
-        y += h;
     }
     (l, lay)
 }
@@ -301,7 +342,7 @@ fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_el
     }
     #[test] fn every_option_row_has_a_command_and_categories_map_actions(){
         let st=State::default();
-        for cat in 0..10 { let lay=layout(&st,&Menu{category:cat,..Default::default()},1.);
+        for cat in 0..10 { let lay=layout(None,&st,&Menu{category:cat,..Default::default()},1.);
             for (_,hit) in &lay.items { if let Hit::Option(c,i)=hit { assert!(option_command(&st,*c,*i).is_some()); } } }
         assert_eq!(category_command(9),Some(Command::Disconnect));assert_eq!(category_command(1),None);
         assert_eq!(slider_value(150.,100.,100.),50);assert_eq!(slider_value(0.,100.,100.),0);
