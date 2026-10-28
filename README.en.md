@@ -73,7 +73,7 @@ authorized session. Independent file/terminal tool peers do not reset input.
 | Xfce | X11 | ✅ Tested in a VM | default |
 | Cinnamon / MATE | X11 | ✅ Tested in a VM | default |
 | Hyprland | Wayland (native wlroots protocols) | 🧪 Experimental, tested in a VM (some features limited, see below) | `--features wayland` |
-| niri | Wayland (native wlroots protocols) | 🧪 Experimental; protocol support confirmed from niri sources, not yet tested on hardware (#55) | `--features wayland` |
+| niri | Wayland (native wlroots protocols) | 🧪 Experimental; capture, text input and portrait switching hardware-tested; other features pending (#55) | `--features wayland` |
 | GNOME / KDE Plasma | Wayland (xdg-desktop-portal) | 🧪 Experimental; validation scope and limits below | `--features wayland,portal` |
 
 The GNOME Wayland Portal/EIS path has been checked for video and mouse/keyboard input on Ubuntu 26.04, GNOME 50, with one 4K screen at 200% scale; auto unlock after a cold locked connection is verified with the official Mac and iPhone 4.42.0 viewers, while other lock recovery and reconnection still need hardware acceptance testing. Apart from that path and GNOME on X11, desktop testing has primarily used virtual machines. If something goes wrong on

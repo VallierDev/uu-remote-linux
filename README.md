@@ -65,7 +65,7 @@ Portal 仅作用于本服务获授权的会话。文件传输、终端等独立�
 | Xfce | X11 | ✅ 虚拟机测试通过 | 默认 |
 | Cinnamon / MATE | X11 | ✅ 虚拟机测试通过 | 默认 |
 | Hyprland | Wayland（wlroots 原生协议） | 🧪 实验性，虚拟机测试（部分功能受限，见下） | `--features wayland` |
-| niri | Wayland（wlroots 原生协议） | 🧪 实验性，协议支持已按 niri 源码确认，尚未实机验收（#55） | `--features wayland` |
+| niri | Wayland（wlroots 原生协议） | 🧪 实验性，采集、文字输入及竖屏切换已实机验收，其余待验证（#55） | `--features wayland` |
 | GNOME / KDE Plasma | Wayland（xdg-desktop-portal） | 🧪 实验性，验证范围与限制见下 | `--features wayland,portal` |
 
 最后一列是源码编译方式；Release 预编译包已包含全部后端，直接使用即可（见[安装](#0-直接用-release-预编译包推荐x86_64)）。
