@@ -887,6 +887,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                     let mut desktop_ended = false;
                     for id in ended { if let Some(s) = sessions.remove(&id) { desktop_ended |= s.role.is_desktop(); close_peer(&s.pc).await; } }
                     if desktop_ended && !sessions.values().any(|s| s.role.is_desktop()) { if let Some(s) = assist.as_mut() { s.session_ended()?; } }
+                    // The controller left: stop sharing now; reconnecting reopens silently with the saved consent.
+                    if !sessions.values().any(|s| s.role.is_desktop()) { if let Some(portal) = &portal_desktop { portal.end_idle(); } }
                     if let Some(s) = assist.as_mut() { s.tick()?; }
                 }
                 SignalingEvent::Connected => {
