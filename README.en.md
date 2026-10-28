@@ -40,8 +40,8 @@ This fork of [VallierDev/uu-remote-linux](https://github.com/VallierDev/uu-remot
 The language is picked once at start, in this order:
 
 1. `UU_LANG=en` or `UU_LANG=zh`;
-2. the choice saved in the viewer's **Settings → General → 语言 / Language** (stored as `~/.config/uuremote/language`,
-   applies after a restart);
+2. the choice saved in the viewer's **Settings → General → 语言 / Language**
+   or the host main window's 语言 / Language row; stored as `~/.config/uuremote/language`, applies after a restart);
 3. the locale: `LC_ALL` / `LC_MESSAGES` / `LANG` starting with `zh` → Chinese, anything else → English.
 
 ```sh

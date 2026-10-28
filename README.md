@@ -34,7 +34,7 @@
 启动时按以下顺序确定界面语言：
 
 1. `UU_LANG=zh` 或 `UU_LANG=en`；
-2. 控制端 **设置 → 常规 → 语言 / Language** 中保存的选择（保存在 `~/.config/uuremote/language`，重启后生效）；
+2. 控制端 **设置 → 常规 → 语言 / Language** 或主机主窗口底部「语言 / Language」中保存的选择（保存在 `~/.config/uuremote/language`，重启后生效）；
 3. 系统区域设置：`LC_ALL` / `LC_MESSAGES` / `LANG` 以 `zh` 开头为中文，其余为英文。
 
 ```sh

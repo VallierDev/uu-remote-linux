@@ -9,6 +9,7 @@
 #include <string.h>
 #include <dlfcn.h>
 #include "i18n.h"
+static void on_language(GtkComboBox *c, gpointer note);
 
 static const char *CSS =
     "window { background-color: #f5f6f8; }\n"
@@ -512,6 +513,15 @@ static void build_window(void) {
     gtk_box_pack_start(GTK_BOX(root), account_card, FALSE, FALSE, 0);
     footer_label = label(L("开源 Linux 被控端 · 非网易官方客户端 · 关闭窗口即停止远程协助", "Open-source Linux host · not an official NetEase client · closing the window stops remote assistance"), "footer");
     gtk_box_pack_end(GTK_BOX(root), footer_label, FALSE, FALSE, 0);
+    GtkWidget *lang_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8), *lang_note = label("", "note");
+    GtkWidget *lang = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(lang), "中文"); gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(lang), "English");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(lang), uu_i18n_english());
+    g_signal_connect(lang, "changed", G_CALLBACK(on_language), lang_note);
+    gtk_box_pack_start(GTK_BOX(lang_row), label("语言 / Language", "key"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(lang_row), lang, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(lang_row), lang_note, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(root), lang_row, FALSE, FALSE, 6);
     if (close_hides) gtk_label_set_text(GTK_LABEL(footer_label), L("开源 Linux 被控端 · 非网易官方客户端 · 关闭窗口后远程协助仍在后台运行", "Open-source Linux host · not an official NetEase client · remote assistance keeps running after the window closes"));
     render_code();
     if (close_hides) build_tray();
@@ -526,6 +536,11 @@ static void build_window(void) {
     if (!start_hidden) gtk_widget_show(window);
 }
 
+static void on_language(GtkComboBox *c, gpointer note) {
+    int english = gtk_combo_box_get_active(c) == 1;
+    gtk_label_set_text(GTK_LABEL(note), english == uu_i18n_english() ? "" : !uu_i18n_save(english) ? L("无法保存语言设置", "Could not save the language")
+        : english ? "Restart uuremote-server to switch to English" : "重新启动 uuremote-server 后切换为中文");
+}
 static void *ui_main(void *arg) {
     (void)arg;
     int ok = gtk_init_check(NULL, NULL);
