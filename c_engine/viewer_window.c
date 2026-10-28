@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 #include "i18n.h"
 
 static const char *CSS =
@@ -50,7 +51,7 @@ static const char *CSS =
     ".status { font-size: 13px; color: #2f6bff; }\n"
     ".toast { background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 18px; font-size: 15px; }\n";
 
-typedef struct { char id[64]; char name[128]; int platform, online, current; } Device;
+typedef struct { char id[64]; char name[128]; int platform, online, current; char thumb[512]; } Device;
 static Device devices[64];
 static int device_count;
 static char queue[16][200];
@@ -175,13 +176,46 @@ static void show_page(const char *name, const char *title) {
     set_header(title, 0);
     gtk_stack_set_visible_child_name(GTK_STACK(stack), name);
 }
+// ---- device preview: the last remote picture saved by the desktop window (src/viewer/thumbs.rs) ----
+static GtkWidget *preview_bg;
+static GdkPixbuf *thumb_pixbuf;
+static char thumb_loaded[512];
+static gint64 thumb_mtime;
+static void load_thumb(const char *path) {
+    struct stat st; gint64 mtime = path[0] && stat(path, &st) == 0 ? (gint64)st.st_mtime : 0;
+    if (!strcmp(path, thumb_loaded) && mtime == thumb_mtime) return;
+    if (thumb_pixbuf) { g_object_unref(thumb_pixbuf); thumb_pixbuf = NULL; }
+    snprintf(thumb_loaded, sizeof thumb_loaded, "%s", path); thumb_mtime = mtime;
+    if (mtime) thumb_pixbuf = gdk_pixbuf_new_from_file(path, NULL);
+    if (preview_bg) gtk_widget_queue_draw(preview_bg);
+}
+static gboolean draw_preview(GtkWidget *w, cairo_t *cr, gpointer d) {
+    (void)d; if (!thumb_pixbuf) return FALSE;
+    double W = gtk_widget_get_allocated_width(w), H = gtk_widget_get_allocated_height(w), r = 12;
+    double pw = gdk_pixbuf_get_width(thumb_pixbuf), ph = gdk_pixbuf_get_height(thumb_pixbuf);
+    double scale = W / pw > H / ph ? W / pw : H / ph; // cover, centered
+    cairo_save(cr);
+    cairo_new_path(cr); cairo_arc(cr, r, r, r, G_PI, 1.5 * G_PI); cairo_arc(cr, W - r, r, r, 1.5 * G_PI, 2 * G_PI);
+    cairo_line_to(cr, W, H); cairo_line_to(cr, 0, H); cairo_close_path(cr); cairo_clip(cr);
+    cairo_translate(cr, (W - pw * scale) / 2, (H - ph * scale) / 2); cairo_scale(cr, scale, scale);
+    gdk_cairo_set_source_pixbuf(cr, thumb_pixbuf, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD); cairo_paint(cr);
+    cairo_restore(cr);
+    // Soft shade at the bottom keeps the "Open desktop" button readable on bright desktops.
+    cairo_pattern_t *g = cairo_pattern_create_linear(0, H * 0.55, 0, H);
+    cairo_pattern_add_color_stop_rgba(g, 0, 0, 0, 0, 0); cairo_pattern_add_color_stop_rgba(g, 1, 0, 0, 0, 0.35);
+    cairo_rectangle(cr, 0, 0, W, H); cairo_set_source(cr, g); cairo_fill(cr); cairo_pattern_destroy(g);
+    return FALSE;
+}
 static void show_device(int index) {
     pthread_mutex_lock(&d_lock);
     if (index < 0 || index >= device_count) { pthread_mutex_unlock(&d_lock); return; }
     selected = index;
     char name[128]; snprintf(name, sizeof name, "%s", devices[index].name);
     int online = devices[index].online;
+    char thumb[512]; snprintf(thumb, sizeof thumb, "%s", devices[index].thumb);
     pthread_mutex_unlock(&d_lock);
+    load_thumb(thumb);
     set_header(name, 1);
     gtk_label_set_markup(GTK_LABEL(badge), online ? L("<span foreground='#22c55e'>●</span> 在线", "<span foreground='#22c55e'>●</span> Online") : L("离线", "Offline"));
     GtkStyleContext *ctx = gtk_widget_get_style_context(badge);
@@ -250,6 +284,7 @@ static gboolean apply_devices(gpointer d) {
     (void)d;
     clear(device_list); clear(all_box);
     pthread_mutex_lock(&d_lock);
+    if (selected >= 0 && selected < device_count) load_thumb(devices[selected].thumb);
     if (!banner_closed) gtk_widget_show_all(banner);
     char group[64]; snprintf(group, sizeof group, L("⌄  电脑 %d", "⌄  Computers %d"), device_count);
     gtk_box_pack_start(GTK_BOX(all_box), label(group, "group"), FALSE, FALSE, 8);
@@ -329,6 +364,7 @@ static GtkWidget *build_login(void) {
 static GtkWidget *build_device(void) {
     GtkWidget *page = vbox(0); gtk_container_set_border_width(GTK_CONTAINER(page), 26);
     GtkWidget *preview = gtk_overlay_new(), *bg = gtk_event_box_new(); add_class(bg, "preview"); gtk_widget_set_size_request(bg, -1, 320);
+    preview_bg = bg; g_signal_connect_after(bg, "draw", G_CALLBACK(draw_preview), NULL);
     gtk_container_add(GTK_CONTAINER(preview), bg);
     GtkWidget *enter = button(L("进入桌面   →", "Open desktop   →"), "enter");
     gtk_widget_set_halign(enter, GTK_ALIGN_CENTER); gtk_widget_set_valign(enter, GTK_ALIGN_END); gtk_widget_set_margin_bottom(enter, 26);
@@ -489,6 +525,14 @@ static void own_titlebar(GtkWidget *w, const char *title) {
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(bar), TRUE);
     gtk_window_set_titlebar(GTK_WINDOW(w), bar);
 }
+static atomic_int host_active;
+static GtkWidget *host_switch;
+static gboolean host_idle(gpointer d) { (void)d; if (host_switch) gtk_switch_set_active(GTK_SWITCH(host_switch), atomic_load(&host_active)); return G_SOURCE_REMOVE; }
+void uu_viewer_ui_set_host(int active) { atomic_store(&host_active, active != 0); g_idle_add(host_idle, NULL); }
+static void on_host(GObject *o, GParamSpec *p, gpointer d) {
+    (void)p; (void)d; int on = gtk_switch_get_active(GTK_SWITCH(o));
+    if (on != atomic_load(&host_active)) { atomic_store(&host_active, on); push(on ? "host\ton" : "host\toff"); }
+}
 static void on_language(GtkComboBox *c, gpointer d) {
     (void)d; int english = gtk_combo_box_get_active(c) == 1;
     if (english == uu_i18n_english()) return;
@@ -531,13 +575,14 @@ static void open_settings(void) {
     // 安全
     GtkWidget *security = settings_page();
     const char *verify[] = {L("仅使用临时验证码", "Temporary code only"), L("仅使用自定义验证码", "Custom code only"), L("临时与自定义验证码", "Temporary and custom codes")};
-    GtkWidget *s1[] = { setting_row(L("允许同账号控制本设备", "Allow the same account to control this device"), NULL, gtk_switch_new()), setting_row(L("允许他人远程协助", "Allow remote assistance"), NULL, gtk_switch_new()) };
+    host_switch = gtk_switch_new(); gtk_switch_set_active(GTK_SWITCH(host_switch), atomic_load(&host_active));
+    g_signal_connect(host_switch, "notify::active", G_CALLBACK(on_host), NULL);
+    GtkWidget *s1[] = { setting_row(L("允许同账号控制本设备", "Allow the same account to control this device"), L("登录后本机会出现在你的设备列表中（uuremote-server 用户服务）", "After sign-in this computer appears in your device list (uuremote-server user service)"), host_switch), setting_row(L("允许他人远程协助", "Allow remote assistance"), NULL, gtk_switch_new()) };
     GtkWidget *s2[] = { setting_row(L("远程协助连接本设备的验证方式", "Verification for remote assistance"), NULL, combo(verify, 3)) };
     GtkWidget *s3[] = { setting_row(L("客户端锁定", "Lock client"), L("防止客户端设置被修改，保障数据与使用安全。", "Prevents client settings from being changed, keeping data and usage safe."), gtk_switch_new()) };
     gtk_box_pack_start(GTK_BOX(security), settings_card(s1, 2), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(security), settings_card(s2, 1), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(security), settings_card(s3, 1), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(security), label(L("本机被控相关设置由 uuremote-server 主机端提供。", "Settings for controlling this computer are provided by the uuremote-server host."), "hint"), FALSE, FALSE, 0);
     gtk_stack_add_titled(GTK_STACK(tabs), security, "security", L("🔒 安全", "🔒 Security"));
     // 键盘
     GtkWidget *keys = settings_page();
@@ -686,12 +731,13 @@ void uu_viewer_ui_set_devices(const char *tsv) {
     device_count = 0;
     char *copy = strdup(tsv ? tsv : ""), *save = NULL;
     for (char *line = strtok_r(copy, "\n", &save); line && device_count < 64; line = strtok_r(NULL, "\n", &save)) {
-        char *f[5] = {0}, *s2 = NULL; int n = 0;
-        for (char *p = strtok_r(line, "\t", &s2); p && n < 5; p = strtok_r(NULL, "\t", &s2)) f[n++] = p;
+        char *f[6] = {0}, *s2 = NULL; int n = 0;
+        for (char *p = strtok_r(line, "\t", &s2); p && n < 6; p = strtok_r(NULL, "\t", &s2)) f[n++] = p;
         if (n < 5) continue;
         Device *d = &devices[device_count++];
         snprintf(d->id, sizeof d->id, "%s", f[0]); snprintf(d->name, sizeof d->name, "%s", f[1]);
         d->platform = atoi(f[2]); d->online = atoi(f[3]); d->current = atoi(f[4]);
+        snprintf(d->thumb, sizeof d->thumb, "%s", n > 5 && f[5][0] == '/' ? f[5] : "");
     }
     free(copy);
     selected = -1;

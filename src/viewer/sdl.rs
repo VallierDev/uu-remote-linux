@@ -3,25 +3,40 @@ use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum
 #[derive(Debug)] enum Command { Files, Type }
 pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest>,
-    pub last_frame:Option<Frame> }
+    pub last_frame:Option<Frame>, chrome:Chrome }
+/// In-window chrome state (src/viewer/hud.rs): menu, network panel, loading screen.
+struct Chrome { font:Option<ab_glyph::FontVec>, scale:f32, pub state:hud::State, menu:hud::Menu, net:Option<hud::NetStats>, tab_hover:bool, tab_down:bool,
+    commands:Vec<hud::Command>, started:std::time::Instant, last_loading:std::time::Instant, title:String, stage:String, labels:std::collections::HashMap<(String,u32,u32),hud::Layer> }
+use super::hud;
 impl Window {
     pub fn new()->Result<Self,String>{
         // SDL's default nearest-neighbour scaling makes remote text uneven whenever the window size
         // differs from the stream; filter instead. Set before the renderer/textures exist.
         sdl2::hint::set_with_priority("SDL_RENDER_SCALE_QUALITY","linear",&sdl2::hint::Hint::Default);
         let sdl=sdl2::init()?;let video=sdl.video()?;
-        let window=video.window("Native viewer (experimental)",1280,720).position_centered().resizable().build().map_err(|_|"Window creation failed")?;
+        let name=super::device_label(std::env::var("UU_VIEWER_DEVICE_NAME").ok().as_deref()).to_owned();
+        let window=video.window(&format!("{name} · {}",crate::i18n::s("UU 远程 Linux 控制端","UU Remote Linux viewer")),1280,720).position_centered().resizable().build().map_err(|_|"Window creation failed")?;
         let mut canvas=window.into_canvas().build().map_err(|_|"Renderer creation failed")?;
         // Wayland maps a toplevel only after its first buffer; without this the window stays
         // invisible until the first decoded frame, which a stalled stream never delivers.
-        canvas.set_draw_color(sdl2::pixels::Color::BLACK);canvas.clear();canvas.present();
+        canvas.set_draw_color(LOADING_BG);canvas.clear();canvas.present();
+        let scale=std::env::var("UU_VIEWER_UI_SCALE").ok().and_then(|v|v.parse::<f32>().ok()).filter(|v|(0.5..=4.).contains(v)).unwrap_or(1.);
+        let mut state=hud::State::default();hud::load_prefs(&mut state);
+        let now=std::time::Instant::now();
+        let chrome=Chrome{font:hud::load_font(),scale,state,menu:hud::Menu::default(),net:None,tab_hover:false,tab_down:false,commands:Vec::new(),started:now,last_loading:now-std::time::Duration::from_secs(1),
+            title:crate::tr!("正在连接 {name}","Connecting to {name}"),stage:crate::i18n::s("正在连接远端设备…","Contacting the remote device…").into(),labels:Default::default()};
         let events=sdl.event_pump()?;let clipboard=video.clipboard();
         let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
-        Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None})
+        Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
     }
     pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone())}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
-    fn viewport(&self)->Viewport {Viewport::fit(self.canvas.window().size(),self.frame)}
+    fn viewport(&self)->Viewport {
+        let window=self.canvas.window().size();
+        if !self.chrome.state.one_to_one {return Viewport::fit(window,self.frame)}
+        let (w,h)=(self.frame.0 as f64,self.frame.1 as f64);
+        Viewport{x:((window.0 as f64-w)/2.).round(),y:((window.1 as f64-h)/2.).round(),width:w,height:h}
+    }
     fn poll_clipboard(&mut self){
         // Use the existing SDL window; wl-paste creates a transient toplevel on GNOME every poll.
         while let Ok(request)=self.clipboard_requests.try_recv(){
@@ -44,20 +59,174 @@ impl Window {
     }
     pub fn poll(&mut self,input:&mut Input)->(bool,Vec<serde_json::Value>){
         let viewport=self.viewport();
-        let dirty=&mut self.clipboard_dirty;let mut redraw=false;
-        let events=self.events.poll_iter().inspect(|event|{
-            if matches!(event,Event::ClipboardUpdate{..}|Event::Window{win_event:WindowEvent::FocusGained,..}){*dirty=true;}
-            redraw|=needs_redraw(event);
-        });
-        let result=translate_actions(events,input,viewport,&mut self.focused,&mut self.files);
+        let mut redraw=false;
+        let events:Vec<Event>=self.events.poll_iter().collect();
+        let mut forward=Vec::with_capacity(events.len());
+        for event in events {
+            if matches!(event,Event::ClipboardUpdate{..}|Event::Window{win_event:WindowEvent::FocusGained,..}){self.clipboard_dirty=true;}
+            redraw|=needs_redraw(&event);
+            let (consumed,changed)=self.chrome_event(&event);redraw|=changed;
+            if !consumed {forward.push(event);}
+        }
+        let result=translate_actions(forward,input,viewport,&mut self.focused,&mut self.files);
         // A compositor resize (tiling, maximize) leaves the surface without a buffer of the new size
         // until the next frame; a static remote desktop sends none, so repaint the last frame now.
         if redraw {if let Some(frame)=self.last_frame.take(){
             log::debug!("Viewer window resized: {:?}",self.canvas.window().size());
             if let Err(e)=self.draw(&frame){log::warn!("Viewer redraw failed: {e}");}
             self.last_frame=Some(frame);
-        }else{self.canvas.set_draw_color(sdl2::pixels::Color::BLACK);self.canvas.clear();self.canvas.present();}}
+        }else{self.loading_frame(true);}}
         result
+    }
+    /// Menu, hotkeys and the control tab. Returns (consumed, needs redraw).
+    fn chrome_event(&mut self,event:&Event)->(bool,bool){
+        use sdl2::keyboard::{Mod,Scancode};
+        let size=self.canvas.window().size();let scale=self.chrome.scale;
+        let tab=hud::tab_rect(self.chrome.font.as_ref(),size,scale);
+        let tab_visible=self.tab_visible();
+        if let Event::KeyDown{scancode:Some(code),keymod,repeat,..}=event {
+            let chord=keymod.intersects(Mod::LCTRLMOD|Mod::RCTRLMOD)&&keymod.intersects(Mod::LALTMOD|Mod::RALTMOD);
+            let command=match code {Scancode::M=>Some(None),Scancode::G=>Some(Some(hud::Command::Stats(!self.chrome.state.stats))),Scancode::Return=>Some(Some(hud::Command::Fullscreen)),_=>None};
+            if chord { if let Some(command)=command {
+                if !repeat { match command {None=>self.chrome.menu.open^=true,Some(c)=>self.command(c)} }
+                return (true,true)
+            }}
+            if self.chrome.menu.open { if *code==Scancode::Escape {self.chrome.menu.open=false;} return (true,true) }
+        }
+        if !self.chrome.menu.open {
+            return match *event {
+                Event::MouseMotion{x,y,..}=>{let h=tab_visible&&tab.contains(x as f32,y as f32);let changed=h!=self.chrome.tab_hover;self.chrome.tab_hover=h;(false,changed)},
+                Event::MouseButtonDown{x,y,mouse_btn:MouseButton::Left,..} if tab_visible&&tab.contains(x as f32,y as f32)=>{self.chrome.menu.open=true;self.chrome.tab_down=true;(true,true)},
+                Event::MouseButtonUp{mouse_btn:MouseButton::Left,..} if self.chrome.tab_down=>{self.chrome.tab_down=false;(true,false)},
+                _=>(false,false),
+            }
+        }
+        let (_,lay)=self.menu_layout();let origin=self.menu_origin(&lay);
+        let hit=|x:i32,y:i32|->Option<hud::Hit>{
+            let (lx,ly)=(x as f32-origin.0,y as f32-origin.1);
+            if tab.contains(x as f32,y as f32) {return Some(hud::Hit::Tab)}
+            if lx<0.||ly<0.||lx>=lay.w||ly>=lay.h {return None}
+            Some(lay.items.iter().find(|(r,_)|r.contains(lx,ly)).map_or(hud::Hit::Panel,|(_,h)|*h))
+        };
+        match *event {
+            Event::MouseMotion{x,y,..}=>{
+                if self.chrome.menu.dragging { if let Some((a,len))=slider(&lay) {self.command(hud::Command::Volume(hud::slider_value(x as f32-origin.0,a,len)));} return (true,true) }
+                let h=hit(x,y);
+                if let Some(hud::Hit::Category(i))=h { if hud::category_command(i).is_none() {self.chrome.menu.category=i;} }
+                let changed=h!=self.chrome.menu.hover;self.chrome.menu.hover=h;(true,changed)
+            },
+            Event::MouseButtonDown{x,y,mouse_btn:MouseButton::Left,..}=>{
+                match hit(x,y) {
+                    None|Some(hud::Hit::Tab)=>{self.chrome.menu.open=false;self.chrome.tab_down=true},
+                    Some(hud::Hit::Category(i))=>match hud::category_command(i) {Some(c)=>{self.chrome.menu.open=false;self.command(c)},None=>self.chrome.menu.category=i},
+                    Some(hud::Hit::Option(c,i))=>if let Some(command)=hud::option_command(&self.chrome.state,c,i) {
+                        if command==hud::Command::Files {self.chrome.menu.open=false;}
+                        self.command(command);
+                    },
+                    Some(hud::Hit::Slider(a,len))=>{self.chrome.menu.dragging=true;self.command(hud::Command::Volume(hud::slider_value(x as f32-origin.0,a,len)))},
+                    Some(hud::Hit::Panel)=>{},
+                }
+                (true,true)
+            },
+            Event::MouseButtonUp{..}=>{self.chrome.tab_down=false;if std::mem::take(&mut self.chrome.menu.dragging){hud::save_prefs(&self.chrome.state);}(true,true)},
+            Event::MouseButtonDown{..}|Event::MouseWheel{..}|Event::KeyUp{..}|Event::TextInput{..}=>(true,false),
+            _=>(false,false),
+        }
+    }
+    /// Local effects happen here; remote ones are drained by `run` through `take_commands`.
+    fn command(&mut self,command:hud::Command){
+        let st=&mut self.chrome.state;
+        match command {
+            hud::Command::Quality(q)=>st.quality=q, hud::Command::Fps(f)=>st.fps=f, hud::Command::Chroma(c)=>st.chroma=c,
+            hud::Command::FollowRemote(b)=>st.follow_remote=b, hud::Command::Volume(v)=>st.volume=v,
+            hud::Command::AutoLock(b)=>st.auto_lock=b, hud::Command::HostMute(b)=>st.host_mute=b, hud::Command::Watch(b)=>st.watch=b,
+            hud::Command::OneToOne(b)=>{st.one_to_one=b;hud::save_prefs(st)},
+            hud::Command::Stats(b)=>{st.stats=b;hud::save_prefs(st)},
+            hud::Command::HideTab(b)=>{st.hide_tab=b;hud::save_prefs(st)},
+            hud::Command::GrabKeys(b)=>{st.grab_keys=b;self.canvas.window_mut().set_keyboard_grab(b)},
+            hud::Command::Fullscreen=>{
+                st.fullscreen^=true;let mode=if st.fullscreen{sdl2::video::FullscreenType::Desktop}else{sdl2::video::FullscreenType::Off};
+                let _=self.canvas.window_mut().set_fullscreen(mode);
+            },
+            hud::Command::Files=>self.files=true,
+            hud::Command::Disconnect=>{},
+        }
+        self.chrome.commands.push(command);
+    }
+    pub fn take_commands(&mut self)->Vec<hud::Command>{std::mem::take(&mut self.chrome.commands)}
+    pub fn state(&self)->&hud::State{&self.chrome.state}
+    pub fn sync_chroma(&mut self,chroma:u32){if chroma!=0 {self.chrome.state.chroma=chroma;}}
+    pub fn set_stage(&mut self,stage:&str){self.chrome.stage=stage.into();}
+    pub fn window_size(&self)->(u32,u32){self.canvas.window().size()}
+    pub fn has_picture(&self)->bool{self.last_frame.is_some()}
+    pub fn set_net(&mut self,net:hud::NetStats){
+        let show=self.chrome.state.stats;let changed=self.chrome.net.as_ref()!=Some(&net);
+        self.chrome.net=Some(net);
+        if show && changed {self.redraw();}
+    }
+    fn tab_visible(&self)->bool{!(self.chrome.state.fullscreen&&self.chrome.state.hide_tab)||self.chrome.menu.open}
+    fn menu_layout(&self)->(hud::Layer,hud::Layout){hud::menu_layer(self.chrome.font.as_ref(),&self.chrome.state,&self.chrome.menu,self.chrome.scale)}
+    fn menu_origin(&self,lay:&hud::Layout)->(f32,f32){
+        let size=self.canvas.window().size();
+        (((size.0 as f32-lay.w)/2.).max(4.).round(),(hud::TAB_H*self.chrome.scale+6.).round())
+    }
+    pub fn redraw(&mut self){
+        if let Some(frame)=self.last_frame.take(){if let Err(e)=self.draw(&frame){log::warn!("Viewer redraw failed: {e}");}self.last_frame=Some(frame);}
+        else {self.loading_frame(true);}
+    }
+    fn blit(&mut self,layer:&hud::Layer,x:i32,y:i32)->Result<(),String>{
+        let creator=self.canvas.texture_creator();
+        let mut t=creator.create_texture_streaming(PixelFormatEnum::RGBA32,layer.w,layer.h).map_err(|_|"Texture creation failed")?;
+        t.set_blend_mode(sdl2::render::BlendMode::Blend);
+        t.update(None,&layer.px,layer.w as usize*4).map_err(|_|"Texture update failed")?;
+        self.canvas.copy(&t,None,Some(Rect::new(x,y,layer.w,layer.h)))
+    }
+    fn label(&mut self,text:&str,size:f32,color:hud::Rgba)->hud::Layer{
+        let key=(text.to_owned(),size.to_bits(),u32::from_le_bytes(color));
+        if self.chrome.labels.len()>64 {self.chrome.labels.clear();}
+        let font=self.chrome.font.as_ref();
+        let layer=self.chrome.labels.entry(key).or_insert_with(||hud::label_layer(font,text,size,color));
+        hud::Layer{w:layer.w,h:layer.h,px:layer.px.clone()}
+    }
+    /// Network panel, control tab and menu over the picture.
+    fn draw_chrome(&mut self)->Result<(),String>{
+        let size=self.canvas.window().size();let scale=self.chrome.scale;
+        if self.chrome.state.stats { if let Some(net)=self.chrome.net.clone() {
+            let layer=hud::stats_layer(self.chrome.font.as_ref(),&hud::stats_lines(&net),scale);
+            self.blit(&layer,size.0 as i32-layer.w as i32-(12.*scale) as i32,size.1 as i32-layer.h as i32-(12.*scale) as i32)?;
+        }}
+        if self.tab_visible() {
+            let r=hud::tab_rect(self.chrome.font.as_ref(),size,scale);
+            let layer=hud::tab_layer(self.chrome.font.as_ref(),scale,self.chrome.tab_hover||self.chrome.menu.open);
+            self.blit(&layer,r.x.round() as i32,0)?;
+        }
+        if self.chrome.menu.open {
+            let (layer,lay)=self.menu_layout();let o=self.menu_origin(&lay);
+            self.blit(&layer,o.0 as i32,o.1 as i32)?;
+        }
+        Ok(())
+    }
+    /// Animated "connecting" screen until the first remote picture; throttled to ~60 fps.
+    pub fn loading_frame(&mut self,force:bool){
+        let now=std::time::Instant::now();
+        if !force && now.duration_since(self.chrome.last_loading)<std::time::Duration::from_millis(16) {return}
+        self.chrome.last_loading=now;
+        let size=self.canvas.window().size();let scale=self.chrome.scale;
+        self.canvas.set_draw_color(LOADING_BG);self.canvas.clear();
+        let t=now.duration_since(self.chrome.started).as_secs_f32();
+        let spin=hud::spinner(t,(56.*scale) as u32);
+        let cy=size.1 as i32/2-(40.*scale) as i32;
+        let _=self.blit(&spin,(size.0 as i32-spin.w as i32)/2,cy-spin.h as i32/2);
+        let (title,stage)=(self.chrome.title.clone(),self.chrome.stage.clone());
+        let a=self.label(&title,20.*scale,[240,242,245,255]);
+        let _=self.blit(&a,(size.0 as i32-a.w as i32)/2,cy+(48.*scale) as i32);
+        // The stage line breathes gently so a long wait still looks alive.
+        let alpha=(170.+60.*(t*2.2).sin()) as u8;
+        let b=self.label(&stage,14.*scale,[160,166,176,255]);
+        let mut b2=b;for p in b2.px.chunks_exact_mut(4){p[3]=(u16::from(p[3])*u16::from(alpha)/255) as u8;}
+        let _=self.blit(&b2,(size.0 as i32-b2.w as i32)/2,cy+(84.*scale) as i32);
+        if self.chrome.menu.open||self.tab_visible() {let _=self.draw_chrome();}
+        self.canvas.present();
     }
     fn draw(&mut self,frame:&Frame)->Result<(),String>{
         // Pad bars belong to the decoded canvas, not the remote picture: viewport and input use the
@@ -69,8 +238,28 @@ impl Window {
         self.canvas.set_draw_color(sdl2::pixels::Color::BLACK);self.canvas.clear();
         let src=super::input::content_rect((frame.width,frame.height),content)
             .map(|(x,y,w,h)|Rect::new(x.round() as i32,y.round() as i32,w.round().max(1.) as u32,h.round().max(1.) as u32));
-        self.canvas.copy(&texture,src,Some(Rect::new(v.x.round() as i32,v.y.round() as i32,v.width.round().max(1.) as u32,v.height.round().max(1.) as u32)))?;self.canvas.present();Ok(())
+        self.canvas.copy(&texture,src,Some(Rect::new(v.x.round() as i32,v.y.round() as i32,v.width.round().max(1.) as u32,v.height.round().max(1.) as u32)))?;
+        drop(texture);self.draw_chrome()?;self.canvas.present();Ok(())
     }
+}
+const LOADING_BG:sdl2::pixels::Color=sdl2::pixels::Color::RGB(17,19,24);
+fn slider(lay:&hud::Layout)->Option<(f32,f32)>{lay.items.iter().find_map(|(_,h)|match h{hud::Hit::Slider(a,len)=>Some((*a,*len)),_=>None})}
+/// Runs `fut` while the window shows the loading animation; closing the window cancels it.
+pub async fn loading<T>(window:Option<&mut Window>,stage:&str,fut:impl std::future::Future<Output=T>)->Result<T,String>{
+    let Some(window)=window else {return Ok(fut.await)};
+    window.set_stage(stage);
+    tokio::pin!(fut);
+    let mut tick=tokio::time::interval(std::time::Duration::from_millis(16));
+    loop {tokio::select!{
+        value=&mut fut=>return Ok(value),
+        _=tick.tick()=>{
+            for event in window.events.poll_iter().collect::<Vec<_>>() {
+                if matches!(event,Event::Quit{..}|Event::Window{win_event:WindowEvent::Close,..}) {return Err("Viewer window closed".into())}
+                let _=window.chrome_event(&event);
+            }
+            window.loading_frame(false);
+        },
+    }}
 }
 fn clipboard_text(bytes:&[u8])->Option<String>{
     if bytes.len()>super::clipboard::MAX_TEXT{return None}
@@ -161,6 +350,13 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let mut input=Input::new(view_only);input.set_mac(window.mac);let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
     let mut heartbeat=tokio::time::interval(std::time::Duration::from_secs(1));
     let deadline=tokio::time::sleep(std::time::Duration::from_secs(30));tokio::pin!(deadline);
+    window.set_stage(crate::i18n::s("正在传输画面…","Waiting for the remote picture…"));
+    if let Some(playback)=audio.as_mut(){playback.volume=window.state().volume;}
+    if window.state().grab_keys {window.canvas.window_mut().set_keyboard_grab(true);}
+    let started=std::time::Instant::now();let mut seq=3_000_000u64;
+    let mut last=(0u64,0u64,0u64,0u64,std::time::Instant::now());
+    let mut codec_name="--";
+    let mut next_thumb=std::time::Instant::now()+std::time::Duration::from_secs(5);
     let result=async {
         loop {tokio::select!{
             command=commands.recv(),if command_open=>{
@@ -198,10 +394,47 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                 let o=&session.peer.observed;let s=&super::desktop::STATS;let r=std::sync::atomic::Ordering::Relaxed;
                 log::info!("Viewer desktop stats: control_open={} echo={} media_packets={} access_units={} presented={} decode_errors={}",
                     o.control_open.load(r),o.echo_received.load(r),o.media_packets.load(r),s[0].load(r),s[1].load(r),s[2].load(r));
+                // Network-status panel: per-second deltas of local counters plus the selected ICE pair.
+                let now=(s[1].load(r),o.media_bytes.load(r),o.video_received.load(r),o.video_expected.load(r),std::time::Instant::now());
+                let secs=now.4.duration_since(last.4).as_secs_f64().max(0.2);
+                let expected=now.3.saturating_sub(last.3);let lost=expected.saturating_sub(now.2.saturating_sub(last.2));
+                let (rtt_ms,route)=session.peer.route().await;
+                window.sync_chroma(o.chroma.load(r));
+                let size=window.last_frame.as_ref().map_or((0,0),|f|f.content.unwrap_or((f.width,f.height)));
+                window.set_net(hud::NetStats{elapsed:started.elapsed().as_secs(),route,fps:((now.0-last.0) as f64/secs).round() as u32,
+                    kbps:(now.1-last.1) as f64*8./1000./secs,rtt_ms,loss:if expected>0 {lost as f64*100./expected as f64} else {0.},size,
+                    codec:codec_name,chroma:window.state().chroma});
+                last=now;
+                if std::time::Instant::now()>=next_thumb { if let Some(frame)=window.last_frame.as_ref() {
+                    if let Err(e)=super::thumbs::save(device,frame){log::debug!("Viewer thumbnail not saved: {e}");}
+                    next_thumb=std::time::Instant::now()+std::time::Duration::from_secs(30);
+                }}
             },
             _=tick.tick()=>{
                 if let Some(playback)=audio.as_mut(){if playback.pump().is_err(){log::warn!("Viewer audio playback stopped");audio=None;}}
-                let (quit,messages)=window.poll(&mut input);
+                let (quit,mut messages)=window.poll(&mut input);
+                if !window.has_picture() {window.loading_frame(false);}
+                for command in window.take_commands() {
+                    seq+=1;
+                    let control=match command {
+                        hud::Command::Quality(q)=>Some(super::wire::capture_setting(seq,&[(2,q)])),
+                        hud::Command::Fps(f)=>Some(super::wire::capture_setting(seq,&[(1,match f{30=>1,60=>2,90=>3,_=>4}),(18,u64::from(f))])),
+                        hud::Command::Chroma(c)=>Some(super::wire::capture_setting(seq,&[(7,u64::from(c))])),
+                        hud::Command::FollowRemote(true)=>Some(super::wire::capture_setting(seq,&[(10,3)])),
+                        hud::Command::FollowRemote(false)=>{let (w,h)=window.window_size();let (w,h)=(u64::from(w&!1),u64::from(h&!1));
+                            Some(super::wire::capture_setting(seq,&[(5,w),(6,h),(16,w),(17,h)]))},
+                        // 远程结束后自动锁屏: SimpleAction 19, value 2 = on, 1 = off.
+                        hud::Command::AutoLock(on)=>Some(super::wire::simple_action(seq,19,Some(if on {2} else {1}))),
+                        // 静音运行: on = SimpleAction 14 then 18, off = 16 (src/system_actions.rs).
+                        hud::Command::HostMute(true)=>{let _=session.peer.send_control(super::wire::simple_action(seq,14,None)).await;seq+=1;Some(super::wire::simple_action(seq,18,None))},
+                        hud::Command::HostMute(false)=>Some(super::wire::simple_action(seq,16,None)),
+                        hud::Command::Volume(v)=>{if let Some(playback)=audio.as_mut(){playback.volume=v;}None},
+                        hud::Command::Watch(on)=>{messages.extend(input.release_all());input.set_view_only(on||view_only);None},
+                        hud::Command::Disconnect=>return Ok(()),
+                        _=>None,
+                    };
+                    if let Some(data)=control { if let Err(e)=session.peer.send_control(data).await {log::warn!("Viewer control command not sent: {e}");} }
+                }
                 window.poll_clipboard();
                 requested|=std::mem::take(&mut window.files);
                 #[cfg(uu_gtk)] {
@@ -252,10 +485,12 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                 if let Some(au)=session.peer.desktop.units.pop(){
                     if session.peer.desktop.reset.swap(false,std::sync::atomic::Ordering::AcqRel){decoder.reset();}
                     decoder.set_codec(au.codec)?;
+                    codec_name=if au.codec==super::media::Codec::H265 {"H.265"} else {"H.264"};
                     super::desktop::display(decoder,window,&au.data,au.codec,&session.peer.desktop.pli)?;}
             }
         }}
     }.await;
+    if let Some(frame)=window.last_frame.as_ref() {if let Err(e)=super::thumbs::save(device,frame){log::debug!("Viewer thumbnail not saved: {e}");}}
     #[cfg(uu_gtk)] if let Some(f)=files {f.abort();let _=f.await;super::tools_ui::hide();session.peer.tools.lock().unwrap().take();}
     if let Some(t)=type_ipc {t.abort();let _=t.await;}
     for m in input.release_all(){let _=session.peer.send_input(&m).await;}

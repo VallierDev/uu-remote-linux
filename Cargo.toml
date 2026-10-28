@@ -1,6 +1,6 @@
 [package]
 name = "uu-remote-linux"
-version = "0.2.39"
+version = "0.3.0"
 edition = "2021"
 default-run = "uuremote-server"
 authors = ["uu-remote-linux contributors"]
@@ -23,7 +23,7 @@ required-features = ["native-viewer"]
 default = []
 native-viewer = []
 viewer-ffmpeg = ["native-viewer", "dep:ffmpeg-next"]
-viewer-sdl = ["native-viewer", "dep:sdl2"]
+viewer-sdl = ["native-viewer", "dep:sdl2", "dep:ab_glyph"]
 wayland = []
 # Experimental direct linear framebuffer capture; never enabled in release builds.
 kms = []
@@ -59,6 +59,7 @@ ffmpeg-next = { version = "6.1", optional = true, default-features = false, feat
 x11rb = { version = "0.13", features = ["damage", "shm", "allow-unsafe-code"], optional = true }
 
 sdl2 = { version = "0.37", optional = true, features = ["use-pkgconfig"] }
+ab_glyph = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # Synthetic loopback WSS certificates only; both crates already occur in Cargo.lock.

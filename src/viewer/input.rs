@@ -66,6 +66,7 @@ impl Input {
     pub fn new(view_only:bool)->Self {Self{view_only,..Default::default()}}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
     pub fn enabled(&self)->bool {!self.view_only}
+    pub fn set_view_only(&mut self,view_only:bool){self.view_only=view_only;}
     pub fn key(&mut self,scan:i32,down:bool)->Option<Value> {
         if self.view_only {return None}
         let vk=if self.mac{mac_keycode(scan)}else{windows_vk(scan)}?;

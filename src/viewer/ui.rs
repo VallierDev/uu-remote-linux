@@ -13,6 +13,7 @@ extern "C" {
     fn uu_viewer_ui_closed() -> c_int;
     fn uu_viewer_ui_confirm_replace() -> c_int;
     fn uu_viewer_ui_toast(text: *const c_char);
+    fn uu_viewer_ui_set_host(active: c_int);
 }
 fn toast(text: &str) { let t = c(text); unsafe { uu_viewer_ui_toast(t.as_ptr()) } }
 
@@ -81,7 +82,8 @@ pub fn device_rows(devices: &[Value], current: Option<&str>) -> String {
         let name = d.get("alias").and_then(Value::as_str).unwrap_or(id);
         let platform = d.get("platform").and_then(Value::as_i64).unwrap_or(0);
         let online = d.get("status").and_then(Value::as_str) == Some("CONNECTED");
-        Some(format!("{}\t{}\t{}\t{}\t{}\n", clean(id), clean(name), platform, online as u8, (current == Some(id)) as u8))
+        let thumb = super::thumbs::existing(id).map(|p| clean(&p.to_string_lossy())).unwrap_or_default();
+        Some(format!("{}\t{}\t{}\t{}\t{}\t{}\n", clean(id), clean(name), platform, online as u8, (current == Some(id)) as u8, thumb))
     }).collect()
 }
 
@@ -94,6 +96,11 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
     let mut next_refresh = Instant::now();
     let mut sessions:std::collections::HashMap<String,Running>=Default::default();
     let mut names: std::collections::HashMap<String, String> = Default::default();
+    // Account whose token the local host last went online with; a new sign-in restarts the host.
+    let mut host_token: Option<String> = None;
+    let mut host_failed = false;
+    let mut just_logged_in = false;
+    unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
     let refresh = |creds: &crate::auth::Credentials| {
         let api = super::api::Api::new(crate::auth::UUAuthClient::new(creds.clone()), crate::auth::BASE_URL);
         async move { api.device_list().await }
@@ -105,12 +112,22 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
             if let Ok(meta) = std::fs::metadata(&qr) {
                 if meta.modified().ok() != qr_seen { qr_seen = meta.modified().ok(); set_login(false, &qr.to_string_lossy(), crate::i18n::s("请用手机扫码并确认","Scan with your phone and confirm"), ""); }
             }
-            if let Ok(Some(_)) = child.try_wait() { login = None; let _ = std::fs::remove_file(&qr); next_refresh = Instant::now(); }
+            if let Ok(Some(_)) = child.try_wait() { login = None; let _ = std::fs::remove_file(&qr); next_refresh = Instant::now(); just_logged_in = true; }
         } else if Instant::now() >= next_refresh {
             next_refresh = Instant::now() + Duration::from_secs(30);
             match credentials() {
                 Ok(creds) => {
                     set_login(true, "", "", crate::i18n::s("已登录","Signed in"));
+                    // Like the official client: once signed in, this computer joins the account's device list.
+                    if super::host::managed() && !host_failed && host_token.as_deref() != Some(creds.token.as_str()) {
+                        let restart = host_token.is_some() || std::mem::take(&mut just_logged_in);
+                        match super::host::enable(&exe, restart) {
+                            Ok(()) => { if restart { toast(crate::i18n::s("本机已上线，可在你的其他设备上远程控制","This computer is online; control it from your other devices")); } }
+                            Err(e) => { host_failed = true; log::warn!("Host service not started: {e}"); }
+                        }
+                        host_token = Some(creds.token.clone());
+                        unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
+                    }
                     match refresh(&creds).await {
                         Ok(data) => {
                             let list = data.get("my_binded_devices").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -131,6 +148,11 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
             match parts.as_slice() {
                 ["quit"] => break,
                 ["refresh"] => next_refresh = Instant::now(),
+                ["host", state] => {
+                    let result = if *state == "on" { host_failed = false; super::host::enable(&exe, false) } else { super::host::disable() };
+                    if let Err(e) = result { toast(&crate::tr!("本机被控设置失败：{e}","Could not change hosting: {e}")); }
+                    unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
+                }
                 ["logout"] => {
                     // Sign out locally: drop the account token, keep the device identity.
                     let path = crate::config::path();
@@ -221,6 +243,6 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
             serde_json::json!({"device_id":"d2","platform":1,"status":"DISCONNECTED"}),
             serde_json::json!({"alias":"no id"}),
         ], Some("d2"));
-        assert_eq!(rows, "d1\ta b\t4\t1\t0\nd2\td2\t1\t0\t1\n");
+        assert_eq!(rows, "d1\ta b\t4\t1\t0\t\nd2\td2\t1\t0\t1\t\n");
     }
 }
