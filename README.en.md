@@ -23,18 +23,6 @@
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Host main window: remote assistance and account"></p>
 <p align="center"><sub>Linux host main window: remote assistance and account (device ID, code and account redacted). The UI is available in Chinese and English (see [Language](#language--语言)).</sub></p>
 
-## This fork (spixyy7/uu-remote-linux)
-
-This fork of [VallierDev/uu-remote-linux](https://github.com/VallierDev/uu-remote-linux) adds:
-
-- **Chinese and English UI.** Every GTK window (viewer launcher, files / port mapping / terminal tools, host main
-  window and QR login) and every viewer message is available in both languages. See [Language](#language--语言).
-- **Sharper text in the native viewer.** The viewer used to scale every remote picture into a fixed 1920x1080 canvas
-  and SDL then stretched it to the window with nearest-neighbour sampling, so text looked uneven and blurry, worst on
-  high-resolution hosts. Frames are now decoded at the host's native resolution, a host resolution change restarts the
-  decoder at the new size, and the window scales with linear filtering. `UU_VIEWER_SIZE=WxH` still forces the old
-  fixed canvas (now resampled with Lanczos). For the sharpest text also request true color: `UU_VIEWER_CHROMA=444`.
-
 ## Language / 语言
 
 The language is picked once at start, in this order:

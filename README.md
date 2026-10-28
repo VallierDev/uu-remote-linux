@@ -19,16 +19,6 @@
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Linux 主机主窗口：远程协助与账号"></p>
 <p align="center"><sub>Linux 被控端主窗口：远程协助与账号（设备 ID、验证码和账号已打码）</sub></p>
 
-## 本分支（spixyy7/uu-remote-linux）
-
-本仓库 fork 自 [VallierDev/uu-remote-linux](https://github.com/VallierDev/uu-remote-linux)，新增：
-
-- **中英文界面。** 所有 GTK 窗口（控制端主界面、文件传输 / 端口映射 / 终端工具、主机主窗口与扫码登录）和控制端提示都支持中文和英文，
-  见[语言](#语言--language)。
-- **原生控制端文字更清晰。** 以前控制端把远端画面统一缩放到固定的 1920x1080 画布，SDL 再用最近邻采样拉伸到窗口，
-  文字发虚、粗细不均，高分辨率被控端尤其明显。现在按被控端原始分辨率解码，被控端分辨率变化时自动重启解码器，窗口缩放使用线性过滤。
-  `UU_VIEWER_SIZE=WxH` 仍可强制使用固定画布（改用 Lanczos 缩放）。想要最清晰的文字，可同时请求真彩：`UU_VIEWER_CHROMA=444`。
-
 ## 语言 / Language
 
 启动时按以下顺序确定界面语言：
