@@ -8,7 +8,7 @@
 //! (analysis/tools-fix-20261013/viewer-fieldmd.json). Results are written to the private
 //! config file (chmod 600). Tokens and tickets are never printed or logged.
 
-use crate::auth::{Credentials, UUAuthClient};
+use crate::auth::{Credentials, QrRequestErrorKind, UUAuthClient};
 use crate::login_ui::{LoginUi, Tone};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -126,6 +126,35 @@ fn render_qr(content: &str) -> Result<String, String> {
 
 /// API code for an expired login QR code.
 const QR_EXPIRED: i64 = 1190;
+
+/// QR API errors must not echo server messages/validation fields: they may contain credentials.
+fn qr_data<'a>(stage: &str, status: u16, body: &'a Value) -> Result<&'a Value, String> {
+    let code = body.get("code").and_then(Value::as_i64);
+    if status == 200 && code == Some(0) { return Ok(body.get("data").unwrap_or(&Value::Null)); }
+    Err(format!("{stage}: http_status={status} api_code={code:?}"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum QrPollAction { Wait(i64), Scanned, Confirmed, Refresh(Duration), Failed(&'static str) }
+
+/// Preserve the official refresh policy; a failed query says nothing about QR expiry.
+fn qr_poll_action(last_status: i64, http_status: u16, body: &Value) -> QrPollAction {
+    if body.get("code").and_then(Value::as_i64) == Some(QR_EXPIRED) {
+        return QrPollAction::Failed("二维码已失效");
+    }
+    let Ok(data) = qr_data("qrcode status", http_status, body) else {
+        return QrPollAction::Failed("二维码状态查询失败");
+    };
+    match data.get("status").and_then(Value::as_i64) {
+        Some(1) => QrPollAction::Wait(1),
+        Some(2) if last_status != 2 => QrPollAction::Scanned,
+        Some(2) => QrPollAction::Wait(2),
+        Some(0) => QrPollAction::Refresh(Duration::from_millis(350)),
+        Some(3) => QrPollAction::Refresh(Duration::ZERO),
+        Some(4) => QrPollAction::Confirmed,
+        _ => QrPollAction::Failed("二维码状态响应异常"),
+    }
+}
 
 /// QR modules as RGBA pixels: `scale` pixels per module, `quiet` light modules around the code.
 fn qr_rgba(content: &str, scale: usize, quiet: usize) -> Result<(Vec<u8>, usize), String> {
@@ -276,8 +305,16 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
     // every QR within seconds (#68).
     let timeout = Duration::from_secs(60);
     loop {
-        let (status, resp) = client.post_with_timeout("/api/v1/qrcode/gen/login", None, timeout).await?;
-        let d = match data("qrcode gen", status, &resp) {
+        let (status, resp) = match client.post_with_timeout("/api/v1/qrcode/gen/login", None, timeout).await {
+            Ok(r) => r,
+            Err(e) if e.response_received() => {
+                eprintln!("QR generation response failed: {e}");
+                wait_for_refresh(ui, "二维码加载失败").await;
+                continue;
+            }
+            Err(e) => return Err(format!("QR generation failed: {e}")),
+        };
+        let d = match qr_data("qrcode gen", status, &resp) {
             Ok(d) => d.clone(),
             Err(e) => { println!("QR code could not be loaded ({e})"); wait_for_refresh(ui, "二维码加载失败").await; continue; }
         };
@@ -303,24 +340,42 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
             let query = json!({"token": ticket, "qrcode_jump_url": url, "login_status": login_status});
             let (status, resp) = match client.post_with_timeout("/api/v1/qrcode/login/status", Some(&query), timeout).await {
                 Ok(r) => r,
-                Err(_) => break "网络超时，二维码已停止刷新",
+                Err(e) => {
+                    eprintln!("QR status query failed: {e}; last_status={login_status}");
+                    break match e.kind {
+                        QrRequestErrorKind::Timeout => "二维码状态查询超时（不代表二维码已失效）",
+                        _ => "二维码状态查询失败（不代表二维码已失效）",
+                    };
+                }
             };
-            let code = resp.get("code").and_then(|c| c.as_i64());
-            if code == Some(QR_EXPIRED) { break "二维码已失效"; }
-            let Ok(d) = data("qrcode status", status, &resp) else { break "二维码状态查询失败"; };
-            let st = d.get("status").and_then(|v| v.as_i64()).unwrap_or(login_status);
-            match st {
-                1 => {}
-                2 => if login_status != 2 {
+            match qr_poll_action(login_status, status, &resp) {
+                QrPollAction::Wait(st) => {
+                    if st == 1 && login_status != 1 { ui.status("等待扫码…", Tone::Info); }
+                    login_status = st;
+                }
+                QrPollAction::Scanned => {
+                    login_status = 2;
                     println!("已扫码，请在手机上确认 (scanned, confirm on the phone)");
                     ui.status("已扫码，请在手机上确认登录", Tone::Ok);
-                },
-                3 => { println!("QR code expired; generating a new one"); break ""; }
-                0 => { tokio::time::sleep(Duration::from_millis(350)).await; break ""; }
-                4 => {
+                }
+                QrPollAction::Refresh(delay) => {
+                    if delay.is_zero() { println!("QR code expired; generating a new one"); }
+                    else { tokio::time::sleep(delay).await; }
+                    break "";
+                }
+                QrPollAction::Confirmed => {
+                    println!("已确认，正在完成登录 (confirmed, completing login)");
+                    ui.status("已确认，正在完成登录…", Tone::Info);
                     let body = json!({"token": ticket, "qrcode_jump_url": url});
-                    let (status, resp) = client.post_with_timeout("/api/v1/login/by_qrcode", Some(&body), timeout).await?;
-                    let d = match data("qrcode login", status, &resp) {
+                    let (status, resp) = match client.post_with_timeout("/api/v1/login/by_qrcode", Some(&body), timeout).await {
+                        Ok(r) => r,
+                        Err(e) if e.response_received() => {
+                            eprintln!("QR login exchange response failed: {e}");
+                            break "登录失败";
+                        }
+                        Err(e) => return Err(format!("QR login exchange failed: {e}")),
+                    };
+                    let d = match qr_data("qrcode login", status, &resp) {
                         Ok(d) => d,
                         Err(e) => { println!("QR login not granted ({e})"); break "登录失败"; }
                     };
@@ -339,9 +394,12 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
                     println!("Logged in as {} ({}); saved to {}", nickname, user, path.display());
                     return Ok(if nickname.is_empty() { user.to_string() } else { nickname.to_string() });
                 }
-                other => { println!("QR status: {other}"); break "二维码已失效"; }
+                QrPollAction::Failed(reason) => {
+                    eprintln!("QR status query stopped: http_status={status} api_code={:?} status={:?} last_status={login_status}",
+                        resp.get("code").and_then(Value::as_i64), resp.get("data").and_then(|d| d.get("status")).and_then(Value::as_i64));
+                    break reason;
+                }
             }
-            login_status = st;
         };
         if !failure.is_empty() { wait_for_refresh(ui, failure).await; }
     }
@@ -376,6 +434,37 @@ async fn wait_for_refresh(ui: &LoginUi, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qr_poll_keeps_waiting_scanned_and_confirmed_distinct() {
+        let reply = |status| json!({"code": 0, "data": {"status": status}});
+        assert_eq!(qr_poll_action(1, 200, &reply(1)), QrPollAction::Wait(1));
+        assert_eq!(qr_poll_action(1, 200, &reply(2)), QrPollAction::Scanned);
+        assert_eq!(qr_poll_action(2, 200, &reply(2)), QrPollAction::Wait(2));
+        assert_eq!(qr_poll_action(2, 200, &reply(4)), QrPollAction::Confirmed);
+        assert_eq!(qr_poll_action(1, 200, &reply(0)), QrPollAction::Refresh(Duration::from_millis(350)));
+        assert_eq!(qr_poll_action(2, 200, &reply(3)), QrPollAction::Refresh(Duration::ZERO));
+        assert_eq!(qr_poll_action(2, 400, &json!({"code": 1190})), QrPollAction::Failed("二维码已失效"));
+    }
+
+    #[test]
+    fn qr_poll_failures_do_not_imply_expiry_or_confirmation() {
+        for last in [1, 2] {
+            for body in [json!(null), json!({"code": 1}), json!({"code": 0, "data": {"status": 4}})] {
+                assert_eq!(qr_poll_action(last, 503, &body), QrPollAction::Failed("二维码状态查询失败"));
+            }
+            assert_eq!(qr_poll_action(last, 200, &json!({"code": 1})), QrPollAction::Failed("二维码状态查询失败"));
+            for data in [json!(null), json!({}), json!({"status": "4"}), json!({"status": 99}), json!({"status": -1})] {
+                assert_eq!(qr_poll_action(last, 200, &json!({"code": 0, "data": data})), QrPollAction::Failed("二维码状态响应异常"));
+            }
+        }
+    }
+
+    #[test]
+    fn qr_api_errors_do_not_echo_server_content() {
+        let body = json!({"code": 1001, "msg": "fixture-token", "data": [{"loc": "fixture-ticket"}]});
+        assert_eq!(qr_data("qrcode gen", 400, &body).unwrap_err(), "qrcode gen: http_status=400 api_code=Some(1001)");
+    }
+
     #[test]
     fn status_ticket_prefers_status_query_ticket() {
         assert_eq!(qr_ticket(&json!({"token": "old", "status_query_ticket": "new"})), Some("new"));

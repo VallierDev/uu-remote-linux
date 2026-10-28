@@ -91,6 +91,48 @@ pub struct UUAuthClient {
     guest_id: Option<String>,
 }
 
+/// QR failures are safe to display: never retain a URL, source error or response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QrRequestErrorKind { Timeout, Connect, Decode, Body, Request }
+impl QrRequestErrorKind {
+    fn from_reqwest(error: &reqwest::Error) -> Self {
+        if error.is_timeout() { Self::Timeout }
+        else if error.is_connect() { Self::Connect }
+        else if error.is_decode() { Self::Decode }
+        else if error.is_body() { Self::Body }
+        else { Self::Request }
+    }
+    fn label(self) -> &'static str {
+        match self { Self::Timeout => "timeout", Self::Connect => "connect", Self::Decode => "decode",
+            Self::Body => "body", Self::Request => "request" }
+    }
+}
+#[derive(Debug)]
+pub struct QrRequestError {
+    pub kind: QrRequestErrorKind,
+    phase: &'static str,
+    elapsed_ms: u128,
+    http_status: Option<u16>,
+}
+impl std::fmt::Display for QrRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "phase={} kind={} elapsed_ms={} http_status={:?}",
+            self.phase, self.kind.label(), self.elapsed_ms, self.http_status)
+    }
+}
+impl QrRequestError {
+    pub fn response_received(&self) -> bool { self.http_status.is_some() }
+    fn new(kind: QrRequestErrorKind, phase: &'static str, started: std::time::Instant, http_status: Option<u16>) -> Self {
+        Self { kind, phase, elapsed_ms: started.elapsed().as_millis(), http_status }
+    }
+}
+async fn send_qr_request(request: reqwest::RequestBuilder, started: std::time::Instant) -> Result<(u16, serde_json::Value), QrRequestError> {
+    let resp = request.send().await.map_err(|e| QrRequestError::new(QrRequestErrorKind::from_reqwest(&e), "send", started, None))?;
+    let status = resp.status().as_u16();
+    let value = resp.json().await.map_err(|e| QrRequestError::new(QrRequestErrorKind::from_reqwest(&e), "response", started, Some(status)))?;
+    Ok((status, value))
+}
+
 /// Transport failures name only the outer request; the cause (certificate, proxy, DNS,
 /// timeout) lives in the source chain. URL user-info (proxy credentials) and query
 /// strings are removed before the chain is shown.
@@ -253,13 +295,13 @@ impl UUAuthClient {
 
     /// Signed POST with an optional JSON body (None = empty body, like Moya `requestPlain`) and an
     /// explicit timeout. The official clients long-poll the QR status with a 60 s request timeout.
-    pub async fn post_with_timeout(&self, path: &str, body: Option<&serde_json::Value>, timeout: std::time::Duration) -> Result<(u16, serde_json::Value), String> {
-        let body_str = body.map(serde_json::to_string).transpose().map_err(|e| e.to_string())?.unwrap_or_default();
-        let resp = self.http.post(format!("{}{}", BASE_URL, path)).timeout(timeout)
-            .headers(self.build_headers("POST", path, &body_str)).body(body_str)
-            .send().await.map_err(|e| format!("HTTP post {path} failed: {}", transport_error(&e)))?;
-        let status = resp.status().as_u16();
-        Ok((status, resp.json().await.unwrap_or(serde_json::Value::Null)))
+    pub async fn post_with_timeout(&self, path: &str, body: Option<&serde_json::Value>, timeout: std::time::Duration) -> Result<(u16, serde_json::Value), QrRequestError> {
+        let started = std::time::Instant::now();
+        let body_str = body.map(serde_json::to_string).transpose()
+            .map_err(|_| QrRequestError::new(QrRequestErrorKind::Request, "encode", started, None))?.unwrap_or_default();
+        let request = self.http.post(format!("{}{}", BASE_URL, path)).timeout(timeout)
+            .headers(self.build_headers("POST", path, &body_str)).body(body_str);
+        send_qr_request(request, started).await
     }
 
     /// Signed JSON POST to another API host (the signature covers the path only).
@@ -387,5 +429,60 @@ mod guest_tests {
     fn proxy_opt_in_accepts_only_explicit_truthy_values() {
         for value in ["1", "true", "TRUE", " yes ", "On"] { assert!(super::proxy_requested(value)); }
         for value in ["", "0", "false", "no", "off", "2"] { assert!(!super::proxy_requested(value)); }
+    }
+}
+
+#[cfg(test)]
+mod qr_request_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Synthetic, loopback-only responses: no account, device, proxy or live login API.
+    async fn response(reply: &'static [u8], stall: bool) -> QrRequestError {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket.write_all(reply).await.unwrap();
+            if stall { std::future::pending::<()>().await; }
+        });
+        let request = reqwest::Client::builder().no_proxy().build().unwrap()
+            .post(format!("http://fixture-user:fixture-password@{addr}/fixture-path?token=fixture-ticket"))
+            .timeout(Duration::from_secs(2));
+        let error = send_qr_request(request, Instant::now()).await.unwrap_err();
+        server.abort();
+        let output = format!("{error} {error:?}");
+        for secret in ["fixture-user", "fixture-password", "fixture-path", "fixture-ticket", "fixture-body", "127.0.0.1", "http://"] {
+            assert!(!output.contains(secret));
+        }
+        error
+    }
+
+    #[tokio::test]
+    async fn qr_request_distinguishes_send_timeout_body_timeout_and_bad_json_without_secrets() {
+        let error = response(b"", true).await;
+        assert_eq!((error.kind, error.phase, error.http_status), (QrRequestErrorKind::Timeout, "send", None));
+        assert!(!error.response_received());
+        let error = response(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", true).await;
+        assert_eq!((error.kind, error.phase, error.http_status), (QrRequestErrorKind::Timeout, "response", Some(200)));
+        assert!(error.response_received());
+        let error = response(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 12\r\n\r\nfixture-body", false).await;
+        assert_eq!((error.kind, error.phase, error.http_status), (QrRequestErrorKind::Decode, "response", Some(502)));
+        assert!(error.response_received());
+    }
+
+    #[tokio::test]
+    async fn qr_connection_failure_is_not_a_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let request = reqwest::Client::builder().no_proxy().build().unwrap()
+            .post(format!("http://{addr}/fixture-ticket")).timeout(Duration::from_secs(2));
+        let error = send_qr_request(request, Instant::now()).await.unwrap_err();
+        assert_eq!((error.kind, error.phase, error.http_status), (QrRequestErrorKind::Connect, "send", None));
+        assert!(!format!("{error} {error:?}").contains("fixture-ticket"));
     }
 }

@@ -195,6 +195,8 @@ cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 用手机上的 **网易 UU 远程 App** 扫码并确认即可。登录信息只保存在本机的
 `~/.config/uuremote/config.json`（权限 0600）里。
 
+登录状态查询失败或达到 60 秒请求超时不代表二维码已过期，也不代表手机已经确认。程序保留官方客户端的刷新策略：查询出错后点击「刷新二维码」（终端按回车；无窗口且无终端时 60 秒后刷新）。二维码请求诊断只包含请求阶段、错误类别、耗时、HTTP/API 状态及最后已知扫码状态，不输出票据、URL 或响应内容；`connect` 类别本身不能确定是 DNS、TLS 还是代理问题。
+
 ### 4. 作为用户服务常驻
 
 `~/.config/systemd/user/uuremote-native.service`：
