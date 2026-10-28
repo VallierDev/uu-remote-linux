@@ -14,6 +14,7 @@ impl Window {
         // SDL's default nearest-neighbour scaling makes remote text uneven whenever the window size
         // differs from the stream; filter instead. Set before the renderer/textures exist.
         sdl2::hint::set_with_priority("SDL_RENDER_SCALE_QUALITY","linear",&sdl2::hint::Hint::Default);
+        #[cfg(uu_gtk)] cairo_decorations();
         let sdl=sdl2::init()?;let video=sdl.video()?;
         let name=super::device_label(std::env::var("UU_VIEWER_DEVICE_NAME").ok().as_deref()).to_owned();
         let window=video.window(&format!("{name} · {}",crate::i18n::s("UU 远程 Linux 控制端","UU Remote Linux viewer")),1280,720).position_centered().resizable().build().map_err(|_|"Window creation failed")?;
@@ -249,6 +250,20 @@ impl Window {
             .map(|(x,y,w,h)|Rect::new(x.round() as i32,y.round() as i32,w.round().max(1.) as u32,h.round().max(1.) as u32));
         self.canvas.copy(&texture,src,Some(Rect::new(v.x.round() as i32,v.y.round() as i32,v.width.round().max(1.) as u32,v.height.round().max(1.) as u32)))?;
         drop(texture);self.draw_chrome()?;self.canvas.present();Ok(())
+    }
+}
+/// On Wayland SDL draws its title bar through libdecor; the GTK plugin calls GTK3 from SDL's thread
+/// while the tool windows run gtk_main on theirs, and the two crash in GTK's style code (SIGSEGV on
+/// closing the file window). Offer libdecor only its cairo plugin unless the user chose a directory.
+#[cfg(uu_gtk)]
+fn cairo_decorations(){
+    if std::env::var_os("LIBDECOR_PLUGIN_DIR").is_some() {return}
+    let Some(cairo)=["/usr/lib64/libdecor/plugins-1","/usr/lib/x86_64-linux-gnu/libdecor/plugins-1","/usr/lib/libdecor/plugins-1"]
+        .iter().map(|d|std::path::Path::new(d).join("libdecor-cairo.so")).find(|p|p.exists()) else {return};
+    let dir=std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir,std::path::PathBuf::from).join("uuremote-libdecor");
+    let link=dir.join("libdecor-cairo.so");
+    if std::fs::create_dir_all(&dir).is_ok() && (link.exists() || std::os::unix::fs::symlink(&cairo,&link).is_ok()) {
+        std::env::set_var("LIBDECOR_PLUGIN_DIR",&dir);
     }
 }
 const LOADING_BG:sdl2::pixels::Color=sdl2::pixels::Color::RGB(17,19,24);

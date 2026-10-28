@@ -325,6 +325,9 @@ impl ControllingSelector for AgentInternal {
                 remote,
                 local
             );
+            if let Some(p) = self.find_pair(local, remote).await {
+                p.record_rtt(pending_request.timestamp.elapsed());
+            }
             let selected_pair_is_none = self.agent_conn.get_selected_pair().is_none();
 
             if let Some(p) = self.find_pair(local, remote).await {
@@ -483,6 +486,9 @@ impl ControlledSelector for AgentInternal {
                 remote,
                 local
             );
+            if let Some(p) = self.find_pair(local, remote).await {
+                p.record_rtt(pending_request.timestamp.elapsed());
+            }
 
             if let Some(p) = self.find_pair(local, remote).await {
                 p.state

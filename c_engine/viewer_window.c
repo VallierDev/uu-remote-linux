@@ -315,8 +315,16 @@ static gboolean apply_devices(gpointer d) {
     gtk_widget_show_all(device_list); gtk_widget_show_all(all_box);
     return G_SOURCE_REMOVE;
 }
+static GtkWidget *account_who, *account_out;
+/* The settings window is built once and kept; refresh its account card on every login change. */
+static void refresh_account(void) {
+    if (!account_who) return;
+    gtk_label_set_text(GTK_LABEL(account_who), logged_in ? (user_text[0] ? user_text : L("已登录", "Signed in")) : L("未登录", "Not signed in"));
+    gtk_widget_set_sensitive(account_out, logged_in);
+}
 static gboolean apply_login(gpointer d) {
     (void)d;
+    refresh_account();
     gtk_label_set_text(GTK_LABEL(status_label), status_text);
     if (qr_path[0]) {
         GdkPixbuf *pix = gdk_pixbuf_new_from_file_at_size(qr_path, 240, 240, NULL);
@@ -538,8 +546,10 @@ static void on_language(GtkComboBox *c, gpointer d) {
     if (english == uu_i18n_english()) return;
     show_toast(!uu_i18n_save(english) ? L("无法保存语言设置", "Could not save the language") : english ? "Restart the viewer to switch to English" : "重新启动控制端后切换为中文");
 }
+static void confirm_logout(void);
+static void on_sign_out(GtkButton *b, gpointer d) { (void)b; (void)d; if (logged_in) confirm_logout(); }
 static void open_settings(void) {
-    if (settings_window) { gtk_window_present(GTK_WINDOW(settings_window)); return; }
+    if (settings_window) { refresh_account(); gtk_window_present(GTK_WINDOW(settings_window)); return; }
     settings_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(settings_window), L("设置", "Settings"));
     gtk_window_set_transient_for(GTK_WINDOW(settings_window), GTK_WINDOW(window));
@@ -554,6 +564,15 @@ static void open_settings(void) {
     gtk_box_pack_start(GTK_BOX(root), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
     // 常规
     GtkWidget *general = settings_page();
+    GtkWidget *acct = hbox(12), *acct_text = vbox(2);
+    gtk_box_pack_start(GTK_BOX(acct_text), label(L("账号", "Account"), "devname"), FALSE, FALSE, 0);
+    account_who = label("", "hint"); gtk_box_pack_start(GTK_BOX(acct_text), account_who, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(acct), acct_text, TRUE, TRUE, 0);
+    account_out = button(L("退出登录", "Sign out"), "secondary"); gtk_widget_set_valign(account_out, GTK_ALIGN_CENTER);
+    g_signal_connect(account_out, "clicked", G_CALLBACK(on_sign_out), NULL); gtk_box_pack_end(GTK_BOX(acct), account_out, FALSE, FALSE, 0);
+    GtkWidget *g0[] = { acct };
+    gtk_box_pack_start(GTK_BOX(general), settings_card(g0, 1), FALSE, FALSE, 0);
+    refresh_account();
     const char *wake[] = {L("永不", "Never"), L("接通电源时", "When plugged in"), L("始终", "Always")}, *close_opts[] = {L("最小化", "Minimize"), L("退出程序", "Quit")};
     GtkWidget *g1[] = { setting_row(L("开机自启动", "Start at login"), NULL, gtk_switch_new()),
         setting_row(L("保持唤醒状态", "Stay awake"), L("防止电脑进入睡眠状态，导致无法远程访问。", "Keep the computer from sleeping so it stays reachable."), combo(wake, 3)),

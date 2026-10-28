@@ -480,14 +480,15 @@ impl AgentInternal {
     /// if no packet has been sent on that pair in the last keepaliveInterval.
     /// Note: the caller should hold the agent lock.
     pub(crate) async fn check_keepalive(&self) {
-        let (local, remote) = {
+        let (local, remote, rtt_stale) = {
             let selected_pair = self.agent_conn.selected_pair.load();
             (*selected_pair)
                 .as_ref()
-                .map_or((None, None), |selected_pair| {
+                .map_or((None, None, false), |selected_pair| {
                     (
                         Some(selected_pair.local.clone()),
                         Some(selected_pair.remote.clone()),
+                        selected_pair.rtt_stale(self.keepalive_interval),
                     )
                 })
         };
@@ -503,7 +504,9 @@ impl AgentInternal {
 
             if (self.keepalive_interval != Duration::from_secs(0))
                 && ((last_sent > self.keepalive_interval)
-                    || (last_received > self.keepalive_interval))
+                    || (last_received > self.keepalive_interval)
+                    // A busy media path never idles; ping anyway so the round trip stays current.
+                    || rtt_stale)
             {
                 // we use binding request instead of indication to support refresh consent schemas
                 // see https://tools.ietf.org/html/rfc7675

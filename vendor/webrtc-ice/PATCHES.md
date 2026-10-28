@@ -14,3 +14,11 @@ padding) per read. `agent_gather.rs` uses it for `ProtoType::Tcp` URLs. UDP gath
 
 TLS trusts the system certificate store (`rustls-native-certs`, as OpenSSL does) plus the bundled
 Mozilla roots. A name mismatch is accepted only when the TURN URL is an IP literal.
+
+## Round-trip time
+
+Upstream never measures it: `CandidatePairStats::current_round_trip_time` is always 0. A successful
+binding response now records `now - request timestamp` on its candidate pair, and the stats report
+the latest sample. Keepalive pings only an idle pair, which a streaming session never is, so the
+selected pair is also pinged when its last sample is older than the keepalive interval (a binding
+request, like a consent check from RFC 7675).

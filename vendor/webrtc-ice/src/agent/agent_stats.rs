@@ -224,6 +224,9 @@ impl AgentInternal {
                 remote_candidate_id: cp.remote.id(),
                 state: cp.state.load(Ordering::SeqCst).into(),
                 nominated: cp.nominated.load(Ordering::SeqCst),
+                current_round_trip_time: cp
+                    .current_round_trip_time()
+                    .map_or(0.0, |rtt| rtt.as_secs_f64()),
                 ..CandidatePairStats::default()
             };
             res.push(stat);
