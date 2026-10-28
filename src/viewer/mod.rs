@@ -25,7 +25,7 @@ pub mod secure_input;
 pub mod type_ipc;
 
 fn device_label(name:Option<&str>)->&str{
-    name.filter(|name|!name.is_empty()).unwrap_or("远端设备")
+    name.filter(|name|!name.is_empty()).unwrap_or_else(||crate::i18n::s("远端设备","Remote device"))
 }
 
 #[cfg(test)]
@@ -33,7 +33,7 @@ mod device_label_tests {
     #[test]
     fn device_name_or_fallback(){
         assert_eq!(super::device_label(Some("测试电脑")),"测试电脑");
-        assert_eq!(super::device_label(None),"远端设备");
-        assert_eq!(super::device_label(Some("")),"远端设备");
+        assert_eq!(super::device_label(None),crate::i18n::s("远端设备","Remote device"));
+        assert_eq!(super::device_label(Some("")),crate::i18n::s("远端设备","Remote device"));
     }
 }

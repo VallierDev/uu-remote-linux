@@ -16,6 +16,7 @@ mod wayland;
 mod auth;
 mod assist;
 mod config;
+mod i18n;
 mod login;
 mod login_ui;
 mod session_lock;

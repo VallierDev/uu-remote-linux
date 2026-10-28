@@ -29,13 +29,13 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Api(code, msg) if !msg.is_empty() => write!(f, "{msg} (code {code})"),
-            Error::AuthenticationExpired => write!(f, "登录已过期，请重新登录"),
-            Error::Transport => write!(f, "网络连接失败"),
-            Error::InvalidAssist => write!(f, "请输入对方的设备 ID 和有效验证码"),
-            Error::InvalidResponse => write!(f, "服务器响应格式无效"),
-            Error::MissingRoom => write!(f, "服务器未返回可用的房间或信令信息"),
-            Error::UnknownKeyboardPlatform => write!(f, "无法确定目标键盘平台，不能启用控制"),
-            Error::Api(code, _) => write!(f, "连接请求失败（错误码 {code}）"),
+            Error::AuthenticationExpired => f.write_str(crate::i18n::s("登录已过期，请重新登录","Sign-in expired, please sign in again")),
+            Error::Transport => f.write_str(crate::i18n::s("网络连接失败","Network connection failed")),
+            Error::InvalidAssist => f.write_str(crate::i18n::s("请输入对方的设备 ID 和有效验证码","Enter the partner's device ID and a valid code")),
+            Error::InvalidResponse => f.write_str(crate::i18n::s("服务器响应格式无效","Invalid server response")),
+            Error::MissingRoom => f.write_str(crate::i18n::s("服务器未返回可用的房间或信令信息","The server returned no usable room or signaling info")),
+            Error::UnknownKeyboardPlatform => f.write_str(crate::i18n::s("无法确定目标键盘平台，不能启用控制","Unknown remote keyboard platform; control is disabled")),
+            Error::Api(code, _) => f.write_str(&crate::tr!("连接请求失败（错误码 {code}）","Connection request failed (error {code})")),
             _ => write!(f, "viewer API: {self:?}"),
         }
     }

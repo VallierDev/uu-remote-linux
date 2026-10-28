@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 #[path = "auth.rs"] mod auth;
 #[path = "config.rs"] mod config;
+#[path = "i18n.rs"] mod i18n;
 #[path = "protocol.rs"] mod protocol;
 mod ws_transport;
 mod viewer;
@@ -57,8 +58,8 @@ async fn run(args:&[String])->Result<(),String> {
             Ok(())
         }
         Some("unbind") if (args.len()==2 || (args.len()==3 && args[2]=="--shared")) && !args[1].is_empty() => {
-            api()?.unbind(&args[1],args.len()==3).await.map_err(|e|format!("删除设备失败：{e}"))?;
-            println!("已从账号删除设备");Ok(())
+            api()?.unbind(&args[1],args.len()==3).await.map_err(|e|crate::tr!("删除设备失败：{e}","Removing the device failed: {e}"))?;
+            println!("{}",crate::i18n::s("已从账号删除设备","Device removed from the account"));Ok(())
         }
         Some("power")=>power_command(args).await,
         Some("type")=>type_command(args).await,
@@ -69,7 +70,7 @@ async fn run(args:&[String])->Result<(),String> {
         Some("terminal"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui")=>tool_command(args).await,
         Some("assist") if args.len()==2=> {
             let code=viewer::assist::read_code(std::io::stdin().lock())?;
-            desktop_command(&["connect".into(),args[1].clone(),"false".into(),"-".into(),"echo".into(),"legacy".into()],Some(code)).await.map_err(|e|format!("协助连接失败：{e}"))
+            desktop_command(&["connect".into(),args[1].clone(),"false".into(),"-".into(),"echo".into(),"legacy".into()],Some(code)).await.map_err(|e|crate::tr!("协助连接失败：{e}","Assistance connection failed: {e}"))
         }
         Some("connect") if args.len()==6 || args.len()==7=> desktop_command(args,None).await,
         _=>Err(HELP.into()),
@@ -169,7 +170,7 @@ async fn type_command(args:&[String])->Result<(),String>{
             if !response.ok {
                 return Err(response.error.unwrap_or_else(||"Secure input failed on running viewer".into()));
             }
-            println!("安全输入已发送（{} 个按键事件，{} 字符）。", response.events, response.chars);
+            println!("{}",crate::tr!("安全输入已发送（{} 个按键事件，{} 字符）。","Secure input sent ({} key events, {} characters).", response.events, response.chars));
             if let Some(path)=response.snapshot {
                 println!("snapshot={path}");
                 log::info!("Secure input snapshot: {path}");
@@ -196,7 +197,7 @@ async fn type_command(args:&[String])->Result<(),String>{
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
     let result=viewer::secure_input::run_session(&mut session,actions.as_slice(),delay).await;
     session.close().await;
-    if result.is_ok(){println!("安全输入已发送（{event_count} 个按键事件）；新会话路径无截图。");}
+    if result.is_ok(){println!("{}",crate::tr!("安全输入已发送（{event_count} 个按键事件）；新会话路径无截图。","Secure input sent ({event_count} key events); no snapshot on the new-session path."));}
     result
 }
 
@@ -295,6 +296,6 @@ async fn power_command(args:&[String])->Result<(),String>{
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
     let result=viewer::power::run(&mut session,action).await;
     session.close().await;
-    if result.is_ok(){println!("电源指令已发送；未确认远端执行结果。");}
+    if result.is_ok(){println!("{}",crate::i18n::s("电源指令已发送；未确认远端执行结果。","Power command sent; the result on the remote device is not confirmed."));}
     result
 }

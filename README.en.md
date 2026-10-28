@@ -21,7 +21,35 @@
 <p align="center"><sub>Linux viewer: device list (device names redacted)</sub></p>
 
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Host main window: remote assistance and account"></p>
-<p align="center"><sub>Linux host main window: remote assistance and account (device ID, code and account redacted). The UI is in Chinese, like the official app.</sub></p>
+<p align="center"><sub>Linux host main window: remote assistance and account (device ID, code and account redacted). The UI is available in Chinese and English (see [Language](#language--语言)).</sub></p>
+
+## This fork (spixyy7/uu-remote-linux)
+
+This fork of [VallierDev/uu-remote-linux](https://github.com/VallierDev/uu-remote-linux) adds:
+
+- **Chinese and English UI.** Every GTK window (viewer launcher, files / port mapping / terminal tools, host main
+  window and QR login) and every viewer message is available in both languages. See [Language](#language--语言).
+- **Sharper text in the native viewer.** The viewer used to scale every remote picture into a fixed 1920x1080 canvas
+  and SDL then stretched it to the window with nearest-neighbour sampling, so text looked uneven and blurry, worst on
+  high-resolution hosts. Frames are now decoded at the host's native resolution, a host resolution change restarts the
+  decoder at the new size, and the window scales with linear filtering. `UU_VIEWER_SIZE=WxH` still forces the old
+  fixed canvas (now resampled with Lanczos). For the sharpest text also request true color: `UU_VIEWER_CHROMA=444`.
+
+## Language / 语言
+
+The language is picked once at start, in this order:
+
+1. `UU_LANG=en` or `UU_LANG=zh`;
+2. the choice saved in the viewer's **Settings → General → 语言 / Language** (stored as `~/.config/uuremote/language`,
+   applies after a restart);
+3. the locale: `LC_ALL` / `LC_MESSAGES` / `LANG` starting with `zh` → Chinese, anything else → English.
+
+```sh
+UU_LANG=en uuremote-viewer ui
+UU_LANG=zh uuremote-server
+```
+
+Protocol strings and messages that come from the UU servers are shown as the server sends them.
 
 <!-- Screenshot placeholder: the Linux desktop controlled from the official client. Take your own
      screenshot, remove account/device details and NetEase logos, save it as docs/images/remote-desktop.png
@@ -602,6 +630,8 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
 - Desktop offers H.264 / H.265; the host chooses the codec. `UU_VIEWER_CODEC=h264` limits both SDP and decoder capabilities to H.264.
   The default request stays 4:2:0; `UU_VIEWER_CHROMA=444` requests true color (4:4:4) after CONTROL opens. The host may fall back to
   4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
+- Frames are decoded at the host's native resolution and scaled to the window with linear filtering; a host resolution
+  change restarts the decoder. `UU_VIEWER_SIZE=WxH` forces a fixed letterboxed canvas instead.
 
 Mac targets use native macOS keycodes; Windows / Linux targets retain Windows VK. Keys follow physical positions, without
 automatically translating Ctrl to Command; on a Mac target the PC Super / Windows key acts as Command. Only verified target

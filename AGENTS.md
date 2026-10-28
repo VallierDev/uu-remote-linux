@@ -29,7 +29,10 @@ This file is written for large language model agents (Claude Code, Codex, Cursor
    the config file / environment. The only built-in default is the public client signing key in `src/auth.rs`.
 6. **Don't break other tools.** The desktop, file-transfer, terminal and port-mapping tools each open their own
    peer connection; a new offer must never close other peers.
-7. Keep changes small and tested; match the surrounding code style (dense, comment only the non-obvious).
+7. **UI text is bilingual.** Every user-facing string has Chinese and English: `L("中文", "English")` in C
+   (`c_engine/i18n.h`), `crate::i18n::s(..)` / `crate::tr!(..)` in Rust (`src/i18n.rs`; `UU_LANG`, saved choice, locale).
+   Logs stay English.
+8. Keep changes small and tested; match the surrounding code style (dense, comment only the non-obvious).
 
 ## 3. Build and test
 
