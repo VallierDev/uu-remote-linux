@@ -16,6 +16,13 @@ fn env_state(name: &str) -> String {
 
 fn line(key: &str, value: impl std::fmt::Display) { println!("{key:<22} {}", redact(&value.to_string())); }
 
+fn format_probe(probe: &crate::video_select::ProbeReport) -> String {
+    let body = probe.order.iter().zip(probe.outcomes.iter())
+        .map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label()))
+        .collect::<Vec<_>>().join(" ");
+    if probe.expires_at.is_some() { format!("{body} (failure result, retried after 10 min)") } else { body }
+}
+
 fn glibc() -> String {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -92,19 +99,24 @@ pub async fn run() -> Result<(), String> {
     line("UU_INPUT_BACKEND", std::env::var("UU_INPUT_BACKEND").unwrap_or_else(|_| "auto".into()));
 
     println!("-- video");
-    let encoder = crate::video::Encoder::requested();
-    line("encoder", format!("{encoder:?} (UU_VIDEO_ENCODER={})", std::env::var("UU_VIDEO_ENCODER").unwrap_or_else(|_| "auto".into())));
-    line("default codec", format!("{:?}", crate::capture_setting::preferred_codec(true, true)));
-    let mut ffmpeg = crate::video::ffmpeg_command();
-    ffmpeg.args(["-hide_banner", "-encoders"]).kill_on_drop(true);
-    match tokio::time::timeout(std::time::Duration::from_secs(5), ffmpeg.output()).await {
-        Ok(Ok(output)) => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let found: Vec<&str> = ["libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi"].into_iter()
-                .filter(|name| text.split_whitespace().any(|word| word == *name)).collect();
-            line("ffmpeg encoders", if found.is_empty() { "none of libx264/libx265/nvenc/vaapi".to_owned() } else { found.join(", ") });
-        }
-        _ => line("ffmpeg encoders", "ffmpeg not runnable (install ffmpeg or set ffmpeg_root)"),
+    let selection = crate::video_select::selection();
+    let env_enc = std::env::var("UU_VIDEO_ENCODER").unwrap_or_else(|_| "unset".into());
+    let codec = match selection.codec_pref { crate::video_select::CodecPref::Auto => "auto", crate::video_select::CodecPref::H264 => "h264", crate::video_select::CodecPref::H265 => "h265" };
+    let probe_text = if selection.encoder_source == crate::video_select::Source::Auto {
+        format_probe(&crate::video::run_auto_probe().await)
+    } else {
+        crate::video_select::cached_probe().as_ref().map(format_probe).unwrap_or_else(|| "not yet run".to_owned())
+    };
+    let selection = if selection.encoder_source == crate::video_select::Source::Auto { crate::video_select::selection() } else { selection };
+    line("encoder probe", probe_text);
+    line("encoder", format!("{:?} (source={}; UU_VIDEO_ENCODER={env_enc})", selection.encoder, crate::video_select::encoder_source_label(selection.encoder_source)));
+    line("codec", format!("{codec} (source={})", crate::video_select::source_label(selection.codec_source)));
+    // Both codecs offered: hardware prefers H.265, CPU stays H.264 unless the preference forces one.
+    let resolved = crate::capture_setting::pick_codec(true, true, crate::video_select::codec_force(selection.codec_pref), crate::video_select::hardware(selection.encoder));
+    line("resolved codec", format!("{resolved:?}"));
+    match crate::video::ffmpeg_encoders().await {
+        Some(found) => line("ffmpeg encoders", if found.is_empty() { "none of libx264/libx265/nvenc/vaapi".to_owned() } else { found.join(", ") }),
+        None => line("ffmpeg encoders", "ffmpeg not runnable (install ffmpeg or set ffmpeg_root)"),
     }
     let mut version = crate::video::ffmpeg_command();
     version.arg("-version").kill_on_drop(true);
@@ -135,9 +147,37 @@ pub async fn run() -> Result<(), String> {
         Err(_) => line("config mode", "missing (run `uuremote-server login`)"),
     }
     line("service", command_output("systemctl", &["--user", "is-active", "uuremote-native.service"]).await.unwrap_or_else(|| "systemctl unavailable".into()));
-    let running = command_output("pgrep", &["-c", "-x", "uuremote-server"]).await.filter(|n| !n.is_empty()).unwrap_or_else(|| "unknown".into());
-    line("uuremote-server procs", format!("{running} (including this one; more than 2 means duplicates)"));
+    let running = host_processes();
+    line("uuremote-server procs", format!("{} (including this one; more than 2 means duplicates)", running.map_or_else(|| "unknown".into(), |n| n.to_string())));
+    if running.is_some_and(|n| n > 2) {
+        println!("  ! another host instance is running (check `pgrep -af uuremote`); stop the extra one, e.g. an old copy started by hand");
+        println!("    instances sharing one identity, on this or another machine, kick each other out of the room: never copy config.json between machines");
+    }
     Ok(())
+}
+
+/// Hosts re-exec through /proc/self/exe (comm "exe"), so match the executable's file name, not the process name.
+/// Helpers a host spawns (Wayland capture, login window) are its children and are not separate instances.
+fn host_processes() -> Option<usize> {
+    let hosts: Vec<(u32, u32)> = std::fs::read_dir("/proc").ok()?.flatten()
+        .filter_map(|entry| Some((entry.file_name().to_str()?.parse::<u32>().ok()?, entry.path())))
+        .filter(|(_, dir)| std::fs::read_link(dir.join("exe")).is_ok_and(|exe| is_host_executable(&exe)))
+        .filter_map(|(pid, dir)| Some((pid, parent_pid(&std::fs::read_to_string(dir.join("stat")).ok()?)?)))
+        .collect();
+    Some(top_level(&hosts))
+}
+
+/// Field 4 of /proc/<pid>/stat; the command name in field 2 may contain spaces and parentheses.
+fn parent_pid(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn top_level(hosts: &[(u32, u32)]) -> usize {
+    hosts.iter().filter(|(_, parent)| !hosts.iter().any(|(pid, _)| pid == parent)).count()
+}
+
+fn is_host_executable(exe: &std::path::Path) -> bool {
+    exe.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.trim_end_matches(" (deleted)") == "uuremote-server")
 }
 
 #[cfg(test)]
@@ -161,5 +201,25 @@ mod tests {
         // Another backend, or a headless host: not this warning.
         assert!(!super::missing_display(DesktopBackend::Wayland, false, None, None));
         assert!(!super::missing_display(DesktopBackend::X11, true, None, None));
+    }
+
+    #[test]
+    fn host_processes_match_the_executable_even_after_reexec() {
+        use std::path::Path;
+        for exe in ["/usr/bin/uuremote-server", "/home/u/.local/bin/uuremote-server", "/usr/bin/uuremote-server (deleted)"] {
+            assert!(super::is_host_executable(Path::new(exe)));
+        }
+        for exe in ["/usr/bin/uuremote-viewer", "/usr/bin/bash", "/usr/bin/uuremote-server-old"] {
+            assert!(!super::is_host_executable(Path::new(exe)));
+        }
+    }
+
+    #[test]
+    fn host_helpers_are_not_counted_as_instances() {
+        assert_eq!(super::parent_pid("8943 (exe) S 1699 8943 1699 0 -1"), Some(1699));
+        assert_eq!(super::parent_pid("12 (a) b (c) R 7 12"), Some(7));
+        // service 10 with a login window 11, a stale copy 20, doctor 30
+        assert_eq!(super::top_level(&[(10, 1), (11, 10), (20, 5), (30, 9)]), 3);
+        assert_eq!(super::top_level(&[(10, 1), (11, 10), (30, 9)]), 2);
     }
 }

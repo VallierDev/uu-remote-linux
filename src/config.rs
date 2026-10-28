@@ -5,6 +5,13 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+/// Tests that point UU_CONFIG at a temp file must take this, or they race.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 pub fn path() -> PathBuf {
     if let Some(p) = std::env::var_os("UU_CONFIG") { return PathBuf::from(p); }
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)

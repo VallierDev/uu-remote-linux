@@ -57,6 +57,10 @@ static int suppress_tray;
 static int cur_verify, cur_refresh, cur_has_custom;
 static char current_id[64], current_code[64];
 static int code_visible = 1, suppress_switch, start_hidden, close_hides;
+// A problem only the person at the desktop can fix (e.g. FFmpeg missing): red line at the top.
+static GtkWidget *problem_label;
+static gchar *problem_text;
+static pthread_mutex_t problem_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static GtkWidget *label(const char *text, const char *cls) {
     GtkWidget *l = gtk_label_new(text);
@@ -305,6 +309,32 @@ static void on_status_menu(GtkStatusIcon *i, guint button, guint time, gpointer 
     (void)i; (void)button; (void)time; (void)d;
     gtk_menu_popup_at_pointer(GTK_MENU(tray_menu), NULL);
 }
+// Monochrome tray icon that follows light/dark panels: GTK and the GNOME AppIndicator extension
+// recolor "-symbolic" names, KDE recolors the ColorScheme-Text class. Installed into the user's
+// hicolor theme (found by every panel's default lookup) and also offered as the icon theme path,
+// so it needs no package install. KDE tries dash-trimmed names ("uu-remote-linux") in each theme
+// before the next one, so the name must not trim into the colored app icon (#87).
+static const char TRAY_ICON_NAME[] = "uuremote-tray-symbolic";
+static const char TRAY_ICON_SVG[] =
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\">"
+    "<style id=\"current-color-scheme\">.ColorScheme-Text{color:#232629}</style>"
+    "<path class=\"ColorScheme-Text\" fill=\"currentColor\" fill-rule=\"evenodd\" d=\"M2.5 2h11A1.5 1.5 0 0 1 15 3.5v7a1.5 1.5 0 0 1-1.5 1.5h-11"
+    "A1.5 1.5 0 0 1 1 10.5v-7A1.5 1.5 0 0 1 2.5 2zm0 1.5v7h11v-7z\"/>"
+    "<path class=\"ColorScheme-Text\" fill=\"currentColor\" d=\"M7.25 12h1.5v1.5H11a.75.75 0 0 1 0 1.5H5a.75.75 0 0 1 0-1.5h2.25z"
+    "M11.5 4.5v4l-1.35-1.35-3.1 3.1-1.2-1.2 3.1-3.1L7.5 4.5z\"/></svg>\n";
+// Returns the icon theme root holding the icon ($XDG_DATA_HOME/icons), or NULL.
+static gchar *write_tray_icon(void) {
+    gchar *root = g_build_filename(g_get_user_data_dir(), "icons", NULL);
+    gchar *apps = g_build_filename(root, "hicolor", "scalable", "apps", NULL);
+    gchar *file = g_strconcat(TRAY_ICON_NAME, ".svg", NULL);
+    gchar *path = g_build_filename(apps, file, NULL), *current = NULL;
+    // Rewriting an unchanged file would only make icon caches rescan.
+    int ok = g_file_get_contents(path, &current, NULL, NULL) && strcmp(current, TRAY_ICON_SVG) == 0;
+    if (!ok) ok = g_mkdir_with_parents(apps, 0755) == 0 && g_file_set_contents(path, TRAY_ICON_SVG, -1, NULL);
+    g_free(apps); g_free(file); g_free(path); g_free(current);
+    if (!ok) { g_free(root); return NULL; }
+    return root;
+}
 static void build_tray(void) {
     tray_menu = gtk_menu_new();
     GtkWidget *open = gtk_menu_item_new_with_label("打开主窗口");
@@ -318,7 +348,10 @@ static void build_tray(void) {
     gtk_menu_shell_append(GTK_MENU_SHELL(tray_menu), gtk_separator_menu_item_new());
     gtk_menu_shell_append(GTK_MENU_SHELL(tray_menu), quit);
     gtk_widget_show_all(tray_menu);
-    const char *icon = gtk_icon_theme_has_icon(gtk_icon_theme_get_default(), "uu-remote-linux") ? "uu-remote-linux" : "computer";
+    gchar *icon_path = write_tray_icon();
+    if (icon_path) gtk_icon_theme_append_search_path(gtk_icon_theme_get_default(), icon_path);
+    const char *fallback = gtk_icon_theme_has_icon(gtk_icon_theme_get_default(), "uu-remote-linux") ? "uu-remote-linux" : "computer";
+    const char *icon = icon_path ? TRAY_ICON_NAME : fallback;
 
     // StatusNotifierItem (GNOME AppIndicator extension, KDE): libayatana-appindicator3 / libappindicator3.
     const char *libs[] = { "libayatana-appindicator3.so.1", "libappindicator3.so.1" };
@@ -329,8 +362,11 @@ static void build_tray(void) {
         void (*set_status)(void *, int) = (void (*)(void *, int))dlsym(h, "app_indicator_set_status");
         void (*set_menu)(void *, GtkMenu *) = (void (*)(void *, GtkMenu *))dlsym(h, "app_indicator_set_menu");
         void (*set_title)(void *, const char *) = (void (*)(void *, const char *))dlsym(h, "app_indicator_set_title");
+        void (*set_theme_path)(void *, const char *) = (void (*)(void *, const char *))dlsym(h, "app_indicator_set_icon_theme_path");
         if (ind_new && set_status && set_menu) {
-            void *ind = ind_new("uu-remote-linux", icon, 0 /* APPLICATION_STATUS */);
+            // Without a theme path the panel cannot find the cached icon; keep the installed one.
+            void *ind = ind_new("uu-remote-linux", set_theme_path ? icon : fallback, 0 /* APPLICATION_STATUS */);
+            if (icon_path && set_theme_path) set_theme_path(ind, icon_path);
             if (set_title) set_title(ind, "UU 远程 Linux 主机");
             set_menu(ind, GTK_MENU(tray_menu));
             set_status(ind, 1 /* ACTIVE */);
@@ -367,6 +403,11 @@ static void build_window(void) {
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_container_set_border_width(GTK_CONTAINER(root), 24);
     gtk_container_add(GTK_CONTAINER(window), root);
+    problem_label = label("", "status");
+    gtk_style_context_add_class(gtk_widget_get_style_context(problem_label), "error");
+    gtk_label_set_line_wrap(GTK_LABEL(problem_label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(problem_label), 40);
+    gtk_box_pack_start(GTK_BOX(root), problem_label, FALSE, FALSE, 0);
 
     GtkWidget *card = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_style_context_add_class(gtk_widget_get_style_context(card), "card");
@@ -477,6 +518,10 @@ static void build_window(void) {
     gtk_widget_set_visible(assist_card, show_assist);
     gtk_widget_set_visible(hint_label, show_assist);
     gtk_widget_set_visible(account_card, show_account);
+    pthread_mutex_lock(&problem_lock);
+    gtk_label_set_text(GTK_LABEL(problem_label), problem_text ? problem_text : "");
+    gtk_widget_set_visible(problem_label, problem_text != NULL);
+    pthread_mutex_unlock(&problem_lock);
     if (!start_hidden) gtk_widget_show(window);
 }
 
@@ -659,6 +704,50 @@ void uu_login_ui_offer_refresh(int visible) {
     g_idle_add(apply_qr_refresh, GINT_TO_POINTER(visible != 0));
 }
 int uu_login_ui_take_refresh(void) { return atomic_exchange(&qr_refresh_requested, 0); }
+
+static gboolean apply_problem(gpointer data) {
+    (void)data;
+    if (window && problem_label) {
+        pthread_mutex_lock(&problem_lock);
+        gtk_label_set_text(GTK_LABEL(problem_label), problem_text ? problem_text : "");
+        gtk_widget_set_visible(problem_label, problem_text != NULL);
+        pthread_mutex_unlock(&problem_lock);
+    }
+    return G_SOURCE_REMOVE;
+}
+// Freedesktop notification through the session bus (no GTK main loop needed). Returns 0 when delivered.
+static int notify_desktop(const char *summary, const char *body) {
+    GDBusConnection *bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
+    if (!bus) return -1;
+    GVariantBuilder actions, hints;
+    g_variant_builder_init(&actions, G_VARIANT_TYPE("as"));
+    g_variant_builder_init(&hints, G_VARIANT_TYPE("a{sv}"));
+    g_variant_builder_add(&hints, "{sv}", "urgency", g_variant_new_byte(2)); // critical: stays until dismissed
+    GVariant *reply = g_dbus_connection_call_sync(bus, "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications", "Notify",
+        g_variant_new("(susssasa{sv}i)", "UU 远程 Linux 主机", 0u, "uu-remote-linux", summary, body, &actions, &hints, -1),
+        G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
+    g_object_unref(bus);
+    if (!reply) return -1;
+    g_variant_unref(reply);
+    return 0;
+}
+// text NULL clears the window line. notify: also tell the person now, by a desktop notification or,
+// without a notification daemon (e.g. bare Xfce), by opening the host window that shows the line.
+// Returns 0 notified, 1 window opened, -1 neither (no notify requested, or no daemon and no window).
+int uu_ui_set_problem(const char *summary, const char *text, int notify) {
+    pthread_mutex_lock(&problem_lock);
+    g_free(problem_text);
+    problem_text = text ? g_strdup(text) : NULL;
+    pthread_mutex_unlock(&problem_lock);
+    int window_ready = ui_started && init_state == 1 && !atomic_load(&closed);
+    if (window_ready) g_idle_add(apply_problem, NULL);
+    if (!notify || !text) return -1;
+    if (notify_desktop(summary ? summary : "", text) == 0) return 0;
+    if (!window_ready) return -1;
+    uu_assist_ui_present();
+    return 1;
+}
 void uu_login_ui_set_done(const char *text) { uu_ui_set_user(text); }
 int uu_login_ui_closed(void) { return atomic_load(&closed); }
 void uu_login_ui_close(void) { uu_assist_ui_close(); }

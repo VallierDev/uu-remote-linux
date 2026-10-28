@@ -21,6 +21,8 @@ pub mod tools;
 
 pub mod clipboard;
 pub mod power;
+pub mod secure_input;
+pub mod type_ipc;
 
 fn device_label(name:Option<&str>)->&str{
     name.filter(|name|!name.is_empty()).unwrap_or("远端设备")

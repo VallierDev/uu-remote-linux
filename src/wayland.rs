@@ -12,7 +12,7 @@ crate::engine_ffi! { crate::engine_plugin::Engine::Wayland;
     fn uu_wl_type_utf8(text: *const libc::c_char) -> i32;
     fn uu_wl_text_ready() -> i32;
 }
-/// How many characters one text-only keymap upload can carry.
+/// How many characters one keymap upload can carry; 0 means this keymap has no spare keycode.
 pub fn text_ready()->i32 {
     #[cfg(all(target_os="linux",feature="wayland"))]
     { return unsafe { uu_wl_text_ready() }; }
@@ -20,7 +20,7 @@ pub fn text_ready()->i32 {
     -1
 }
 /// Mobile input-method text (#13/#46). Returns the number of characters typed, or a negative code
-/// when no usable text keycode is available. Never logs the text.
+/// when this keymap has no spare keycode to carry them. Never logs the text.
 pub fn type_utf8(text:&str)->i32 {
     #[cfg(all(target_os="linux",feature="wayland"))]
     {
@@ -179,7 +179,7 @@ pub fn input_probe()->Result<(),String> {
 pub fn text_probe()->Result<(),String> {
     init()?;
     let ready=text_ready();
-    if ready<=0 { return Err("this keymap has no usable text keycode".into()); }
+    if ready<=0 { return Err("this keymap has no spare keycode: mobile text input cannot be carried".into()); }
     const SAMPLE:&str="uu remote abc 你好世界";
     let (sample,builtin)=match std::env::var("UU_PROBE_TEXT") {
         Ok(value)=>(value,false), Err(_)=>(SAMPLE.to_owned(),true),
@@ -205,11 +205,13 @@ pub fn text_probe()->Result<(),String> {
     Ok(())
 }
 
-// Opt-in single-track monitor switching for Hyprland. The existing native engine owns
-// capture/pointer binding; no compositor layout or user credentials are modified.
+// Opt-in single-track monitor switching: Hyprland outputs (UU_WAYLAND_MULTISCREEN) or X11 RandR
+// monitors (UU_X11_MULTISCREEN). The existing engines own capture/pointer binding; X11 crops the
+// root to the selected monitor. No compositor layout or user credentials are modified.
 #[derive(Clone, Debug)]
-pub struct Output { pub name:String, pub width:u32, pub height:u32, pub fps:i32 }
-static OUTPUTS: std::sync::OnceLock<Vec<Output>> = std::sync::OnceLock::new();
+pub struct Output { pub name:String, pub width:u32, pub height:u32, pub fps:i32, pub x:i32, pub y:i32 }
+struct Inventory { outputs:Vec<Output>, x11:bool }
+static OUTPUTS: std::sync::OnceLock<Inventory> = std::sync::OnceLock::new();
 #[derive(Default)]
 struct Selection { id:usize, generation:u64, presented:Option<u64>, failed:bool }
 impl Selection {
@@ -222,11 +224,17 @@ impl Selection {
     fn ready(&self)->bool {self.presented==Some(self.generation)}
 }
 static SELECTION:std::sync::Mutex<Selection>=std::sync::Mutex::new(Selection {id:0,generation:0,presented:None,failed:false});
-pub fn outputs() -> &'static [Output] {
+fn inventory() -> &'static Inventory {
     OUTPUTS.get_or_init(|| {
+        let backend=crate::desktop_backend::detect().ok();
+        if backend==Some(crate::desktop_backend::DesktopBackend::X11) && !crate::desktop_backend::headless()
+            && std::env::var("UU_X11_MULTISCREEN").ok().as_deref()==Some("1") {
+            let outputs=x11_outputs();
+            return Inventory {x11:!outputs.is_empty(),outputs};
+        }
         if !cfg!(all(target_os="linux",feature="wayland"))
             || std::env::var("UU_WAYLAND_MULTISCREEN").ok().as_deref()!=Some("1")
-            || crate::desktop_backend::detect().ok()!=Some(crate::desktop_backend::DesktopBackend::Wayland) {return Vec::new();}
+            || backend!=Some(crate::desktop_backend::DesktopBackend::Wayland) {return Inventory {outputs:Vec::new(),x11:false};}
         let niri=std::env::var_os("NIRI_SOCKET").is_some();
         let output=if niri {std::process::Command::new("niri").args(["msg","--json","outputs"]).output()}
             else {std::process::Command::new("hyprctl").args(["monitors","-j"]).output()};
@@ -235,8 +243,60 @@ pub fn outputs() -> &'static [Output] {
             let preferred=std::env::var("UU_WAYLAND_OUTPUT").unwrap_or_default();
             if niri {parse_niri_outputs(&output.stdout,&preferred)} else {parse_outputs(&output.stdout,&preferred)}
         });
-        match result {Ok(outputs)=>outputs,Err(reason)=>{log::warn!("Wayland multi-screen disabled: {}",reason);Vec::new()}}
+        let outputs=match result {Ok(outputs)=>outputs,Err(reason)=>{log::warn!("Wayland multi-screen disabled: {}",reason);Vec::new()}};
+        Inventory {outputs,x11:false}
     })
+}
+pub fn outputs() -> &'static [Output] {&inventory().outputs}
+/// X11 monitors are advertised: the stream captures the selected monitor's region of the root.
+pub fn x11_multiscreen()->bool {inventory().x11}
+/// Read once, like the Hyprland inventory: a changed monitor layout needs a host restart.
+fn x11_outputs()->Vec<Output> {
+    let mut command=std::process::Command::new("xrandr");
+    if let Some(display)=crate::capture::x11_display().or_else(||std::env::var("DISPLAY").ok()).filter(|d|!d.is_empty()) {
+        command.arg("--display").arg(display);
+    }
+    let result=command.arg("--listmonitors").output().map_err(|_|"xrandr unavailable").and_then(|output| {
+        if !output.status.success() {return Err("xrandr failed");}
+        parse_x11_monitors(&String::from_utf8_lossy(&output.stdout),&std::env::var("UU_X11_OUTPUT").unwrap_or_default(),crate::video::display_fps() as i32)
+    });
+    match result {
+        Ok(outputs) if outputs.len()>=2=>{log::info!("X11 multi-screen: {} monitors",outputs.len());outputs},
+        Ok(_)=>{log::warn!("X11 multi-screen disabled: fewer than two monitors");Vec::new()},
+        Err(reason)=>{log::warn!("X11 multi-screen disabled: {}",reason);Vec::new()},
+    }
+}
+/// `xrandr --listmonitors`: ` 0: +*HDMI-0 1920/527x1080/296+1920+0  HDMI-0` (`*` = primary).
+/// The preferred monitor (UU_X11_OUTPUT, else the primary) is id 0; the rest go left to right.
+fn parse_x11_monitors(text:&str,preferred:&str,fps:i32)->Result<Vec<Output>,&'static str> {
+    fn geometry(text:&str)->Option<(u32,u32,i32,i32)> {
+        let (width,rest)=text.split_once('x')?;
+        let split=rest.find('+')?;
+        let (height,offsets)=rest.split_at(split);
+        let mut offsets=offsets[1..].split('+');
+        let size=|v:&str|v.split('/').next()?.parse::<u32>().ok();
+        let (x,y)=(offsets.next()?.parse::<i32>().ok()?,offsets.next()?.parse::<i32>().ok()?);
+        if offsets.next().is_some() || x<0 || y<0 {return None;}
+        Some((size(width)?,size(height)?,x,y))
+    }
+    let mut seen=std::collections::HashSet::new();
+    let mut primary=String::new();
+    let mut outputs=Vec::new();
+    for line in text.lines().skip(1) {
+        let mut fields=line.split_whitespace();
+        let (Some(_),Some(tag),Some(rect))=(fields.next(),fields.next(),fields.next()) else {continue};
+        let name=tag.trim_start_matches(['+','*']);
+        let Some((width,height,x,y))=geometry(rect) else {continue};
+        if name.is_empty() || name.len()>127 || !seen.insert(name.to_owned())
+            || width<2 || height<2 || width>16384 || height>16384 || u64::from(width)*u64::from(height)*4>256*1024*1024 {continue;}
+        if tag.contains('*') {primary=name.to_owned();}
+        outputs.push(Output {name:name.into(),width,height,fps,x,y});
+    }
+    let first=if preferred.is_empty() {primary} else {preferred.to_owned()};
+    outputs.sort_by_key(|m| (m.name!=first,m.x,m.y));
+    outputs.truncate(16);
+    if outputs.is_empty() || (!preferred.is_empty() && outputs[0].name!=preferred) {return Err("No capturable preferred output");}
+    Ok(outputs)
 }
 fn parse_niri_outputs(json:&[u8],preferred:&str)->Result<Vec<Output>,&'static str> {
     let inventory=serde_json::from_slice::<serde_json::Map<String,serde_json::Value>>(json).map_err(|_|"Invalid niri inventory")?;
@@ -262,7 +322,7 @@ fn parse_outputs(json:&[u8],preferred:&str)->Result<Vec<Output>,&'static str> {
         let height=u32::try_from(m["height"].as_u64()?).ok()?;
         if name.is_empty() || name.len()>127 || name.contains('\0') || !seen.insert(name.to_owned())
             || width<2 || height<2 || width>16384 || height>16384 || u64::from(width)*u64::from(height)*4>256*1024*1024 {return None;}
-        Some(Output {name:name.into(),width,height,fps:m["refreshRate"].as_f64()?.round().clamp(1.0,240.0) as i32})
+        Some(Output {name:name.into(),width,height,fps:m["refreshRate"].as_f64()?.round().clamp(1.0,240.0) as i32,x:0,y:0})
     }).collect();
     outputs.sort_by_key(|m| (m.name!=preferred,m.name.clone()));
     outputs.truncate(16);
@@ -273,6 +333,35 @@ pub fn selection()->(usize,u64) {let s=SELECTION.lock().unwrap();(s.id,s.generat
 pub fn selected()->usize {selection().0}
 pub fn source(id:usize)->Option<&'static Output> {outputs().get(id)}
 pub fn input_size(fallback:(u32,u32))->(u32,u32) {source(selected()).map_or(fallback,|s|(s.width,s.height))}
+/// Region the encoder captures for this display: the Wayland output, or the selected X11 monitor.
+pub fn capture_source(display:&str,portal:bool,id:usize)->Option<&'static Output> {
+    if display.starts_with("wayland:") || (!portal && !display.starts_with("kms:") && x11_multiscreen()) {source(id)} else {None}
+}
+/// Offset of the selected X11 monitor in the root: absolute input is relative to that monitor.
+pub fn x11_placement()->Option<(i32,i32)> {
+    if !x11_multiscreen() {return None;}
+    source(selected()).map(|s|(s.x,s.y))
+}
+/// Pixel size of one advertised output. Unknown ids keep `fallback` (connection size).
+pub fn source_size(id:usize,fallback:(u32,u32))->(u32,u32) {
+    #[cfg(test)]
+    if let Some(outputs)=*test_outputs().lock().unwrap_or_else(|e|e.into_inner()) {
+        return outputs.get(id).map_or(fallback,|s|(s.width,s.height));
+    }
+    source(id).map_or(fallback,|s|(s.width,s.height))
+}
+#[cfg(test)]
+fn test_outputs()->&'static std::sync::Mutex<Option<&'static [Output]>> {
+    static SLOT:std::sync::OnceLock<std::sync::Mutex<Option<&'static [Output]>>>=std::sync::OnceLock::new();
+    SLOT.get_or_init(||std::sync::Mutex::new(None))
+}
+/// Native size written into CaptureSettingSync. Wayland uses the output the encoder is reading
+/// (`source_id`), which can differ from the size captured when the connection opened; so does an
+/// X11 monitor with UU_X11_MULTISCREEN. Otherwise X11, portal and KMS keep the connection size
+/// (X11 mode changes go through `x11_resized`).
+pub fn sync_native(display:&str,source_id:usize,connection:(u32,u32))->(u32,u32) {
+    if display.starts_with("wayland:") || (!display.starts_with("kms:") && x11_multiscreen()) {source_size(source_id,connection)} else {connection}
+}
 pub fn input_ready()->bool {outputs().is_empty() || SELECTION.lock().unwrap().ready()}
 pub fn switch_failed()->bool {SELECTION.lock().unwrap().failed}
 pub fn presented(id:usize,generation:u64) {SELECTION.lock().unwrap().sent(id,generation);}
@@ -281,7 +370,12 @@ pub fn failed(id:usize,generation:u64) {
     if (state.id,state.generation)==(id,generation) {state.failed=true;}
 }
 pub fn select(id:usize)->Result<(),String> {
-    let output=source(id).ok_or("Unknown Wayland screen")?;
+    let output=source(id).ok_or("Unknown screen")?;
+    if x11_multiscreen() {
+        SELECTION.lock().unwrap().begin(id);
+        log::info!("X11 screen selected: id={} source={}x{}+{}+{}",id,output.width,output.height,output.x,output.y);
+        return Ok(());
+    }
     #[cfg(all(target_os="linux",feature="wayland"))]
     {
         let name=std::ffi::CString::new(output.name.as_str()).map_err(|_|"Invalid output name")?;
@@ -392,5 +486,38 @@ mod selection_regressions {
         let outputs=parse_outputs(json,"").unwrap();
         assert_eq!(outputs.len(),1);assert_eq!(outputs[0].name,"normal");
         assert!(parse_outputs(b"not JSON","").is_err());
+    }
+    #[test]
+    fn x11_monitors_keep_their_root_offsets() {
+        // #98: GNOME/X11, two 1920x1080 monitors side by side, primary on the right.
+        let text="Monitors: 2\n 0: +*HDMI-0 1920/527x1080/296+1920+0  HDMI-0\n 1: +HDMI-1 1920/521x1080/293+0+0  HDMI-1\n";
+        let outputs=parse_x11_monitors(text,"",60).unwrap();
+        assert_eq!(outputs.iter().map(|m|(m.name.as_str(),m.width,m.height,m.x,m.y)).collect::<Vec<_>>(),
+            vec![("HDMI-0",1920,1080,1920,0),("HDMI-1",1920,1080,0,0)]);
+        let outputs=parse_x11_monitors(text,"HDMI-1",60).unwrap();
+        assert_eq!((outputs[0].name.as_str(),outputs[1].name.as_str()),("HDMI-1","HDMI-0"));
+        assert!(parse_x11_monitors(text,"DP-9",60).is_err());
+        // xrandr --setmonitor virtual monitors (output "none"); no primary: left to right.
+        let virtual_monitors="Monitors: 3\n 0: +A 1280/338x1024/270+1280+0  none\n 1: +B 1280/338x1024/270+0+0  none\n 2: C 0/0x0/0+0+0  none\n";
+        let outputs=parse_x11_monitors(virtual_monitors,"",30).unwrap();
+        assert_eq!(outputs.iter().map(|m|(m.name.as_str(),m.x)).collect::<Vec<_>>(),vec![("B",0),("A",1280)]);
+        assert!(parse_x11_monitors("Monitors: 1\n 0: +*X 1920/1x1080/1-10+0  X\n","",60).is_err());
+        assert!(parse_x11_monitors("garbage","",60).is_err());
+    }
+    #[test]
+    fn sync_native_follows_the_wayland_source_id() {
+        assert_eq!(sync_native(":0",1,(1920,1080)),(1920,1080));
+        assert_eq!(sync_native("kms:/dev/dri/card0",1,(1920,1080)),(1920,1080));
+        let inventory:&'static [Output]=Box::leak(vec![
+            Output {name:"eDP-1".into(),width:1920,height:1080,fps:60,x:0,y:0},
+            Output {name:"HDMI-A-1".into(),width:2560,height:1440,fps:75,x:0,y:0},
+        ].into_boxed_slice());
+        *test_outputs().lock().unwrap()=Some(inventory);
+        // Connection opened on the first output; the encoder is reading the second.
+        assert_eq!(sync_native("wayland:wayland-0",1,(1920,1080)),(2560,1440));
+        assert_eq!(source_size(0,(800,600)),(1920,1080));
+        assert_eq!(sync_native("wayland:wayland-0",9,(800,600)),(800,600));
+        assert_eq!(sync_native(":0",1,(1920,1080)),(1920,1080));
+        *test_outputs().lock().unwrap()=None;
     }
 }

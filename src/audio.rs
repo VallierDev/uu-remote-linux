@@ -1,7 +1,6 @@
 //! Desktop sound for the viewer's 声音 menu: the default output's monitor (PulseAudio or
 //! PipeWire-pulse) is encoded to Opus and sent on the negotiated audio m-line.
-//! Encoding runs in this process with the `inproc-av` feature (unless `UU_FFMPEG_ROOT` is set),
-//! otherwise an FFmpeg child process does it.
+//! An FFmpeg child process does the encoding.
 //! PipeWire monitors ignore the sink's mute by default, so 被控端静音运行 keeps the stream audible.
 //! `UU_AUDIO=0` disables it; `UU_AUDIO_SOURCE` picks another Pulse source.
 
@@ -57,14 +56,6 @@ fn read_packets(stdout: impl Read, tx: &tokio::sync::mpsc::Sender<bytes::Bytes>)
 fn start(source: &str, tx: tokio::sync::mpsc::Sender<bytes::Bytes>)
     -> Result<(Stopper, tokio::task::JoinHandle<Result<(), String>>), String> {
     let stop = Arc::new(AtomicBool::new(false));
-    #[cfg(feature = "inproc-av")]
-    if crate::inproc_encoder::selected() {
-        let job = tokio::task::spawn_blocking({
-            let (stop, source) = (stop.clone(), source.to_owned());
-            move || crate::inproc_encoder::run_audio(&source, tx, stop)
-        });
-        return Ok((Stopper { stop, child: None }, job));
-    }
     let mut child = spawn_encoder(source)?;
     let stdout = child.stdout.take().ok_or("Encoder stdout missing")?;
     let job = tokio::task::spawn_blocking(move || read_packets(stdout, &tx));

@@ -70,6 +70,16 @@ impl DamageCapture {
 
     pub fn size(&self) -> (u32, u32) { (self.width as u32, self.height as u32) }
 
+    pub fn shm_raw_ptr(&self) -> *mut u8 { self.shm_ptr }
+
+    pub fn shm_size(&self) -> usize { self.len }
+
+    pub fn refresh(&mut self) -> Result<(), String> {
+        self.conn.shm_get_image(self.root, 0, 0, self.width, self.height, !0, Z_PIXMAP, self.seg, 0)
+            .map_err(text)?.reply().map_err(text)?;
+        Ok(())
+    }
+
     /// Waits up to `timeout` for the screen to change. Returns `true` on change, `false` on timeout.
     pub fn wait(&mut self, timeout: Duration) -> Result<bool, String> {
         let deadline = Instant::now() + timeout;

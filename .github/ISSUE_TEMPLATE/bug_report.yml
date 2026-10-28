@@ -32,8 +32,8 @@ body:
     attributes:
       label: 诊断信息 / Diagnostics
       description: |
-        先复现一次问题，然后在被控的 Linux 上运行下面的命令，把输出粘贴到这里（IP 会被自动抹掉，不包含密码、令牌或剪贴板内容）。
-        Reproduce the problem, then run this on the Linux host and paste the output (IPs are masked; no passwords, tokens or clipboard data).
+        先复现一次问题，然后在被控 Linux 的**图形桌面里打开的终端**中运行下面的命令（SSH 或 tty 里缺少桌面环境变量，doctor 结果不准），把输出粘贴到这里（IPv4/IPv6/MAC 地址会被自动抹掉，不包含密码、令牌或剪贴板内容）。
+        Reproduce the problem, then run this in a terminal **inside the Linux graphical session** (SSH/tty lacks the desktop environment, so doctor would be misleading) and paste the output (IPv4/IPv6/MAC addresses are masked; no passwords, tokens or clipboard data).
 
         ```sh
         {
@@ -45,8 +45,9 @@ body:
           echo "== 显卡"; lspci 2>/dev/null | grep -iE 'vga|3d'
           echo "== FFmpeg"; ffmpeg -hide_banner -encoders 2>/dev/null | grep -E 'h264_nvenc|libx264'
           echo "== 日志"; journalctl --user -u uuremote-native.service --since "-30min" --no-pager -o cat \
-            | grep -E 'Starting|backend|Selected capture|Desktop encoder|Capture setting request|Desktop video settings|Offer for connection|WARN|ERROR' | tail -n 80
-        } 2>&1 | sed -E 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/x.x.x.x/g'
+            | grep -E 'Starting|backend|Selected capture|Desktop encoder|Capture setting request|Desktop video settings|Offer for connection|PeerConnection State|Remote controller disconnected|ICE path|Port mapping|WARN|ERROR' \
+            | grep -vE 'webrtc_ice|webrtc_dtls|webrtc::mux' | tail -n 120
+        } 2>&1 | sed -E 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/x.x.x.x/g; s/([0-9a-fA-F]{1,4}:){4,7}[0-9a-fA-F]{1,4}|[0-9a-fA-F]{0,4}::[0-9a-fA-F:]*[0-9a-fA-F]/x:x::x/g'
         ```
       render: text
     validations:

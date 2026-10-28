@@ -172,10 +172,12 @@ impl Peer {
                 if index==0 {
                     let weak=Arc::downgrade(&channel);let state=observed.clone();
                     let chroma444=shape.capture_type==1 && std::env::var("UU_VIEWER_CHROMA").is_ok_and(|v|v=="444");
+                    let desktop_track=shape.capture_type==1;
                     channel.on_open(Box::new(move ||Box::pin(async move {
                         state.control_open.store(true,Ordering::Release);
                         if let Some(channel)=weak.upgrade(){
                             let _=channel.send(&bytes::Bytes::from(wire::echo_request_with_clipboard(1,clipboard_enabled))).await;
+                            if desktop_track {let _=channel.send(&bytes::Bytes::from(wire::request_video_track())).await;}
                             if chroma444 {let _=channel.send(&bytes::Bytes::from(wire::request_chroma444())).await;}
                         }
                     })));

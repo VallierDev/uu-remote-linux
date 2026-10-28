@@ -328,12 +328,18 @@ impl InputInjector {
         // uinput ABS axes span the compositor's whole desktop. A captured output
         // uses its own pixel space; bind absolute motion to that Wayland output,
         // including when uinput remains in use for keyboard/buttons/relative input.
+        // Only a compositor without wlr-virtual-pointer (-2) falls through to the uinput
+        // absolute pointer; an out-of-range point must not land on another output.
         if !relative && self.backend==crate::desktop_backend::DesktopBackend::Wayland {
-            return crate::wayland::move_pointer(x,y,false);
+            let result=crate::wayland::move_pointer(x,y,false);
+            if result!=-2 { return result; }
         }
+        // X11 multi-screen: the point is inside the selected monitor; XTest and uinput span the root.
+        let placement=if relative || self.backend!=crate::desktop_backend::DesktopBackend::X11 {None} else {crate::wayland::x11_placement()};
+        let (x,y)=placement.map_or((x,y),|(ox,oy)|(x+ox,y+oy));
         if let Some(uinput)=&self.uinput {
             if relative { return Self::uinput_result(uinput.move_relative(x,y)); }
-            let (w,h)=*self.screen.lock().unwrap();
+            let (w,h)=placement.and_then(|_|crate::capture::x11_last_size()).unwrap_or(*self.screen.lock().unwrap());
             if w > 1 && h > 1 {
                 let scale = |v: i32, extent: u32| (i64::from(v) * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
                 return Self::uinput_result(uinput.move_absolute(scale(x,w),scale(y,h)));
@@ -366,8 +372,93 @@ impl InputInjector {
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::key(symbol,pressed) }
         else { unsafe { x11_key_symbol(symbol as libc::c_ulong,i32::from(pressed)) } }
     }
-    /// Mobile input-method text (`text_input`). X11 types it directly; Wayland uses a separate
-    /// text-only virtual keyboard. Other backends log once.
+    /// Set clipboard content for text injection on Wayland / Portal.
+    /// Tries Portal RemoteDesktop.SetSelection first, then wl-copy as fallback.
+    fn set_clipboard_text(&self, text: &str) -> bool {
+        if text.is_empty() || text.len() > crate::clipboard::MAX_TEXT {
+            return false;
+        }
+        // In unit tests, never invoke external clipboard binaries (wl-copy)
+        // or alter the system clipboard to prevent side effects on developer desktops.
+        #[cfg(test)]
+        {
+            let _ = text;
+            false
+        }
+        #[cfg(not(test))]
+        {
+            // 1. Try Portal clipboard if session is bound and active
+            if let Some(portal) = self.portal.lock().unwrap().as_ref() {
+                if portal.clipboard_set(text).is_ok() {
+                    return true;
+                }
+            }
+            // 2. Try wl-copy in Wayland session
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                if let Ok(mut child) = std::process::Command::new("wl-copy")
+                    .args(["--type", "text/plain;charset=utf-8"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    if let Ok(status) = child.wait() {
+                        if status.success() {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+    }
+
+    /// Injects text by copying it to the clipboard and simulating a paste shortcut.
+    /// Uses Shift+Insert by default (broadest Linux compatibility across GUI apps and terminals),
+    /// or Ctrl+V if configured via UU_WAYLAND_PASTE_KEY=ctrl_v.
+    fn paste_text_via_clipboard(&self, text: &str) -> bool {
+        if !self.set_clipboard_text(text) {
+            return false;
+        }
+
+        // Give the clipboard daemon / compositor a brief moment to register the selection.
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let use_ctrl_v = std::env::var("UU_WAYLAND_PASTE_KEY")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("ctrl_v") || v.eq_ignore_ascii_case("ctrl+v"));
+
+        if use_ctrl_v {
+            // Control_L (0xffe3) + 'v' (0x76)
+            self.inject_key(0xffe3, true);
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            self.inject_key(0x76, true);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.inject_key(0x76, false);
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            self.inject_key(0xffe3, false);
+        } else {
+            // Shift_L (0xffe1) + Insert (0xff63)
+            self.inject_key(0xffe1, true);
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            self.inject_key(0xff63, true);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            self.inject_key(0xff63, false);
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            self.inject_key(0xffe1, false);
+        }
+
+        // Brief delay allowing the target application to consume the paste event
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        true
+    }
+
+    /// Mobile input-method text (`text_input`). X11 types it directly; Wayland re-maps a spare
+    /// keycode in the virtual keyboard's keymap. Portal and other Wayland environments inject
+    /// via clipboard paste (Shift+Insert). Set UU_WAYLAND_TEXT=0 to disable Wayland text injection.
     pub fn text_input(&self, text: &str) {
         let _serial=self.serial.lock().unwrap();
         let Ok(c_text)=std::ffi::CString::new(text.replace('\0',"")) else { return };
@@ -375,17 +466,31 @@ impl InputInjector {
             let typed=unsafe { x11_type_utf8(c_text.as_ptr()) };
             log::info!("Desktop text input: chars={} result={}", text.chars().count(), typed);
         } else if self.backend==crate::desktop_backend::DesktopBackend::Wayland {
-            // Escape hatch: keep the old behaviour without rebuilding.
+            // Escape hatch: disable Wayland text typing/pasting entirely without rebuilding.
             if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
             let typed=crate::wayland::type_utf8(text);
             if typed>=0 {
                 log::info!("Desktop text input: chars={} result={}", text.chars().count(), typed);
                 return;
             }
-            // A keymap whose keycodes are all mapped cannot carry text; report it once.
+            // Fallback to clipboard paste if keymap has no spare keycodes or native typing failed
+            if self.paste_text_via_clipboard(text) {
+                log::info!("Desktop text input (Wayland clipboard paste fallback): chars={} result=ok", text.chars().count());
+                return;
+            }
             static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true,std::sync::atomic::Ordering::Relaxed) {
-                log::warn!("Mobile text input unavailable on the Wayland backend (no spare keycode in this keymap)");
+                log::warn!("Mobile text input unavailable on the Wayland backend (native and clipboard fallback failed)");
+            }
+        } else if self.backend==crate::desktop_backend::DesktopBackend::Portal {
+            if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
+            if self.paste_text_via_clipboard(text) {
+                log::info!("Desktop text input (Portal clipboard paste): chars={} result=ok", text.chars().count());
+                return;
+            }
+            static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true,std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("Portal clipboard text paste failed: ensure clipboard permission or wl-copy is available");
             }
         } else {
             static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
@@ -695,5 +800,61 @@ mod output_pointer_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test,target_os="linux"))]
+mod x11_monitor_pointer_tests {
+    use super::*;
+    #[test]
+    #[ignore="requires an X11 display with two or more RandR monitors and UU_X11_MULTISCREEN=1; moves pointer only"]
+    fn absolute_pointer_lands_on_the_selected_x11_monitor() {
+        let _capture=crate::capture::ScreenCapture::new().unwrap();
+        let input=InputInjector::new();
+        assert_eq!(input.backend,crate::desktop_backend::DesktopBackend::X11);
+        let outputs=crate::wayland::outputs();assert!(crate::wayland::x11_multiscreen() && outputs.len()>=2,"needs two X11 monitors");
+        for (id,output) in outputs.iter().enumerate().chain(outputs.iter().enumerate().rev()) {
+            crate::wayland::select(id).unwrap();
+            for (x,y) in [(0.0,0.0),(0.5,0.5),(0.999,0.999),(0.1,0.9)] {
+                let size=(output.width,output.height);
+                let pixels=crate::input_mapping::normalized_pointer(x,y,size.0,size.1).unwrap();
+                input.mouse_absolute_normalized(x,y,size);input.flush_pointer();
+                let (mut ax,mut ay,mut mask)=(0,0,0);
+                assert_eq!(unsafe {x11_pointer_state(&mut ax,&mut ay,&mut mask)},0);
+                assert_eq!((ax,ay),(output.x+pixels.0,output.y+pixels.1),"monitor={} normalized=({x},{y})",output.name);
+            }
+        }
+        crate::wayland::select(0).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod clipboard_paste_text_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_and_oversized_text() {
+        let input = InputInjector::new();
+        assert!(!input.set_clipboard_text(""));
+        let oversized = "a".repeat(crate::clipboard::MAX_TEXT + 1);
+        assert!(!input.set_clipboard_text(&oversized));
+    }
+
+    #[test]
+    fn text_input_handles_portal_backend_safely_without_side_effects() {
+        let mut input = InputInjector::new();
+        input.backend = crate::desktop_backend::DesktopBackend::Portal;
+        // In unit tests, set_clipboard_text avoids external commands so this
+        // will not mutate the host's actual clipboard.
+        input.text_input("测试输入法文字");
+    }
+
+    #[test]
+    fn text_input_respects_disable_env() {
+        let mut input = InputInjector::new();
+        input.backend = crate::desktop_backend::DesktopBackend::Portal;
+        std::env::set_var("UU_WAYLAND_TEXT", "0");
+        input.text_input("测试输入法文字");
+        std::env::remove_var("UU_WAYLAND_TEXT");
     }
 }

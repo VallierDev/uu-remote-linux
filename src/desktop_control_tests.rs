@@ -215,3 +215,56 @@ async fn locked_control_unlock_requests_and_tools_work_without_a_video_frame() {
         drop(lock);
     }).await.expect("locked bootstrap/tool regression exceeded deadline");
 }
+
+#[tokio::test]
+async fn capture_desktop_on_a_port_mapping_peer_promotes_it_once() {
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let input = Arc::new(InputInjector::without_desktop());
+        let (host, mut viewer) = connect(input.clone(), false, None, &["CONTROL_DATA_CHANNEL", "FILE_DATA_CHANNEL"]).await;
+        let (requests, mut requested) = mpsc::unbounded_channel();
+        host.on_desktop_request(move || { let _ = requests.send(()); });
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        assert!(!host.role.is_desktop() && host.role.input().is_none());
+        // The Mac viewer opens the desktop on its existing port-mapping peer (#99).
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(5, 0, 3, &[8, 4])).await;
+        tokio::time::timeout(Duration::from_secs(5), requested.recv()).await.unwrap().unwrap();
+        host.promote(None);
+        assert!(host.role.is_desktop());
+        assert!(host.role.input().is_some_and(|session| session.is_current()));
+        // CONTROL repeats the desktop initialization for the same viewer.
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        // The port-mapping session on this peer still answers.
+        send(&viewer, "FILE_DATA_CHANNEL", mapping(2, b"still mapped")).await;
+        receive(&mut viewer.messages, "FILE_DATA_CHANNEL", 27).await;
+        // A repeated capture_desktop does not ask again, and a later promote is a no-op.
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(6, 0, 3, &[8, 4])).await;
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(7, 0, 3, &[8, 0])).await;
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
+        assert!(requested.try_recv().is_err());
+        let lease = host.role.input().unwrap();
+        host.promote(None);
+        assert!(lease.is_current());
+        // Its video ended on its own (capture failed while locked, #114): capture_desktop restarts it
+        // on the same input lease.
+        let ended = tokio::spawn(async {});
+        *host.role.stream_task.lock().unwrap() = Some(ended.abort_handle());
+        ended.await.unwrap();
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(9, 0, 3, &[8, 4])).await;
+        tokio::time::timeout(Duration::from_secs(5), requested.recv()).await.unwrap().unwrap();
+        host.promote(None);
+        assert!(host.role.is_desktop() && !host.role.stream_ended() && lease.is_current());
+        // A newer desktop demotes it; the port mapping stays, and capture_desktop promotes it again.
+        host.demote();
+        assert!(!host.role.is_desktop() && host.role.input().is_none());
+        send(&viewer, "FILE_DATA_CHANNEL", mapping(2, b"after demotion")).await;
+        receive(&mut viewer.messages, "FILE_DATA_CHANNEL", 27).await;
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(8, 0, 3, &[8, 4])).await;
+        tokio::time::timeout(Duration::from_secs(5), requested.recv()).await.unwrap().unwrap();
+        host.promote(None);
+        assert!(host.role.is_desktop() && host.role.input().is_some_and(|session| session.is_current()));
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        host.pc.close().await.unwrap();
+        viewer.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("capture_desktop promotion exceeded deadline");
+}

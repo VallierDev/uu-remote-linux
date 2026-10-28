@@ -12,6 +12,8 @@ pub const FF_SIMPLE_ACTION: u8 = 2;
 pub const FF_SYSTEM_METRICS: u8 = 2;
 
 pub const SHOW_DESKTOP: u64 = 2;
+/// Opens the desktop on an existing connection (the viewer's port mapping reuses its peer, #99).
+pub const CAPTURE_DESKTOP: u64 = 4;
 pub const REBOOT_SYSTEM: u64 = 9;
 pub const LOCK_SYSTEM: u64 = 10;
 pub const SHUTDOWN_SYSTEM: u64 = 12;
@@ -25,11 +27,27 @@ pub const SET_AUTO_LOCK: u64 = 19;
 /// Host settings from the viewer's 安全 menu. The viewer sends them only when a switch is toggled
 /// and shows what SystemMetrics reports, so they are host-wide and persisted (like the official
 /// host), not per connection: a reconnect must still lock / mute.
-#[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-struct Settings {
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Settings {
     #[serde(default)] auto_lock: bool,
     #[serde(default)] keep_mute: bool,
     #[serde(default)] mute_permanent: bool,
+    /// "auto" or absent does not override the environment. A non-string value becomes None so a bad
+    /// video field cannot drop auto_lock / mute when the document is loaded.
+    #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_encoder: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_codec: Option<String>,
+}
+
+fn lenient_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    use serde::Deserialize;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(_) => {
+            log::warn!("Ignoring non-string video_encoder/video_codec in host settings");
+            Ok(None)
+        }
+        None => Ok(None),
+    }
 }
 
 struct HostState {
@@ -39,22 +57,83 @@ struct HostState {
     desktop_sessions: usize,
 }
 
-fn settings_path() -> std::path::PathBuf { crate::config::path().with_file_name("host_settings.json") }
+pub(crate) fn settings_path() -> std::path::PathBuf { crate::config::path().with_file_name("host_settings.json") }
+
+pub(crate) fn load_settings() -> Settings {
+    std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Re-read, apply `patch`, write via a temp file and rename (mode 0600).
+pub(crate) fn merge_save(patch: impl FnOnce(&mut Settings)) -> Result<Settings, String> {
+    merge_write(patch)?;
+    let settings = load_settings();
+    if let Ok(mut guard) = state().lock() { guard.settings = settings.clone(); }
+    Ok(settings)
+}
 
 fn state() -> &'static Mutex<HostState> {
     static STATE: std::sync::OnceLock<Mutex<HostState>> = std::sync::OnceLock::new();
     STATE.get_or_init(|| {
-        let settings = std::fs::read(settings_path()).ok()
-            .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let settings = load_settings();
         Mutex::new(HostState { settings, restore: None, desktop_sessions: 0 })
     })
 }
 
-fn save(settings: &Settings) {
+/// Re-read, copy only the security switches from `settings`, keep video_* from disk.
+fn save(settings: &Settings) -> Result<(), String> {
+    merge_write(|disk| {
+        disk.auto_lock = settings.auto_lock;
+        disk.keep_mute = settings.keep_mute;
+        disk.mute_permanent = settings.mute_permanent;
+    })
+}
+
+/// Held across read-patch-write-rename so set-* and a security-toggle save cannot clobber each other.
+struct SettingsLock { file: std::fs::File }
+impl SettingsLock {
+    fn acquire(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock_path = path.with_file_name("host_settings.json.lock");
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(&lock_path).map_err(|e| e.kind().to_string())?;
+        let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+        if rc != 0 { return Err(std::io::Error::last_os_error().kind().to_string()); }
+        Ok(Self { file })
+    }
+}
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN); }
+    }
+}
+
+/// NotFound starts from defaults. Any other read or parse error leaves the file untouched:
+/// a bad document must not be rewritten with security switches forced off.
+fn read_for_merge(path: &std::path::Path) -> Result<Settings, String> {
+    match std::fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(format!("host settings unreadable: {}", e.kind())),
+        // serde_json::Error's Display quotes the offending value; the journal and set-* must not.
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| match (e.line(), e.column()) {
+            (0, 0) => "host_settings.json is not valid".to_owned(),
+            (line, column) => format!("host_settings.json is not valid (line {line}, column {column})"),
+        }),
+    }
+}
+
+fn merge_write(patch: impl FnOnce(&mut Settings)) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let path = settings_path();
-    let result = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())
-        .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()));
-    if let Err(e) = result { log::warn!("Host settings not saved: {}", e); }
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir).map_err(|e| e.kind().to_string())?; }
+    let _lock = SettingsLock::acquire(&path)?;
+    let mut disk = read_for_merge(&path)?;
+    patch(&mut disk);
+    let json = serde_json::to_vec_pretty(&disk).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp).map_err(|e| e.kind().to_string())?;
+    file.write_all(&json).map_err(|e| e.kind().to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.kind().to_string())?;
+    Ok(())
 }
 
 /// Handle for one desktop connection (system actions are host-wide).
@@ -142,7 +221,7 @@ impl PeerActions {
             _ => {}
         }
         let mut state = state().lock().unwrap();
-        let before = state.settings;
+        let before = state.settings.clone();
         match action {
             // 静音运行 on: the viewer sends MUTE_SYSTEM + MUTE_TEMPORARY (observed), off: MUTE_RESTORE.
             MUTE_SYSTEM | MUTE_TEMPORARY => {
@@ -172,7 +251,7 @@ impl PeerActions {
             }
             _ => return false,
         }
-        if state.settings != before { save(&state.settings); }
+        if state.settings != before { if let Err(e) = save(&state.settings) { log::warn!("Host settings not saved: {e}"); } }
         true
     }
 
@@ -205,7 +284,7 @@ impl PeerActions {
     pub fn metrics_payload(&self, sound: bool, desktop: crate::system_metrics::Permission) -> Vec<u8> {
         use crate::system_metrics::payload_with_settings;
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-        let current = state().lock().unwrap().settings;
+        let current = state().lock().unwrap().settings.clone();
         payload_with_settings(desktop, desktop, desktop, &home, &crate::system_metrics::Settings {
             sound, keep_mute: current.keep_mute, mute_permanent: current.mute_permanent, auto_lock: current.auto_lock,
         })
@@ -272,6 +351,76 @@ mod tests {
         assert_eq!(fields[1].number, 12);
         assert_eq!(fields[1].value, WireValue::Bytes(&[26, 3, b'w', b'o', b'w']));
         assert!(plugin_response(&decode_wire(&[10, 2, 8, 9]).unwrap()).is_none());
+    }
+    #[test]
+    fn merge_save_keeps_security_fields_and_mode() {
+        let _guard = crate::config::test_env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("uu-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        std::env::set_var("UU_CONFIG", &cfg);
+        let path = settings_path();
+        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":true,"mute_permanent":false}"#).unwrap();
+        let saved = merge_save(|s| s.video_encoder = Some("vaapi".into())).unwrap();
+        assert!(saved.auto_lock && saved.keep_mute && !saved.mute_permanent);
+        assert_eq!(saved.video_encoder.as_deref(), Some("vaapi"));
+        let again = merge_save(|s| s.video_codec = Some("h264".into())).unwrap();
+        assert_eq!(again.video_encoder.as_deref(), Some("vaapi"));
+        assert_eq!(again.video_codec.as_deref(), Some("h264"));
+        assert!(again.auto_lock);
+        let mode = { use std::os::unix::fs::PermissionsExt; std::fs::metadata(&path).unwrap().permissions().mode() & 0o777 };
+        assert_eq!(mode, 0o600);
+        // A mute/lock save must not drop video_* written after the in-memory copy was taken.
+        let mut memory = load_settings();
+        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":true,"mute_permanent":false,"video_encoder":"nvenc","video_codec":"h265"}"#).unwrap();
+        memory.keep_mute = false;
+        save(&memory).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["video_encoder"], "nvenc");
+        assert_eq!(disk["video_codec"], "h265");
+        assert_eq!(disk["keep_mute"], false);
+        assert_eq!(disk["auto_lock"], true);
+        // A non-string video field must not fail the whole document (security switches survive).
+        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":false,"mute_permanent":true,"video_encoder":1,"video_codec":{"x":1}}"#).unwrap();
+        let loaded = load_settings();
+        assert!(loaded.auto_lock && !loaded.keep_mute && loaded.mute_permanent);
+        assert!(loaded.video_encoder.is_none() && loaded.video_codec.is_none());
+        merge_save(|s| s.video_encoder = Some("cpu".into())).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["auto_lock"], true);
+        assert_eq!(disk["mute_permanent"], true);
+        assert_eq!(disk["video_encoder"], "cpu");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("UU_CONFIG");
+    }
+    #[test]
+    fn merge_write_refuses_malformed_or_unreadable_settings() {
+        let _guard = crate::config::test_env_lock().lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("uu-settings-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("UU_CONFIG", dir.join("config.json"));
+        let path = settings_path();
+        let malformed = br#"{"auto_lock":true, "keep_mute":"#;
+        std::fs::write(&path, malformed).unwrap();
+        let err = merge_write(|s| s.video_encoder = Some("cpu".into())).unwrap_err();
+        assert!(err.contains("not valid"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), malformed);
+        let bad_type = br#"{"auto_lock":"yes","keep_mute":false,"mute_permanent":false}"#;
+        std::fs::write(&path, bad_type).unwrap();
+        let err = merge_write(|s| s.video_codec = Some("h265".into())).unwrap_err();
+        assert!(err.contains("not valid"), "{err}");
+        assert!(err.contains("line ") && err.contains("column "), "{err}");
+        assert!(!err.contains("yes"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), bad_type);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = merge_write(|s| s.video_encoder = Some("cpu".into())).unwrap_err();
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(path.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var("UU_CONFIG");
     }
     #[test]
     fn args_shape_never_contains_values() {

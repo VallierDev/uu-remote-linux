@@ -1,20 +1,133 @@
-//! In-process X11 capture and H.264/HEVC encoding through libavdevice/libavcodec.
-//! It replaces the `ffmpeg` child process with the same codec options, so the viewer
-//! still receives the same Annex-B access units (AUD, SPS/PPS, IDR, P).
+//! In-process X11 capture (XDamage + XShm) and NVENC encoding through the NVIDIA driver.
+//! With UU_VIDEO_ENCODER=vaapi, H.264 / HEVC go through VAAPI instead: a DRI3 DMA-BUF of the root window is
+//! imported as a VA surface and converted/scaled by VPP, so the CPU never touches the pixels (XShm upload
+//! when DRI3 is unavailable).
+//! When capture and encoder sizes match, the XShm buffer is registered as CUDA pinned memory and
+//! NVENC reads it by DMA, so there is no host-to-device copy (the X server still writes XShm).
+
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ffmpeg_next as ff;
-use ff::format::{format::Format, sample, Pixel, Sample};
-use ff::ChannelLayout;
-use ff::util::picture;
-use ff::{codec, encoder, frame, software::scaling, Dictionary, Packet, Rational};
-use tokio::sync::mpsc;
-use tokio::sync::{Semaphore, OwnedSemaphorePermit};
-use std::collections::VecDeque;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::damage_capture::DamageCapture;
+
+#[repr(C)]
+struct NvencEngineOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct NvencConfigFFI {
+    width: u32,
+    height: u32,
+    fps: u32,
+    gop: u32,
+    cq: u32,
+    target_bps: i64,
+    max_bps: i64,
+    buffer_bits: i64,
+    is_hevc: libc::c_int,
+    chroma_444: libc::c_int,
+}
+
+#[repr(C)]
+struct VaapiEngineOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct VaapiConfigFFI {
+    width: u32,
+    height: u32,
+    cap_width: u32,
+    cap_height: u32,
+    fps: u32,
+    gop: u32,
+    target_bps: i64,
+    max_bps: i64,
+    buffer_bits: i64,
+    is_hevc: libc::c_int,
+    device: *const libc::c_char,
+}
+
+#[repr(C)]
+struct Dri3CaptureOpaque {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    fn nvenc_create(config: *const NvencConfigFFI) -> *mut NvencEngineOpaque;
+    fn nvenc_register_host_buffer(
+        engine: *mut NvencEngineOpaque,
+        host_ptr: *mut libc::c_void,
+        size: usize,
+    ) -> libc::c_int;
+    fn nvenc_encode_frame(
+        engine: *mut NvencEngineOpaque,
+        input_argb: *const u8,
+        pitch: u32,
+        force_idr: libc::c_int,
+        out_data: *mut *const u8,
+        out_len: *mut u32,
+    ) -> libc::c_int;
+    fn nvenc_destroy(engine: *mut NvencEngineOpaque);
+
+    fn vaapi_create(config: *const VaapiConfigFFI) -> *mut VaapiEngineOpaque;
+    fn vaapi_import_dma_buffer(engine: *mut VaapiEngineOpaque, dma_fd: libc::c_int, stride: u32) -> libc::c_int;
+    fn vaapi_upload_host_buffer(engine: *mut VaapiEngineOpaque, host_ptr: *const u8, pitch: u32) -> libc::c_int;
+    fn vaapi_encode_frame(
+        engine: *mut VaapiEngineOpaque,
+        force_idr: libc::c_int,
+        out_data: *mut *const u8,
+        out_len: *mut u32,
+    ) -> libc::c_int;
+    fn vaapi_destroy(engine: *mut VaapiEngineOpaque);
+
+    fn dri3_capture_create(display_name: *const libc::c_char, width: u32, height: u32) -> *mut Dri3CaptureOpaque;
+    fn dri3_capture_blit(cap: *mut Dri3CaptureOpaque) -> libc::c_int;
+    fn dri3_capture_wait_damage(cap: *mut Dri3CaptureOpaque, timeout_ms: libc::c_int) -> libc::c_int;
+    fn dri3_capture_get_dma_fd(cap: *mut Dri3CaptureOpaque) -> libc::c_int;
+    fn dri3_capture_get_stride(cap: *mut Dri3CaptureOpaque) -> u32;
+    fn dri3_capture_destroy(cap: *mut Dri3CaptureOpaque);
+}
+
+struct SafeNvencEngine(*mut NvencEngineOpaque);
+
+unsafe impl Send for SafeNvencEngine {}
+
+impl Drop for SafeNvencEngine {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { nvenc_destroy(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+struct SafeVaapiEngine(*mut VaapiEngineOpaque);
+unsafe impl Send for SafeVaapiEngine {}
+impl Drop for SafeVaapiEngine {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { vaapi_destroy(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+struct SafeDri3Capture(*mut Dri3CaptureOpaque);
+unsafe impl Send for SafeDri3Capture {}
+impl Drop for SafeDri3Capture {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { dri3_capture_destroy(self.0) };
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
 
 pub struct Config {
     pub display: String,
@@ -26,43 +139,56 @@ pub struct Config {
     pub target_bps: i64,
     pub max_bps: i64,
     pub buffer_bits: i64,
-    pub encoder: crate::video::Encoder,
     pub codec: crate::capture_setting::VideoCodec,
-    /// Capture on XDamage changes (XShm) instead of x11grab; `UU_CAPTURE=grab` turns it off.
-    pub damage: bool,
+    /// ChromaFormat (capture_setting::CHROMA_444 = 4:4:4).
+    pub chroma: u64,
+    /// UU_VIDEO_ENCODER=vaapi: the VAAPI engine (H.264 / HEVC Main) instead of NVENC.
+    pub vaapi: bool,
 }
 
-/// `UU_VIDEO_PIPELINE=process` keeps the original ffmpeg child-process path.
 pub fn disabled() -> bool {
     std::env::var("UU_VIDEO_PIPELINE").is_ok_and(|v| v == "process")
 }
 
-/// Damage-driven capture is on unless `UU_CAPTURE=grab` asks for x11grab.
 pub fn damage_enabled() -> bool {
     std::env::var("UU_CAPTURE").map_or(true, |v| v != "grab")
 }
 
-/// In-process capture is used unless the process path is requested, or a bundled FFmpeg prefix
-/// (`UU_FFMPEG_ROOT` / config `ffmpeg_root`) is set: that build was chosen on purpose, so keep using it.
-pub fn selected() -> bool {
-    !disabled() && crate::config::ffmpeg_root().is_none()
+pub fn selected(encoder: crate::video::Encoder) -> bool {
+    matches!(encoder, crate::video::Encoder::Nvenc | crate::video::Encoder::Vaapi) && damage_enabled() && !disabled() && crate::config::ffmpeg_root().is_none()
 }
 
-fn text(error: ff::Error) -> String { error.to_string() }
-
-fn ensure_init() -> Result<(), String> {
-    static INIT: Once = Once::new();
-    let mut result = Ok(());
-    INIT.call_once(|| {
-        if let Err(error) = ff::init() { result = Err(text(error)); }
-        ff::device::register_all();
-    });
-    result
+/// One encoder thread per stream. Aborting the reader only asks the blocking thread to stop at its
+/// next wake-up, so a restart waits here until the previous NVENC session and XShm are released.
+/// The key is the stream's IDR flag, which survives encoder restarts.
+pub async fn stream_slot(stream: &Arc<AtomicBool>) -> tokio::sync::OwnedMutexGuard<()> {
+    type Slots = Vec<(std::sync::Weak<AtomicBool>, Arc<tokio::sync::Mutex<()>>)>;
+    static SLOTS: std::sync::Mutex<Slots> = std::sync::Mutex::new(Vec::new());
+    let slot = {
+        let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        slots.retain(|(key, _)| key.strong_count() > 0);
+        match slots.iter().find(|(key, _)| std::ptr::eq(key.as_ptr(), Arc::as_ptr(stream))) {
+            Some((_, slot)) => slot.clone(),
+            None => {
+                let slot = Arc::new(tokio::sync::Mutex::new(()));
+                slots.push((Arc::downgrade(stream), slot.clone()));
+                slot
+            }
+        }
+    };
+    slot.lock_owned().await
 }
 
-pub struct EncodedUnit { pub data: Vec<u8>, pub permit: OwnedSemaphorePermit, pub completed_at: Instant }
+pub struct EncodedUnit {
+    pub data: Vec<u8>,
+    pub permit: OwnedSemaphorePermit,
+    pub completed_at: Instant,
+}
 
-fn acquire(budget: &Arc<Semaphore>, units: &mpsc::Sender<EncodedUnit>) -> Option<OwnedSemaphorePermit> {
+fn acquire(
+    budget: &Arc<Semaphore>,
+    units: &mpsc::Sender<EncodedUnit>,
+) -> Option<OwnedSemaphorePermit> {
     tokio::runtime::Handle::current().block_on(async {
         tokio::select! {
             permit = budget.clone().acquire_owned() => permit.ok(),
@@ -71,294 +197,6 @@ fn acquire(budget: &Arc<Semaphore>, units: &mpsc::Sender<EncodedUnit>) -> Option
     })
 }
 
-#[cfg(test)]
-mod budget_tests {
-    use super::*;
-    #[tokio::test]
-    async fn closing_encoder_output_wakes_a_blocked_capture() {
-        let budget=Arc::new(Semaphore::new(0));
-        let (tx,rx)=mpsc::channel(1);
-        let worker=tokio::task::spawn_blocking(move || acquire(&budget,&tx));
-        tokio::task::yield_now().await;
-        drop(rx);
-        assert!(tokio::time::timeout(Duration::from_secs(1),worker).await.unwrap().unwrap().is_none());
-    }
-}
-
-fn drain(encoder: &mut encoder::Video, packet: &mut Packet, units: &mpsc::Sender<EncodedUnit>, permits: &mut VecDeque<OwnedSemaphorePermit>) -> Result<bool, String> {
-    loop {
-        match encoder.receive_packet(packet) {
-            Ok(()) => {
-                let data = packet.data().unwrap_or_default().to_vec();
-                let permit = permits.pop_front().ok_or("Encoder returned an unbudgeted access unit")?;
-                if units.blocking_send(EncodedUnit {data, permit, completed_at: Instant::now()}).is_err() { return Ok(false); }
-            }
-            Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => return Ok(true),
-            Err(error) => return Err(text(error)),
-        }
-    }
-}
-
-/// Opens the selected video encoder for `config`. Returns the encoder, its input pixel format and output size.
-fn open_encoder(config: &Config) -> Result<(encoder::Video, Pixel, u32, u32), String> {
-    // H.264/HEVC 4:2:0 and NVENC need even dimensions; an odd native capture is padded (see run_damage).
-    let (width, height) = config.output.unwrap_or(config.input);
-    let (width, height) = (width + width % 2, height + height % 2);
-    let codec = encoder::find_by_name(config.encoder.name_for(config.codec))
-        .ok_or_else(|| format!("{} is not available in this FFmpeg build", config.encoder.name_for(config.codec)))?;
-    // Allocate for this codec so FFmpeg fills its defaults; libx264 rejects a context allocated without one.
-    let mut context = unsafe { codec::context::Context::wrap(ff::sys::avcodec_alloc_context3(codec.as_ptr()), None) }.encoder().video().map_err(text)?;
-    context.set_width(width);
-    context.set_height(height);
-    // NVENC takes packed BGR0 directly, so the GPU path skips the CPU colour conversion to YUV420P.
-    let pixel = match config.encoder { crate::video::Encoder::Nvenc => Pixel::BGRZ, crate::video::Encoder::Vaapi => Pixel::NV12, _ => Pixel::YUV420P };
-    context.set_format(if config.encoder == crate::video::Encoder::Vaapi { Pixel::VAAPI } else { pixel });
-    if config.encoder == crate::video::Encoder::Vaapi { attach_vaapi(&mut context, width, height)?; }
-    context.set_time_base(Rational::new(1, config.fps as i32));
-    context.set_frame_rate(Some(Rational::new(config.fps as i32, 1)));
-    context.set_gop(config.gop);
-    context.set_max_b_frames(0);
-    context.set_bit_rate(config.target_bps as usize);
-    context.set_max_bit_rate(config.max_bps as usize);
-    // The CLI's -maxrate/-bufsize map to these raw fields, which the encoder wrappers read.
-    unsafe {
-        let raw = context.as_mut_ptr();
-        (*raw).rc_max_rate = config.max_bps;
-        (*raw).rc_buffer_size = config.buffer_bits as i32;
-    }
-    let cq = config.cq.to_string();
-    let gop = config.gop.to_string();
-    let mut options = Dictionary::new();
-    let hevc = config.codec == crate::capture_setting::VideoCodec::H265;
-    if config.encoder == crate::video::Encoder::Vaapi {
-        for (key,value) in [("profile", if hevc { "main" } else { "constrained_baseline" }), ("rc_mode", "VBR"), ("async_depth", "1"), ("aud", "1")] { options.set(key,value); }
-        options.set("qmin", &cq);
-    } else if config.encoder == crate::video::Encoder::Nvenc {
-        for (key, value) in [("preset", "p4"), ("tune", "ull"), ("profile", if hevc { "main" } else { "baseline" }), ("rc", "vbr"),
-            ("rc-lookahead", "0"), ("zerolatency", "1"), ("delay", "0"), ("aud", "1"), ("forced-idr", "1")] {
-            options.set(key, value);
-        }
-        options.set("cq", &cq);
-    } else if hevc {
-        for (key, value) in [("preset", "superfast"), ("tune", "zerolatency"), ("profile", "main"), ("threads", "4"), ("forced-idr", "1")] {
-            options.set(key, value);
-        }
-        options.set("crf", &cq);
-        options.set("x265-params", &crate::video::x265_params(&gop));
-    } else {
-        let x264 = format!("aud=1:repeat-headers=1:scenecut=0:keyint={gop}:min-keyint={gop}");
-        for (key, value) in [("preset", "superfast"), ("tune", "zerolatency"), ("profile", "baseline"), ("threads", "4")] {
-            options.set(key, value);
-        }
-        options.set("crf", &cq);
-        options.set("x264-params", &x264);
-    }
-    let encoder = context.open_as_with(codec, options).map_err(text)?;
-    Ok((encoder, pixel, width, height))
-}
-
-// Each codec owns a reference to its hardware frame pool. Every error path releases
-// the temporary device/pool refs; AVCodecContext releases its own ref on drop.
-fn attach_vaapi(context: &mut encoder::video::Video, width: u32, height: u32) -> Result<(), String> {
-    use ff::sys::*;
-    let device_name = CString::new(crate::video::vaapi_device()).map_err(|_| "Invalid VAAPI device")?;
-    unsafe {
-        let mut device = std::ptr::null_mut();
-        let result = av_hwdevice_ctx_create(&mut device, AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI, device_name.as_ptr(), std::ptr::null_mut(), 0);
-        if result < 0 { return Err(format!("VAAPI device initialization failed: {}", text(ff::Error::from(result)))); }
-        let mut pool = av_hwframe_ctx_alloc(device);
-        av_buffer_unref(&mut device);
-        if pool.is_null() { return Err("VAAPI frame pool allocation failed".into()); }
-        let frames = (*pool).data as *mut AVHWFramesContext;
-        (*frames).format = AVPixelFormat::AV_PIX_FMT_VAAPI;
-        (*frames).sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
-        (*frames).width = width as i32;
-        (*frames).height = height as i32;
-        (*frames).initial_pool_size = 8;
-        let result = av_hwframe_ctx_init(pool);
-        if result < 0 { av_buffer_unref(&mut pool); return Err(format!("VAAPI frame pool initialization failed: {}", text(ff::Error::from(result)))); }
-        (*context.as_mut_ptr()).hw_frames_ctx = pool;
-    }
-    Ok(())
-}
-
-fn send_video_frame(encoder: &mut encoder::Video, frame: &frame::Video, kind: crate::video::Encoder) -> Result<(), String> {
-    if kind != crate::video::Encoder::Vaapi { return encoder.send_frame(frame).map_err(text); }
-    let mut uploaded = frame::Video::empty();
-    unsafe {
-        let result = ff::sys::av_hwframe_get_buffer((*encoder.as_ptr()).hw_frames_ctx, uploaded.as_mut_ptr(), 0);
-        if result < 0 { return Err(text(ff::Error::from(result))); }
-        let result = ff::sys::av_hwframe_transfer_data(uploaded.as_mut_ptr(), frame.as_ptr(), 0);
-        if result < 0 { return Err(text(ff::Error::from(result))); }
-        let result = ff::sys::av_frame_copy_props(uploaded.as_mut_ptr(), frame.as_ptr());
-        if result < 0 { return Err(text(ff::Error::from(result))); }
-    }
-    encoder.send_frame(&uploaded).map_err(text)
-}
-
-/// Runs until `stop` is set or the receiver is dropped. A set `idr` flag forces the next frame to be an IDR.
-pub fn run(config: Config, units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>) -> Result<(), String> {
-    ensure_init()?;
-    if config.damage {
-        match DamageCapture::open(&config.display) {
-            Ok(capture) => return run_damage(config, capture, units, stop, idr, budget),
-            Err(error) => log::warn!("Damage-driven capture unavailable, using x11grab: {error}"),
-        }
-    }
-    let name = CString::new("x11grab").map_err(|e| e.to_string())?;
-    let raw = unsafe { ff::sys::av_find_input_format(name.as_ptr()) };
-    if raw.is_null() { return Err("x11grab input is not available in this FFmpeg build".into()); }
-    let input_format = Format::Input(unsafe { ff::format::format::Input::wrap(raw as *mut _) });
-    let mut capture_options = Dictionary::new();
-    capture_options.set("framerate", &config.fps.to_string());
-    capture_options.set("video_size", &format!("{}x{}", config.input.0, config.input.1));
-    // The viewer draws its own pointer; do not bake a second one into the video.
-    capture_options.set("draw_mouse", "0");
-    let mut input = ff::format::open_with(&config.display, &input_format, capture_options).map_err(text)?.input();
-
-    let stream = input.streams().best(ff::media::Type::Video).ok_or("X11 capture has no video stream")?;
-    let index = stream.index();
-    let mut decoder = codec::context::Context::from_parameters(stream.parameters()).map_err(text)?.decoder().video().map_err(text)?;
-
-    let (mut encoder, pixel, width, height) = open_encoder(&config)?;
-
-    let mut scaler: Option<(scaling::Context, (Pixel, u32, u32))> = None;
-    let mut decoded = frame::Video::empty();
-    let mut converted = frame::Video::empty();
-    let mut packet = Packet::empty();
-    let started = Instant::now();
-    let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
-    let mut last_at: Option<Duration> = None;
-    let mut last_slot: i64 = -1;
-    let mut permits = VecDeque::with_capacity(4);
-    let mut packets = input.packets();
-    loop {
-        if stop.load(Ordering::Relaxed) { return Ok(()); }
-        let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
-        let Some((stream, input_packet)) = packets.next() else { return Ok(()); };
-        if stream.index() != index { continue; }
-        decoder.send_packet(&input_packet).map_err(text)?;
-        match decoder.receive_frame(&mut decoded) {
-            Ok(()) => {}
-            Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => continue,
-            Err(error) => return Err(text(error)),
-        }
-        // x11grab catches up after a stall by grabbing back-to-back. A frame arriving within half
-        // a frame interval of the previous one is part of that burst and is dropped, as the old
-        // `-fps_mode vfr` did. Normal jitter stays well above that threshold.
-        let now = started.elapsed();
-        if last_at.is_some_and(|previous| now - previous < frame_interval / 2) { continue; }
-        last_at = Some(now);
-        let slot = ((now.as_micros() * u128::from(config.fps) + 500_000) / 1_000_000) as i64;
-        let slot = slot.max(last_slot + 1);
-        last_slot = slot;
-
-        // Pass the capture buffer straight through when it already matches the encoder input.
-        let frame = if decoded.format() == pixel && decoded.width() == width && decoded.height() == height {
-            &mut decoded
-        } else {
-            let key = (decoded.format(), decoded.width(), decoded.height());
-            if scaler.as_ref().map(|(_, k)| *k) != Some(key) {
-                let context = scaling::Context::get(key.0, key.1, key.2, pixel, width, height, scaling::Flags::BILINEAR).map_err(text)?;
-                scaler = Some((context, key));
-            }
-            if let Some((context, _)) = scaler.as_mut() { context.run(&decoded, &mut converted).map_err(text)?; }
-            &mut converted
-        };
-
-        frame.set_pts(Some(slot));
-        frame.set_kind(if idr.swap(false, Ordering::AcqRel) { picture::Type::I } else { picture::Type::None });
-        send_video_frame(&mut encoder, frame, config.encoder)?;
-        permits.push_back(permit);
-        if !drain(&mut encoder, &mut packet, &units, &mut permits)? { return Ok(()); }
-    }
-}
-
-/// Damage-driven loop. Damage only marks the picture dirty; a dirty picture is captured and encoded on
-/// the next fixed frame tick, so the stream keeps a steady cadence while the screen moves. The viewer's
-/// jitter buffer grows with irregular arrivals, and irregular sends were what raised its latency.
-fn run_damage(config: Config, mut capture: DamageCapture, units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>) -> Result<(), String> {
-    let (mut encoder, pixel, width, height) = open_encoder(&config)?;
-    let (cap_width, cap_height) = capture.size();
-    // Native size uses the even encoder size. The extra row/column is never overwritten, so it stays black.
-    let native = config.output.is_none();
-    let (frame_width, frame_height) = if native { (width, height) } else { (cap_width, cap_height) };
-    let mut captured = frame::Video::new(Pixel::BGRZ, frame_width, frame_height);
-    if native { captured.data_mut(0).fill(0); }
-    let mut converted = frame::Video::empty();
-    let mut scaler = None;
-    let mut packet = Packet::empty();
-    let started = Instant::now();
-    let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
-    // Keepalive gaps are random between 15 and 25 fps: a steady 1 fps reads as a stall to the viewer.
-    let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.subsec_nanos()) | 1;
-    let mut keepalive = random_keepalive(&mut seed);
-    let mut dirty = true;
-    let mut next_tick = Instant::now();
-    let mut last_send = Instant::now();
-    let mut last_slot: i64 = -1;
-    let mut permits = VecDeque::with_capacity(4);
-    let locked = crate::session_lock::watch_locked();
-    let mut last_locked = *locked.borrow();
-    loop {
-        if stop.load(Ordering::Relaxed) { return Ok(()); }
-        let deadline = if dirty { next_tick } else { last_send + keepalive };
-        let wait = deadline.saturating_duration_since(Instant::now());
-        // A change marks the picture dirty and falls through, so a client that damages the root constantly
-        // cannot keep an overdue tick waiting.
-        if capture.wait(wait.max(Duration::from_millis(1)))? { dirty = true; }
-        let now = Instant::now();
-        if dirty && now < next_tick { continue; }
-        if !dirty && now < last_send + keepalive { continue; }
-        let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
-        if stop.load(Ordering::Relaxed) { return Ok(()); }
-        dirty |= capture.wait(Duration::ZERO)?;
-        let state = *locked.borrow();
-        if state != last_locked { dirty = true; last_locked = state; }
-
-        if dirty {
-            let source = capture.capture()?;
-            let bytes_per_line = cap_width as usize * 4;
-            let stride = captured.stride(0);
-            let row = bytes_per_line.min(stride);
-            for (y, src) in source.chunks_exact(bytes_per_line).enumerate() {
-                captured.data_mut(0)[y * stride..y * stride + row].copy_from_slice(&src[..row]);
-            }
-        }
-
-        let slot = ((started.elapsed().as_micros() * u128::from(config.fps) + 500_000) / 1_000_000) as i64;
-        let slot = slot.max(last_slot + 1);
-        last_slot = slot;
-
-        let frame = if pixel == Pixel::BGRZ && width == captured.width() && height == captured.height() {
-            &mut captured
-        } else {
-            if scaler.is_none() {
-                scaler = Some(scaling::Context::get(Pixel::BGRZ, captured.width(), captured.height(), pixel, width, height, scaling::Flags::BILINEAR).map_err(text)?);
-            }
-            if dirty {
-                if let Some(context) = scaler.as_mut() { context.run(&captured, &mut converted).map_err(text)?; }
-            }
-            &mut converted
-        };
-        frame.set_pts(Some(slot));
-        frame.set_kind(if idr.swap(false, Ordering::AcqRel) { picture::Type::I } else { picture::Type::None });
-        send_video_frame(&mut encoder, frame, config.encoder)?;
-        permits.push_back(permit);
-        if !drain(&mut encoder, &mut packet, &units, &mut permits)? { return Ok(()); }
-        let now = Instant::now();
-        if dirty {
-            // Keep the tick phase; after a long idle, restart the phase from now instead of bursting to catch up.
-            let next = next_tick + frame_interval;
-            next_tick = if next > now { next } else { now + frame_interval };
-            dirty = false;
-        }
-        last_send = now;
-        keepalive = random_keepalive(&mut seed);
-    }
-}
-
-/// Picks the next keepalive gap in 40–67 ms (15–25 fps) with a small xorshift generator.
 fn random_keepalive(seed: &mut u32) -> Duration {
     *seed ^= *seed << 13;
     *seed ^= *seed >> 17;
@@ -366,89 +204,525 @@ fn random_keepalive(seed: &mut u32) -> Duration {
     Duration::from_micros(40_000 + u64::from(*seed % 26_700))
 }
 
-/// Encodes a PulseAudio/PipeWire source to Opus in this process. Each Opus packet is sent as is.
-pub fn run_audio(source: &str, units: mpsc::Sender<bytes::Bytes>, stop: Arc<AtomicBool>) -> Result<(), String> {
-    ensure_init()?;
-    let name = CString::new("pulse").map_err(|e| e.to_string())?;
-    let raw = unsafe { ff::sys::av_find_input_format(name.as_ptr()) };
-    if raw.is_null() { return Err("pulse input is not available in this FFmpeg build".into()); }
-    let input_format = Format::Input(unsafe { ff::format::format::Input::wrap(raw as *mut _) });
-    let mut capture_options = Dictionary::new();
-    capture_options.set("fragment_size", "1920");
-    let mut input = ff::format::open_with(&source, &input_format, capture_options).map_err(text)?.input();
+pub fn run(
+    config: Config,
+    units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>,
+    idr: Arc<AtomicBool>,
+    budget: Arc<Semaphore>,
+) -> Result<(), String> {
+    if config.vaapi {
+        run_vaapi(config, units, stop, idr, budget)
+    } else {
+        run_nvenc(config, units, stop, idr, budget)
+    }
+}
 
-    let stream = input.streams().best(ff::media::Type::Audio).ok_or("Pulse source has no audio stream")?;
-    let index = stream.index();
-    let mut decoder = codec::context::Context::from_parameters(stream.parameters()).map_err(text)?.decoder().audio().map_err(text)?;
+fn run_vaapi(
+    config: Config,
+    units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>,
+    idr: Arc<AtomicBool>,
+    budget: Arc<Semaphore>,
+) -> Result<(), String> {
+    let (width, height) = config.output.unwrap_or(config.input);
+    let (width, height) = (width + width % 2, height + height % 2);
+    let (cap_width, cap_height) = config.input;
+    log::info!(
+        "Initializing Native In-Process VAAPI: {}x{} -> {}x{}, {} fps, GOP {}, HEVC={}",
+        cap_width,
+        cap_height,
+        width,
+        height,
+        config.fps,
+        config.gop,
+        config.codec == crate::capture_setting::VideoCodec::H265
+    );
+    let device = CString::new(crate::video::vaapi_device()).map_err(|_| "UU_VAAPI_DEVICE contains NUL".to_string())?;
+    let ffi_cfg = VaapiConfigFFI {
+        width,
+        height,
+        cap_width,
+        cap_height,
+        fps: config.fps,
+        gop: config.gop,
+        target_bps: config.target_bps,
+        max_bps: config.max_bps,
+        buffer_bits: config.buffer_bits,
+        is_hevc: libc::c_int::from(config.codec == crate::capture_setting::VideoCodec::H265),
+        device: device.as_ptr(),
+    };
+    let raw_engine = unsafe { vaapi_create(&ffi_cfg) };
+    if raw_engine.is_null() {
+        return Err("Failed to create native VAAPI engine".into());
+    }
+    let engine = SafeVaapiEngine(raw_engine);
 
-    let codec = encoder::find_by_name("libopus").ok_or("Opus encoder is not available in this FFmpeg build")?;
-    let mut context = unsafe { codec::context::Context::wrap(ff::sys::avcodec_alloc_context3(codec.as_ptr()), None) }.encoder().audio().map_err(text)?;
-    context.set_rate(48_000);
-    context.set_format(Sample::I16(sample::Type::Packed));
-    // FFmpeg 6 reads the AVChannelLayout field; the deprecated channel_layout alone makes libopus fail with EINVAL.
-    unsafe { ff::sys::av_channel_layout_default(&mut (*context.as_mut_ptr()).ch_layout, 2) };
-    context.set_time_base(Rational::new(1, 48_000));
-    context.set_bit_rate(128_000);
-    let mut options = Dictionary::new();
-    options.set("application", "lowdelay");
-    options.set("frame_duration", "20");
-    let mut encoder = context.open_as_with(codec, options).map_err(text)?;
-    // libopus takes fixed-size frames: 960 samples per channel for 20 ms.
-    let frame_samples = match encoder.frame_size() as usize { 0 => 960, n => n };
+    // Capture stays at the full input size; VPP scales (or pads) to the encoder size.
+    let display = CString::new(config.display.as_str()).map_err(|_| "DISPLAY contains NUL".to_string())?;
+    let dri3 = Some(SafeDri3Capture(unsafe { dri3_capture_create(display.as_ptr(), cap_width, cap_height) }))
+        .filter(|c| !c.0.is_null())
+        .filter(|c| unsafe {
+            let (fd, stride) = (dri3_capture_get_dma_fd(c.0), dri3_capture_get_stride(c.0));
+            fd >= 0 && stride > 0 && vaapi_import_dma_buffer(engine.0, fd, stride) == 0
+        });
+    let mut capture = None;
+    if dri3.is_some() {
+        log::info!("Native VAAPI imports a DRI3 DMA-BUF of the root window (GPU blit, VPP to NV12)");
+    } else {
+        log::warn!("DRI3 DMA-BUF unavailable on {}, uploading XShm frames to VAAPI", config.display);
+        capture = Some(
+            DamageCapture::open(&config.display)
+                .map_err(|e| format!("DamageCapture::open failed on {}: {e}", config.display))?,
+        );
+    }
 
-    let mut resampler = None;
-    let mut decoded = frame::Audio::empty();
-    let mut converted = frame::Audio::empty();
-    let mut fifo: Vec<i16> = Vec::new();
-    let mut pts: i64 = 0;
-    let mut packet = Packet::empty();
-    for (stream, input_packet) in input.packets() {
-        if stop.load(Ordering::Relaxed) { return Ok(()); }
-        if stream.index() != index { continue; }
-        decoder.send_packet(&input_packet).map_err(text)?;
-        loop {
-            match decoder.receive_frame(&mut decoded) {
-                Ok(()) => {}
-                Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => break,
-                Err(error) => return Err(text(error)),
-            }
-            // The decoder may leave the deprecated channel_layout unset; derive it from the channel count.
-            let source_layout = ChannelLayout::default(i32::from(decoded.channels()));
-            if resampler.is_none() {
-                resampler = Some(ff::software::resampling::Context::get(
-                    decoded.format(), source_layout, decoded.rate(),
-                    Sample::I16(sample::Type::Packed), ChannelLayout::STEREO, 48_000,
-                ).map_err(text)?);
-            }
-            // Keep both layout fields of the decoded frame in step with the resampler's input layout.
-            decoded.set_channel_layout(source_layout);
-            unsafe { ff::sys::av_channel_layout_default(&mut (*decoded.as_mut_ptr()).ch_layout, i32::from(decoded.channels())) };
-            if let Some(resampler) = resampler.as_mut() { resampler.run(&decoded, &mut converted).map_err(text)?; }
-            let samples = converted.samples() * 2;
-            fifo.extend(converted.data(0)[..samples * 2].chunks_exact(2).map(|b| i16::from_ne_bytes([b[0], b[1]])));
+    let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.subsec_nanos())
+        | 1;
+    let mut keepalive = random_keepalive(&mut seed);
+    let mut dirty = true;
+    let mut next_tick = Instant::now();
+    let mut last_send = Instant::now();
+    let mut permits = VecDeque::with_capacity(4);
 
-            while fifo.len() >= frame_samples * 2 {
-                let mut out = frame::Audio::new(Sample::I16(sample::Type::Packed), frame_samples, ChannelLayout::STEREO);
-                unsafe { ff::sys::av_channel_layout_default(&mut (*out.as_mut_ptr()).ch_layout, 2) };
-                out.set_rate(48_000);
-                out.set_pts(Some(pts));
-                for (dst, src) in out.data_mut(0)[..frame_samples * 4].chunks_exact_mut(2).zip(fifo.drain(..frame_samples * 2)) {
-                    dst.copy_from_slice(&src.to_ne_bytes());
-                }
-                pts += frame_samples as i64;
-                encoder.send_frame(&out).map_err(text)?;
-                loop {
-                    match encoder.receive_packet(&mut packet) {
-                        Ok(()) => {
-                            let data = bytes::Bytes::copy_from_slice(packet.data().unwrap_or_default());
-                            if units.blocking_send(data).is_err() { return Ok(()); }
-                        }
-                        Err(ff::Error::Other { errno }) if errno == libc::EAGAIN => break,
-                        Err(error) => return Err(text(error)),
+    let locked = crate::session_lock::watch_locked();
+    let mut last_locked = *locked.borrow();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let deadline = if dirty {
+            next_tick
+        } else {
+            last_send + keepalive
+        };
+        let timeout = deadline.saturating_duration_since(Instant::now());
+
+        if vaapi_wait(&dri3, &mut capture, timeout.max(Duration::from_millis(1)))? {
+            dirty = true;
+        }
+
+        let now = Instant::now();
+        if dirty && now < next_tick {
+            continue;
+        }
+        if !dirty && now < last_send + keepalive {
+            continue;
+        }
+
+        let Some(permit) = acquire(&budget, &units) else {
+            return Ok(());
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        dirty |= vaapi_wait(&dri3, &mut capture, Duration::ZERO)?;
+        let state = *locked.borrow();
+        if state != last_locked {
+            dirty = true;
+            last_locked = state;
+        }
+
+        let force_idr = if idr.swap(false, Ordering::AcqRel) {
+            1
+        } else {
+            0
+        };
+
+        // Keepalive frames re-encode the last surface; only damage needs a new copy of the screen.
+        if dirty {
+            match (dri3.as_ref(), capture.as_mut()) {
+                (Some(c), _) => {
+                    if unsafe { dri3_capture_blit(c.0) } != 0 {
+                        return Err("DRI3 blit of the root window failed".into());
                     }
                 }
+                (None, Some(c)) => {
+                    let pitch = c.size().0 * 4;
+                    let res = unsafe { vaapi_upload_host_buffer(engine.0, c.capture()?.as_ptr(), pitch) };
+                    if res != 0 {
+                        return Err(format!("vaapi_upload_host_buffer failed with error {res}"));
+                    }
+                }
+                (None, None) => unreachable!(),
+            }
+        }
+
+        let mut out_data: *const u8 = std::ptr::null();
+        let mut out_len: u32 = 0;
+        let res = unsafe { vaapi_encode_frame(engine.0, force_idr, &mut out_data, &mut out_len) };
+        if res != 0 {
+            return Err(format!("vaapi_encode_frame failed with error {res}"));
+        }
+
+        if out_len > 0 && !out_data.is_null() {
+            let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
+            permits.push_back(permit);
+            let send_permit = permits.pop_front().unwrap();
+
+            if units
+                .blocking_send(EncodedUnit {
+                    data,
+                    permit: send_permit,
+                    completed_at: Instant::now(),
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+
+        let now = Instant::now();
+        if dirty {
+            let next = next_tick + frame_interval;
+            next_tick = if next > now {
+                next
+            } else {
+                now + frame_interval
+            };
+            dirty = false;
+        }
+        last_send = now;
+        keepalive = random_keepalive(&mut seed);
+    }
+}
+fn vaapi_wait(dri3: &Option<SafeDri3Capture>, capture: &mut Option<DamageCapture>, timeout: Duration) -> Result<bool, String> {
+    match (dri3, capture) {
+        (Some(c), _) => match unsafe { dri3_capture_wait_damage(c.0, timeout.as_millis().min(1000) as i32) } {
+            r if r < 0 => Err("XDamage wait on the DRI3 connection failed".into()),
+            r => Ok(r > 0),
+        },
+        (None, Some(c)) => c.wait(timeout),
+        (None, None) => unreachable!(),
+    }
+}
+
+fn run_nvenc(
+    config: Config,
+    units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>,
+    idr: Arc<AtomicBool>,
+    budget: Arc<Semaphore>,
+) -> Result<(), String> {
+    let (width, height) = config.output.unwrap_or(config.input);
+    let (width, height) = (width + width % 2, height + height % 2);
+    let is_hevc = if config.codec == crate::capture_setting::VideoCodec::H265 {
+        1
+    } else {
+        0
+    };
+
+    let chroma_444 = libc::c_int::from(config.chroma == crate::capture_setting::CHROMA_444);
+    log::info!(
+        "Initializing Native In-Process NVENC: {}x{}, {} fps, GOP {}, CQ {}, HEVC={}, 4:4:4={}",
+        width,
+        height,
+        config.fps,
+        config.gop,
+        config.cq,
+        is_hevc == 1,
+        chroma_444 == 1
+    );
+
+    let ffi_cfg = NvencConfigFFI {
+        width,
+        height,
+        fps: config.fps,
+        gop: config.gop,
+        cq: config.cq,
+        target_bps: config.target_bps,
+        max_bps: config.max_bps,
+        buffer_bits: config.buffer_bits,
+        is_hevc,
+        chroma_444,
+    };
+
+    let mut capture = DamageCapture::open(&config.display)
+        .map_err(|e| format!("DamageCapture::open failed on {}: {e}", config.display))?;
+
+    let raw_engine = unsafe { nvenc_create(&ffi_cfg) };
+    if raw_engine.is_null() {
+        return Err("Failed to create native NVENC engine".into());
+    }
+    let engine = SafeNvencEngine(raw_engine);
+    let (cap_width, cap_height) = capture.size();
+
+    // Check if capture buffer can be Zero-Copy registered directly
+    let mut zero_copy = false;
+    if cap_width == width && cap_height == height {
+        let shm_ptr = capture.shm_raw_ptr() as *mut libc::c_void;
+        let shm_len = capture.shm_size();
+        let res = unsafe { nvenc_register_host_buffer(engine.0, shm_ptr, shm_len) };
+        if res == 0 {
+            zero_copy = true;
+            log::info!("Native NVENC reads the registered XShm buffer directly (no host-to-device copy)");
+        } else {
+            log::warn!("nvenc_register_host_buffer returned {res}, copying frames with cuMemcpyHtoD");
+        }
+    } else {
+        log::info!(
+            "Capture size ({}x{}) != encoder size ({}x{}): {} on the CPU, then cuMemcpyHtoD",
+            cap_width,
+            cap_height,
+            width,
+            height,
+            if config.output.is_some() { "bilinear scaling" } else { "padding" }
+        );
+    }
+
+    let bytes_per_line = cap_width as usize * 4;
+    let frame_interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
+
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.subsec_nanos())
+        | 1;
+    let mut keepalive = random_keepalive(&mut seed);
+    let mut dirty = true;
+    let mut next_tick = Instant::now();
+    let mut last_send = Instant::now();
+    let mut permits = VecDeque::with_capacity(4);
+    let mut frame_buf = Vec::new();
+
+    let locked = crate::session_lock::watch_locked();
+    let mut last_locked = *locked.borrow();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let deadline = if dirty {
+            next_tick
+        } else {
+            last_send + keepalive
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+
+        if capture.wait(wait.max(Duration::from_millis(1)))? {
+            dirty = true;
+        }
+
+        let now = Instant::now();
+        if dirty && now < next_tick {
+            continue;
+        }
+        if !dirty && now < last_send + keepalive {
+            continue;
+        }
+
+        let Some(permit) = acquire(&budget, &units) else {
+            return Ok(());
+        };
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        dirty |= capture.wait(Duration::ZERO)?;
+        let state = *locked.borrow();
+        if state != last_locked {
+            dirty = true;
+            last_locked = state;
+        }
+
+        let force_idr = if idr.swap(false, Ordering::AcqRel) {
+            1
+        } else {
+            0
+        };
+
+        let mut out_data: *const u8 = std::ptr::null();
+        let mut out_len: u32 = 0;
+
+        let res = if zero_copy {
+            // In Zero-Copy mode: refresh XShm, then NVENC DMA-reads directly from shm_ptr
+            if dirty {
+                capture.refresh()?;
+            }
+            unsafe {
+                nvenc_encode_frame(
+                    engine.0,
+                    std::ptr::null(), // NULL means use zero-copy registered buffer
+                    bytes_per_line as u32,
+                    force_idr,
+                    &mut out_data,
+                    &mut out_len,
+                )
+            }
+        } else {
+            // Copy path: 其他分辨率 is scaled; an odd native size is padded with black to the even encoder size
+            let source = capture.capture()?;
+            let (target_ptr, pitch) = if cap_width == width && cap_height == height {
+                (source.as_ptr(), bytes_per_line as u32)
+            } else {
+                frame_buf.resize(width as usize * height as usize * 4, 0);
+                if config.output.is_some() {
+                    scale_bilinear_argb32(source, cap_width, cap_height, &mut frame_buf, width, height);
+                } else {
+                    pad_argb32(source, cap_width, cap_height, &mut frame_buf, width, height);
+                }
+                (frame_buf.as_ptr(), width * 4)
+            };
+            unsafe {
+                nvenc_encode_frame(
+                    engine.0,
+                    target_ptr,
+                    pitch,
+                    force_idr,
+                    &mut out_data,
+                    &mut out_len,
+                )
+            }
+        };
+
+        if res != 0 {
+            return Err(format!("nvenc_encode_frame failed with error {res}"));
+        }
+
+        if out_len > 0 && !out_data.is_null() {
+            let data = unsafe { std::slice::from_raw_parts(out_data, out_len as usize) }.to_vec();
+            permits.push_back(permit);
+            let send_permit = permits.pop_front().unwrap();
+
+            if units
+                .blocking_send(EncodedUnit {
+                    data,
+                    permit: send_permit,
+                    completed_at: Instant::now(),
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+
+        let now = Instant::now();
+        if dirty {
+            let next = next_tick + frame_interval;
+            next_tick = if next > now {
+                next
+            } else {
+                now + frame_interval
+            };
+            dirty = false;
+        }
+        last_send = now;
+        keepalive = random_keepalive(&mut seed);
+    }
+}
+
+/// Bilinear ARGB32 scaling (the former swscale path used SWS_BILINEAR), with 8-bit fixed-point
+/// weights and pixel centers aligned.
+fn scale_bilinear_argb32(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, dst_h: u32) {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+    // Source position in 1/256 pixel units: (d + 0.5) * src / dst - 0.5, clamped to the image.
+    let taps = |dst_len: u32, src_len: u32| -> Vec<(usize, usize, u32)> {
+        (0..dst_len)
+            .map(|d| {
+                let pos = ((2 * u64::from(d) + 1) * u64::from(src_len) * 128 / u64::from(dst_len)).saturating_sub(128);
+                let first = ((pos >> 8) as usize).min(src_len as usize - 1);
+                let second = (first + 1).min(src_len as usize - 1);
+                (first, second, (pos & 255) as u32)
+            })
+            .collect()
+    };
+    let (columns, rows) = (taps(dst_w, src_w), taps(dst_h, src_h));
+    let src_stride = src_w as usize * 4;
+    for (dst_row, &(y0, y1, fy)) in dst.chunks_exact_mut(dst_w as usize * 4).zip(&rows) {
+        let (top, bottom) = (&src[y0 * src_stride..], &src[y1 * src_stride..]);
+        for (pixel, &(x0, x1, fx)) in dst_row.chunks_exact_mut(4).zip(&columns) {
+            for c in 0..4 {
+                let lerp = |row: &[u8]| u32::from(row[x0 * 4 + c]) * (256 - fx) + u32::from(row[x1 * 4 + c]) * fx;
+                pixel[c] = ((lerp(top) * (256 - fy) + lerp(bottom) * fy + 32768) >> 16) as u8;
             }
         }
     }
-    Ok(())
+}
+
+/// Copies the capture into the top-left corner of the larger encoder frame; the rest stays black.
+fn pad_argb32(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, dst_h: u32) {
+    let (src_stride, dst_stride) = (src_w as usize * 4, dst_w as usize * 4);
+    let copy = src_stride.min(dst_stride);
+    for (y, dst_row) in dst.chunks_exact_mut(dst_stride).enumerate() {
+        if y < src_h.min(dst_h) as usize {
+            dst_row[..copy].copy_from_slice(&src[y * src_stride..y * src_stride + copy]);
+            dst_row[copy..].fill(0);
+        } else {
+            dst_row.fill(0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[tokio::test]
+    async fn closing_encoder_output_wakes_a_blocked_capture() {
+        let budget = Arc::new(Semaphore::new(0));
+        let (tx, rx) = mpsc::channel(1);
+        let worker = tokio::task::spawn_blocking(move || acquire(&budget, &tx));
+        tokio::task::yield_now().await;
+        drop(rx);
+        assert!(tokio::time::timeout(Duration::from_secs(1), worker).await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_slot_waits_for_the_previous_encoder_of_the_same_stream() {
+        let (stream, other) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let held = stream_slot(&stream).await;
+        // Another stream is independent.
+        drop(tokio::time::timeout(Duration::from_secs(1), stream_slot(&other)).await.unwrap());
+        assert!(tokio::time::timeout(Duration::from_millis(50), stream_slot(&stream)).await.is_err());
+        drop(held);
+        drop(tokio::time::timeout(Duration::from_secs(1), stream_slot(&stream)).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+    fn image(w: u32, h: u32, pixel: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let pixel = &pixel;
+        (0..h).flat_map(|y| (0..w).flat_map(move |x| pixel(x, y))).collect()
+    }
+
+    #[test]
+    fn bilinear_scaling_keeps_flat_areas_and_averages_edges() {
+        let flat = image(8, 6, |_, _| [10, 20, 30, 255]);
+        let mut out = vec![0; 4 * 3 * 4];
+        scale_bilinear_argb32(&flat, 8, 6, &mut out, 4, 3);
+        assert!(out.chunks(4).all(|p| p == [10, 20, 30, 255]));
+        // A 2:1 downscale of alternating black/white columns lands between the two, not on one of them.
+        let stripes = image(4, 2, |x, _| if x % 2 == 0 { [0; 4] } else { [255; 4] });
+        let mut out = vec![0; 2 * 1 * 4];
+        scale_bilinear_argb32(&stripes, 4, 2, &mut out, 2, 1);
+        assert!(out.iter().all(|&v| v == 128), "{out:?}");
+        // Upscaling interpolates and never reads past the last row/column.
+        let ramp = image(2, 1, |x, _| [(x * 200) as u8; 4]);
+        let mut out = vec![0; 4 * 2 * 4];
+        scale_bilinear_argb32(&ramp, 2, 1, &mut out, 4, 2);
+        let row: Vec<u8> = out[..16].chunks(4).map(|p| p[0]).collect();
+        assert_eq!(row, vec![0, 50, 150, 200]);
+    }
+
+    #[test]
+    fn odd_capture_is_padded_with_black_not_stretched() {
+        let src = image(3, 3, |x, y| [(x + 3 * y + 1) as u8; 4]);
+        let mut out = vec![9; 4 * 4 * 4];
+        pad_argb32(&src, 3, 3, &mut out, 4, 4);
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let expected = if x < 3 && y < 3 { (x + 3 * y + 1) as u8 } else { 0 };
+                assert_eq!(out[(y * 4 + x) * 4], expected, "({x},{y})");
+            }
+        }
+    }
 }

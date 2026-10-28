@@ -1,4 +1,4 @@
-//! Uses the same optional FFmpeg dependency as the host inproc-av feature.
+//! Uses the optional FFmpeg 6 libraries of the `viewer-ffmpeg` feature.
 use super::desktop::{Decoder,Frame};
 use ffmpeg_next as av;
 use super::media::Codec;
@@ -37,7 +37,7 @@ impl Decoder for Ffmpeg {
             let mut rgb=av::frame::Video::empty();scaler.run(&decoded,&mut rgb).map_err(|_|"Frame conversion failed")?;
             let mut data=Vec::with_capacity(w as usize*h as usize*3);
             for row in 0..h as usize {let start=row*rgb.stride(0);data.extend_from_slice(&rgb.data(0)[start..start+w as usize*3]);}
-            frames.push(Frame{width:w,height:h,rgb:data});
+            frames.push(Frame{width:w,height:h,rgb:data,content:None});
         } Ok(frames)
     }
 }

@@ -1,8 +1,12 @@
+#[cfg(test)]
+#[path = "video_wake_tests.rs"]
+mod wake_tests;
+
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -177,16 +181,9 @@ impl CompleteFrame {
 
 const RTP_CLOCK: u64 = 90_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum Encoder { Cpu, Nvenc, Vaapi }
 impl Encoder {
-    pub(crate) fn requested() -> Self { Self::from_setting(std::env::var("UU_VIDEO_ENCODER").ok().as_deref(), nvidia_present()) }
-    /// Unset/auto tries NVENC only with an NVIDIA driver loaded: `ffmpeg -encoders` lists h264_nvenc
-    /// on any machine, so without this every stream start first ran a doomed NVENC process (#10).
-    fn from_setting(value: Option<&str>, nvidia: bool) -> Self {
-        match value { Some("cpu") => Self::Cpu, Some("vaapi") => Self::Vaapi, Some("nvenc") => Self::Nvenc,
-            _ => if nvidia { Self::Nvenc } else { Self::Cpu } }
-    }
     pub(crate) fn name_for(self, codec: VideoCodec) -> &'static str {
         match (self, codec) {
             (Self::Cpu, VideoCodec::H264) => "libx264", (Self::Cpu, VideoCodec::H265) => "libx265",
@@ -195,16 +192,12 @@ impl Encoder {
         }
     }
 }
-fn nvidia_present() -> bool {
+pub(crate) fn nvidia_present() -> bool {
     std::path::Path::new("/proc/driver/nvidia/version").exists() || std::path::Path::new("/dev/nvidia0").exists()
 }
-/// 真彩 (4:4:4) needs the FFmpeg process pipeline with NVENC or libx264 (h264_vaapi and the
-/// in-process encoder are 4:2:0 only).
-pub fn full_chroma_available() -> bool {
-    #[cfg(feature = "inproc-av")]
-    if crate::inproc_encoder::selected() { return false; }
-    Encoder::requested() != Encoder::Vaapi
-}
+/// 真彩 (4:4:4): NVENC (in-process or FFmpeg) and libx264; h264_vaapi is 4:2:0 only.
+/// A GPU without 4:4:4 NVENC falls back to libx264, which keeps 4:4:4.
+pub(crate) fn full_chroma_for(encoder: Encoder) -> bool { encoder != Encoder::Vaapi }
 
 /// (-profile:v, -pix_fmt) for NVENC / libx264 / libx265: 4:4:4 (真彩) needs a 4:4:4 profile.
 fn chroma_args(settings: &VideoSettings, encoder: Encoder) -> (&'static str, &'static str) {
@@ -264,10 +257,29 @@ fn cpu_hevc_options(settings: &VideoSettings, gop: &str) -> Vec<String> {
 
 /// NVENC converts packed RGB on the GPU (BT.601 limited range, tagged bt470bg like the swscale default;
 /// compared on the 3090), so 4:2:0 without scaling skips the CPU BGRA→YUV pass (#16: ~2 cores at 4K).
-/// `input` is the source pixel format; `UU_NVENC_RGB=0` restores CPU conversion.
+/// When the desktop is composited on the NVIDIA card itself, the packed-RGB path is slower than CPU
+/// conversion (#16: RTX 5070 at 4K, 82.6 vs 98 fps), so it stays off unless `UU_NVENC_RGB=1`.
+/// `input` is the source pixel format; `UU_NVENC_RGB=0` always restores CPU conversion.
 fn nvenc_rgb_input(settings: &VideoSettings, encoder: Encoder, input: &'static str) -> Option<&'static str> {
-    (encoder == Encoder::Nvenc && settings.chroma != crate::capture_setting::CHROMA_444 && settings.output.is_none()
-        && std::env::var("UU_NVENC_RGB").as_deref() != Ok("0")).then_some(input)
+    let wanted = match std::env::var("UU_NVENC_RGB").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => !nvidia_drives_display(std::path::Path::new("/sys/class/drm")),
+    };
+    (encoder == Encoder::Nvenc && settings.chroma != crate::capture_setting::CHROMA_444 && settings.output.is_none() && wanted)
+        .then_some(input)
+}
+
+/// A connected DRM connector (`cardN-HDMI-A-1/status`) on a card bound to the nvidia driver.
+/// Only visible with nvidia-drm modeset, which Wayland compositors require.
+fn nvidia_drives_display(drm: &std::path::Path) -> bool {
+    std::fs::read_dir(drm).into_iter().flatten().flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some((card, _)) = name.split_once('-') else { return false; };
+        card.starts_with("card")
+            && std::fs::read_to_string(entry.path().join("status")).is_ok_and(|s| s.trim() == "connected")
+            && std::fs::read_link(drm.join(card).join("device/driver")).is_ok_and(|p| p.file_name().is_some_and(|n| n == "nvidia"))
+    })
 }
 
 fn encoder_options(settings: &VideoSettings, encoder: Encoder, gop: &str, rgb: Option<&'static str>) -> Vec<String> {
@@ -346,6 +358,52 @@ fn ffmpeg_spec() -> FfmpegSpec {
 
 pub(crate) fn ffmpeg_command() -> Command { ffmpeg_spec().command() }
 
+/// Encoders of interest that the configured FFmpeg lists; `None` when it cannot run (bounded to 5 s).
+pub async fn ffmpeg_encoders() -> Option<Vec<&'static str>> {
+    let mut ffmpeg = ffmpeg_command();
+    ffmpeg.args(["-hide_banner", "-encoders"]).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(5), ffmpeg.output()).await.ok()?.ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(["libx264", "libx265", "h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi"].into_iter()
+        .filter(|name| text.split_whitespace().any(|word| word == *name)).collect())
+}
+
+/// Without FFmpeg the desktop stream fails after the viewer connects and it waits on
+/// 正在传输画面 with no message of its own. Checked at startup and on each desktop offer:
+/// logged, shown in the host window, and sent as a desktop notification (at most every 5 minutes).
+/// Installing FFmpeg clears the window line on the next check; no restart is needed.
+pub fn check_ffmpeg_usable() {
+    if crate::desktop_backend::headless() { return; }
+    tokio::spawn(async {
+        static LAST_NOTICE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        const SUMMARY: &str = "无法传输远程画面";
+        match ffmpeg_encoders().await {
+            None => {
+                log::error!("FFmpeg is not runnable: desktop video cannot start and viewers stay on 正在传输画面. Install ffmpeg (Debian/Ubuntu: sudo apt install ffmpeg; Arch: sudo pacman -S ffmpeg; Fedora: ffmpeg from RPM Fusion), or set ffmpeg_root, then check `uuremote-server doctor`");
+                let text = "未找到可运行的 FFmpeg，客户端会一直停在「正在传输画面」。\n请安装后重新连接：sudo apt install ffmpeg（Arch：sudo pacman -S ffmpeg；Fedora 需先启用 RPM Fusion）";
+                let previous = {
+                    let mut last = LAST_NOTICE.lock().unwrap_or_else(|e| e.into_inner());
+                    let previous = *last;
+                    let due = previous.is_none_or(|at| at.elapsed() >= Duration::from_secs(300));
+                    if due { *last = Some(Instant::now()); }
+                    due.then_some(previous)
+                };
+                // The notification is a blocking D-Bus call (bounded to 3 s).
+                let told = tokio::task::spawn_blocking(move || crate::assist::show_problem(SUMMARY, Some(text), previous.is_some())).await.unwrap_or(false);
+                // Only a notice that reached the person starts the 5-minute quiet period.
+                if let (Some(previous), false) = (previous, told) {
+                    *LAST_NOTICE.lock().unwrap_or_else(|e| e.into_inner()) = previous;
+                    log::warn!("Missing FFmpeg: no desktop notification daemon and no host window to show it");
+                }
+            }
+            Some(found) => {
+                if !found.contains(&"libx264") { log::warn!("FFmpeg has no libx264: CPU encoding and the fallback after a hardware encoder failure are unavailable. Install a full ffmpeg build"); }
+                tokio::task::spawn_blocking(|| crate::assist::show_problem(SUMMARY, None, false));
+            }
+        }
+    });
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FfmpegTimingMode { Modern, Legacy }
 
@@ -413,33 +471,153 @@ async fn ffmpeg_timing_mode(spec: &FfmpegSpec) -> FfmpegTimingMode {
     *cell.get_or_init(|| probe_timing_mode(spec)).await
 }
 
+type HevcCache = Mutex<HashMap<(FfmpegSpec, Encoder), Arc<tokio::sync::OnceCell<bool>>>>;
+
+fn hevc_cache() -> &'static HevcCache {
+    static CACHE: OnceLock<HevcCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hevc_cell(cache: &HevcCache, spec: &FfmpegSpec, encoder: Encoder) -> Arc<tokio::sync::OnceCell<bool>> {
+    let mut cache = cache.lock().expect("HEVC probe cache poisoned");
+    cache.entry((spec.clone(), encoder)).or_insert_with(|| Arc::new(tokio::sync::OnceCell::const_new())).clone()
+}
+
 /// A compiled-in encoder name does not prove that its driver can initialize.
-/// Probe one synthetic 4:2:0 frame once per process before advertising HEVC.
-pub async fn hevc_available() -> bool {
-    static AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-    *AVAILABLE.get_or_init(|| async {
-        let requested = Encoder::requested();
-        let mut candidates = vec![requested];
-        if requested != Encoder::Cpu { candidates.push(Encoder::Cpu); }
-        for encoder in candidates {
-            let settings = VideoSettings { codec: VideoCodec::H265, ..Default::default() };
-            let mut command = ffmpeg_command();
-            command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-            if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
-            command.args(["-f", "lavfi", "-i", "color=black:size=256x256:rate=1", "-frames:v", "1", "-an"]);
-            if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
-            command.args(encoder_options(&settings, encoder, "30", None));
-            command.args(["-f", "hevc", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
-            if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(5), command.output()).await {
-                if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H265) {
-                    log::info!("HEVC encoder probe: {} ok", encoder.name_for(VideoCodec::H265));
-                    return true;
-                }
+/// Probe one synthetic 4:2:0 frame per resolved encoder and FFmpeg spec. The caller
+/// passes the session's encoder so capability matches that snapshot. set-encoder
+/// changes the snapshot for the next session, so a process-wide bool would keep advertising
+/// the first session's result.
+const AUTO_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+/// One synthetic H.264 IDR. Failure reasons stay enum values: stderr and device paths are not logged.
+pub(crate) async fn probe_encoder_idr(encoder: Encoder) -> crate::video_select::ProbeOutcome {
+    use crate::video_select::{ProbeFail, ProbeOutcome};
+    let settings = VideoSettings { codec: VideoCodec::H264, ..Default::default() };
+    let mut command = ffmpeg_command();
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+    if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
+    command.args(["-f", "lavfi", "-i", "color=c=black:s=256x256:r=1", "-frames:v", "1", "-an"]);
+    if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
+    command.args(encoder_options(&settings, encoder, "30", None));
+    command.args(["-f", "h264", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
+    let process = match tokio::time::timeout(AUTO_PROBE_BUDGET, command.output()).await {
+        Ok(Ok(output)) if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H264) => ProbeOutcome::Ok,
+        Ok(Ok(output)) if output.status.success() => ProbeOutcome::Fail(ProbeFail::NoIdr),
+        Ok(Ok(_)) => ProbeOutcome::Fail(ProbeFail::Exit),
+        Ok(Err(_)) => ProbeOutcome::Fail(ProbeFail::Spawn),
+        Err(_) => ProbeOutcome::Fail(ProbeFail::Timeout),
+    };
+    // The native engine opens against a real X display, so a synthetic lavfi frame cannot
+    // exercise it. When this build would try that engine first, a process-only failure must
+    // not drop the candidate (NativeUnprobed → legacy auto for it).
+    crate::video_select::outcome_for_candidate(process, native_engine_would_run(encoder))
+}
+
+/// True when `read_encoder_with` would open the in-process engine for this candidate
+/// on the selected desktop backend (X11 only; not Wayland, portal, KMS, or headless).
+fn native_engine_would_run(encoder: Encoder) -> bool {
+    native_engine_eligible(encoder, native_display_kind())
+}
+
+fn native_display_kind() -> NativeDisplayKind {
+    if crate::desktop_backend::headless() { return NativeDisplayKind::None; }
+    match crate::desktop_backend::detect() {
+        Ok(crate::desktop_backend::DesktopBackend::Wayland) => NativeDisplayKind::Wayland,
+        Ok(crate::desktop_backend::DesktopBackend::Kms) => NativeDisplayKind::Kms,
+        Ok(crate::desktop_backend::DesktopBackend::Portal) => NativeDisplayKind::Portal,
+        _ => NativeDisplayKind::X11,
+    }
+}
+
+fn auto_probe_flight() -> &'static tokio::sync::Mutex<()> {
+    static FLIGHT: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    FLIGHT.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Start the auto probe when auto is selected and the cache is empty or stale
+/// (TTL, or NVIDIA presence changed since the report). Returns immediately.
+/// One probe runs at a time; an in-flight probe is left alone.
+/// Explicit encoder (setting or `UU_VIDEO_ENCODER`) does not spawn a probe.
+pub fn warm_auto_probe() {
+    if !crate::video_select::should_warm_auto_probe(crate::video_select::selection().encoder_source) { return; }
+    if !crate::video_select::probe_needs_run(std::time::Instant::now(), nvidia_present()) { return; }
+    tokio::spawn(async { let _ = run_auto_probe().await; });
+}
+
+/// Diagnostics that encode must see the same auto choice as a warmed-up host.
+/// An explicit encoder (setting or env) skips the probe.
+pub async fn ensure_auto_probed() {
+    if crate::video_select::selection().encoder_source == crate::video_select::Source::Auto {
+        let _ = run_auto_probe().await;
+    }
+}
+
+/// Run the probe to completion (doctor, or the background warm-up).
+/// A success or a CPU-only skip stays cached. A hardware failure expires after
+/// `PROBE_FAILURE_TTL`; the next `warm_auto_probe` starts one background retry.
+pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
+    let now = std::time::Instant::now();
+    let nvidia = nvidia_present();
+    if let Some(cached) = crate::video_select::cached_probe() {
+        if !crate::video_select::probe_stale(&cached, now, nvidia) { return cached; }
+    }
+    let _flight = auto_probe_flight().lock().await;
+    let now = std::time::Instant::now();
+    let nvidia = nvidia_present();
+    if let Some(cached) = crate::video_select::cached_probe() {
+        if !crate::video_select::probe_stale(&cached, now, nvidia) { return cached; }
+    }
+    let reason = crate::video_select::reprobe_reason(crate::video_select::cached_probe().as_ref(), nvidia);
+    let nvidia = nvidia_present();
+    let order = crate::video_select::auto_order(nvidia);
+    // One candidate (CPU, no NVIDIA) has nothing to choose; skip the synthetic IDR.
+    let mut outcomes = Vec::with_capacity(order.len());
+    if order.len() == 1 {
+        outcomes.push(crate::video_select::ProbeOutcome::NotProbed);
+    } else {
+        for encoder in &order { outcomes.push(probe_encoder_idr(*encoder).await); }
+    }
+    let probed = crate::video_select::choose_from_probe(&order, &outcomes);
+    let chosen = crate::video_select::chosen_after_native(nvidia, &order, &outcomes, probed);
+    let report = crate::video_select::ProbeReport::fresh(order, outcomes, chosen, now, nvidia);
+    let parts: Vec<String> = report.order.iter().zip(report.outcomes.iter()).map(|(e, o)| format!("{}={}", format!("{e:?}").to_ascii_lowercase(), o.label())).collect();
+    if let Some(reason) = reason {
+        log::info!("Encoder probe: {reason} {}", parts.join(" "));
+    } else {
+        log::info!("Encoder probe: {}", parts.join(" "));
+    }
+    crate::video_select::store_probe(report.clone());
+    report
+}
+
+pub async fn hevc_available(requested: Encoder) -> bool {
+    let spec = ffmpeg_spec();
+    let cell = hevc_cell(hevc_cache(), &spec, requested);
+    *cell.get_or_init(|| probe_hevc(spec, requested)).await
+}
+
+async fn probe_hevc(spec: FfmpegSpec, requested: Encoder) -> bool {
+    let mut candidates = vec![requested];
+    if requested != Encoder::Cpu { candidates.push(Encoder::Cpu); }
+    for encoder in candidates {
+        let settings = VideoSettings { codec: VideoCodec::H265, ..Default::default() };
+        let mut command = spec.command();
+        command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
+        if encoder == Encoder::Vaapi { command.args(["-vaapi_device", &vaapi_device()]); }
+        command.args(["-f", "lavfi", "-i", "color=black:size=256x256:rate=1", "-frames:v", "1", "-an"]);
+        if encoder == Encoder::Vaapi { command.args(["-vf", &vaapi_filter(None)]); }
+        command.args(encoder_options(&settings, encoder, "30", None));
+        command.args(["-f", "hevc", "pipe:1"]).kill_on_drop(true).stderr(std::process::Stdio::null());
+        if let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(5), command.output()).await {
+            if output.status.success() && is_independent_frame_for(&output.stdout, VideoCodec::H265) {
+                log::info!("HEVC encoder probe: {} ok", encoder.name_for(VideoCodec::H265));
+                return true;
             }
         }
-        log::info!("HEVC encoder probe: unavailable");
-        false
-    }).await
+    }
+    log::info!("HEVC encoder probe: unavailable");
+    false
 }
 
 /// Round UP (+1ns float guard) so webrtc's floor(duration*90000) yields exactly `ticks`.
@@ -502,19 +680,69 @@ impl Drop for StopOnDrop { fn drop(&mut self) { self.0.store(true, std::sync::at
 async fn read_encoder(
     size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
     latest: mpsc::Sender<Arc<CompleteFrame>>,
-    settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+    mut settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+    selection: crate::video_select::Selection,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if display == wake_tests::DISPLAY { return wake_tests::encode(latest, settings, sequence, budget).await; }
     // The sequence is shared so a CPU fallback or settings restart continues it (skip statistics stay correct).
-    let encoder = Encoder::requested();
-    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,sequence,settings,idr,budget).await; }
-    match read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,sequence.clone(),settings,idr.clone(),budget.clone()).await {
+    // `selection` is fixed for this desktop connection (taken where the codec is negotiated).
+    let encoder = selection.encoder;
+    if settings.chroma == crate::capture_setting::CHROMA_444 && !full_chroma_for(encoder) {
+        settings.chroma = crate::capture_setting::CHROMA_420;
+        log::info!("Chroma 4:4:4 requested; encoder={} source={} encodes 4:2:0", format!("{encoder:?}").to_ascii_lowercase(), crate::video_select::encoder_source_label(selection.encoder_source));
+    }
+    if encoder == Encoder::Cpu { return read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await; }
+    #[cfg_attr(not(feature = "inproc-av"), allow(unused_mut))]
+    let mut result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,true,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+    // A failed native NVENC session (old driver, unsupported mode) still leaves FFmpeg's NVENC process pipeline.
+    #[cfg(feature = "inproc-av")]
+    if let Err(error) = &result {
+        if !latest.is_closed() && native_inproc(&display, portal.is_some(), encoder) && x11_resized(&display, portal.is_some(), size).is_none() {
+            log::warn!("In-process {} stream unavailable; switching to the FFmpeg process pipeline: {}",encoder.name_for(settings.codec),error);
+            result = read_encoder_with(size,display.clone(),portal.clone(),latest.clone(),encoder,false,sequence.clone(),settings,idr.clone(),budget.clone(),selection).await;
+        }
+    }
+    match result {
         Ok(())=>Ok(()),
-        Err(error) if !latest.is_closed()=>{
+        Err(error) if !latest.is_closed() && x11_resized(&display, portal.is_some(), size).is_none()=>{
             log::warn!("{} stream unavailable; switching scoped encoder to CPU: {}",encoder.name_for(settings.codec),error);
-            read_encoder_with(size,display,portal,latest,Encoder::Cpu,sequence,settings,idr,budget).await
+            read_encoder_with(size,display,portal,latest,Encoder::Cpu,true,sequence,settings,idr,budget,selection).await
         },
         Err(error)=>Err(error),
     }
+}
+
+/// A resized X11 root fails every encoder alike (x11grab BadMatch on the old size);
+/// returns the new size so the stream restarts capture instead of walking the fallback chain.
+fn x11_resized(display: &str, portal: bool, size: (u32, u32)) -> Option<(u32, u32)> {
+    if portal || display.starts_with("wayland:") || display.starts_with("kms:") { return None; }
+    crate::capture::x11_size().filter(|current| *current != size)
+}
+
+/// Same predicate `native_inproc` uses: X11 only, and the in-process engine is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeDisplayKind { X11, Wayland, Portal, Kms, None }
+
+pub(crate) fn native_engine_eligible(encoder: Encoder, kind: NativeDisplayKind) -> bool {
+    #[cfg(feature = "inproc-av")]
+    { kind == NativeDisplayKind::X11 && crate::inproc_encoder::selected(encoder) }
+    #[cfg(not(feature = "inproc-av"))]
+    { let _ = (encoder, kind); false }
+}
+
+/// The native in-process NVENC path serves X11 only (not Wayland/KMS capture or a portal session).
+#[cfg(feature = "inproc-av")]
+fn native_inproc(display: &str, portal: bool, encoder: Encoder) -> bool {
+    native_engine_eligible(encoder, display_kind(display, portal))
+}
+
+#[cfg(feature = "inproc-av")]
+fn display_kind(display: &str, portal: bool) -> NativeDisplayKind {
+    if portal { NativeDisplayKind::Portal }
+    else if display.starts_with("wayland:") { NativeDisplayKind::Wayland }
+    else if display.starts_with("kms:") { NativeDisplayKind::Kms }
+    else { NativeDisplayKind::X11 }
 }
 
 /// Capture and encode inside this process; each packet is one access unit.
@@ -528,9 +756,11 @@ async fn read_inprocess(
     let stop = Arc::new(AtomicBool::new(false));
     // If this future is dropped (reader task aborted), the blocking encoder stops at its next packet.
     let _stop_on_drop = StopOnDrop(stop.clone());
+    // A restart aborts the previous reader without waiting for its blocking encoder; wait for it here.
+    let slot = crate::inproc_encoder::stream_slot(&idr).await;
     let job = tokio::task::spawn_blocking({
         let stop = stop.clone();
-        move || crate::inproc_encoder::run(config, units_tx, stop, idr, budget)
+        move || { let _slot = slot; crate::inproc_encoder::run(config, units_tx, stop, idr, budget) }
     });
     let mut gate = DependencyGate::default();
     while let Some(unit) = units.recv().await {
@@ -550,19 +780,20 @@ async fn read_inprocess(
 /// whole IDR frame, otherwise large desktops get near-grey keyframes that sharpen over the GOP (#8).
 /// Half a second of bitrate still starved repeated 0.5 s-GOP keyframes at 3296x2036/2M; one second did not.
 fn buffer_kbits(max_kbps: u32, encoder: Encoder) -> u32 {
-    if encoder == Encoder::Cpu { max_kbps.clamp(500, 8000) }
-    else if encoder == Encoder::Vaapi {
-        let requested = std::env::var("UU_VAAPI_BUFFER_MS").ok();
-        vaapi_buffer_kbits(max_kbps, requested.as_deref()).unwrap_or((max_kbps / 8).clamp(100, 500))
-    }
-    else { (max_kbps / 8).clamp(100, 500) }
+    let env = match encoder {
+        Encoder::Cpu => return max_kbps.clamp(500, 8000),
+        Encoder::Vaapi => "UU_VAAPI_BUFFER_MS",
+        Encoder::Nvenc => "UU_NVENC_BUFFER_MS",
+    };
+    let requested = std::env::var(env).ok();
+    buffer_ms_kbits(max_kbps, requested.as_deref()).unwrap_or((max_kbps / 8).clamp(100, 500))
 }
 
-/// Opt-in VAAPI VBV buffer: `码率上限 × 毫秒 / 1000` for `UU_VAAPI_BUFFER_MS` in 10-1000 ms.
-/// The 100-500 kbit default is sized for NVENC; VAAPI quantizes a whole desktop keyframe when
-/// the buffer is that small, which reads as a blur that sharpens over each GOP (#42).
+/// Opt-in hardware VBV buffer: `码率上限 × 毫秒 / 1000` for `UU_VAAPI_BUFFER_MS` /
+/// `UU_NVENC_BUFFER_MS` in 10-1000 ms. With the 100-500 kbit default the encoder quantizes a
+/// whole desktop keyframe, which reads as a blur that sharpens over each GOP (#42 VAAPI, #103 NVENC).
 /// Unset, out of range or unparsable values keep the default buffer.
-fn vaapi_buffer_kbits(max_kbps: u32, value: Option<&str>) -> Option<u32> {
+fn buffer_ms_kbits(max_kbps: u32, value: Option<&str>) -> Option<u32> {
     let ms = value?.trim().parse::<u32>().ok().filter(|ms| (10..=1000).contains(ms))?;
     Some((max_kbps.saturating_mul(ms) / 1000).max(1))
 }
@@ -579,13 +810,17 @@ fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
 }
 
 async fn read_encoder_with(
-    size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,encoder:Encoder,sequence:Arc<std::sync::atomic::AtomicU64>,
+    size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,encoder:Encoder,
+    #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] allow_inproc: bool,sequence:Arc<std::sync::atomic::AtomicU64>,
     settings: VideoSettings, #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+    selection: crate::video_select::Selection,
 )->Result<(),String>{
-    let selected_output=if display.starts_with("wayland:") {crate::wayland::source(settings.source_id)} else {None};
+    let selected_output=crate::wayland::capture_source(&display,portal.is_some(),settings.source_id);
     let size=selected_output.map_or(size,|s|(s.width,s.height));
     let kms=display.starts_with("kms:");
     let wayland=kms || display.starts_with("wayland:");
+    // X11 multi-screen: x11grab reads only the selected monitor's region of the root.
+    let x11_region=selected_output.filter(|_|!wayland);
     let (permits_tx,mut permits_rx)=mpsc::channel::<OwnedSemaphorePermit>(4);
     let kms_capture=if kms {
         let capture=tokio::task::spawn_blocking(crate::kms::Capture::open).await.map_err(|_|"KMS worker failed")??;
@@ -593,17 +828,18 @@ async fn read_encoder_with(
         Some(Arc::new(capture))
     } else { None };
     #[cfg(feature = "inproc-av")]
-    if !wayland && portal.is_none() && crate::inproc_encoder::selected() {
+    if allow_inproc && x11_region.is_none() && native_inproc(&display, portal.is_some(), encoder) {
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
             gop: gop_frames(settings.fps, true) as u32, cq: settings.cq() as u32,
             target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
-            max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, encoder, codec: settings.codec,
-            damage: crate::inproc_encoder::damage_enabled(),
+            max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec, chroma: settings.chroma,
+            vaapi: encoder == Encoder::Vaapi,
         };
-        log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} pipeline=in-process",
-            display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec));
+        log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} source={} pipeline=in-process",
+            display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec),
+            crate::video_select::encoder_source_label(selection.encoder_source));
         return read_inprocess(config, latest, sequence, idr, budget).await;
     }
     let source_size = size;
@@ -615,7 +851,7 @@ async fn read_encoder_with(
     let cq = settings.cq().to_string();
     // x11grab delivers bgr0; the Wayland/portal/KMS pipe is bgra.
     let rgb = nvenc_rgb_input(&settings, encoder, if wayland { "bgra" } else { "bgr0" });
-    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} pix_fmt={} low_latency=true",display,size,settings.output,settings.fps,cq,maxrate,encoder.name_for(settings.codec),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
+    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.fps,cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(selection.encoder_source),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
     // A bundled FFmpeg prefix (config ffmpeg_root / UU_FFMPEG_ROOT) or `ffmpeg` on PATH.
     let ffmpeg = ffmpeg_spec();
     let mut command = ffmpeg.command();
@@ -626,8 +862,9 @@ async fn read_encoder_with(
             "-framerate",&fps,"-i","pipe:0","-an"]);
     } else {
         // The viewer draws its local pointer; do not bake a second into video.
+        let input=x11_region.map_or_else(||display.clone(),|o|format!("{display}+{},{}",o.x,o.y));
         command.args(["-f","x11grab","-draw_mouse","0","-framerate",&fps,
-            "-video_size",&size,"-i",&display,"-an"]);
+            "-video_size",&size,"-i",&input,"-an"]);
     }
     // 其他分辨率: scale the captured desktop (the host display mode is left untouched).
     command.args(scale_options(&settings, encoder, Some(source_size)));
@@ -767,7 +1004,9 @@ pub(crate) fn transport_closed(pc: &RTCPeerConnection) -> bool {
         || pc.sctp().state() == webrtc::sctp_transport::sctp_transport_state::RTCSctpTransportState::Closed
 }
 
-fn probe_settings() -> Result<VideoSettings,String> {
+/// Encoder and settings for `desktop-video-probe` / `UU_PROBE_INPUT`.
+/// `UU_PROBE_CHROMA=444` is the viewer's 真彩 request, applied when the selected encoder can do 4:4:4.
+pub(crate) fn probe_plan() -> Result<(crate::video_select::Selection, VideoSettings), String> {
     let fps=crate::wayland::capture_fps(std::env::var("UU_PROBE_FPS").ok().as_deref())?;
     // UU_PROBE_QUALITY selects a viewer preset (1 fast 1M, 2 general 2M, 3 HD 8M, 4 bluray 20M,
     // 5 auto); bitrate presets exercise the capped/ABR encoder path instead of CRF.
@@ -775,16 +1014,15 @@ fn probe_settings() -> Result<VideoSettings,String> {
         None=>crate::capture_setting::QUALITY_AUTO,
         Some(v)=>v.parse::<u64>().ok().filter(|q|(1..=5).contains(q)).ok_or("UU_PROBE_QUALITY must be 1-5")?,
     };
-    Ok(VideoSettings {fps,quality,codec:probe_codec(),..VideoSettings::default()})
-}
-
-/// The probe follows `UU_VIDEO_CODEC` so the HEVC path can be measured at all (H.264 otherwise),
-/// and its first access unit is then checked against that codec instead of always H.264.
-fn probe_codec() -> VideoCodec {
-    match std::env::var("UU_VIDEO_CODEC").ok().as_deref().map(str::to_ascii_lowercase).as_deref() {
-        Some("h265") | Some("hevc") => VideoCodec::H265,
+    let mut settings=VideoSettings {fps,quality,..VideoSettings::default()};
+    let selection = crate::video_select::selection();
+    let chroma = if std::env::var("UU_PROBE_CHROMA").as_deref()==Ok("444") { crate::capture_setting::CHROMA_444 } else { crate::capture_setting::CHROMA_420 };
+    settings.codec = match crate::video_select::codec_force(selection.codec_pref) {
+        Some("h265") => VideoCodec::H265,
         _ => VideoCodec::H264,
-    }
+    };
+    if chroma == crate::capture_setting::CHROMA_444 && full_chroma_for(selection.encoder) { settings.chroma = chroma; }
+    Ok((selection, settings))
 }
 
 fn probe_input_command(spec:&FfmpegSpec,input:&std::ffi::OsStr,loop_input:bool,settings:&VideoSettings,
@@ -819,13 +1057,14 @@ async fn probe_input_size(spec:&FfmpegSpec,input:&std::ffi::OsStr)->Result<(u32,
 
 /// Fixed input bypasses desktop initialization and always uses the FFmpeg process encoder.
 pub async fn probe_input(input:OsString,path:Option<String>)->Result<(),String> {
+    ensure_auto_probed().await;
     use std::io::Write;
-    let settings=probe_settings()?;
+    let (selection, settings)=probe_plan()?;
     let wanted:u64=std::env::var("UU_PROBE_FRAMES").ok().and_then(|v|v.parse().ok()).unwrap_or(5);
     if wanted==0 { return Err("Fixed-input UU_PROBE_FRAMES must be positive".into()); }
     let spec=ffmpeg_spec();
     let size=probe_input_size(&spec,&input).await?;
-    let encoder=Encoder::requested();
+    let encoder = selection.encoder;
     let (maxrate,_)=rate_args(&settings,encoder);
     let output=settings.output.unwrap_or(size);
     println!("Fixed input probe: source={}x{} output={}x{} fps={} cq={} maxrate={} encoder={}",
@@ -869,6 +1108,7 @@ pub async fn probe_input(input:OsString,path:Option<String>)->Result<(),String> 
 
 /// Exercise the real capture/encoder chain without UU auth or a network peer.
 pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,path:Option<String>)->Result<(),String> {
+    ensure_auto_probed().await;
     use std::io::Write;
     let mut file=match path {
         Some(path)=>Some(std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e|format!("Video probe file: {e}"))?),
@@ -876,8 +1116,8 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
     };
     let (tx,mut rx)=mpsc::channel(4);
     let sequence=Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let settings=probe_settings()?;
-    let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,settings,sequence,Arc::new(AtomicBool::new(false)),Arc::new(Semaphore::new(4)))));
+    let (selection, settings)=probe_plan()?;
+    let _reader=EncoderTask(tokio::spawn(read_encoder(size,display,portal,tx,settings,sequence,Arc::new(AtomicBool::new(false)),Arc::new(Semaphore::new(4)),selection)));
     let mut count=0;
     let mut bytes=0;
     // UU_PROBE_FRAMES lengthens the sample for baseline measurements; default is 5 frames.
@@ -895,8 +1135,26 @@ pub async fn probe(size:(u32,u32),display:String,portal:Option<Arc<crate::portal
     Ok(())
 }
 
+fn keep_stream_display_awake() {
+    #[cfg(test)]
+    let result = wake_tests::wake().unwrap_or_else(crate::capture::keep_display_awake);
+    #[cfg(not(test))]
+    let result = crate::capture::keep_display_awake();
+    // Waking the output is optional; a transient failure does not mean capture failed.
+    if result.is_err() { log::warn!("Display wake failed; continuing desktop stream and retrying next interval"); }
+}
+
+/// `sync_tx` receives a Message 25 payload when a live encoder switch changes the encoded chroma.
 pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
-    mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>) -> Result<(), String> {
+    settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
+    selection: crate::video_select::Selection, sync_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>) -> Result<(), String> {
+    stream_desktop_at(pc, track, size, display, portal, settings, applied, idr, selection, sync_tx, crate::video_select::reload_generation_value()).await
+}
+
+pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_track::VideoTrack>, mut size: (u32, u32), display: String, portal:Option<Arc<crate::portal::PortalSession>>,
+    mut settings: tokio::sync::watch::Receiver<VideoSettings>, applied: Arc<tokio::sync::watch::Sender<VideoSettings>>, idr: Arc<AtomicBool>,
+    selection: crate::video_select::Selection, sync_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>, reload_at_session: u64) -> Result<(), String> {
+    let _desktop_mode = crate::desktop_mode::StreamGuard::new();
     loop {
         if transport_closed(&pc) { return Ok(()); }
         if pc.connection_state() == RTCPeerConnectionState::Connected
@@ -905,7 +1163,7 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
     }
     // Portal power/idle policy belongs to its CONTROL-scoped supervisor,
     // including when video has no frames or the user locks manually.
-    if portal.is_none() { crate::capture::keep_display_awake()?; }
+    if portal.is_none() { keep_stream_display_awake(); }
     let portal_stream = portal.is_some();
     let (latest, mut receiver) = mpsc::channel(4);
     let budget=Arc::new(Semaphore::new(4));
@@ -916,7 +1174,26 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
         applied.send_replace(current);
         settings.borrow_and_update();
     }
-    let mut reader = EncoderTask(tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone(), budget.clone())));
+    // SIGUSR2 re-reads host_settings and restarts this encoder when the effective encoder changes.
+    // The negotiated codec stays; a codec-only change is logged and applied on the next connection.
+    let mut live_selection = selection;
+    let mut seen_codec_pref = selection.codec_pref;
+    let mut reload = crate::video_select::subscribe_reload();
+    // Only a SIGUSR2 since the session snapshot. A probe that finishes during setup is not a reload
+    // (sessions started before the probe keep the legacy encoder for their lifetime).
+    let mut reload_pending = crate::video_select::reload_since_session(reload_at_session, *reload.borrow());
+    let open = {
+        let display = display.clone();
+        let portal = portal.clone();
+        let latest = latest.clone();
+        let sequence = sequence.clone();
+        let idr = idr.clone();
+        let budget = budget.clone();
+        move |size: (u32, u32), selection: crate::video_select::Selection, settings: VideoSettings| {
+            read_encoder(size, display.clone(), portal.clone(), latest.clone(), settings, sequence.clone(), idr.clone(), budget.clone(), selection)
+        }
+    };
+    let mut reader = EncoderTask(tokio::spawn(open(size, live_selection, current)));
     let mut previous = None;
     let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
     let mut settings_open = true;
@@ -931,30 +1208,76 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
     let (mut window_frames, mut window_skipped) = (0u64, 0u64);
     let mut send_interrupted=false;
     'stream: loop {
+        if reload.has_changed().unwrap_or(false) || reload_pending {
+            reload_pending = false;
+            // Mark the watch seen. An unconsumed has_changed stays true and restarts every frame.
+            let _ = reload.borrow_and_update();
+            let fresh = crate::video_select::selection();
+            let plan = crate::video_select::plan_switch(live_selection.encoder, seen_codec_pref, &fresh, current.chroma);
+            if let Some(plan) = plan.filter(|plan| plan.encoder.is_some()) {
+                    let encoder = plan.encoder.unwrap();
+                    let chroma = if plan.chroma_downgraded { "420" } else if current.chroma == crate::capture_setting::CHROMA_444 { "444" } else { "420" };
+                    log::info!("Encoder switch: {} -> {} reason={} chroma={chroma}",
+                        format!("{:?}", live_selection.encoder).to_ascii_lowercase(),
+                        format!("{encoder:?}").to_ascii_lowercase(),
+                        crate::video_select::encoder_source_label(fresh.encoder_source));
+                    live_selection.encoder = encoder;
+                    live_selection.encoder_source = fresh.encoder_source;
+                    seen_codec_pref = fresh.codec_pref;
+                    if plan.chroma_downgraded {
+                        applied.send_modify(|value| value.chroma = plan.chroma);
+                        current.chroma = plan.chroma;
+                        settings.borrow_and_update();
+                        if let Some(sync) = sync_tx.as_ref() {
+                            // Wayland: x11_resized is None, and the connection size can be a previous output.
+                            let native = x11_resized(&display, portal_stream, size).unwrap_or_else(|| crate::wayland::sync_native(&display, current.source_id, size));
+                            let payload = crate::capture_setting::sync_payload(&current, native);
+                            let _ = sync.send(payload);
+                        }
+                    }
+                    // In-process engines honor this on the first frame; the process pipeline starts on an IDR.
+                    idr.store(true, std::sync::atomic::Ordering::Relaxed);
+                    reader.restart(open(size, live_selection, current)).await;
+            } else if plan.is_some() {
+                    log::info!("Codec preference changed; takes effect the next time a desktop connection starts");
+                    seen_codec_pref = fresh.codec_pref;
+                    live_selection.codec_pref = fresh.codec_pref;
+                    live_selection.codec_source = fresh.codec_source;
+            }
+        }
         let next = *settings.borrow_and_update();
         if next != current || send_interrupted {
             let discard = next.codec != current.codec || next.source_generation != current.source_generation || next.source_id != current.source_id || send_interrupted;
             current = next;
             timeline.fps = u64::from(next.fps);
+            // A viewer resolution choice may have changed the X11 display mode (desktop_mode).
+            if let Some(resized) = x11_resized(&display, portal_stream, size) { size = resized; }
             if discard {
                 reader.0.abort();
                 let _ = (&mut reader.0).await;
                 while receiver.try_recv().is_ok() {}
-                reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone(), budget.clone()));
+                reader.0 = tokio::spawn(open(size, live_selection, next));
             } else {
-                reader.restart(read_encoder(size, display.clone(), portal.clone(), latest.clone(), next, sequence.clone(), idr.clone(), budget.clone())).await;
+                reader.restart(open(size, live_selection, next)).await;
             }
             send_interrupted=false;
         }
         tokio::select! {
             result = &mut reader.0 => {
                 let result = result.map_err(|e| format!("Encoder reader task: {e}"))?;
+                if let Some(resized) = result.as_ref().err().and_then(|_| x11_resized(&display, portal_stream, size)) {
+                    log::info!("Desktop geometry changed during the stream ({}x{} -> {}x{}); restarting capture", size.0, size.1, resized.0, resized.1);
+                    size = resized;
+                    while receiver.try_recv().is_ok() {}
+                    reader.0 = tokio::spawn(open(size, live_selection, current));
+                    continue;
+                }
                 if let (Err(error), VideoCodec::H265, true) = (&result, current.codec, track.supports(VideoCodec::H264)) {
                     log::warn!("HEVC stream failed ({error}); falling back to negotiated H264");
                     applied.send_modify(|value| value.codec = VideoCodec::H264);
                     current = *settings.borrow_and_update();
                     while receiver.try_recv().is_ok() {}
-                    reader.0 = tokio::spawn(read_encoder(size, display.clone(), portal.clone(), latest.clone(), current, sequence.clone(), idr.clone(), budget.clone()));
+                    reader.0 = tokio::spawn(open(size, live_selection, current));
                     continue;
                 }
                 if result.is_err() && !crate::wayland::outputs().is_empty() && !crate::wayland::input_ready() {
@@ -1009,8 +1332,10 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
                 previous = Some(frame.sequence);
                 max_send_ms=max_send_ms.max(send_started.elapsed().as_millis());
                 frames += 1;
+                #[cfg(test)]
+                if wake_tests::active() { stats = Instant::now() - Duration::from_secs(30); }
                 if stats.elapsed() >= Duration::from_secs(30) {
-                    if !portal_stream { crate::capture::keep_display_awake()?; }
+                    if !portal_stream { keep_stream_display_awake(); }
                     log::info!("Desktop latest-frame stats: sent={} skipped={} latest_seq={} window_s={} window_sent={} window_skipped={} max_slot_age_ms={} max_send_ms={}",
                         frames, skipped, frame.sequence, stats.elapsed().as_secs(), frames - window_frames, skipped - window_skipped, max_age_ms, max_send_ms);
                     (window_frames, window_skipped) = (frames, skipped);
@@ -1025,6 +1350,28 @@ pub async fn stream_desktop(pc: Arc<RTCPeerConnection>, track: Arc<crate::video_
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nvidia_display_is_detected_from_connected_connectors() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("uu-drm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let card = |n: &str, driver: &str, connector: &str, status: &str| {
+            std::fs::create_dir_all(root.join(format!("drivers/{driver}"))).unwrap();
+            std::fs::create_dir_all(root.join(format!("drm/{n}/device"))).unwrap();
+            let _ = symlink(root.join(format!("drivers/{driver}")), root.join(format!("drm/{n}/device/driver")));
+            std::fs::create_dir_all(root.join(format!("drm/{n}-{connector}"))).unwrap();
+            std::fs::write(root.join(format!("drm/{n}-{connector}/status")), format!("{status}\n")).unwrap();
+        };
+        let drm = root.join("drm");
+        card("card0", "i915", "HDMI-A-1", "connected");
+        card("card1", "nvidia", "DP-1", "disconnected");
+        assert!(!super::nvidia_drives_display(&drm), "iGPU drives the display");
+        card("card1", "nvidia", "DP-2", "connected");
+        assert!(super::nvidia_drives_display(&drm), "NVIDIA drives a display");
+        assert!(!super::nvidia_drives_display(&root.join("missing")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn native_frame_dimensions_are_padded_to_even() {
         // A scaled compositor can report an odd logical desktop (e.g. two stacked 150% monitors →
@@ -1146,6 +1493,26 @@ mod tests {
     }
 
     #[test]
+    fn native_unprobed_only_when_x11_inproc_is_eligible() {
+        use crate::video_select::{outcome_for_candidate, ProbeFail, ProbeOutcome};
+        let exit = ProbeOutcome::Fail(ProbeFail::Exit);
+        for kind in [NativeDisplayKind::Wayland, NativeDisplayKind::Portal, NativeDisplayKind::Kms, NativeDisplayKind::None] {
+            assert!(!native_engine_eligible(Encoder::Nvenc, kind), "{kind:?}");
+            assert_eq!(outcome_for_candidate(exit, native_engine_eligible(Encoder::Nvenc, kind)), exit);
+        }
+        assert!(!native_engine_eligible(Encoder::Cpu, NativeDisplayKind::X11));
+        let x11 = native_engine_eligible(Encoder::Nvenc, NativeDisplayKind::X11);
+        let stored = outcome_for_candidate(exit, x11);
+        if cfg!(feature = "inproc-av") && native_engine_eligible(Encoder::Nvenc, NativeDisplayKind::X11) {
+            assert!(x11);
+            assert_eq!(stored, ProbeOutcome::NativeUnprobed);
+        } else {
+            assert!(!x11);
+            assert_eq!(stored, exit);
+        }
+    }
+
+    #[test]
     fn timing_probe_failure_keeps_modern_args() {
         let modern = b"  -fps_mode mode\n  -enc_time_base ratio\n";
         // Legacy is only confirmed from a completed help dump that lacks the options.
@@ -1204,26 +1571,21 @@ mod tests {
     }
 
     #[test]
-    fn vaapi_buffer_env_is_opt_in_and_bounded() {
-        assert_eq!(vaapi_buffer_kbits(30_000, None), None);
-        assert_eq!(vaapi_buffer_kbits(30_000, Some("250")), Some(7500));
-        assert_eq!(vaapi_buffer_kbits(30_000, Some(" 10 ")), Some(300));
-        assert_eq!(vaapi_buffer_kbits(30_000, Some("1000")), Some(30_000));
+    fn hw_buffer_env_is_opt_in_and_bounded() {
+        assert_eq!(buffer_ms_kbits(30_000, None), None);
+        assert_eq!(buffer_ms_kbits(30_000, Some("250")), Some(7500));
+        assert_eq!(buffer_ms_kbits(30_000, Some(" 10 ")), Some(300));
+        assert_eq!(buffer_ms_kbits(30_000, Some("1000")), Some(30_000));
         // Out of the documented range, empty or unparsable keeps the default buffer.
         for value in ["", "9", "1001", "0", "abc", "-250", "250ms"] {
-            assert_eq!(vaapi_buffer_kbits(30_000, Some(value)), None, "{value}");
+            assert_eq!(buffer_ms_kbits(30_000, Some(value)), None, "{value}");
         }
         // A tiny cap must not produce a zero-sized buffer.
-        assert_eq!(vaapi_buffer_kbits(1, Some("10")), Some(1));
+        assert_eq!(buffer_ms_kbits(1, Some("10")), Some(1));
     }
 
     #[test]
     fn vaapi_is_explicit_and_upload_follows_scale() {
-        assert_eq!(Encoder::from_setting(None, true), Encoder::Nvenc);
-        assert_eq!(Encoder::from_setting(None, false), Encoder::Cpu);
-        assert_eq!(Encoder::from_setting(Some("nvenc"), false), Encoder::Nvenc);
-        assert_eq!(Encoder::from_setting(Some("cpu"), true), Encoder::Cpu);
-        assert_eq!(Encoder::from_setting(Some("vaapi"), true), Encoder::Vaapi);
         assert_eq!(vaapi_filter(None), "format=nv12,hwupload");
         assert_eq!(vaapi_filter(Some((1280,720))), "scale=1280:720:flags=bilinear,format=nv12,hwupload");
         let options = vaapi_options(&VideoSettings::default(), "30");
@@ -1353,7 +1715,25 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires installed FFmpeg with a working HEVC encoder"]
     async fn hevc_capability_probe_initializes_real_encoder() {
-        assert!(hevc_available().await);
+        assert!(hevc_available(crate::video_select::selection().encoder).await);
+    }
+    #[tokio::test]
+    async fn hevc_probe_cache_is_keyed_by_encoder_and_ffmpeg_spec() {
+        let cache = Mutex::new(HashMap::new());
+        let spec = FfmpegSpec { program: PathBuf::from("ffmpeg"), ld_library_path: None, path: None };
+        let other = FfmpegSpec { program: PathBuf::from("/opt/ffmpeg/bin/ffmpeg"), ld_library_path: None, path: None };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lookup = |spec: &FfmpegSpec, encoder: Encoder, result: bool| {
+            let cell = hevc_cell(&cache, spec, encoder);
+            let calls = calls.clone();
+            async move { *cell.get_or_init(|| async move { calls.fetch_add(1, Ordering::SeqCst); result }).await }
+        };
+        assert!(lookup(&spec, Encoder::Cpu, true).await);
+        assert!(lookup(&spec, Encoder::Cpu, false).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!lookup(&spec, Encoder::Nvenc, false).await);
+        assert!(lookup(&other, Encoder::Cpu, true).await);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
     #[test]
     fn hevc_annex_b_boundaries_and_irap_use_two_byte_headers() {

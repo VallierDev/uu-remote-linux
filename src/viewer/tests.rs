@@ -82,6 +82,8 @@ async fn complete_session_uses_loopback_signaling_and_virtual_rtc_through_echo()
                         for (action,number) in [(super::power::Action::Reboot,9),(super::power::Action::Shutdown,12)] {
                             if message.data.as_ref()==action.message(2).as_slice(){input_tx.send(json!({"power":number})).await.unwrap();return}
                         }
+                        // Desktop sessions also request the video track (RPC 15), like the official viewer.
+                        if message.data.as_ref()==wire::request_video_track().as_slice() {return}
                         assert_eq!(&message.data[..],&wire::echo_request(1));
                         let mut action=Vec::new();wire::int(1,1,&mut action);wire::bytes(2,br#"{"seq":1}"#,&mut action);
                         if let Some(channel)=weak.upgrade(){channel.send(&bytes::Bytes::from(wire::envelope(100,3,&action))).await.unwrap();}

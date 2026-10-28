@@ -159,8 +159,36 @@ static size_t symbols_close(const char *text) {
     }
     return 0;
 }
-/* Reusable codes for the separate text-only keyboard; the physical-key map stays unchanged. */
+/* Named keycodes the keymap gives no symbol to. Reading the compositor's own list is the only
+   portable way: pressing an unmapped keycode types nothing, and uu_wl_key never matches one
+   because it searches by keysym. Highest first, since uu_wl_key takes the lowest match. */
 static unsigned find_spare_codes(xkb_keycode_t *out,unsigned limit) {
+    unsigned count=0;
+    xkb_keycode_t min=xkb_keymap_min_keycode(keymap);
+    for(xkb_keycode_t code=xkb_keymap_max_keycode(keymap);code>min && count<limit;code--) {
+        if(code<8 || code>=sizeof(held_keys) || !xkb_keymap_key_get_name(keymap,code)) continue;
+        int mapped=0;
+        for(xkb_level_index_t level=0;level<xkb_keymap_num_levels_for_key(keymap,code,0) && !mapped;level++) {
+            const xkb_keysym_t *syms;
+            if(xkb_keymap_key_get_syms_by_level(keymap,code,0,level,&syms)>0) mapped=1;
+        }
+        if(!mapped) out[count++]=code;
+    }
+    return count;
+}
+/* A keycode the session keymap already produces this symbol with, unshifted. Typing through it
+   needs no upload, so no client can mistranslate it - and it is how plain latin text and spaces
+   arrive without touching the keymap at all. Spares never match: the pristine keymap leaves them
+   unmapped. */
+static xkb_keycode_t existing_keycode(xkb_keysym_t symbol) {
+    for(xkb_keycode_t code=xkb_keymap_min_keycode(keymap);code<=xkb_keymap_max_keycode(keymap);code++) {
+        if(code<8 || code>=sizeof(held_keys)) continue;
+        const xkb_keysym_t *syms;
+        if(xkb_keymap_key_get_syms_by_level(keymap,code,0,0,&syms)==1 && syms[0]==symbol) return code;
+    }
+    return 0;
+}
+static unsigned find_niri_text_codes(xkb_keycode_t *out,unsigned limit) {
     /* Printable physical keys work in Chromium; reserved evdev codes can be discarded. */
     static const xkb_keycode_t text_codes[]={24,25,26,27,28,29,30,31,32,33,38,39,40,41,42,43,44,45,46,52,53,54,55,56,57,58};
     unsigned count=0;
@@ -188,10 +216,8 @@ static void release_held_keys_locked(void) {
    key_state and held_keys: pressed and released here. */
 static int flush_batch(char *buffer,size_t capacity,const char names[][64],const xkb_keycode_t *codes,unsigned count,int *typed) {
     release_held_keys_locked();
-    if(sync_display()!=0) return -1;
-    usleep(8000);
-    /* niri activates changed maps on modifiers; do not detach its active device. */
-    if(!getenv("NIRI_SOCKET") && rekey_keyboard()!=0) return -1;
+    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
+    else if(rekey_keyboard()!=0) return -1;
     size_t at=keymap_insert;
     memcpy(buffer,keymap_text,at);
     for(unsigned i=0;i<count;i++) {
@@ -201,15 +227,16 @@ static int flush_batch(char *buffer,size_t capacity,const char names[][64],const
     }
     memcpy(buffer+at,keymap_text+keymap_insert,keymap_text_len-keymap_insert);
     if(upload_keymap(buffer,at+(keymap_text_len-keymap_insert))!=0) return -1;
-    zwp_virtual_keyboard_v1_modifiers(keyboard,0,0,0,0);
+    if(getenv("NIRI_SOCKET")) zwp_virtual_keyboard_v1_modifiers(keyboard,0,0,0,0);
     if(sync_display()!=0) return -1;
-    usleep(8000);
+    if(getenv("NIRI_SOCKET")) usleep(8000);
     for(unsigned i=0;i<count;i++) { press_keycode(codes[i]); (*typed)++; }
-    if(sync_display()!=0) return -1;
-    usleep(8000);
+    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
     return 0;
 }
-/* Map each UTF-8 batch onto printable physical codes on the text-only keyboard. */
+/* Type UTF-8 like xdotool type does on X11, but on Wayland: characters the session keymap already
+   has go out as ordinary keycodes, the rest share the spares of one keymap upload (~70 KB, so one
+   batch per upload), in text order. Never logs the text. */
 static int type_utf8_locked(const char *text) {
     size_t capacity=keymap_text_len+(size_t)UU_TEXT_SPARE*96+64;
     char *buffer=malloc(capacity);
@@ -233,7 +260,14 @@ static int type_utf8_locked(const char *text) {
         else if(cp<0x20 || cp==0x7f || (cp>=0x80 && cp<0xa0)) continue; /* controls carry no text */
         else if(cp<0x100) sym=cp;                                      /* Latin-1 keysyms equal the code point */
         else sym=(xkb_keysym_t)(0x1000000|cp);                         /* Unicode keysym */
-        if(count==spare_count) {
+        xkb_keycode_t existing=getenv("NIRI_SOCKET")?0:existing_keycode(sym);
+        if(existing) {
+            if(count && flush_batch(buffer,capacity,names,codes,count,&typed)!=0) { failed=1; break; }
+            count=0;
+            press_keycode(existing); typed++;
+            continue;
+        }
+        if(count==(getenv("NIRI_SOCKET")?spare_count:UU_TEXT_SPARE)) {
             if(flush_batch(buffer,capacity,names,codes,count,&typed)!=0) { failed=1; break; }
             count=0;
         }
@@ -244,25 +278,28 @@ static int type_utf8_locked(const char *text) {
     }
     if(!failed && count) failed=flush_batch(buffer,capacity,names,codes,count,&typed)!=0;
     free(buffer);
-    if(sync_display()!=0) return -1;
-    usleep(8000);
+    /* Restore the pristine keymap whatever happened above, so uu_wl_key keeps its own symbol map. */
+    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
+    else if(upload_keymap(keymap_text,keymap_text_len)!=0) return -1;
     return failed && !typed?-1:typed;
 }
 int uu_wl_type_utf8(const char *text) {
     pthread_mutex_lock(&lock);
     int typed=-1;
     if(initialized && text && keymap_text && keymap_insert && spare_count) {
-        /* Text has its own device: remapping printable codes must not change physical-key input. */
-        release_held_keys_locked();
-        struct zwp_virtual_keyboard_v1 *saved=keyboard;
-        keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
-        if(keyboard) {typed=type_utf8_locked(text);sync_display();usleep(8000);if(keyboard) zwp_virtual_keyboard_v1_destroy(keyboard);}
-        keyboard=saved;
+        if(getenv("NIRI_SOCKET")) {
+            /* Only niri uses printable codes on a separate text device; preserve the Hyprland path. */
+            release_held_keys_locked();
+            struct zwp_virtual_keyboard_v1 *saved=keyboard;
+            keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
+            if(keyboard) {typed=type_utf8_locked(text);sync_display();usleep(8000);if(keyboard) zwp_virtual_keyboard_v1_destroy(keyboard);}
+            keyboard=saved;
+        } else typed=type_utf8_locked(text);
     }
     if(typed>=0 && wl_display_flush(display)<0) typed=-1;
     pthread_mutex_unlock(&lock); return typed;
 }
-/* Diagnostic: how many characters one text keymap upload can carry. */
+/* Diagnostic: how many characters one keymap upload can carry, 0 when this keymap has no spare. */
 int uu_wl_text_ready(void) {
     pthread_mutex_lock(&lock);
     int ready=initialized && keymap_text && keymap_insert ? (int)spare_count : 0;
@@ -521,13 +558,16 @@ int uu_wl_init(int32_t *w,int32_t *h) {
     wl_registry_add_listener(registry,&registry_listener,NULL);
     if(sync_display()!=0 || sync_display()!=0) goto end;
     dma_init();
-    if(!shm || !seat || !copy_manager || !pointer_manager || !keyboard_manager || !output_count) goto end;
+    /* wlr-virtual-pointer is an optional input path. When the compositor does not
+       advertise it, pointer injection is skipped and the caller may drive input
+       through uinput; screencopy + virtual keyboard are still enough to capture. */
+    if(!shm || !seat || !copy_manager || !output_count) goto end;
     const char *name=getenv("UU_WAYLAND_OUTPUT"); selected=0;
     if(name && *name) {
         for(selected=0;selected<output_count;selected++) if(!strcmp(outputs[selected].name,name)) break;
         if(selected==output_count) goto end;
     }
-    if(outputs[selected].transform>WL_OUTPUT_TRANSFORM_270) goto end;
+    if(!uu_output_transform_supported(outputs[selected].transform,getenv("NIRI_SOCKET")!=NULL)) goto end;
     width=outputs[selected].width; height=outputs[selected].height;
     if(outputs[selected].transform&1) {uint32_t t=width;width=height;height=t;}
     if(!width || !height || width>16384 || height>16384 || (uint64_t)width*height*4>256*1024*1024) goto end;
@@ -535,23 +575,30 @@ int uu_wl_init(int32_t *w,int32_t *h) {
         power=zwlr_output_power_manager_v1_get_output_power(power_manager,outputs[selected].handle);
         zwlr_output_power_v1_add_listener(power,&power_listener,NULL);
     }
-    pointer=zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(pointer_manager,seat,outputs[selected].handle);
-    keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
-    xkb=xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    if(!xkb) goto end;
-    struct xkb_rule_names names={.layout="us"};
-    keymap=xkb_keymap_new_from_names(xkb,&names,XKB_KEYMAP_COMPILE_NO_FLAGS);
-    if(!keymap) goto end;
-    key_state=xkb_state_new(keymap); if(!key_state) goto end;
-    keymap_text=xkb_keymap_get_as_string(keymap,XKB_KEYMAP_FORMAT_TEXT_V1);
-    if(!keymap_text) goto end;
-    keymap_text_len=strlen(keymap_text)+1;
-    if(upload_keymap(keymap_text,keymap_text_len)!=0) goto end;
-    if(sync_display()!=0) goto end;
-    /* Text typing needs unmapped keycodes and a place to declare them. A keymap without either
-       only costs that path - uu_wl_type_utf8 refuses and the caller keeps its own fallback. */
-    keymap_insert=symbols_close(keymap_text);
-    spare_count=find_spare_codes(spare_codes,sizeof(spare_codes)/sizeof(spare_codes[0]));
+    if(pointer_manager) pointer=zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(pointer_manager,seat,outputs[selected].handle);
+    /* Some compositors reject a virtual keyboard from anything that is not their active
+       input method (Denial does), and a rejected proxy poisons later requests. Allow the
+       caller to opt out and rely on uinput for key input instead. */
+    const char *skip_kbd=getenv("UU_WAYLAND_NO_VIRTUAL_KEYBOARD");
+    if(keyboard_manager && !(skip_kbd && *skip_kbd && strcmp(skip_kbd,"0")))
+        keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
+    if(keyboard) {
+        xkb=xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+        if(!xkb) goto end;
+        struct xkb_rule_names names={.layout="us"};
+        keymap=xkb_keymap_new_from_names(xkb,&names,XKB_KEYMAP_COMPILE_NO_FLAGS);
+        if(!keymap) goto end;
+        key_state=xkb_state_new(keymap); if(!key_state) goto end;
+        keymap_text=xkb_keymap_get_as_string(keymap,XKB_KEYMAP_FORMAT_TEXT_V1);
+        if(!keymap_text) goto end;
+        keymap_text_len=strlen(keymap_text)+1;
+        if(upload_keymap(keymap_text,keymap_text_len)!=0) goto end;
+        if(sync_display()!=0) goto end;
+        /* Text typing needs unmapped keycodes and a place to declare them. A keymap without either
+           only costs that path - uu_wl_type_utf8 refuses and the caller keeps its own fallback. */
+        keymap_insert=symbols_close(keymap_text);
+        spare_count=getenv("NIRI_SOCKET")?find_niri_text_codes(spare_codes,UU_TEXT_SPARE):find_spare_codes(spare_codes,UU_TEXT_SPARE);
+    }
     initialized=1; *w=width; *h=height; result=0;
 end:
     if(result!=0) reset();
@@ -564,13 +611,16 @@ int uu_wl_select_output(const char *name,uint32_t expected_w,uint32_t expected_h
     if(!initialized || !name || sync_display()!=0) goto end;
     unsigned target;
     for(target=0;target<output_count;target++) if(!strcmp(outputs[target].name,name)) break;
-    if(target==output_count || outputs[target].transform>WL_OUTPUT_TRANSFORM_270) goto end;
+    if(target==output_count || !uu_output_transform_supported(outputs[target].transform,getenv("NIRI_SOCKET")!=NULL)) goto end;
     uint32_t w=outputs[target].width,h=outputs[target].height;
     if(outputs[target].transform&1) {uint32_t t=w;w=h;h=t;}
     if(w!=expected_w || h!=expected_h || !w || !h || w>16384 || h>16384 || (uint64_t)w*h*4>256*1024*1024) goto end;
-    struct zwlr_virtual_pointer_v1 *next=zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(pointer_manager,seat,outputs[target].handle);
-    if(!next) goto end;
-    if(sync_display()!=0) {zwlr_virtual_pointer_v1_destroy(next);goto end;}
+    struct zwlr_virtual_pointer_v1 *next=NULL;
+    if(pointer_manager) {
+        next=zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(pointer_manager,seat,outputs[target].handle);
+        if(!next) goto end;
+        if(sync_display()!=0) {zwlr_virtual_pointer_v1_destroy(next);goto end;}
+    }
     for(unsigned i=0;i<2;i++) { frame_clear(&frames[i]); dma_clear(&frames[i]); shm_clear(&frames[i]); }
     pending=0;
     if(pointer) zwlr_virtual_pointer_v1_destroy(pointer);
@@ -652,6 +702,8 @@ end:
 }
 int uu_wl_move(int32_t x,int32_t y,int relative) {
     pthread_mutex_lock(&lock); int result=-1;
+    /* -2: no virtual pointer at all, so the caller may use uinput; -1 stays a real failure. */
+    if(initialized && !pointer) { result=-2; goto end; }
     if(initialized) {
         if(relative) {
             /* UU reports pixels (source DPR=1); Wayland motion is in logical points. */
@@ -660,8 +712,9 @@ int uu_wl_move(int32_t x,int32_t y,int relative) {
         }
         else if(x>=0 && y>=0 && x<(int32_t)width && y<(int32_t)height) {
             uint32_t sx,sy,sw=outputs[selected].width,sh=outputs[selected].height;
-            /* Compositors apply the output transform to absolute device coordinates. */
-            uu_source_pixel(outputs[selected].transform,sw,sh,x,y,&sx,&sy);
+            /* niri/Smithay applies the output transform to absolute device coordinates. */
+            if(getenv("NIRI_SOCKET")) uu_source_pixel(outputs[selected].transform,sw,sh,x,y,&sx,&sy);
+            else {sx=x;sy=y;sw=width;sh=height;}
             zwlr_virtual_pointer_v1_motion_absolute(pointer,timestamp(),sx,sy,sw,sh);
         }
         else goto end;
@@ -671,6 +724,7 @@ end: pthread_mutex_unlock(&lock); return result;
 }
 int uu_wl_button(int button,int pressed) {
     pthread_mutex_lock(&lock); int result=-1;
+    if(initialized && !pointer) { goto end; } /* no virtual pointer: report failure so the caller falls back to uinput */
     if(initialized) {
         if(button>=4 && button<=7) {
             if(pressed) {
@@ -690,6 +744,7 @@ end: pthread_mutex_unlock(&lock); return result;
 }
 int uu_wl_key(uint64_t symbol,int pressed) {
     pthread_mutex_lock(&lock); int result=-1;
+    if(initialized && !keyboard) { pthread_mutex_unlock(&lock); return -1; } /* no virtual keyboard: caller falls back to uinput */
     if(initialized) {
         for(xkb_keycode_t code=xkb_keymap_min_keycode(keymap);code<=xkb_keymap_max_keycode(keymap);code++) {
             int matches=0;
@@ -720,20 +775,24 @@ int uu_wl_release_all(void) {
     if(initialized) {
         /* Sweep this client's virtual keyboard directly: a keysym lookup can
            fail for unmapped OEM/keypad symbols before reaching held modifiers. */
-        for(xkb_keycode_t code=xkb_keymap_min_keycode(keymap);code<=xkb_keymap_max_keycode(keymap);code++) {
-            if(code<8 || code>=sizeof(held_keys) || !xkb_keymap_key_get_name(keymap,code)) continue;
-            zwp_virtual_keyboard_v1_key(keyboard,timestamp(),code-8,WL_KEYBOARD_KEY_STATE_RELEASED);
-            if(held_keys[code]) xkb_state_update_key(key_state,code,XKB_KEY_UP);
+        if(keyboard) {
+            for(xkb_keycode_t code=xkb_keymap_min_keycode(keymap);code<=xkb_keymap_max_keycode(keymap);code++) {
+                if(code<8 || code>=sizeof(held_keys) || !xkb_keymap_key_get_name(keymap,code)) continue;
+                zwp_virtual_keyboard_v1_key(keyboard,timestamp(),code-8,WL_KEYBOARD_KEY_STATE_RELEASED);
+                if(held_keys[code]) xkb_state_update_key(key_state,code,XKB_KEY_UP);
+            }
+            zwp_virtual_keyboard_v1_modifiers(keyboard,
+                xkb_state_serialize_mods(key_state,XKB_STATE_MODS_DEPRESSED),
+                xkb_state_serialize_mods(key_state,XKB_STATE_MODS_LATCHED),
+                xkb_state_serialize_mods(key_state,XKB_STATE_MODS_LOCKED),
+                xkb_state_serialize_layout(key_state,XKB_STATE_LAYOUT_EFFECTIVE));
         }
         memset(held_keys,0,sizeof(held_keys));
-        zwp_virtual_keyboard_v1_modifiers(keyboard,
-            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_DEPRESSED),
-            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_LATCHED),
-            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_LOCKED),
-            xkb_state_serialize_layout(key_state,XKB_STATE_LAYOUT_EFFECTIVE));
-        for(unsigned code=0x110;code<=0x114;code++)
-            zwlr_virtual_pointer_v1_button(pointer,timestamp(),code,WL_POINTER_BUTTON_STATE_RELEASED);
-        zwlr_virtual_pointer_v1_frame(pointer);
+        if(pointer) {
+            for(unsigned code=0x110;code<=0x114;code++)
+                zwlr_virtual_pointer_v1_button(pointer,timestamp(),code,WL_POINTER_BUTTON_STATE_RELEASED);
+            zwlr_virtual_pointer_v1_frame(pointer);
+        }
         result=wl_display_flush(display)<0?-1:0;
     }
     pthread_mutex_unlock(&lock);return result;

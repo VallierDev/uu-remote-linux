@@ -1,10 +1,12 @@
 //! UU Remote Pure Native Linux Server (Rust Edition)
 //! Zero-Wine, Zero-Python, Single-Binary, 5 Native Tools Integrated
 
+mod ws_transport;
 mod engine_plugin;
 mod doctor;
 mod wol;
 mod desktop_backend;
+mod desktop_mode;
 mod desktop_session;
 mod desktop_power;
 mod portal;
@@ -29,6 +31,7 @@ mod signaling;
 mod terminal;
 mod webrtc;
 mod video;
+mod video_select;
 mod video_track;
 mod locked_video;
 #[cfg(test)]
@@ -70,6 +73,14 @@ static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 fn superseded_peer_ids(sessions: &HashMap<String, WebRtcSession>, ice: &str, desktop: bool) -> Vec<String> {
     sessions.iter().filter(|(id, peer)| id.as_str() == ice || (desktop && peer.desktop))
         .map(|(id, _)| id.clone()).collect()
+}
+
+/// A peer whose transport is already broken can leave `PeerConnection::close`
+/// waiting indefinitely; signaling must keep flowing without it.
+async fn close_peer(pc: &::webrtc::peer_connection::RTCPeerConnection) {
+    if tokio::time::timeout(std::time::Duration::from_secs(5), pc.close()).await.is_err() {
+        log::warn!("Peer connection close timed out; continuing");
+    }
 }
 fn released_peer_ids<T>(sessions: &HashMap<String, T>, ice: Option<&serde_json::Value>) -> Vec<String> {
     let ice = ice.map(|id| id.as_str().map(str::to_owned).unwrap_or_else(|| id.to_string()));
@@ -126,12 +137,179 @@ fn systemd_unit() -> Option<String> {
     cgroup.lines().find_map(|l| l.rsplit('/').next().filter(|u| u.ends_with(".service")).map(str::to_owned))
 }
 fn display_present() -> bool { std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() }
+
+fn set_video_pref() -> Result<(), Box<dyn std::error::Error>> {
+    let which = std::env::args().nth(1).unwrap_or_default();
+    let stored = std::env::args().nth(2).unwrap_or_default().trim().to_ascii_lowercase();
+    let stored = if stored == "hevc" { "h265".to_owned() } else { stored };
+    if let Err(e) = system_actions::merge_save(|settings| {
+        if which == "set-encoder" { settings.video_encoder = Some(stored.clone()); }
+        else { settings.video_codec = Some(stored.clone()); }
+    }) {
+        // Exit 2 is reserved for bad CLI input; a settings file that cannot be merged is exit 1.
+        eprintln!("{which}: {e}");
+        std::process::exit(1);
+    }
+    let selection = video_select::selection();
+    let codec = match selection.codec_pref { video_select::CodecPref::Auto => "auto", video_select::CodecPref::H264 => "h264", video_select::CodecPref::H265 => "h265" };
+    println!("encoder={:?} source={} codec_pref={codec} source={}", selection.encoder, video_select::encoder_source_label(selection.encoder_source), video_select::source_label(selection.codec_source));
+    // Both subcommands wake the host. Encoder changes restart live desktop streams; codec changes are logged only.
+    match notify_host(libc::SIGUSR2) {
+        Ok(()) => println!("notified the running host"),
+        Err(_) => println!(
+            "host not running, or the running host is not this binary: takes effect the next time a desktop connection starts, or after restarting the service"
+        ),
+    }
+    if which == "set-codec" {
+        println!("takes effect the next time a desktop connection starts");
+    }
+    Ok(())
+}
+
+/// Signal the host recorded in host.pid only when `/proc/<pid>/exe` is exactly
+/// `canonicalize(current_exe())`. A filename match is not enough: an older host
+/// has no SIGUSR2 handler, and the default action terminates the process.
+/// A replaced binary reads back as `… (deleted)` and does not match.
+fn notify_host(signal: i32) -> Result<(), ()> {
+    let pid = std::fs::read_to_string(host_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .filter(|p| *p > 1)
+        .ok_or(())?;
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|_| ())?;
+    let own = std::fs::canonicalize(std::env::current_exe().map_err(|_| ())?).map_err(|_| ())?;
+    if !same_host_binary(&exe, &own) {
+        return Err(());
+    }
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// `/proc/<pid>/exe` must equal the canonical path of this binary. A trailing ` (deleted)` does not match.
+fn same_host_binary(proc_exe: &std::path::Path, own: &std::path::Path) -> bool {
+    proc_exe == own
+}
+
+/// Explicit command words for set-encoder / set-codec. Empty and whitespace are illegal.
+pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() { return false; }
+    let value = value.to_ascii_lowercase();
+    match which {
+        "set-encoder" => matches!(value.as_str(), "auto" | "cpu" | "vaapi" | "nvenc"),
+        "set-codec" => matches!(value.as_str(), "auto" | "h264" | "h265" | "hevc"),
+        _ => false,
+    }
+}
+
+const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+    "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
+
+/// Unknown arguments and illegal set-encoder / set-codec values exit 2 (never start a second host).
+/// help / -h / --help exit 0 so main prints usage instead of starting the host.
+pub(crate) fn reject_cli(arg: Option<&str>, argc: usize, value_ok: bool) -> Option<i32> {
+    if matches!(arg, Some("help" | "-h" | "--help")) { return Some(0); }
+    if arg.is_some_and(|a| !SUBCOMMANDS.contains(&a)) { return Some(2); }
+    if matches!(arg, Some("set-encoder" | "set-codec")) && (argc != 3 || !value_ok) { return Some(2); }
+    None
+}
+
+#[cfg(test)]
+mod cli_exit_tests {
+    #[test]
+    fn unknown_and_illegal_subcommand_exit_2() {
+        assert_eq!(super::reject_cli(Some("not-a-command"), 2, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 3, false), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 2, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-codec"), 4, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 3, true), None);
+        assert_eq!(super::reject_cli(Some("set-codec"), 3, true), None);
+        assert_eq!(super::reject_cli(Some("help"), 2, true), Some(0));
+        assert_eq!(super::reject_cli(Some("-h"), 2, true), Some(0));
+        assert_eq!(super::reject_cli(Some("--help"), 2, true), Some(0));
+        assert_eq!(super::reject_cli(None, 1, true), None);
+        assert!(!super::cli_pref_ok("set-encoder", ""));
+        assert!(!super::cli_pref_ok("set-encoder", "   "));
+        assert!(!super::cli_pref_ok("set-codec", ""));
+        assert!(!super::cli_pref_ok("set-codec", "\t"));
+        assert!(!super::cli_pref_ok("set-encoder", "bogus"));
+        assert!(super::cli_pref_ok("set-encoder", " NVENC "));
+        assert!(super::cli_pref_ok("set-codec", "hevc"));
+        assert_eq!(super::reject_cli(Some("set-encoder"), 3, super::cli_pref_ok("set-encoder", "")), Some(2));
+        assert_eq!(super::reject_cli(Some("set-codec"), 3, super::cli_pref_ok("set-codec", "  ")), Some(2));
+    }
+
+    /// SIGUSR1 and SIGUSR2 are installed with no assist UI. `host.pid` is written only after both exist.
+    #[test]
+    fn signal_handlers_install_without_assist() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let _guard = crate::config::test_env_lock().lock().unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("uuremote-signal-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::env::set_var("UU_CONFIG", dir.join("config.json"));
+            assert!(super::install_host_signals(None));
+            let pid = std::fs::read_to_string(super::host_pid_path()).unwrap();
+            assert_eq!(pid.trim(), std::process::id().to_string());
+            std::env::remove_var("UU_CONFIG");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn sigusr2_requires_the_same_canonical_binary() {
+        let own = std::path::Path::new("/home/user/.local/bin/uuremote-server");
+        assert!(super::same_host_binary(own, own));
+        assert!(!super::same_host_binary(
+            std::path::Path::new("/tmp/unpack/uuremote-server"),
+            own
+        ));
+        assert!(!super::same_host_binary(
+            std::path::Path::new("/home/user/.local/bin/uuremote-server (deleted)"),
+            own
+        ));
+    }
+}
 /// SIGUSR1 (`uuremote-server show`) opens the host window.
-fn present_on_usr1(ui: std::sync::Arc<assist::LocalUi>) {
-    // Install the handler before publishing the pid: SIGUSR1's default action terminates the process.
-    let Ok(mut usr1) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) else { return };
+/// SIGUSR2 (set-encoder, set-codec, or `kill -USR2`) re-reads host_settings. Encoder changes switch live desktop streams; codec changes are logged for the next connection.
+/// The default action of either signal terminates the process, so both handlers are installed before `host.pid` is written.
+/// SIGUSR2 is independent of remote assistance: `UU_REMOTE_ASSIST=0` and a failed assist setup still switch live encoders.
+/// SIGUSR1 is installed first as a no-op so `show` cannot terminate a host that has no assist window yet.
+fn install_host_signals(ui: Option<std::sync::Arc<assist::LocalUi>>) -> bool {
+    static USR1: std::sync::Once = std::sync::Once::new();
+    static USR2: std::sync::Once = std::sync::Once::new();
+    let mut usr1_ok = true;
+    USR1.call_once(|| {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+            Ok(mut usr1) => { tokio::spawn(async move { while usr1.recv().await.is_some() {} }); }
+            Err(_) => usr1_ok = false,
+        }
+    });
+    if !usr1_ok { return false; }
+    let mut usr2_ok = true;
+    USR2.call_once(|| {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
+            Ok(mut usr2) => { tokio::spawn(async move { while usr2.recv().await.is_some() { crate::video_select::publish_reload(); } }); }
+            Err(_) => usr2_ok = false,
+        }
+    });
+    if !usr2_ok { return false; }
+    // Assist attaches later and replaces the no-op with the window. A second registration replaces the first.
+    if let Some(ui) = ui {
+        if let Ok(mut usr1) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+            tokio::spawn(async move { while usr1.recv().await.is_some() { ui.present(); } });
+        }
+    }
     write_host_pid();
-    tokio::spawn(async move { while usr1.recv().await.is_some() { ui.present(); } });
+    true
+}
+
+fn present_on_usr1(ui: std::sync::Arc<assist::LocalUi>) {
+    let _ = install_host_signals(Some(ui));
 }
 
 fn host_pid_path() -> std::path::PathBuf { config::path().with_file_name("host.pid") }
@@ -139,7 +317,9 @@ fn host_pid_path() -> std::path::PathBuf { config::path().with_file_name("host.p
 fn write_host_pid() {
     use std::os::unix::fs::OpenOptionsExt;
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(host_pid_path()) {
+    let path = host_pid_path();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path) {
         let _ = write!(f, "{}", std::process::id());
     }
 }
@@ -225,16 +405,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_module("uuremote_server", log::LevelFilter::Info).init();
     } else { env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init(); }
     // An unknown argument must never fall through to starting a second full host server.
-    const SUBCOMMANDS: [&str; 15] = ["doctor", "show", "assist", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
-        "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
-    if let Some(arg) = std::env::args().nth(1).filter(|a| !SUBCOMMANDS.contains(&a.as_str())) {
+    let arg1 = std::env::args().nth(1);
+    let value_ok = match arg1.as_deref() {
+        Some(which @ ("set-encoder" | "set-codec")) => cli_pref_ok(which, &std::env::args().nth(2).unwrap_or_default()),
+        _ => true,
+    };
+    if let Some(code) = reject_cli(arg1.as_deref(), std::env::args().len(), value_ok) {
         let usage = format!("usage: uuremote-server [{}]\n  (no argument: run the host)", SUBCOMMANDS.join(" | "));
-        if matches!(arg.as_str(), "help" | "-h" | "--help") { println!("{usage}"); return Ok(()); }
+        if code == 0 { println!("{usage}"); return Ok(()); }
         eprintln!("unknown argument\n{usage}");
-        std::process::exit(2);
+        std::process::exit(code);
     }
 
     if std::env::args().nth(1).as_deref() == Some("show") { return show_running_host(); }
+    if matches!(std::env::args().nth(1).as_deref(), Some("set-encoder") | Some("set-codec")) { return set_video_pref(); }
     if assist_enabled && !unified {
         if std::env::args().len() > 2 { return Err("assist accepts no additional arguments; configure it with a private UU_CONFIG".into()); }
         assist::configure()?;
@@ -446,6 +630,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     virtual_audio::init();
     let _audio_cleanup=virtual_audio::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
+    session_ice::configure_relay_transport();
+    // Before host.pid, and before assist: a missing or failed assist session must still handle SIGUSR2.
+    let _ = install_host_signals(None);
+    video::warm_auto_probe();
+    video::check_ffmpeg_usable();
 
     if !desktop_backend::headless() && desktop_backend::detect()? == desktop_backend::DesktopBackend::X11 && desktop_backend::wayland_session_running() {
         // X11 capture inside a Wayland session reads XWayland's root window: all black, no error (#61).
@@ -506,7 +695,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(task) = command_task { task.abort(); }
     // One exit path for commands, signals, transport failures and UI failures.
     if let Some(session) = assist.as_mut() { session.allowed = false; }
-    for (_, old) in webrtc_sessions.lock().await.drain() { let _ = old.pc.close().await; }
+    for (_, old) in webrtc_sessions.lock().await.drain() { close_peer(&old.pc).await; }
     virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
     // Switching identity (signed in / out) restarts at once and the new identity republishes the same
     // device share: logout already withdrew it, and after a QR login the cloud moved it to the account
@@ -558,6 +747,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
     let mut capture_types: HashMap<String, (u64,crate::session_ice::SessionIce)> = HashMap::new();
     let mut mac_by_ice: HashMap<String, bool> = HashMap::new();
     let mut next_mac = false;
+    // Tool peers ask here to become the desktop (capture_desktop on an existing connection, #99).
+    let (desktop_requests, mut desktop_requested) = mpsc::unbounded_channel::<String>();
 
     loop {
         if *shutdown.borrow() {
@@ -642,6 +833,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                 _ = shutdown.changed() => Some(SignalingEvent::Stop),
                 command = commands.recv(), if assist.is_some() => Some(SignalingEvent::AssistCommand(command.unwrap_or(assist::Command::Stop))),
                 _ = assist_tick.tick(), if assist.is_some() => Some(SignalingEvent::AssistTick),
+                Some(ice) = desktop_requested.recv() => Some(SignalingEvent::DesktopRequested(ice)),
                 event = rx_event.recv() => event,
             };
             let Some(evt) = event else { break; };
@@ -676,8 +868,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         ::webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed |
                         ::webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed)).map(|(id, _)| id.clone()).collect();
                     let mut desktop_ended = false;
-                    for id in ended { if let Some(s) = sessions.remove(&id) { desktop_ended |= s.desktop; let _ = s.pc.close().await; } }
-                    if desktop_ended && !sessions.values().any(|s| s.desktop) { if let Some(s) = assist.as_mut() { s.session_ended()?; } }
+                    for id in ended { if let Some(s) = sessions.remove(&id) { desktop_ended |= s.role.is_desktop(); close_peer(&s.pc).await; } }
+                    if desktop_ended && !sessions.values().any(|s| s.role.is_desktop()) { if let Some(s) = assist.as_mut() { s.session_ended()?; } }
                     if let Some(s) = assist.as_mut() { s.tick()?; }
                 }
                 SignalingEvent::Connected => {
@@ -764,8 +956,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         ::webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed |
                         ::webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Failed)).map(|(k, _)| k.clone()).collect();
                     let mut desktop_ended = false;
-                    for k in ended { if let Some(old) = sessions.remove(&k) { desktop_ended |= old.desktop; let _ = old.pc.close().await; } }
-                    if desktop_ended && !sessions.values().any(|s| s.desktop) { if let Some(s) = assist.as_mut() { s.session_ended()?; } }
+                    for k in ended { if let Some(old) = sessions.remove(&k) { desktop_ended |= old.role.is_desktop(); close_peer(&old.pc).await; } }
+                    if desktop_ended && !sessions.values().any(|s| s.role.is_desktop()) { if let Some(s) = assist.as_mut() { s.session_ended()?; } }
                     if let Some(s) = assist.as_mut() { s.tick()?; }
 
                     if soac.msg_type == "offer" {
@@ -775,16 +967,21 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         let controller_mac = mac_by_ice.remove(&ice).unwrap_or(next_mac);
                         if desktop { input.set_mac_controller(controller_mac); }
                         log::info!("Offer for connection: capture_type={} desktop={} active_peers={}", capture_type, desktop, sessions.len());
+                        // An expired NVENC failure is re-probed in the background. This offer keeps the cached encoder.
+                        if desktop { video::warm_auto_probe(); video::check_ffmpeg_usable(); }
                         // Replace only this ICE id or a previous desktop, never tool peers.
                         for id in superseded_peer_ids(&sessions, &ice, desktop) {
-                            if let Some(old) = sessions.remove(&id) { let _ = old.pc.close().await; }
+                            if let Some(old) = sessions.remove(&id) { close_peer(&old.pc).await; }
                         }
+                        // A tool peer promoted by capture_desktop stops its desktop but keeps its tools.
+                        if desktop { for old in sessions.values() { old.demote(); } }
                         if desktop && desktop_backend::headless() {
                             log::info!("Desktop connection ignored: headless mode (terminal, file transfer and port mapping remain available)");
                             continue;
                         }
                         let resized=desktop && capture.init_error.is_none() && capture.backend==desktop_backend::DesktopBackend::X11
-                            && tokio::task::spawn_blocking(crate::capture::x11_resized).await.unwrap_or(false);
+                            // Compare with this capture, not the engine: a live stream may already have refreshed it.
+                            && tokio::task::spawn_blocking(crate::capture::x11_size).await.ok().flatten().is_some_and(|size| size!=(capture.width,capture.height));
                         if resized { log::info!("Desktop geometry changed since startup; reinitializing capture"); }
                         let session_capture=if desktop && portal_desktop.is_none() && (capture.init_error.is_some() || resized) {
                             match tokio::task::spawn_blocking(ScreenCapture::new).await {
@@ -799,7 +996,12 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         if desktop { if let Some(portal) = &portal_desktop { portal.begin(); } }
                         match WebRtcSession::new(session_capture, input.clone(), signaling_client.clone(), desktop, transport,
                             if desktop { portal_desktop.clone() } else { None }).await {
-                            Ok(sess) => {
+                            Ok(mut sess) => {
+                                sess.controller_mac = controller_mac;
+                                if !desktop {
+                                    let (requests, peer) = (desktop_requests.clone(), ice.clone());
+                                    sess.on_desktop_request(move || { let _ = requests.send(peer.clone()); });
+                                }
                                 // Register before awaiting SDP: shutdown can always close
                                 // a peer whose answer may already be queued to the viewer.
                                 sessions.insert(ice.clone(), sess);
@@ -822,7 +1024,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                                 }
                                 Err(_) => {
                                     log::error!("Failed to handle offer (details omitted)");
-                                    if let Some(session) = sessions.remove(&ice) { let _ = session.pc.close().await; }
+                                    if let Some(session) = sessions.remove(&ice) { close_peer(&session.pc).await; }
                                 }
                             }},
                             Err(_) => log::error!("Create peer failed (details omitted)"),
@@ -844,12 +1046,49 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                     let mut desktop_ended = false;
                     for k in targets {
                         if let Some(old) = sessions.remove(&k) {
-                            desktop_ended |= old.desktop;
-                            if let Err(e) = old.pc.close().await { log::warn!("Close released peer failed: {}", e); }
+                            desktop_ended |= old.role.is_desktop();
+                            close_peer(&old.pc).await;
                         }
                     }
-                    if desktop_ended && !sessions.values().any(|s| s.desktop) { if let Some(s) = assist.as_mut() { s.session_ended()?; } }
+                    if desktop_ended && !sessions.values().any(|s| s.role.is_desktop()) { if let Some(s) = assist.as_mut() { s.session_ended()?; } }
                     if let Some(s) = assist.as_mut() { s.tick()?; }
+                }
+                SignalingEvent::DesktopRequested(ice) => {
+                    let mut sessions = webrtc_sessions.lock().await;
+                    let Some(peer) = sessions.get(&ice).filter(|peer| !peer.role.is_desktop()) else { continue; };
+                    if desktop_backend::headless() {
+                        log::info!("Desktop request on a tool connection ignored: headless mode");
+                        continue;
+                    }
+                    if portal_desktop.is_some() {
+                        log::info!("Desktop request on a tool connection not supported with the Portal backend; open the desktop before port mapping");
+                        continue;
+                    }
+                    let controller_mac = peer.controller_mac;
+                    let current = peer.desktop_capture();
+                    // Same recovery as a desktop offer: the display may have come up or been resized after this peer.
+                    let resized = current.init_error.is_none() && current.backend == desktop_backend::DesktopBackend::X11
+                        && tokio::task::spawn_blocking(crate::capture::x11_size).await.ok().flatten().is_some_and(|size| size != (current.width, current.height));
+                    if resized { log::info!("Desktop geometry changed since this connection opened; reinitializing capture"); }
+                    let screen = if current.init_error.is_some() || resized {
+                        match tokio::task::spawn_blocking(ScreenCapture::new).await {
+                            Ok(Ok(screen)) => { capture = Arc::new(screen); Some(capture.clone()) },
+                            Ok(Err(error)) => { log::info!("Desktop request on a tool connection ignored: {error}"); continue; },
+                            Err(_) => { log::warn!("Desktop initialization worker failed"); continue; },
+                        }
+                    } else { None };
+                    video::warm_auto_probe(); video::check_ffmpeg_usable();
+                    input.set_mac_controller(controller_mac);
+                    input.bind_portal(screen.as_ref().map_or_else(|| sessions[&ice].capture.portal.clone(), |screen| screen.portal.clone()));
+                    // One desktop at a time, as for a new desktop offer. Peers offered as desktops
+                    // close; a promoted tool peer only stops its desktop and keeps its tools.
+                    let superseded: Vec<String> = sessions.iter().filter(|(id, old)| id.as_str() != ice && old.role.is_desktop())
+                        .map(|(id, _)| id.clone()).collect();
+                    for id in superseded {
+                        if sessions[&id].desktop { if let Some(old) = sessions.remove(&id) { close_peer(&old.pc).await; } }
+                        else { sessions[&id].demote(); }
+                    }
+                    if let Some(peer) = sessions.get(&ice) { peer.promote(screen); }
                 }
                 SignalingEvent::Disconnected => {
                     capture_types.clear();

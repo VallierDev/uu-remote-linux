@@ -2,6 +2,10 @@ fn main() {
     println!("cargo:rerun-if-changed=c_engine/wayland_transform.h");
     println!("cargo:rerun-if-changed=c_engine/portal_clipboard.inc");
     println!("cargo:rerun-if-changed=c_engine/x11_engine.c");
+    println!("cargo:rerun-if-changed=c_engine/nvenc_engine.c");
+    println!("cargo:rerun-if-changed=c_engine/nvenc_engine.h");
+    println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/dynlink_cuda.h");
+    println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/nvEncodeAPI.h");
     println!("cargo:rerun-if-changed=c_engine/clipboard.c");
     println!("cargo:rerun-if-changed=c_engine/assist_window.c");
     println!("cargo:rerun-if-changed=c_engine/viewer_window.c");
@@ -22,11 +26,27 @@ fn main() {
             build.compile("uu_kms_engine");
             println!("cargo:rustc-link-lib=drm");
         }
-        cc::Build::new()
-            .file("c_engine/x11_engine.c")
+        let mut x11_build = cc::Build::new();
+        x11_build.file("c_engine/x11_engine.c")
             .file("c_engine/clipboard.c")
-            .file("c_engine/pam_check.c")
-            .compile("x11_engine");
+            .file("c_engine/pam_check.c");
+        if std::env::var_os("CARGO_FEATURE_INPROC_AV").is_some() {
+            x11_build.file("c_engine/nvenc_engine.c");
+            x11_build.file("c_engine/vaapi_engine.c");
+            x11_build.file("c_engine/dri3_capture.c");
+            for f in ["c_engine/vaapi_engine.c", "c_engine/vaapi_engine.h", "c_engine/dri3_capture.c", "c_engine/dri3_capture.h"] {
+                println!("cargo:rerun-if-changed={f}");
+            }
+            x11_build.include("vendor/ffnvcodec");
+            // libva/libva-drm are dlopen'ed at runtime (like NVENC's libcuda); these are
+            // link-time-only deps of the DRI3/VAAPI engines and must stay out of default builds.
+            println!("cargo:rustc-link-lib=gbm");
+            println!("cargo:rustc-link-lib=X11-xcb");
+            println!("cargo:rustc-link-lib=xcb");
+            println!("cargo:rustc-link-lib=xcb-dri3");
+            println!("cargo:rustc-link-lib=xcb-damage");
+        }
+        x11_build.compile("x11_engine");
 
         println!("cargo:rustc-link-lib=X11");
         println!("cargo:rustc-link-lib=Xext");

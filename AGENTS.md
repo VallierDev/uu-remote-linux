@@ -38,9 +38,13 @@ Dependencies (Ubuntu/Debian):
 ```sh
 sudo apt install build-essential pkg-config \
     libx11-dev libxext-dev libxtst-dev libxfixes-dev libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev libgtk-3-dev ffmpeg
-# --features inproc-av:      libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev
-#                            (FFmpeg 6.x only; in-process capture/encoding, Ubuntu 24.04 ships it. FFmpeg >= 7
-#                            fails in ffmpeg-sys-next with "avfft.h file not found", before our build.rs runs)
+# --features inproc-av:      X11 in-process capture + native NVENC/VAAPI. NVENC headers are vendored and
+#                            libcuda/libnvidia-encode dlopen'ed at runtime (NVENC API 12.1, driver >= 530).
+#                            The VAAPI/DRI3 engines compile against
+#                            libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage-dev;
+#                            libva/libva-drm themselves are dlopen'ed at runtime (no hard libva dependency)
+# --features viewer-ffmpeg:  libavcodec-dev libavformat-dev libavdevice-dev libswscale-dev libclang-dev
+#                            (FFmpeg 6.x only. FFmpeg >= 7 fails in ffmpeg-sys-next with "avfft.h file not found")
 # --features wayland:        libwayland-dev libxkbcommon-dev wl-clipboard
 # --features wayland,portal: + libglib2.0-dev libpipewire-0.3-dev libei-dev (libei >= 1.1)
 ```
@@ -69,6 +73,9 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
    X11 → default build. Hyprland → `--features wayland`. GNOME/KDE on Wayland → `--features wayland,portal`
    (or advise the user to pick the "on Xorg" session at the login screen, which is the best-supported path).
 2. Install dependencies and build (section 3). Copy the binary: `install -Dm755 target/release/uuremote-server ~/.local/bin/uuremote-server`.
+   From a release tarball run its `./install.sh` as the desktop user instead: it installs into `~/.local`, writes the user unit
+   (keeps an existing one) and installs FFmpeg with libx264 via sudo apt/pacman when missing (Fedora/openSUSE: prints the command).
+   The .deb depends on `ffmpeg`. Without FFmpeg the viewer waits on 正在传输画面; the host checks at startup and on each desktop offer, logs an error and tells the desktop user (freedesktop notification, else opens its window with a red line; `assist::show_problem`).
 3. **Login (needs the human).** Run `uuremote-server login` inside the graphical session. A GTK window shows a QR
    code; the user scans it with the UU Remote mobile app and confirms. Without a display use
    `uuremote-server login --no-gui` (terminal QR). Credentials are written to `~/.config/uuremote/config.json`
@@ -110,24 +117,28 @@ viewer does not reconnect them automatically.
 | Item | Meaning |
 |---|---|
 | `~/.config/uuremote/config.json` | user_id, device_id, client_id, system_id, machine_guid, token, csrf; optional `sign_key`, `ffmpeg_root`. `$UU_CONFIG` overrides the path |
-| `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent |
+| `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent; optional `video_encoder` (`auto`/`cpu`/`vaapi`/`nvenc`) and `video_codec` (`auto`/`h264`/`h265`), written by `set-encoder` / `set-codec` (0600, merge write). Non-`auto` beats `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`. `set-encoder` and `set-codec` both send `SIGUSR2` to the pid in `host.pid` (same binary). Live desktop streams restart the encoder (`EncoderTask::restart`, sequence kept, first frame IDR) without dropping the peer. Codec preference is logged and applies on the next desktop stream. `SIGUSR2` does not re-probe. Hand edits: `kill -USR2 $(cat ~/.config/uuremote/host.pid)` |
 | `UU_DESKTOP_BACKEND` | `auto` (default) / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless: no display; desktop offers ignored; tool peers get a nominal 1920x1080 screen + Allow permissions, which the port-mapping viewer requires) |
+| `UU_X11_MULTISCREEN=1`, `UU_X11_OUTPUT` | X11: advertise each RandR monitor (`xrandr --listmonitors`, read once at start; primary or `UU_X11_OUTPUT` is id 0) through the same screen-switch path as `UU_WAYLAND_MULTISCREEN` (`wayland::outputs`/`select`). x11grab reads `display+x,y` at the monitor size, XTest/uinput absolute input adds the monitor offset, the in-process engine and `desktop_mode` resize are skipped (分辨率 scales). Needs two or more monitors |
+| `UU_DESKTOP_RESIZE=0` | X11: the viewer's 分辨率 choice scales the encoded stream instead of changing the display mode. Default: `src/desktop_mode.rs` switches the primary output via xrandr (adds a CVT-RB mode when missing, re-applies once if mutter resets it), restores the original mode for resolution_type 3 and 2 s after the last desktop stream ends |
+| `UU_NVENC_RGB=0` / `=1` | NVENC 4:2:0 without scaling takes packed BGRA/BGR0 directly (no CPU swscale). Default: on, except when a connected DRM connector belongs to an nvidia-bound card (desktop composited on the encoding GPU; #16 measured 82.6 vs 98 fps at 4K). `0` forces CPU conversion, `1` forces the direct path |
 | `UU_INPUT_BACKEND` | `auto` (uinput on Wayland/portal when `/dev/uinput` is accessible, udev `uaccess` rule in README) / `uinput` / `native`. X11 keeps XTest (held-key autorepeat handling) |
 | Mac viewer Cmd | With 「使用 macOS 快捷键」 off the Mac viewer sends Cmd=VK_LWIN 0x5B, Option=0xA4, Ctrl=0xA2; connect header `controller_platform`=4 is macOS. For Mac controllers Cmd is held back: Cmd+C/V/A/F/X/Z → Ctrl+key (terminal: Cmd+C/V → Ctrl+Shift+C/V), other combos/alone → Super |
 | `UU_TERMINAL_SHORTCUTS=0` | disable Ctrl+V → Ctrl+Shift+V in focused X11 terminals (Mac Cmd and Ctrl both arrive as VK_LCONTROL) |
 | `contrib/virtual-desktop/` | Xvfb + session (`UU_VIRTUAL_SESSION`, `UU_VIRTUAL_BUS=user|private`) for monitorless hosts; serve it with `DISPLAY=:99` |
-| `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: explicit Intel/AMD; `nvenc`: force; unset: NVENC→CPU only if `/proc/driver/nvidia/version` or `/dev/nvidia0` exists, else CPU (#10) |
-| `UU_VIDEO_CODEC=h264` | force H.264 even when the viewer negotiated H.265 (default: H.265 when both sides support it) |
+| `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: explicit Intel/AMD; `nvenc`: force; unset/`auto`: background probe, one synthetic IDR per candidate, 3 s each. While #33 is open, auto is NVENC then CPU when `/proc/driver/nvidia/version` or `/dev/nvidia0` exists; with no NVIDIA the only candidate is CPU and the probe is skipped. A session that starts before the probe finishes uses the legacy rule (NVENC if NVIDIA is present, else CPU). On `--features inproc-av`, a process-only failure of NVENC when the native engine would try it first on X11 is `native_unprobed` and keeps that legacy NVENC choice (Wayland, portal, and KMS fall back to CPU). The skipped CPU-only probe is logged `not probed (only candidate)`. A successful probe and that CPU-only skip stay cached while NVIDIA presence (`/proc/driver/nvidia/version` or `/dev/nvidia0`) matches the report. A later desktop connection whose presence differs treats the report as stale and starts one background re-probe (`warm_auto_probe`, non-blocking, one at a time) and still uses the cached encoder. A hardware-candidate failure (NVENC failed, chosen CPU) is cached for 10 minutes (`PROBE_FAILURE_TTL`); the next desktop connection after that starts the same re-probe and still uses the cached encoder. Explicit `cpu` / `vaapi` / `nvenc` (setting file or `UU_VIDEO_ENCODER`) does not start the probe. A later success selects NVENC again; another failure restarts the 10 minutes. `native_unprobed` is not a failure cache. Ignored when `host_settings.json` `video_encoder` is not `auto`. Explicit `vaapi` with 真彩 encodes 4:2:0 and reports that in CaptureSettingSync (field 3). VAAPI is not an auto candidate until #33 |
+| `UU_VIDEO_CODEC=h264` | force H.264 even when the viewer negotiated H.265 (default: H.265 when both sides support it and the encoder is hardware). Same precedence as the encoder: setting file, then this variable, then auto |
 | `UU_FFMPEG_ROOT` | FFmpeg prefix (`bin/ffmpeg`, libs in `lib/x86_64-linux-gnu`) |
 | `UU_AUDIO=0`, `UU_AUDIO_SOURCE` | disable sound / choose the Pulse source (default `@DEFAULT_MONITOR@`) |
 | `UU_LOGIN_WINDOW=0` | don't auto-open the login window |
 | `UU_ENGINE_DIR` | directory holding `libuu-wayland.so` / `libuu-portal.so` (`--features engine-plugins`, used by release packages: engines are dlopen'ed only on Wayland sessions; also searched next to the binary, `../lib/uu-remote-linux`, `~/.local/lib/uu-remote-linux`, `/usr/lib/uu-remote-linux`) |
 | `UU_WOL_HELPER=1` | experimental: report LAN info (`api-ipv4…/api/v1/device/wake_on_lan/info` {mac, ip, subnet_mask}) after sign-in and answer `wake_on_lan` pushes (`target_device` {mac, ip, subnet_mask}) with a magic packet, like the official Windows host (field names from its log strings; not verified end to end). `wake_on_lan` push key names are always logged |
-| `UU_USE_PROXY=1` | honor HTTP/SOCKS proxy env vars; cloud API clients bypass env proxies by default |
+| `UU_USE_PROXY=1` | honor HTTP/HTTPS proxy env vars for REST and WebSocket signaling, and also gather TURN relays over TCP/TLS through that proxy (`vendor/webrtc-ice/PATCHES.md`; chain-verified, name mismatch tolerated for IP TURN URLs); clients bypass env proxies by default |
 | `UU_REMOTE_ASSIST=0`, `UU_ASSIST_ALLOW=1`, `UU_ASSIST_UI=tty`, `UU_ASSIST_DEBUG=1` | disable assistance / allow at start / terminal UI for `assist` / include the server's short error message in assist errors |
 
-Token has no expiry field; API code 1120 (HTTP 422) means invalid/expired → re-login. The config is re-read
-every 60 s.
+Token has no expiry field; API code 1120 (HTTP 422) means invalid/expired → re-login. `config.json` is parsed once
+(`config::file()`); only a `LoginExpired` room answer re-reads it from disk (`config::read_fresh()`) before waiting
+for a new QR login.
 
 ## 6. Code map
 
@@ -158,9 +169,8 @@ every 60 s.
 | `src/viewer_main.rs`, `src/viewer/` | experimental viewer (`--features native-viewer,viewer-sdl`): cloud join, WebRTC offer side, SDL desktop window (ffmpeg CLI decode), files/terminal/portmap/power/assist tools, device removal (`POST /api/v1/device/{id}/unbind`, verified live; shared devices use `/api/v1/device/share/{id}/unbind`, strings only), GTK launcher |
 | `c_engine/viewer_window.c`, `c_engine/viewer_tools.c` | viewer GTK launcher and tool windows (files, port mapping, terminal list) |
 
-Diagnostic subcommands: `doctor` (paste-safe report: session, selected backend, engine plugins, uinput, encoders,
-default codec, sign-in/service state; booleans and names only), `login [--no-gui]`, `unlock-check` (password on stdin, prints only accepted/rejected),
-`desktop-probe [new.png]`, `desktop-video-probe` (`UU_PROBE_FPS`, `UU_PROBE_FRAMES`, `UU_PROBE_QUALITY` 1-5 = viewer bitrate preset, 5 auto; `UU_PROBE_INPUT` fixed video/image sequence, `UU_PROBE_LOOP=1` repeats), `wayland-input-probe`, `clipboard-acceptance`,
+Diagnostic subcommands: `doctor` (paste-safe report: session, selected backend, engine plugins, uinput, encoder and codec with source, sign-in/service state; booleans and names only), `set-encoder auto|cpu|vaapi|nvenc` and `set-codec auto|h264|h265` (both notify a running host with SIGUSR2; live encoder switch, negotiated codec unchanged, codec preference on the next desktop stream; illegal values exit 2), `login [--no-gui]`, `unlock-check` (password on stdin, prints only accepted/rejected),
+`desktop-probe [new.png]`, `desktop-video-probe` (`UU_PROBE_FPS`, `UU_PROBE_FRAMES`, `UU_PROBE_QUALITY` 1-5 = viewer bitrate preset, 5 auto; `UU_PROBE_CHROMA=444` 真彩; `UU_PROBE_INPUT` fixed video/image sequence, `UU_PROBE_LOOP=1` repeats), `wayland-input-probe`, `clipboard-acceptance`,
 `portal-acceptance`, `help`. Unknown arguments exit with code 2. Builds up to v0.1.0 did **not** reject them and
 started a second full host server instead, so check that a subcommand exists in the binary you run.
 
@@ -183,7 +193,7 @@ started a second full host server instead, so check that a subcommand exists in 
   5 Auto, 6 Custom. Resolution: 16/17 pixel size or 5/6, 10 resolution_type (3 = follow remote).
   Field 7 `chorma_format` (ChromaFormat 1 = 4:2:0, 3 = 4:4:4) is sent when 真彩 is toggled; ff_capture_setting versions
   are cumulative (3 CHROMA_SAMPLING, 4 CUSTOM_BITRATE, 5 DPI_SCALE, 6 HDR). 4:4:4 = NVENC `high444p` / x264 `high444`
-  with `yuv444p`; VAAPI and inproc stay 4:2:0.
+  with `yuv444p`; the in-process NVENC engine uses High 4:4:4 / HEVC FRExt (AQ off); VAAPI stays 4:2:0.
   Reply `RpcResponse{2 CaptureSettingResponse{}}` (no errors = applied) and send Message 25 CaptureSettingSync
   (field 3 = the chroma actually encoded).
 - ConnectOptions field 4 `decoder_cap_list` = DecoderCap {1 fps, 2 codec_type (1 H264, 2 H265), 3 width, 4 height,
@@ -271,16 +281,25 @@ started a second full host server instead, so check that a subcommand exists in 
 - Update README.md / README.en.md when user-visible features or limitations change, and add
   `docs/release-notes/<tag>.md` before tagging a release.
 
-### VAAPI (opt-in / 显式启用)
+### VAAPI
 
-`UU_VIDEO_ENCODER=vaapi` selects Intel/AMD H.264 VAAPI; `UU_VAAPI_DEVICE` defaults to
-`/dev/dri/renderD128` (render-node permissions required). No automatic VAAPI selection.
-Both FFmpeg process and `--features inproc-av` upload NV12 frames to a VAAPI frame pool.
+`UU_VIDEO_ENCODER=vaapi` or `set-encoder vaapi` selects Intel/AMD H.264 VAAPI explicitly.
+`UU_VAAPI_DEVICE` defaults to `/dev/dri/renderD128` (render-node permissions required).
+Auto is NVENC then CPU when an NVIDIA driver is present, otherwise CPU. VAAPI is not an
+auto candidate until #33.
+The FFmpeg process pipeline uploads NV12 frames to a VAAPI frame pool. With `--features inproc-av` on X11, VAAPI
+H.264/HEVC Main runs in process: a DRI3 DMA-BUF of the root (XShm upload without DRI3) goes through VPP to NV12
+and VCN, with SPS/PPS(/VPS) and slice headers packed by the host as radeonsi (Mesa 26) needs; parameters follow
+FFmpeg's hevc_vaapi/h264_vaapi on that driver. Accepted on AMD HawkPoint1 (Mesa 26.2.3) and Cezanne
+(Mesa 26.2.5; XShm-upload and DRI3 zero-copy probes plus a full HEVC Mac-viewer session) with the official
+Mac viewer (presets, fps, scaling); Intel iHD is not verified. Measured on Cezanne + RTX 3050 Ti
+(1920x1200, desktop-video-probe, 300 frames): in-process VAAPI ~1.5 ms CPU/frame vs in-process NVENC
+~7.1 ms vs libx264 process pipeline ~19 ms.
 VBR uses the viewer bitrate preset and CQ-derived minimum QP, no B-frames, async depth 1,
 AUD and the existing GOP/VFR timing. Unsupported device/driver/initialization falls back to libx264
 with a warning. Accepted on Intel UHD 770 (iHD) with the default FFmpeg process pipeline and the official Mac
-viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). AMD and the `inproc-av`
-VAAPI path are not hardware-verified.
+viewer (presets, fps, scaling, reconnect; no fallback, ~40% less CPU than libx264). The process pipeline on
+AMD is not separately verified (AMD acceptance is the in-process engine above).
 
 ### Virtual audio / 虚拟声卡
 
@@ -321,8 +340,8 @@ This permission can inject into the whole seat, including lock/greeter screens.
 Optional VAAPI: `intel-media-driver` (modern Intel) or `libva-mesa-driver` (AMD), `libva-utils`
 for `vainfo`. Optional KMS: `libdrm`. Virtual Xfce: `xorg-server-xvfb xorg-xauth xorg-xdpyinfo
 xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`.
-Rolling Arch FFmpeg may be newer than supported `inproc-av` (FFmpeg 6.x); use the default process
-pipeline or build against a separate FFmpeg 6 prefix. Do not downgrade the system FFmpeg.
+Rolling Arch FFmpeg may be newer than supported `viewer-ffmpeg` (FFmpeg 6.x); build it against a separate
+FFmpeg 6 prefix. Do not downgrade the system FFmpeg. The host's `inproc-av` does not link FFmpeg.
 User-bus headless setup and the official Mac checklist: [virtual desktop acceptance](contrib/virtual-desktop/ACCEPTANCE.md).
 
 ### Experimental KMS / 实验后端
