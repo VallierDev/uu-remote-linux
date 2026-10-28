@@ -163,16 +163,19 @@ fn redact_urls(text: &str) -> String {
     out
 }
 
-/// Cloud API clients ignore ambient HTTP/SOCKS proxy settings by default: a local
+/// Cloud API and signaling clients ignore ambient HTTP/HTTPS proxy settings by default: a local
 /// proxy that intercepts TLS breaks login and signaling. `UU_USE_PROXY=1` opts back
 /// into reqwest's standard proxy environment handling.
 pub fn http_client_builder() -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder();
-    if std::env::var("UU_USE_PROXY").ok().as_deref().is_some_and(proxy_requested) {
+    if proxy_enabled() {
         builder
     } else {
         builder.no_proxy()
     }
+}
+pub(crate) fn proxy_enabled() -> bool {
+    std::env::var("UU_USE_PROXY").ok().as_deref().is_some_and(proxy_requested)
 }
 fn proxy_requested(value: &str) -> bool {
     matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")

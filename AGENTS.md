@@ -133,7 +133,7 @@ viewer does not reconnect them automatically.
 | `UU_LOGIN_WINDOW=0` | don't auto-open the login window |
 | `UU_ENGINE_DIR` | directory holding `libuu-wayland.so` / `libuu-portal.so` (`--features engine-plugins`, used by release packages: engines are dlopen'ed only on Wayland sessions; also searched next to the binary, `../lib/uu-remote-linux`, `~/.local/lib/uu-remote-linux`, `/usr/lib/uu-remote-linux`) |
 | `UU_WOL_HELPER=1` | experimental: report LAN info (`api-ipv4…/api/v1/device/wake_on_lan/info` {mac, ip, subnet_mask}) after sign-in and answer `wake_on_lan` pushes (`target_device` {mac, ip, subnet_mask}) with a magic packet, like the official Windows host (field names from its log strings; not verified end to end). `wake_on_lan` push key names are always logged |
-| `UU_USE_PROXY=1` | honor HTTP/SOCKS proxy env vars; cloud API clients bypass env proxies by default |
+| `UU_USE_PROXY=1` | honor HTTP/HTTPS proxy env vars for REST and WebSocket signaling (not ICE/media); clients bypass env proxies by default |
 | `UU_REMOTE_ASSIST=0`, `UU_ASSIST_ALLOW=1`, `UU_ASSIST_UI=tty`, `UU_ASSIST_DEBUG=1` | disable assistance / allow at start / terminal UI for `assist` / include the server's short error message in assist errors |
 
 Token has no expiry field; API code 1120 (HTTP 422) means invalid/expired → re-login. `config.json` is parsed once

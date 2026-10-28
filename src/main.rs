@@ -1,6 +1,7 @@
 //! UU Remote Pure Native Linux Server (Rust Edition)
 //! Zero-Wine, Zero-Python, Single-Binary, 5 Native Tools Integrated
 
+mod ws_transport;
 mod engine_plugin;
 mod doctor;
 mod wol;

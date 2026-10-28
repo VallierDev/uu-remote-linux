@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -231,14 +230,8 @@ mod refresh_tests {
 async fn open_socket(
     req: tokio_tungstenite::tungstenite::handshake::client::Request,
     limit: Duration,
-) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, String> {
-    match tokio::time::timeout(limit, connect_async(req)).await {
-        Ok(result) => result.map(|(ws, _)| ws).map_err(|e| format!("WS connect failed: {}", e)),
-        Err(_) => {
-            log::warn!("Signaling connect timed out after {}s", limit.as_secs());
-            Err("WS connect timed out".into())
-        }
-    }
+) -> Result<crate::ws_transport::Socket, String> {
+    crate::ws_transport::connect(req, limit).await
 }
 
 impl SignalingClient {

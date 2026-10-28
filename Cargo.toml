@@ -60,6 +60,11 @@ x11rb = { version = "0.13", features = ["damage", "shm", "allow-unsafe-code"], o
 
 sdl2 = { version = "0.37", optional = true, features = ["use-pkgconfig"] }
 
+[dev-dependencies]
+# Synthetic loopback WSS certificates only; both crates already occur in Cargo.lock.
+rcgen = "0.11.3"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+
 [build-dependencies]
 cc = "1.0"
 

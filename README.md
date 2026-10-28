@@ -328,7 +328,12 @@ systemctl --user restart uuremote-native.service
 | `UU_ASSIST_ALLOW=1` | 启动时就允许他人远程协助（覆盖窗口里保存的开关状态） |
 | `UU_PORT_MAPPING=0` | 关闭端口映射（对应官方被控端的开关） |
 | `UU_WOL_HELPER=1` | 实验性：让这台主机像官方 Windows 被控端一样充当「远程开机」辅助设备——登录后向网易上报本机局域网信息，收到云端唤醒请求时向同一局域网发送唤醒包（未经端到端验证） |
-| `UU_USE_PROXY=1` | 使用环境变量里的 HTTP/SOCKS 代理；默认忽略代理、直连网易服务器 |
+| `UU_USE_PROXY=1` | REST API 与 host/viewer WebSocket 信令共用环境 HTTP/HTTPS 代理策略；默认忽略代理、直连 |
+
+
+`UU_USE_PROXY=1` 仅使用当前进程已有的代理配置；`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`（及小写形式）和 `NO_PROXY` 按 reqwest 的标准规则选择，大写优先。信令拒绝选定变量中的无效/不支持的代理 URL（仅 HTTP/HTTPS；不支持 SOCKS）、带路径/查询/片段的代理 URL，以及会忽略代理的 CGI 环境；此校验比 reqwest 默默忽略坏值更严格。未配置匹配代理或命中 `NO_PROXY` 时仍正常直连，选中代理后连接失败不会改为直连。信令保留 TLS 证书校验，不跟随重定向，也不转发认证头到重定向目标。
+
+**这只解决 HTTP 与 WebSocket 的代理兼容性，不代理 ICE/WebRTC 媒体，也不提供 TURN TCP/TLS 或任何新的网络出口。** 登录、信令和媒体必须分别有允许使用的网络路径。连接器只返回固定错误类别/HTTP 状态；不要为诊断开启会记录 URL/认证信息的依赖库 TRACE 日志。
 
 「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto（有 NVIDIA 时 NVENC 优先，失败再 CPU；没有 NVIDIA 时就是 CPU，不探测；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。成功结果缓存到进程退出，但 NVIDIA 是否存在（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）与报告不一致时，下一次桌面连接会在后台再探测一次（`warm_auto_probe`），这一路仍用缓存的编码器，直到新结果写入。NVENC 失败只缓存 10 分钟，到期后的桌面连接同样在后台再探测一次，这一路仍用当前结果。`set-encoder` 和 `set-codec` 写完后若 `host.pid` 指向正在运行的本程序，都会发 `SIGUSR2`：编码器变化时进行中的桌面流立刻换编码器（不断开，沿用本会话已协商的 codec；新编码器起不来时按进程内 → FFmpeg 进程 → CPU 回退）。手改文件后可 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。`SIGUSR2` 不重新探测。codec 偏好仍在下次建立桌面连接时生效（运行中的 host 只记日志，不重开编码）。显式 `vaapi` 请求真彩时仍用 VAAPI、编码 4:2:0，并在 CaptureSettingSync 的 field 3 回报 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。VAAPI 进入 auto 要等 #33。
 

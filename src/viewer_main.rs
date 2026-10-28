@@ -3,6 +3,7 @@
 #[path = "auth.rs"] mod auth;
 #[path = "config.rs"] mod config;
 #[path = "protocol.rs"] mod protocol;
+mod ws_transport;
 mod viewer;
 #[cfg(test)] #[path="hevc.rs"] mod hevc;
 use viewer::clipboard;

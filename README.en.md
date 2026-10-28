@@ -360,7 +360,12 @@ Common environment variables:
 | `UU_LOGIN_WINDOW=0` | Do not open the login window automatically when credentials are missing |
 | `UU_PORT_MAPPING=0` | Disable port mapping (the official host's controlled-side switch) |
 | `UU_WOL_HELPER=1` | Experimental: act as a remote-boot helper like the official Windows host — report this host's LAN info after sign-in and send a magic packet to the LAN when the cloud asks to wake a PC (not verified end to end) |
-| `UU_USE_PROXY=1` | Honor HTTP/SOCKS proxy environment variables; by default proxies are ignored and NetEase servers are reached directly |
+| `UU_USE_PROXY=1` | Share environment HTTP/HTTPS proxy policy between REST and host/viewer WebSocket signaling; proxies are ignored by default |
+
+
+`UU_USE_PROXY=1` uses only proxy settings already available to the current process. `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (and lowercase forms) and `NO_PROXY` follow reqwest's standard selection, with uppercase taking precedence. Signaling rejects invalid/unsupported values in the selected variables (HTTP/HTTPS only, not SOCKS), proxy URLs with paths/queries/fragments, and CGI environments that would ignore proxies; this validation is intentionally stricter than silently ignoring bad values. No matching proxy or a `NO_PROXY` match still means direct access; a selected proxy failing does not trigger direct fallback. Certificate verification remains enabled and redirects are not followed, so room authentication is not forwarded to a redirect target.
+
+**This covers HTTP/WebSocket compatibility only: it does not proxy ICE/WebRTC media, add TURN TCP/TLS, or create network access.** Login, signaling and media each need an allowed network path. Connector errors expose only fixed categories/HTTP status; do not enable dependency TRACE logs that may record URLs or authentication information.
 
 Host settings such as "lock after remote session" and "mute host" are stored in
 `~/.config/uuremote/host_settings.json`. The same file stores `video_encoder`

@@ -3,13 +3,11 @@
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use std::{collections::VecDeque,time::Duration};
 
 pub struct Signal {
-    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ws: crate::ws_transport::Socket,
     next_ack:u64,
     pending:VecDeque<Value>,
     legacy_prefix:bool,
@@ -17,14 +15,14 @@ pub struct Signal {
 impl Signal {
     pub async fn connect(urls:&[String], token:&str, timeout:Duration, legacy_prefix:bool)->Result<Self,String> {
         for url in urls {
-            if let Ok(Ok(signal))=tokio::time::timeout(timeout,Self::one(url,token,legacy_prefix)).await {return Ok(signal)}
+            if let Ok(Ok(signal))=tokio::time::timeout(timeout,Self::one(url,token,legacy_prefix,timeout)).await {return Ok(signal)}
         }
         Err("Signaling connection failed (details omitted)".into())
     }
-    async fn one(url:&str,token:&str,legacy_prefix:bool)->Result<Self,String> {
+    async fn one(url:&str,token:&str,legacy_prefix:bool,timeout:Duration)->Result<Self,String> {
         let mut request=format!("{}/socket.io/?transport=websocket&EIO=4",url.trim_end_matches('/')).into_client_request().map_err(|_|"Invalid signaling endpoint")?;
         request.headers_mut().insert("X-NRD-AUTH",token.parse().map_err(|_|"Invalid room authentication header")?);
-        let (ws,_)=connect_async(request).await.map_err(|_|"Signaling transport failed")?;
+        let ws=crate::ws_transport::connect(request,timeout).await?;
         let mut s=Self{ws,next_ack:10,pending:VecDeque::new(),legacy_prefix};
         let mut opened=false;
         loop {
