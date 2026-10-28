@@ -544,7 +544,8 @@ static void on_host(GObject *o, GParamSpec *p, gpointer d) {
 static void on_language(GtkComboBox *c, gpointer d) {
     (void)d; int english = gtk_combo_box_get_active(c) == 1;
     if (english == uu_i18n_english()) return;
-    show_toast(!uu_i18n_save(english) ? L("无法保存语言设置", "Could not save the language") : english ? "Restart the viewer to switch to English" : "重新启动控制端后切换为中文");
+    if (!uu_i18n_save(english)) show_toast(L("无法保存语言设置", "Could not save the language"));
+    else push("relaunch");
 }
 static void confirm_logout(void);
 static void on_sign_out(GtkButton *b, gpointer d) { (void)b; (void)d; if (logged_in) confirm_logout(); }

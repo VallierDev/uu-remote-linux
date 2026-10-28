@@ -148,6 +148,13 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
             match parts.as_slice() {
                 ["quit"] => break,
                 ["refresh"] => next_refresh = Instant::now(),
+                ["relaunch"] => {
+                    // Language is read once at start: restart the launcher in place. Open
+                    // sessions are separate processes and keep running.
+                    use std::os::unix::process::CommandExt;
+                    let _ = std::process::Command::new(&exe).args(std::env::args_os().skip(1)).exec();
+                    toast(crate::i18n::s("请重新启动控制端以切换语言","Restart the viewer to switch the language"));
+                }
                 ["host", state] => {
                     let result = if *state == "on" { host_failed = false; super::host::enable(&exe, false) } else { super::host::disable() };
                     if let Err(e) = result { toast(&crate::tr!("本机被控设置失败：{e}","Could not change hosting: {e}")); }
