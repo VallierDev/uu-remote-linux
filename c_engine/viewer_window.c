@@ -277,31 +277,42 @@ static void clear(GtkWidget *container) {
 }
 
 // ---- device info dialog (设备信息) ----
+/* Only what the account API actually reports: rename and hardware details have no known
+ * request, so the dialog no longer offers them as placeholders. */
+static GtkWidget *info_row(const char *title, GtkWidget *value) {
+    GtkWidget *row = hbox(12);
+    gtk_box_pack_start(GTK_BOX(row), label(title, "hint"), FALSE, FALSE, 0);
+    gtk_widget_set_halign(value, GTK_ALIGN_END); gtk_widget_set_hexpand(value, TRUE);
+    gtk_box_pack_end(GTK_BOX(row), value, TRUE, TRUE, 0);
+    return row;
+}
 static void on_info(GtkButton *b, gpointer index) {
     (void)b;
     int i = GPOINTER_TO_INT(index);
-    char name[128] = "";
-    pthread_mutex_lock(&d_lock); if (i >= 0 && i < device_count) snprintf(name, sizeof name, "%s", devices[i].name); pthread_mutex_unlock(&d_lock);
-    GtkWidget *dialog = gtk_dialog_new_with_buttons(L("设备信息", "Device info"), GTK_WINDOW(window), GTK_DIALOG_MODAL, L("完成", "Done"), GTK_RESPONSE_OK, NULL);
-    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog)), *box = vbox(12);
-    gtk_container_set_border_width(GTK_CONTAINER(box), 20);
-    GtkWidget *c1 = vbox(8); add_class(c1, "card");
-    GtkWidget *r = hbox(8); gtk_box_pack_start(GTK_BOX(r), label(L("名称", "Name"), "devname"), TRUE, TRUE, 0); gtk_box_pack_end(GTK_BOX(r), label(name, "hint"), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(c1), r, FALSE, FALSE, 0);
-    GtkWidget *rename = button(L("重命名", "Rename"), "secondary"); gtk_widget_set_halign(rename, GTK_ALIGN_END);
-    g_signal_connect(rename, "clicked", G_CALLBACK(unsupported), L("重命名", "Rename"));
-    gtk_box_pack_start(GTK_BOX(c1), rename, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), c1, FALSE, FALSE, 0);
-    GtkWidget *c2 = vbox(10); add_class(c2, "card");
-    const char *rows[] = {L("处理器", "Processor"), L("网卡", "Network adapter"), L("总内存", "Total memory"), L("系统版本", "OS version"), L("显卡", "Graphics")};
-    for (int k = 0; k < 5; k++) {
-        GtkWidget *line = hbox(8);
-        gtk_box_pack_start(GTK_BOX(line), label(rows[k], "devname"), TRUE, TRUE, 0);
-        gtk_box_pack_end(GTK_BOX(line), label("—", "hint"), FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(c2), line, FALSE, FALSE, 0);
-    }
-    gtk_box_pack_start(GTK_BOX(box), c2, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(box), label(L("硬件信息暂未获取。", "Hardware info not available yet."), "hint"), FALSE, FALSE, 0);
+    Device d = {0};
+    pthread_mutex_lock(&d_lock); if (i >= 0 && i < device_count) d = devices[i]; pthread_mutex_unlock(&d_lock);
+    if (!d.id[0]) return;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(L("设备信息", "Device info"), GTK_WINDOW(window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT | GTK_DIALOG_USE_HEADER_BAR, NULL, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 400, -1);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog)), *box = vbox(16);
+    gtk_container_set_border_width(GTK_CONTAINER(box), 24);
+    GtkWidget *head = hbox(12);
+    gtk_box_pack_start(GTK_BOX(head), platform_icon(d.platform, d.online), FALSE, FALSE, 0);
+    GtkWidget *title = label(d.name, "h2"); gtk_label_set_ellipsize(GTK_LABEL(title), PANGO_ELLIPSIZE_END);
+    gtk_box_pack_start(GTK_BOX(head), title, TRUE, TRUE, 0);
+    GtkWidget *state = gtk_label_new(d.online ? L("在线", "Online") : L("离线", "Offline"));
+    add_class(state, "badge"); if (!d.online) add_class(state, "off");
+    gtk_widget_set_valign(state, GTK_ALIGN_CENTER);
+    gtk_box_pack_end(GTK_BOX(head), state, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), head, FALSE, FALSE, 0);
+    GtkWidget *card = vbox(12); add_class(card, "card");
+    const char *platform = d.platform == 4 ? "macOS" : d.platform == 1 ? "Windows" : L("其他", "Other");
+    gtk_box_pack_start(GTK_BOX(card), info_row(L("系统", "System"), label(platform, "devname")), FALSE, FALSE, 0);
+    GtkWidget *id = label(d.id, "devname"); gtk_label_set_selectable(GTK_LABEL(id), TRUE);
+    gtk_box_pack_start(GTK_BOX(card), info_row(L("设备 ID", "Device ID"), id), FALSE, FALSE, 0);
+    if (d.current) gtk_box_pack_start(GTK_BOX(card), info_row(L("说明", "Note"), label(L("本机", "This device"), "devname")), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), card, FALSE, FALSE, 0);
     gtk_container_add(GTK_CONTAINER(area), box);
     gtk_widget_show_all(dialog); gtk_dialog_run(GTK_DIALOG(dialog)); gtk_widget_destroy(dialog);
 }
