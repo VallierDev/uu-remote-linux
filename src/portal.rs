@@ -755,7 +755,9 @@ mod tests {
     fn errors_never_include_remote_messages_or_identifiers() {
         assert!(super::check(4).unwrap_err().contains("cancelled or denied"));
         assert!(super::check(9).unwrap_err().contains("closed or stream lost"));
-        assert!(super::check(15).unwrap_err().contains("--features wayland,portal"));
+        // Portal builds name the missing runtime engine; other builds say how to get one.
+        let unavailable = super::check(15).unwrap_err();
+        assert!(unavailable.contains("--features wayland,portal") || (cfg!(feature = "portal") && unavailable.contains("engine unavailable")));
     }
     #[test]
     fn portal_error_display_is_fixed_and_sanitized() {
