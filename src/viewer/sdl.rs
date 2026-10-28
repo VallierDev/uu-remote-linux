@@ -327,7 +327,13 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
                     input.scroll(dx,dy)
                 },
                 _=>None,
-            };if let Some(m)=message{messages.push(m);}
+            };if let Some(m)=message{
+                // Several motions in one poll: only the newest position matters. Sending each one
+                // queues a drag behind itself on a slow (relayed) path; clicks keep their order.
+                let motion=|m:&serde_json::Value|m.get("action").and_then(serde_json::Value::as_str)==Some("mouse_move_absolute");
+                if motion(&m) && messages.last().is_some_and(motion) {messages.pop();}
+                messages.push(m);
+            }
         } (quit,messages)
 }
 
@@ -517,6 +523,9 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                         codec_name=if au.codec==super::media::Codec::H265 {"H.265"} else {"H.264"};
                         super::desktop::display(decoder,window,&au.data,au.codec,&session.peer.desktop.pli)?;
                     }}
+                // A picture can finish after its access unit was written; show it without waiting
+                // for the next one (a single keystroke may change the remote screen only once).
+                else {super::desktop::drain(decoder,window)?;}
             }
         }}
     }.await;
@@ -764,6 +773,17 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             Event::Window{timestamp:0,window_id:1,win_event:WindowEvent::FocusGained},Event::Quit{timestamp:0}];
         let (quit,out)=translate(events,&mut input,Viewport::fit((800,600),(1920,1080)),&mut focused);
         assert!(quit);assert!(out.is_empty());assert!(input.release_all().is_empty());
+    }
+    #[test] fn motions_in_one_poll_send_only_the_newest_and_keep_click_order(){
+        let mut input=Input::default();let mut focused=true;
+        let motion=|x,y|Event::MouseMotion{timestamp:0,window_id:1,which:0,mousestate:sdl2::mouse::MouseState::from_sdl_state(0),x,y,xrel:1,yrel:1};
+        let down=Event::MouseButtonDown{timestamp:0,window_id:1,which:0,mouse_btn:MouseButton::Left,clicks:1,x:0,y:0};
+        let v=Viewport::fit((800,600),(800,600));
+        let (_,out)=translate([motion(10,10),motion(20,20),down,motion(30,30),motion(40,40)],&mut input,v,&mut focused);
+        let actions:Vec<&str>=out.iter().map(|m|m["action"].as_str().unwrap()).collect();
+        assert_eq!(actions.len(),3,"{out:?}");
+        assert_eq!(actions[0],"mouse_move_absolute");assert_eq!(actions[2],"mouse_move_absolute");assert_ne!(actions[1],"mouse_move_absolute");
+        assert!((out[0]["abs_x"].as_f64().unwrap()-20./800.).abs()<0.01 && (out[2]["abs_x"].as_f64().unwrap()-40./800.).abs()<0.01,"{out:?}");
     }
     #[test] fn focus_event_releases_and_suppresses_input_until_focus_returns(){
         let mut input=Input::default();input.key(4,true);input.button(1,true);let mut focused=true;

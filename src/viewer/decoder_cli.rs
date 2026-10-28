@@ -132,7 +132,16 @@ impl Decoder for Cli {
             return Err("remote resolution changed".into());
         }
         let input=self.input.as_mut().ok_or("ffmpeg input closed")?;
-        input.write_all(au).and_then(|_|input.flush()).map_err(|_|"ffmpeg decoder exited")?;
+        // The raw-stream parser ends an access unit only when the next one starts; an access unit
+        // delimiter right after it releases the picture now instead of one remote frame later.
+        let delimiter:&[u8]=match self.codec {Codec::H264=>&[0,0,0,1,0x09,0xf0],Codec::H265=>&[0,0,0,1,0x46,0x01,0x50]};
+        input.write_all(au).and_then(|_|input.write_all(delimiter)).and_then(|_|input.flush()).map_err(|_|"ffmpeg decoder exited")?;
+        self.take_frames()
+    }
+    fn poll(&mut self)->Vec<Frame> {self.take_frames().unwrap_or_default()}
+}
+impl Cli {
+    fn take_frames(&mut self)->Result<Vec<Frame>,String> {
         let mut out=Vec::new();
         loop {
             match self.frames.try_recv() {

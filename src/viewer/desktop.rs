@@ -7,7 +7,10 @@ impl Default for Desktop {
 }
 /// `content` is the source picture size inside the (possibly padded) RGB canvas; None = full frame.
 pub struct Frame { pub width:u32, pub height:u32, pub rgb:Vec<u8>, pub content:Option<(u32,u32)> }
-pub trait Decoder { fn set_codec(&mut self,codec:super::media::Codec)->Result<(),String>; fn decode(&mut self, au:&[u8])->Result<Vec<Frame>,String>; fn reset(&mut self); }
+pub trait Decoder { fn set_codec(&mut self,codec:super::media::Codec)->Result<(),String>; fn decode(&mut self, au:&[u8])->Result<Vec<Frame>,String>; fn reset(&mut self);
+    /// Frames finished since the last call, without new input; an asynchronous decoder
+    /// returns a picture here instead of holding it until the next access unit arrives.
+    fn poll(&mut self)->Vec<Frame> {Vec::new()} }
 pub trait FrameSink { fn present(&mut self,frame:&Frame)->Result<(),String>; }
 /// Counts only (access units, presented frames, decode errors) for the periodic stats line.
 pub static STATS:[std::sync::atomic::AtomicU64;3]=[std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0)];
@@ -18,6 +21,11 @@ pub fn is_key_frame(codec:super::media::Codec,au:&[u8])->bool {
         super::media::Codec::H264=>w[3]&0x1f==5,
         super::media::Codec::H265=>(16..=21).contains(&((w[3]>>1)&0x3f)),
     })
+}
+/// Shows the newest frame a decoder finished between access units.
+pub fn drain(decoder:&mut dyn Decoder,sink:&mut dyn FrameSink)->Result<(),String> {
+    if let Some(frame)=decoder.poll().pop() {STATS[1].fetch_add(1,Ordering::Relaxed);sink.present(&frame)?;}
+    Ok(())
 }
 pub fn display(decoder:&mut dyn Decoder,sink:&mut dyn FrameSink,au:&[u8],codec:super::media::Codec,pli:&AtomicBool)->Result<(),String> {
     let units=STATS[0].fetch_add(1,Ordering::Relaxed)+1;
