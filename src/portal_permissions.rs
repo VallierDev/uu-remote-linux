@@ -23,6 +23,9 @@ pub fn desktop_key() -> &'static str {
     if desktop.split(':').any(|v| v == "kde") { "kde" } else { "gnome" }
 }
 
+/// Consent for one monitor (Mutter connector); connectors are checked to be file-name safe.
+pub fn monitor_key(connector: &str) -> String { format!("{}@{}", desktop_key(), connector) }
+
 pub fn take(dir: &Path, key: &str) -> Option<String> {
     let path = dir.join(key);
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path).ok()?;

@@ -210,7 +210,7 @@ pub fn text_probe()->Result<(),String> {
 // root to the selected monitor. No compositor layout or user credentials are modified.
 #[derive(Clone, Debug)]
 pub struct Output { pub name:String, pub width:u32, pub height:u32, pub fps:i32, pub x:i32, pub y:i32 }
-struct Inventory { outputs:Vec<Output>, x11:bool }
+struct Inventory { outputs:Vec<Output>, x11:bool, portal:bool }
 static OUTPUTS: std::sync::OnceLock<Inventory> = std::sync::OnceLock::new();
 #[derive(Default)]
 struct Selection { id:usize, generation:u64, presented:Option<u64>, failed:bool }
@@ -230,11 +230,15 @@ fn inventory() -> &'static Inventory {
         if backend==Some(crate::desktop_backend::DesktopBackend::X11) && !crate::desktop_backend::headless()
             && std::env::var("UU_X11_MULTISCREEN").ok().as_deref()==Some("1") {
             let outputs=x11_outputs();
-            return Inventory {x11:!outputs.is_empty(),outputs};
+            return Inventory {x11:!outputs.is_empty(),outputs,portal:false};
+        }
+        if backend==Some(crate::desktop_backend::DesktopBackend::Portal) && !crate::desktop_backend::headless() {
+            let outputs=portal_outputs();
+            return Inventory {portal:!outputs.is_empty(),outputs,x11:false};
         }
         if !cfg!(all(target_os="linux",feature="wayland"))
             || std::env::var("UU_WAYLAND_MULTISCREEN").ok().as_deref()!=Some("1")
-            || backend!=Some(crate::desktop_backend::DesktopBackend::Wayland) {return Inventory {outputs:Vec::new(),x11:false};}
+            || backend!=Some(crate::desktop_backend::DesktopBackend::Wayland) {return Inventory {outputs:Vec::new(),x11:false,portal:false};}
         let niri=std::env::var_os("NIRI_SOCKET").is_some();
         let output=if niri {std::process::Command::new("niri").args(["msg","--json","outputs"]).output()}
             else {std::process::Command::new("hyprctl").args(["monitors","-j"]).output()};
@@ -244,10 +248,36 @@ fn inventory() -> &'static Inventory {
             if niri {parse_niri_outputs(&output.stdout,&preferred)} else {parse_outputs(&output.stdout,&preferred)}
         });
         let outputs=match result {Ok(outputs)=>outputs,Err(reason)=>{log::warn!("Wayland multi-screen disabled: {}",reason);Vec::new()}};
-        Inventory {outputs,x11:false}
+        Inventory {outputs,x11:false,portal:false}
     })
 }
 pub fn outputs() -> &'static [Output] {&inventory().outputs}
+/// GNOME portal grants one monitor per consent (multi-select is refused), so each monitor
+/// gets its own saved consent and a switch opens that monitor's session. Read once.
+fn portal_outputs()->Vec<Output> {
+    let monitors=crate::portal::monitors();
+    if monitors.len()<2 {return Vec::new();}
+    let fps=crate::video::display_fps() as i32;
+    let mut outputs:Vec<Output>=monitors.iter().map(|m|Output {name:m.connector.clone(),width:m.width,height:m.height,fps,x:m.x,y:m.y}).collect();
+    // Screen 0 is the one opened first: the monitor whose consent is already saved, else the primary.
+    let dir=crate::portal::permissions_directory();
+    let granted=|name:&str|dir.as_deref().is_some_and(|d|d.join(crate::portal::monitor_key(name)).exists());
+    let primary=monitors.iter().find(|m|m.primary).map(|m|m.connector.clone()).unwrap_or_default();
+    outputs.sort_by_key(|o|(!granted(&o.name),o.name!=primary,o.x,o.y));
+    outputs.truncate(16);
+    log::info!("Portal multi-screen: {} monitors",outputs.len());
+    outputs
+}
+/// Connector of the selected screen when the portal advertises several monitors.
+pub fn portal_monitor()->Option<String> {
+    if !inventory().portal {return None;}
+    source(selected()).map(|o|o.name.clone())
+}
+/// Monitor at a portal stream's logical position (Mutter logical layout).
+pub fn portal_monitor_at(x:i32,y:i32)->Option<String> {
+    if !inventory().portal {return None;}
+    outputs().iter().find(|o|(o.x,o.y)==(x,y)).map(|o|o.name.clone())
+}
 /// X11 monitors are advertised: the stream captures the selected monitor's region of the root.
 pub fn x11_multiscreen()->bool {inventory().x11}
 /// Read once, like the Hyprland inventory: a changed monitor layout needs a host restart.
@@ -371,6 +401,13 @@ pub fn failed(id:usize,generation:u64) {
 }
 pub fn select(id:usize)->Result<(),String> {
     let output=source(id).ok_or("Unknown screen")?;
+    if inventory().portal {
+        let mut state=SELECTION.lock().unwrap();
+        crate::portal::switch_active(&output.name)?;
+        state.begin(id);
+        log::info!("Portal screen selected: id={} source={}x{}",id,output.width,output.height);
+        return Ok(());
+    }
     if x11_multiscreen() {
         SELECTION.lock().unwrap().begin(id);
         log::info!("X11 screen selected: id={} source={}x{}+{}+{}",id,output.width,output.height,output.x,output.y);

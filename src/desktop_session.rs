@@ -123,6 +123,14 @@ impl PortalDesktop {
             || state.screen.portal.as_ref().is_some_and(|portal| !portal.is_alive()));
     }
     pub fn snapshot(&self) -> State { self.state.borrow().clone() }
+    /// No desktop controller left: stop sharing the screen. begin() then sees the dead
+    /// session and the next controller's maintain() reopens it with the saved consent.
+    pub fn end_idle(&self) {
+        if let Some(portal) = self.snapshot().screen.portal.as_ref().filter(|portal| portal.is_alive()) {
+            portal.end();
+            log::info!("Portal screen sharing ended: no desktop controller");
+        }
+    }
     pub fn subscribe(&self) -> watch::Receiver<State> { self.state.subscribe() }
     pub fn lock_state(&self) -> watch::Receiver<Option<bool>> { self.locked.clone() }
     #[cfg(test)]

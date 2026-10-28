@@ -816,7 +816,8 @@ async fn read_encoder_with(
     selection: crate::video_select::Selection,
 )->Result<(),String>{
     let selected_output=crate::wayland::capture_source(&display,portal.is_some(),settings.source_id);
-    let size=selected_output.map_or(size,|s|(s.width,s.height));
+    // Portal frames come from the session's current monitor, whatever the advertised mode says.
+    let size=portal.as_ref().map(|p|p.size()).or(selected_output.map(|s|(s.width,s.height))).unwrap_or(size);
     let kms=display.starts_with("kms:");
     let wayland=kms || display.starts_with("wayland:");
     // X11 multi-screen: x11grab reads only the selected monitor's region of the root.
@@ -929,7 +930,8 @@ async fn read_encoder_with(
             let interval=Duration::from_nanos(1_000_000_000/u64::from(settings.fps));
             let mut tick=tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut frame=vec![0;(session.width as usize)*(session.height as usize)*4];
+            let (width,height)=session.size();
+            let mut frame=vec![0;(width as usize)*(height as usize)*4];
             let mut version=None;
             loop {
                 tick.tick().await;

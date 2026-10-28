@@ -70,6 +70,8 @@ use webrtc::WebRtcSession;
 /// Set before a normal return when the host must come back in the other mode (signed in / out).
 static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop { fn drop(&mut self) { self.0.abort(); } }
 fn superseded_peer_ids(sessions: &HashMap<String, WebRtcSession>, ice: &str, desktop: bool) -> Vec<String> {
     sessions.iter().filter(|(id, peer)| id.as_str() == ice || (desktop && peer.desktop))
         .map(|(id, _)| id.clone()).collect()
@@ -713,6 +715,21 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
     assist: &mut Option<assist::Assist>, commands: &mut mpsc::Receiver<assist::Command>, webrtc_sessions: Arc<Mutex<HashMap<String, WebRtcSession>>>) -> Result<(), Box<dyn std::error::Error>> {
     let portal_desktop = (capture.backend == desktop_backend::DesktopBackend::Portal && !desktop_backend::headless())
         .then(|| Arc::new(desktop_session::PortalDesktop::new(capture.clone())));
+    // Stop sharing the screen once no desktop controller is left. Viewers send stop_capture
+    // before leaving and phones reconnect within seconds, so require two idle checks in a row.
+    let idle_watch = portal_desktop.clone().map(|portal| {
+        let sessions = webrtc_sessions.clone();
+        tokio::spawn(async move {
+            let mut idle = 0u8;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if sessions.lock().await.values().any(|s| s.role.is_desktop()) { idle = 0; continue; }
+                idle = idle.saturating_add(1);
+                if idle >= 2 { portal.end_idle(); }
+            }
+        })
+    });
+    let _idle_watch = idle_watch.map(|task| AbortOnDrop(task.abort_handle()));
     let mut auth = if let Some(session) = assist.as_ref() { session.client.clone() } else {
         let creds = match config::file().and_then(Credentials::load) {
             Ok(creds) => creds,

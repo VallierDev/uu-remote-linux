@@ -56,7 +56,7 @@ struct uu_portal {
     int format_valid, stream_started;
     gint64 interrupted_at, display_changed_at;
     uint32_t node, width, height;
-    int logical_width, logical_height;
+    int logical_width, logical_height, position_x, position_y, has_position;
     int absolute_stream_pixels;
     struct ei *ei;
     GList *ei_devices;
@@ -369,6 +369,7 @@ static int read_stream_result(struct uu_portal *p, GVariant *results) {
         g_variant_get(entry, "(u@a{sv})", &p->node, &properties);
         /* Optional 'size' is compositor logical coordinates, not frame pixels. */
         g_variant_lookup(properties, "size", "(ii)", &p->logical_width, &p->logical_height);
+        p->has_position = g_variant_lookup(properties, "position", "(ii)", &p->position_x, &p->position_y);
         const char *mapping_id = NULL;
         if (g_variant_lookup(properties, "mapping_id", "&s", &mapping_id)) p->mapping_id = g_strdup(mapping_id);
         g_variant_unref(properties); g_variant_unref(entry);
@@ -674,4 +675,64 @@ int uu_portal_key(struct uu_portal *p, uint32_t symbol, int keycode, int pressed
     int result = prepare_input(p); if (result) return result;
     if (p->ei) return portal_eis_key(p, keycode, pressed);
     return notify(p, "NotifyKeyboardKeysym", g_variant_new("(o@a{sv}iu)", p->session, empty_options(), (gint)symbol, (guint)!!pressed));
+}
+
+/* Logical position of the granted monitor: matches a Mutter logical monitor. */
+int uu_portal_stream_position(struct uu_portal *p, int32_t *x, int32_t *y) {
+    if (!p || !p->has_position) return 11;
+    *x = p->position_x; *y = p->position_y;
+    return 0;
+}
+/* Mutter's monitors as "connector\twidth\theight\tx\ty\tprimary\n" lines: current mode in
+ * pixels, logical position. Returns the count, or -1 without Mutter (KDE, no session bus). */
+int uu_portal_monitors(char *out, size_t length) {
+    if (!out || !length) return -1;
+    out[0] = 0;
+    GDBusConnection *bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
+    if (!bus) return -1;
+    GVariant *reply = g_dbus_connection_call_sync(bus, MUTTER_DISPLAY, MUTTER_DISPLAY_PATH, MUTTER_DISPLAY,
+        "GetCurrentState", NULL, G_VARIANT_TYPE("(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"),
+        G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
+    g_object_unref(bus);
+    if (!reply) return -1;
+    GVariant *monitors = g_variant_get_child_value(reply, 1), *logical = g_variant_get_child_value(reply, 2);
+    int count = 0; size_t used = 0;
+    for (gsize i = 0; i < g_variant_n_children(logical); i++) {
+        gint32 x, y; gdouble scale; guint32 transform; gboolean primary; GVariant *specs, *props;
+        g_variant_get_child(logical, i, "(iidub@a(ssss)@a{sv})", &x, &y, &scale, &transform, &primary, &specs, &props);
+        const gchar *connector = NULL;
+        if (g_variant_n_children(specs)) g_variant_get_child(specs, 0, "(&s&s&s&s)", &connector, NULL, NULL, NULL);
+        gint32 width = 0, height = 0;
+        for (gsize m = 0; connector && m < g_variant_n_children(monitors); m++) {
+            GVariant *monitor = g_variant_get_child_value(monitors, m), *spec = g_variant_get_child_value(monitor, 0),
+                *modes = g_variant_get_child_value(monitor, 1);
+            const gchar *name = NULL; g_variant_get_child(spec, 0, "&s", &name);
+            for (gsize k = 0; name && !strcmp(name, connector) && k < g_variant_n_children(modes); k++) {
+                GVariant *mode = g_variant_get_child_value(modes, k), *mode_props = g_variant_get_child_value(mode, 6);
+                gboolean current = FALSE;
+                if (g_variant_lookup(mode_props, "is-current", "b", &current) && current)
+                    g_variant_get_child(mode, 1, "i", &width), g_variant_get_child(mode, 2, "i", &height);
+                g_variant_unref(mode_props); g_variant_unref(mode);
+            }
+            g_variant_unref(modes); g_variant_unref(spec); g_variant_unref(monitor);
+        }
+        if (transform % 2) { gint32 t = width; width = height; height = t; } /* 90/270, flipped or not */
+        if (connector && width > 0 && height > 0) {
+            int n = snprintf(out + used, length - used, "%s\t%d\t%d\t%d\t%d\t%d\n", connector, width, height, x, y, primary ? 1 : 0);
+            if (n > 0 && (size_t)n < length - used) { used += (size_t)n; count++; }
+        }
+        g_variant_unref(specs); g_variant_unref(props);
+    }
+    g_variant_unref(monitors); g_variant_unref(logical); g_variant_unref(reply);
+    return count;
+}
+/* End the compositor session now (screen-share indicator off) while the handle stays valid;
+ * captures then report a closed stream until the handle is replaced. */
+void uu_portal_end(struct uu_portal *p) {
+    if (!p || atomic_exchange(&p->closed, 1)) return;
+    if (p->bus && p->session) {
+        GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
+            NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
+        if (reply) g_variant_unref(reply);
+    }
 }

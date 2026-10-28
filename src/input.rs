@@ -334,6 +334,11 @@ impl InputInjector {
             let result=crate::wayland::move_pointer(x,y,false);
             if result!=-2 { return result; }
         }
+        // Portal (GNOME/KDE): absolute motion is addressed to the shared stream, i.e. the captured
+        // monitor; a uinput tablet would stretch the point across every monitor of the desktop.
+        if !relative && self.backend==crate::desktop_backend::DesktopBackend::Portal {
+            if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("motion", portal.move_pointer(f64::from(x),f64::from(y),false)); }
+        }
         // X11 multi-screen: the point is inside the selected monitor; XTest and uinput span the root.
         let placement=if relative || self.backend!=crate::desktop_backend::DesktopBackend::X11 {None} else {crate::wayland::x11_placement()};
         let (x,y)=placement.map_or((x,y),|(ox,oy)|(x+ox,y+oy));
@@ -352,6 +357,11 @@ impl InputInjector {
         else if relative { unsafe { x11_mouse_relative(x,y) } } else { unsafe { x11_mouse_move(x,y) } }
     }
     fn inject_button(&self,button:i32,pressed:bool)->i32 {
+        // Portal: clicks follow absolute motion on the same session, so a tap cannot land
+        // before the compositor has moved the pointer there (uinput is a separate queue).
+        if self.backend==crate::desktop_backend::DesktopBackend::Portal {
+            if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("button", portal.button(button,pressed)); }
+        }
         if let Some(uinput)=&self.uinput {
             if let Some((v,h))=crate::uinput::wheel_step(button) { return if pressed { Self::uinput_result(uinput.wheel(v,h)) } else { 0 }; }
             if let Some(code)=crate::uinput::button_code(button) { return Self::uinput_result(uinput.button(code,pressed)); }
