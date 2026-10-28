@@ -12,6 +12,13 @@ pub trait FrameSink { fn present(&mut self,frame:&Frame)->Result<(),String>; }
 /// Counts only (access units, presented frames, decode errors) for the periodic stats line.
 pub static STATS:[std::sync::atomic::AtomicU64;3]=[std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0)];
 fn wants_key_frame(units:u64,presented:u64)->bool {presented==0 && units%30==0}
+/// True when an Annex-B access unit carries an IDR/IRAP slice the decoder can restart from.
+pub fn is_key_frame(codec:super::media::Codec,au:&[u8])->bool {
+    au.windows(4).enumerate().filter(|(_,w)|w[..3]==[0,0,1]).any(|(_,w)|match codec {
+        super::media::Codec::H264=>w[3]&0x1f==5,
+        super::media::Codec::H265=>(16..=21).contains(&((w[3]>>1)&0x3f)),
+    })
+}
 pub fn display(decoder:&mut dyn Decoder,sink:&mut dyn FrameSink,au:&[u8],codec:super::media::Codec,pli:&AtomicBool)->Result<(),String> {
     let units=STATS[0].fetch_add(1,Ordering::Relaxed)+1;
     // A later session can join a clean stream with no IDR in flight (#124): keep asking until a frame shows.
@@ -35,6 +42,13 @@ pub fn display(decoder:&mut dyn Decoder,sink:&mut dyn FrameSink,au:&[u8],codec:s
     }
 }
 #[cfg(test)] mod tests {
+    #[test] fn key_frames_by_nal_type(){
+        use crate::viewer::media::Codec;
+        assert!(super::is_key_frame(Codec::H264,&[0,0,0,1,0x67,1,0,0,0,1,0x68,2,0,0,0,1,0x65,3]));
+        assert!(!super::is_key_frame(Codec::H264,&[0,0,0,1,0x61,1]));
+        assert!(super::is_key_frame(Codec::H265,&[0,0,0,1,0x40,1,0,0,1,0x26,1,3]));
+        assert!(!super::is_key_frame(Codec::H265,&[0,0,0,1,0x02,1]));
+    }
     use super::*;
     struct Mock(bool);impl Decoder for Mock {fn set_codec(&mut self,_:crate::viewer::media::Codec)->Result<(),String>{Ok(())} fn decode(&mut self,_:&[u8])->Result<Vec<Frame>,String>{if self.0{Err("synthetic".into())}else{Ok(vec![Frame{width:1,height:1,rgb:vec![0;3],content:None}])}} fn reset(&mut self){self.0=false;}}
     struct Sink(usize);impl FrameSink for Sink{fn present(&mut self,f:&Frame)->Result<(),String>{assert_eq!(f.rgb.len(),3);self.0+=1;Ok(())}}

@@ -139,7 +139,7 @@ pub enum Command {
 }
 /// What the menu shows as selected. Remote settings start at the official viewer's defaults and
 /// reflect only this session's choices; the host does not report them back.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct State {
     pub quality: u64, pub fps: u32, pub chroma: u32, pub follow_remote: bool, pub one_to_one: bool, pub volume: u8,
     pub auto_lock: bool, pub host_mute: bool, pub grab_keys: bool, pub watch: bool, pub stats: bool, pub hide_tab: bool, pub fullscreen: bool,
@@ -179,6 +179,7 @@ fn options(cat: usize, st: &State) -> Vec<Opt> {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Hit { Tab, Category(usize), Option(usize, usize), Slider(f32, f32), Panel }
+#[derive(Clone, PartialEq)]
 pub struct Menu { pub open: bool, pub category: usize, pub hover: Option<Hit>, pub dragging: bool }
 impl Default for Menu { fn default() -> Self { Self { open: false, category: 1, hover: None, dragging: false } } }
 
@@ -186,9 +187,11 @@ pub struct Rect { pub x: f32, pub y: f32, pub w: f32, pub h: f32 }
 impl Rect { pub fn contains(&self, x: f32, y: f32) -> bool { x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h } }
 
 pub const TAB_H: f32 = 30.;
-pub fn tab_text() -> &'static str { s("☰  控制中心", "☰  Control center") }
+pub fn tab_text() -> &'static str { s("控制中心", "Control center") }
+/// Width of the drawn menu icon plus its gap; fonts without U+2630 would show a box.
+const ICON_W: f32 = 18.;
 pub fn tab_rect(font: Option<&FontVec>, window: (u32, u32), scale: f32) -> Rect {
-    let w = measure(font, tab_text(), 13. * scale) + 28. * scale;
+    let w = measure(font, tab_text(), 13. * scale) + (28. + ICON_W) * scale;
     Rect { x: (window.0 as f32 - w) / 2., y: 0., w, h: TAB_H * scale }
 }
 pub fn tab_layer(font: Option<&FontVec>, scale: f32, hover: bool) -> Layer {
@@ -196,7 +199,8 @@ pub fn tab_layer(font: Option<&FontVec>, scale: f32, hover: bool) -> Layer {
     let mut l = Layer::new(r.w.ceil() as u32, r.h.ceil() as u32);
     // Flat top edge: the pill hangs from the window border.
     l.round_rect(0., -12. * scale, r.w, r.h + 12. * scale, 12. * scale, if hover { [40, 44, 52, 235] } else { [24, 26, 31, 205] });
-    l.text(font, 14. * scale, (r.h - 13. * scale * 1.25) / 2., tab_text(), 13. * scale, TEXT);
+    for i in 0..3 { l.round_rect(14. * scale, r.h / 2. + (i as f32 * 4. - 5.) * scale, 11. * scale, 1.6 * scale, 0.8 * scale, TEXT); }
+    l.text(font, (14. + ICON_W) * scale, (r.h - 13. * scale * 1.25) / 2., tab_text(), 13. * scale, TEXT);
     l
 }
 

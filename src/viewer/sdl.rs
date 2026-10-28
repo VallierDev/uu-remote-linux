@@ -6,7 +6,8 @@ pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl
     pub last_frame:Option<Frame>, chrome:Chrome }
 /// In-window chrome state (src/viewer/hud.rs): menu, network panel, loading screen.
 struct Chrome { font:Option<ab_glyph::FontVec>, scale:f32, pub state:hud::State, menu:hud::Menu, net:Option<hud::NetStats>, tab_hover:bool, tab_down:bool,
-    commands:Vec<hud::Command>, started:std::time::Instant, last_loading:std::time::Instant, title:String, stage:String, labels:std::collections::HashMap<(String,u32,u32),hud::Layer> }
+    commands:Vec<hud::Command>, started:std::time::Instant, last_loading:std::time::Instant, title:String, stage:String, labels:std::collections::HashMap<(String,u32,u32),hud::Layer>,
+    menu_cache:Option<(hud::State,hud::Menu,f32,hud::Layer)> }
 use super::hud;
 impl Window {
     pub fn new()->Result<Self,String>{
@@ -24,7 +25,7 @@ impl Window {
         let mut state=hud::State::default();hud::load_prefs(&mut state);
         let now=std::time::Instant::now();
         let chrome=Chrome{font:hud::load_font(),scale,state,menu:hud::Menu::default(),net:None,tab_hover:false,tab_down:false,commands:Vec::new(),started:now,last_loading:now-std::time::Duration::from_secs(1),
-            title:crate::tr!("正在连接 {name}","Connecting to {name}"),stage:crate::i18n::s("正在连接远端设备…","Contacting the remote device…").into(),labels:Default::default()};
+            title:crate::tr!("正在连接 {name}","Connecting to {name}"),stage:crate::i18n::s("正在连接远端设备…","Contacting the remote device…").into(),labels:Default::default(),menu_cache:None};
         let events=sdl.event_pump()?;let clipboard=video.clipboard();
         let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
         Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
@@ -101,7 +102,7 @@ impl Window {
                 _=>(false,false),
             }
         }
-        let (_,lay)=self.menu_layout();let origin=self.menu_origin(&lay);
+        let lay=hud::layout(self.chrome.font.as_ref(),&self.chrome.state,&self.chrome.menu,scale);let origin=self.menu_origin(&lay);
         let hit=|x:i32,y:i32|->Option<hud::Hit>{
             let (lx,ly)=(x as f32-origin.0,y as f32-origin.1);
             if tab.contains(x as f32,y as f32) {return Some(hud::Hit::Tab)}
@@ -203,8 +204,14 @@ impl Window {
             self.blit(&layer,r.x.round() as i32,0)?;
         }
         if self.chrome.menu.open {
-            let (layer,lay)=self.menu_layout();let o=self.menu_origin(&lay);
-            self.blit(&layer,o.0 as i32,o.1 as i32)?;
+            // Rasterizing the menu is costly; reuse it until what it shows changes.
+            let c=&self.chrome;
+            let cached=matches!(&c.menu_cache,Some((st,m,sc,_)) if *st==c.state&&*m==c.menu&&*sc==c.scale);
+            if !cached {let (layer,_)=self.menu_layout();self.chrome.menu_cache=Some((self.chrome.state.clone(),self.chrome.menu.clone(),scale,layer));}
+            let lay=hud::layout(self.chrome.font.as_ref(),&self.chrome.state,&self.chrome.menu,scale);let o=self.menu_origin(&lay);
+            let (st,m,sc,layer)=self.chrome.menu_cache.take().expect("menu cached above");
+            let r=self.blit(&layer,o.0 as i32,o.1 as i32);
+            self.chrome.menu_cache=Some((st,m,sc,layer));r?;
         }
         Ok(())
     }
@@ -358,6 +365,8 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let started=std::time::Instant::now();let mut seq=3_000_000u64;
     let mut last=(0u64,0u64,0u64,0u64,std::time::Instant::now());
     let mut codec_name="--";
+    // After a local drop the decoder has no reference picture; P-frames would only smear blocks.
+    let mut await_key=false;
     let mut next_thumb=std::time::Instant::now()+std::time::Duration::from_secs(5);
     let result=async {
         loop {tokio::select!{
@@ -485,10 +494,14 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                 if quit{return Ok(())}
                 // At most one AU per iteration keeps local event polling responsive.
                 if let Some(au)=session.peer.desktop.units.pop(){
-                    if session.peer.desktop.reset.swap(false,std::sync::atomic::Ordering::AcqRel){decoder.reset();}
-                    decoder.set_codec(au.codec)?;
-                    codec_name=if au.codec==super::media::Codec::H265 {"H.265"} else {"H.264"};
-                    super::desktop::display(decoder,window,&au.data,au.codec,&session.peer.desktop.pli)?;}
+                    if session.peer.desktop.reset.swap(false,std::sync::atomic::Ordering::AcqRel){decoder.reset();await_key=true;}
+                    if await_key && !super::desktop::is_key_frame(au.codec,&au.data) {session.peer.desktop.pli.store(true,std::sync::atomic::Ordering::Release);}
+                    else {
+                        await_key=false;
+                        decoder.set_codec(au.codec)?;
+                        codec_name=if au.codec==super::media::Codec::H265 {"H.265"} else {"H.264"};
+                        super::desktop::display(decoder,window,&au.data,au.codec,&session.peer.desktop.pli)?;
+                    }}
             }
         }}
     }.await;
