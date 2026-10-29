@@ -337,8 +337,76 @@ pub fn save_prefs(st: &State) {
 }
 fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_else(|| "viewer.json".into(), |d| d.join("viewer.json")) }
 
+// ---------------------------------------------------------------- transfer card
+
+/// The dropped-files upload in progress, shown above the bottom edge with Pause and Cancel.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct Transfer { pub label: String, pub done: u64, pub total: u64, pub sized: bool, pub paused: bool, pub hover: Option<TransferHit> }
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TransferHit { Pause, Cancel, Card }
+pub fn bytes(n: u64) -> String {
+    let mut v = n as f64; let mut unit = 0;
+    while v >= 1024. && unit < 3 { v /= 1024.; unit += 1; }
+    if unit == 0 { format!("{n} B") } else { format!("{v:.1} {}", ["B", "KB", "MB", "GB"][unit]) }
+}
+/// `text` cut with an ellipsis to fit `width`.
+fn fit(font: Option<&FontVec>, text: &str, size: f32, width: f32) -> String {
+    if measure(font, text, size) <= width { return text.into() }
+    let mut cut: String = text.into();
+    while !cut.is_empty() && measure(font, &format!("{cut}…"), size) > width { cut.pop(); }
+    format!("{cut}…")
+}
+/// The card layer (shadow margin included) and its hit areas in layer coordinates.
+pub fn transfer_layer(font: Option<&FontVec>, t: &Transfer, scale: f32) -> (Layer, Vec<(Rect, TransferHit)>) {
+    let k = |v: f32| v * scale;
+    let sh = k(SHADOW);
+    let card_rect = Rect { x: sh, y: sh, w: k(380.), h: k(104.) };
+    let mut l = Layer::new((card_rect.w + sh * 2.).ceil() as u32, (card_rect.h + sh * 2.).ceil() as u32);
+    card(&mut l, &card_rect, scale);
+    let (pad, size) = (k(16.), k(TEXT_SIZE));
+    let (x, y, inner) = (card_rect.x + pad, card_rect.y + pad, card_rect.w - pad * 2.);
+    let fraction = if t.total > 0 { (t.done as f64 / t.total as f64).clamp(0., 1.) as f32 } else if t.sized { 1. } else { 0. };
+    let status = if t.paused { s("已暂停", "Paused").to_owned() } else if t.sized { format!("{:.0}%", fraction * 100.) } else { String::new() };
+    let status_w = measure(font, &status, k(12.));
+    l.text(font, x, y, &fit(font, &t.label, size, inner - status_w - k(12.)), size, TEXT);
+    l.text(font, x + inner - status_w, y + k(1.), &status, k(12.), DIM);
+    // Progress track; the fill dims while paused and stays empty until a file is under way.
+    let bar_y = y + k(26.);
+    l.round_rect(x, bar_y, inner, k(6.), k(3.), [255, 255, 255, 28]);
+    if t.sized && fraction > 0. { l.round_rect(x, bar_y, (inner * fraction).max(k(6.)), k(6.), k(3.), if t.paused { [148, 163, 184, 255] } else { ACCENT }); }
+    // Buttons on the bottom row, the size line beside them.
+    let (bh, row_y) = (k(28.), card_rect.y + card_rect.h - pad - k(28.));
+    let pause = if t.paused { s("继续", "Resume") } else { s("暂停", "Pause") };
+    let cancel = s("取消", "Cancel");
+    let width = |text: &str| measure(font, text, k(12.5)) + k(28.);
+    let cancel_r = Rect { x: x + inner - width(cancel), y: row_y, w: width(cancel), h: bh };
+    let pause_r = Rect { x: cancel_r.x - k(8.) - width(pause), y: row_y, w: width(pause), h: bh };
+    for (r, text, hit) in [(&pause_r, pause, TransferHit::Pause), (&cancel_r, cancel, TransferHit::Cancel)] {
+        let hover = t.hover == Some(hit);
+        let fill = match (hit, hover) { (TransferHit::Cancel, true) => [248, 113, 113, 46], (_, true) => [255, 255, 255, 40], _ => [255, 255, 255, 20] };
+        l.round_rect(r.x, r.y, r.w, r.h, k(7.), fill);
+        let color = if hit == TransferHit::Cancel && hover { DANGER } else { TEXT };
+        l.text(font, r.x + (r.w - measure(font, text, k(12.5))) / 2., r.y + (r.h - k(12.5) * 1.25) / 2., text, k(12.5), color);
+    }
+    if t.sized && t.total > 0 {
+        let detail = format!("{} / {}", bytes(t.done), bytes(t.total));
+        l.text(font, x, row_y + (bh - k(11.5) * 1.25) / 2., &fit(font, &detail, k(11.5), pause_r.x - x - k(8.)), k(11.5), DIM);
+    }
+    (l, vec![(pause_r, TransferHit::Pause), (cancel_r, TransferHit::Cancel), (card_rect, TransferHit::Card)])
+}
+
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn transfer_card_sizes_and_buttons(){
+        assert_eq!(bytes(512),"512 B");assert_eq!(bytes(1536),"1.5 KB");assert_eq!(bytes(5*1024*1024),"5.0 MB");
+        let t=Transfer{label:"Uploading a very long file name that does not fit.iso".repeat(3),done:50,total:100,sized:true,..Default::default()};
+        let (l,hits)=transfer_layer(None,&t,1.);
+        assert!(l.w>380&&l.h>104);
+        let (pause,cancel,card)=(&hits[0].0,&hits[1].0,&hits[2].0);
+        assert!(pause.x+pause.w<=cancel.x&&cancel.x+cancel.w<=card.x+card.w);
+        assert_eq!(hits.iter().map(|h|h.1).collect::<Vec<_>>(),[TransferHit::Pause,TransferHit::Cancel,TransferHit::Card]);
+        assert!(fit(None,&t.label,13.,100.).ends_with('…'));
+    }
     #[test] fn layers_blend_inside_bounds_only(){
         let mut l=Layer::new(8,8);l.round_rect(-4.,-4.,20.,20.,3.,[255,0,0,255]);l.circle(100.,100.,5.,[0,0,0,255]);
         assert!(l.px.chunks_exact(4).all(|p|p==[255,0,0,255]));

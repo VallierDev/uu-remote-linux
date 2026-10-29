@@ -58,9 +58,13 @@ impl Session {
                     event.get(1).and_then(|b|b.get("type").or_else(||b.get("data").and_then(|d|d.get("type")))).and_then(Value::as_str).unwrap_or("-"));
                 match event.get(0).and_then(Value::as_str) {
                     Some("soac")=>if let Some(body)=event.get(1) {self.peer.receive(body).await?},
-                    Some("released"|"left"|"leave")=> {
+                    Some(name@("released"|"left"|"leave"))=> {
+                        // Key names and route comparisons only, no ids.
+                        let body=event.get(1).unwrap_or(&Value::Null);
+                        let keys=|v:&Value|v.as_object().map(|o|o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+                        log::info!("Viewer {name} event: keys={:?} data_keys={:?} route={}",keys(body),keys(body.get("data").unwrap_or(&Value::Null)),self.peer.route_comparison(body));
                         // An event for another peer must not tear down this session.
-                        if self.peer.matches_route(event.get(1).unwrap_or(&Value::Null)) {return Err("Remote session released".into())}
+                        if self.peer.matches_route(body) {return Err("Remote session released".into())}
                     }
                     _=>{},
                 }

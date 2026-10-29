@@ -302,6 +302,12 @@ impl Peer {
             && !body.get("app_control_id").is_some_and(|v|v.as_str()!=Some(self.app_id.as_str()))
             && !event.get("client_id").is_some_and(|v|v.as_str()!=Some(self.remote_client.as_str()))
     }
+    /// For each route field matches_route checks: absent, same or other (no values).
+    pub fn route_comparison(&self,event:&Value)->String {
+        let body=event.get("data").unwrap_or(event);
+        let cmp=|v:Option<&Value>,ours:&str|match v {None=>"absent",Some(v) if v.as_str()==Some(ours)=>"same",_=>"other"};
+        format!("ice_id={} app_control_id={} client_id={}",cmp(body.get("ice_id"),&self.ice_id),cmp(body.get("app_control_id"),&self.app_id),cmp(event.get("client_id"),&self.remote_client))
+    }
     pub fn ready(&self,policy:ReadyPolicy,explicit:bool)->bool {
         self.observed.echo_received.load(Ordering::Acquire) && match policy {ReadyPolicy::EchoOnly=>true,ReadyPolicy::Explicit=>explicit}
     }

@@ -8,7 +8,7 @@ pub struct Entry {pub kind:u64,pub name:String,pub size:u64,pub modified:u64,pub
 pub struct Progress {pub task:u64,pub transferred:u64,pub total:u64}
 // Keep request/task ids unique when a desktop file window is reopened.
 static NEXT:AtomicU64=AtomicU64::new(100);
-pub struct Files {io:Transport,rx:AsyncMutex<mpsc::Receiver<Packet>>,next:&'static AtomicU64,canceled:AtomicBool,poisoned:AtomicBool,wake:Notify,progress:mpsc::Sender<Progress>}
+pub struct Files {io:Transport,rx:AsyncMutex<mpsc::Receiver<Packet>>,next:&'static AtomicU64,canceled:AtomicBool,stopped:AtomicBool,paused:AtomicBool,poisoned:AtomicBool,wake:Notify,progress:mpsc::Sender<Progress>}
 /// Last path component for either separator; hosts may be Windows (`C:\x`) or Unix.
 pub fn base_name(path:&str)->&str{path.trim_end_matches(['/','\\']).rsplit(['/','\\']).next().filter(|s|!s.is_empty()).unwrap_or(path)}
 pub fn remote_join(dir:&str,name:&str)->String{
@@ -46,13 +46,25 @@ impl Drop for Stage {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}
 /// file completes; the lowest buffered id is then the base.
 struct Download {file:tokio::fs::File,written:u64,next:Option<u64>,blocks:BTreeMap<u64,Vec<u8>>}
 impl Files {
-    pub fn new(io:Transport,rx:mpsc::Receiver<Packet>)->(Self,mpsc::Receiver<Progress>){let(tx,progress)=mpsc::channel(64);(Self{io,rx:AsyncMutex::new(rx),next:&NEXT,canceled:AtomicBool::new(false),poisoned:AtomicBool::new(false),wake:Notify::new(),progress:tx},progress)}
+    pub fn new(io:Transport,rx:mpsc::Receiver<Packet>)->(Self,mpsc::Receiver<Progress>){let(tx,progress)=mpsc::channel(64);(Self{io,rx:AsyncMutex::new(rx),next:&NEXT,canceled:AtomicBool::new(false),stopped:AtomicBool::new(false),paused:AtomicBool::new(false),poisoned:AtomicBool::new(false),wake:Notify::new(),progress:tx},progress)}
     /// Cancels the active operation; subsequent operations can reuse the session.
     pub fn cancel(&self){self.canceled.store(true,Ordering::Release);self.wake.notify_waiters();}
+    /// Cancels the active operation and every later one (the dropped-files batch).
+    pub fn stop(&self){self.stopped.store(true,Ordering::Release);self.cancel();}
+    /// A paused upload sends no further block until resumed; the host keeps the open task.
+    pub fn set_paused(&self,on:bool){self.paused.store(on,Ordering::Release);self.wake.notify_waiters();}
+    fn halted(&self)->bool{self.canceled.load(Ordering::Acquire)||self.stopped.load(Ordering::Acquire)}
+    async fn resumed(&self)->Result<(),String>{loop{
+        let notified=self.wake.notified();tokio::pin!(notified);notified.as_mut().enable();
+        if self.halted(){return Err("File transfer canceled".into())}
+        if !self.paused.load(Ordering::Acquire){return Ok(())}
+        notified.await;
+    }}
     async fn recv(&self,rx:&mut mpsc::Receiver<Packet>)->Result<Vec<u8>,String>{loop{
         let notified=self.wake.notified();tokio::pin!(notified);notified.as_mut().enable();
-        if self.canceled.load(Ordering::Acquire){return Err("File transfer canceled".into())}
-        let(c,b)=tokio::select!{r=receive(rx)=>r?,_=notified=>return Err("File transfer canceled".into())};if c==FILE{return Ok(b)}
+        if self.halted(){return Err("File transfer canceled".into())}
+        // Pause and resume wake this too; only a cancel ends the wait (checked above).
+        let(c,b)=tokio::select!{r=receive(rx)=>r?,_=notified=>continue};if c==FILE{return Ok(b)}
     }}
     async fn request(&self,rx:&mut mpsc::Receiver<Packet>,case:u32,body:&[u8],expected:u32)->Result<Vec<u8>,String>{
         if self.poisoned.load(Ordering::Acquire){return Err("File session requires reconnect after failed cleanup".into())}
@@ -98,7 +110,7 @@ impl Files {
             let mut ask=id(task,1);wire::int(3,size,&mut ask);let r=self.request(&mut rx,3,&ask,3).await?;check(uint(&r,3))?;
             if uint(&r,2)!=0 || uint(&r,4)!=0{return Err("Unexpected upload skip/resume".into())}
             let mut done=0;let mut block=0;let mut buf=vec![0;32*1024];
-            loop{let n=file.read(&mut buf).await.map_err(|_|"Upload read failed")?;if n==0{break}
+            loop{self.resumed().await?;let n=file.read(&mut buf).await.map_err(|_|"Upload read failed")?;if n==0{break}
                 let mut b=id(task,1);wire::int(2,block,&mut b);wire::bytes(3,&buf[..n],&mut b);
                 let r=self.request(&mut rx,4,&b,4).await?;check(uint(&r,3))?;
                 if uint(&r,2)!=block || uint(&r,4)!=n as u64{return Err("Invalid upload block acknowledgement".into())}

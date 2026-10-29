@@ -17,11 +17,29 @@ extern "C" {
 }
 fn toast(text: &str) { let t = c(text); unsafe { uu_viewer_ui_toast(t.as_ptr()) } }
 
+/// Session children's stderr (already free of names, paths, keys and text) kept for local
+/// troubleshooting in `$XDG_STATE_HOME/uuremote/viewer-session.log` (0600; starts over past 8 MiB).
+fn session_log() -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let state = std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()).map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state")))?;
+    let dir = state.join("uuremote");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("viewer-session.log");
+    let mut options = std::fs::OpenOptions::new();
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 8 << 20) { options.write(true).truncate(true); } else { options.append(true); }
+    options.create(true).mode(0o600).open(path).ok()
+}
+
 /// Runs one session child; on failure shows its last error line (log lines start with '[').
 fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::oneshot::Receiver<()>, success: Option<&'static str>) -> tokio::task::JoinHandle<()> {
     use tokio::io::AsyncBufReadExt;
+    use std::io::Write;
     let stderr = child.stderr.take();
     tokio::spawn(async move {
+        let mut log = session_log();
+        let mut keep = |line: &str| if let Some(file) = log.as_mut() { let _ = writeln!(file, "{line}"); };
+        keep(&format!("--- session started pid={}", child.id().unwrap_or(0)));
         let mut last = String::new();
         let mut lines = stderr.map(|e| tokio::io::BufReader::new(e).lines());
         let status = loop {
@@ -32,7 +50,7 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
                 }
                 status = child.wait() => break status,
                 line = async { match lines.as_mut() { Some(l) => l.next_line().await, None => std::future::pending().await } } => match line {
-                    Ok(Some(l)) => { if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); } }
+                    Ok(Some(l)) => { keep(&l); if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); } }
                     _ => lines = None,
                 },
             }
@@ -41,10 +59,12 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
         let _ = tokio::time::timeout(Duration::from_millis(200), async {
             if let Some(lines) = lines.as_mut() {
                 while let Ok(Some(l)) = lines.next_line().await {
+                    keep(&l);
                     if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); }
                 }
             }
         }).await;
+        keep(&format!("--- session ended success={}", status.as_ref().is_ok_and(|s| s.success())));
         if !status.is_ok_and(|s| s.success()) {
             let reason = match last.as_str() {
                 "" => crate::i18n::s("连接已断开","Disconnected").to_owned(),

@@ -1,29 +1,54 @@
 //! Files dropped on the desktop window go to the remote folder under the drop point.
 //! A Windows host has no protocol message for that, so a short-lived terminal session asks the
-//! remote PowerShell which window lies under the point (desktop or an Explorer folder).
-//! Paths and file names never enter logs.
-use super::tools::{Packet,Transport,files::{self,Entry,Files},terminal::{Event,Terminal}};
-use std::{collections::HashSet,path::PathBuf,sync::{Arc,Mutex},time::{Duration,Instant}};
-use tokio::sync::mpsc;
+//! remote PowerShell which window lies under the point (desktop or an Explorer folder). It runs on
+//! the desktop connection's own BINARY channel: a second connection would join the device's room
+//! again, and the cloud then ends the desktop session (observed: `leave` with the desktop's ice_id).
+//! Windows 11 hands that console to a visible Windows Terminal window, which then covers the drop
+//! point (observed: CASCADIA_HOSTING_WINDOW_CLASS under the point): the probe minimizes its own or the
+//! foreground terminal window (never closes one) and skips every terminal window while walking top-down.
+//! `UU_VIEWER_DROP_PROBE=0` skips it (always the remote Desktop). Paths and file names never enter logs.
+use super::tools::{Packet,Transport,FILE,files::{self,Entry,Files},terminal::{Event,Terminal}};
+use std::{collections::HashSet,path::PathBuf,sync::Arc,time::{Duration,Instant}};
+use tokio::sync::{mpsc,watch};
 
 /// What the remote reported under the drop point.
 #[derive(Debug,Clone,PartialEq,serde::Deserialize,serde::Serialize)]
-pub struct Target {pub kind:String,pub path:String}
-pub type Status=mpsc::UnboundedSender<(String,bool)>;
+pub struct Target {pub kind:String,pub path:String,#[serde(default)] pub diag:Diag}
+/// Where the probe ran (numbers and booleans; the window as a category, never its title).
+#[derive(Debug,Clone,Default,PartialEq,serde::Deserialize,serde::Serialize)]
+pub struct Diag {#[serde(default)] pub sid:i64,#[serde(default)] pub active:i64,#[serde(default)] pub sys:bool,#[serde(default)] pub cursor:bool,#[serde(default)] pub window:String}
+/// What the transfer card shows: a stage line, the current file in bytes, or the final message.
+#[derive(Debug,Clone,PartialEq)]
+pub enum Update {Stage(String),File{label:String,done:u64,total:u64},Finished(String)}
+pub type Status=mpsc::UnboundedSender<Update>;
+/// The transfer card's buttons.
+#[derive(Debug,Clone,Copy,Default,PartialEq)]
+pub struct Control {pub paused:bool,pub canceled:bool}
+/// Longest wait for the remote PowerShell before the Desktop is used instead.
+const PROBE_LIMIT:Duration=Duration::from_secs(20);
 
 /// One statement per line, no here-strings: the host's PSReadLine reads the decoded text through `iex`.
 /// `{NX}`/`{NY}` are the drop point relative to the monitor that holds the remote cursor (the streamed one).
 const PROBE:&str=r##"$ErrorActionPreference='Stop'
-if(-not ('UuDrop.D' -as [type])){Add-Type -Name D -Namespace UuDrop -MemberDefinition '[StructLayout(LayoutKind.Sequential)] public struct P{public int X;public int Y;} [StructLayout(LayoutKind.Sequential)] public struct R{public int L;public int T;public int Rt;public int B;} [StructLayout(LayoutKind.Sequential)] public struct MI{public int Size;public R Mon;public R Work;public int Flags;} [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c); [DllImport("user32.dll")] public static extern bool GetCursorPos(out P p); [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(P p,uint f); [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr m,ref MI i); [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(P p); [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h,uint f); [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,System.Text.StringBuilder s,int n); [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,System.Text.StringBuilder s,int n);'}
+if(-not ('UuDrop.D' -as [type])){Add-Type -Name D -Namespace UuDrop -MemberDefinition '[StructLayout(LayoutKind.Sequential)] public struct P{public int X;public int Y;} [StructLayout(LayoutKind.Sequential)] public struct R{public int L;public int T;public int Rt;public int B;} [StructLayout(LayoutKind.Sequential)] public struct MI{public int Size;public R Mon;public R Work;public int Flags;} [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c); [DllImport("user32.dll")] public static extern bool GetCursorPos(out P p); [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(P p,uint f); [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr m,ref MI i); [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(P p); [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h,uint f); [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,System.Text.StringBuilder s,int n); [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,System.Text.StringBuilder s,int n); [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId(); [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h); [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h,uint c); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out R r); [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h,int i); [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h,int a,out int v,int n); [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int c); [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();'}
+function UuClass($x){$b=New-Object Text.StringBuilder 64;[UuDrop.D]::GetClassName($x,$b,64)|Out-Null;$b.ToString()}
+$term=@('CASCADIA_HOSTING_WINDOW_CLASS','ConsoleWindowClass','PseudoConsoleWindow')
+$own=[UuDrop.D]::GetAncestor([UuDrop.D]::GetConsoleWindow(),3);$fg=[UuDrop.D]::GetForegroundWindow()
+foreach($x in @($own,$fg)){if($x -ne [IntPtr]::Zero -and $term -contains (UuClass $x)){[UuDrop.D]::ShowWindow($x,7)|Out-Null}}
 try{$a=[UuDrop.D]::SetThreadDpiAwarenessContext([IntPtr](-4))}catch{$a=[IntPtr]::Zero};if($a -eq [IntPtr]::Zero){[UuDrop.D]::SetProcessDPIAware()|Out-Null}
-$c=New-Object UuDrop.D+P;[UuDrop.D]::GetCursorPos([ref]$c)|Out-Null
+$c=New-Object UuDrop.D+P;$cur=[UuDrop.D]::GetCursorPos([ref]$c)
 $i=New-Object UuDrop.D+MI;$i.Size=40;[UuDrop.D]::GetMonitorInfo([UuDrop.D]::MonitorFromPoint($c,2),[ref]$i)|Out-Null
 $p=New-Object UuDrop.D+P;$p.X=[Math]::Min($i.Mon.Rt-1,[int]($i.Mon.L+{NX}*($i.Mon.Rt-$i.Mon.L)));$p.Y=[Math]::Min($i.Mon.B-1,[int]($i.Mon.T+{NY}*($i.Mon.B-$i.Mon.T)))
-$h=[UuDrop.D]::GetAncestor([UuDrop.D]::WindowFromPoint($p),2)
+$h0=[UuDrop.D]::GetAncestor([UuDrop.D]::WindowFromPoint($p),2)
+$h=[IntPtr]::Zero;$w=[UuDrop.D]::GetTopWindow([IntPtr]::Zero)
+while($w -ne [IntPtr]::Zero -and $h -eq [IntPtr]::Zero){if($w -ne $own -and [UuDrop.D]::IsWindowVisible($w)){$r=New-Object UuDrop.D+R;[UuDrop.D]::GetWindowRect($w,[ref]$r)|Out-Null;if($p.X -ge $r.L -and $p.X -lt $r.Rt -and $p.Y -ge $r.T -and $p.Y -lt $r.B){$ex=[UuDrop.D]::GetWindowLong($w,-20);$cl=0;[UuDrop.D]::DwmGetWindowAttribute($w,14,[ref]$cl,4)|Out-Null;if((($ex -band 0x20) -eq 0) -and ($cl -eq 0) -and -not ($term -contains (UuClass $w))){$h=$w}}};$w=[UuDrop.D]::GetWindow($w,2)}
+if($h -eq [IntPtr]::Zero){$h=$h0}
 $s=New-Object Text.StringBuilder 512;[UuDrop.D]::GetClassName($h,$s,512)|Out-Null;$cls=$s.ToString();$s.Clear()|Out-Null;[UuDrop.D]::GetWindowText($h,$s,512)|Out-Null;$title=$s.ToString()
 $kind='other';$path=[Environment]::GetFolderPath('Desktop')
 if($cls -eq 'Progman' -or $cls -eq 'WorkerW'){$kind='desktop'}elseif($cls -eq 'CabinetWClass' -or $cls -eq 'ExploreWClass'){$kind='virtual';try{$tabs=@((New-Object -ComObject Shell.Application).Windows()|?{[int64]$_.HWND -eq [int64]$h});$t=@(@($tabs|?{$title.StartsWith([string]$_.LocationName)})+$tabs)[0];$f=if($t){[string]$t.Document.Folder.Self.Path};if($f -match '^([A-Za-z]:\\|\\\\)'){$kind='folder';$path=$f}}catch{}}
-'UU'+'DROP:'+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((@{kind=$kind;path=$path}|ConvertTo-Json -Compress)))+':END'"##;
+$ck=if($h -eq [IntPtr]::Zero){'none'}elseif($kind -ne 'other'){'shell'}else{'app'}
+$d=@{sid=[Diagnostics.Process]::GetCurrentProcess().SessionId;active=[int64][UuDrop.D]::WTSGetActiveConsoleSessionId();sys=[Security.Principal.WindowsIdentity]::GetCurrent().IsSystem;cursor=[bool]$cur;window=$ck}
+'UU'+'DROP:'+[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((@{kind=$kind;path=$path;diag=$d}|ConvertTo-Json -Compress)))+':END'"##;
 /// Wide enough that the reply never wraps in the host's ConPTY.
 const COLS:u16=1000;
 
@@ -55,9 +80,10 @@ fn marker(text:&str)->Option<Target>{
     let text=plain(text);let start=text.find("UUDROP:")?+7;let end=start+text[start..].find(":END")?;
     serde_json::from_slice(&base64::engine::general_purpose::STANDARD.decode(&text[start..end]).ok()?).ok()
 }
-/// Runs the probe on a terminal tool connection (child process `drop-target`).
+/// Runs the probe on a terminal transport: the desktop connection's, or a tool connection's (`drop-target`).
 pub async fn target(io:Transport,rx:mpsc::Receiver<Packet>,nx:f64,ny:f64)->Result<Target,String>{
-    let(t,mut output)=Terminal::new(io,rx);t.check_env().await?;
+    // No check_env: the official Windows host has none and would only cost its 3 s timeout.
+    let(t,mut output)=Terminal::new(io,rx);
     let id=t.open(COLS,40).await?;
     let line=probe_line(nx,ny)+"\r";
     let result=async{
@@ -83,15 +109,6 @@ pub async fn target(io:Transport,rx:mpsc::Receiver<Packet>,nx:f64,ny:f64)->Resul
     }.await;
     let _=t.close(id).await;result
 }
-/// Asks a `drop-target` child; its terminal connection is separate from the desktop session.
-async fn locate(device:&str,nx:f64,ny:f64)->Result<Target,String>{
-    let exe=std::env::current_exe().map_err(|_|"Cannot locate the viewer executable")?;
-    let child=tokio::process::Command::new(exe).args(["drop-target",device,&format!("{nx:.5}"),&format!("{ny:.5}")])
-        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true).output();
-    let out=tokio::time::timeout(Duration::from_secs(60),child).await.map_err(|_|"Drop location timed out")?.map_err(|_|"Cannot start the drop helper")?;
-    String::from_utf8_lossy(&out.stdout).lines().rev().find_map(|l|serde_json::from_str(l).ok()).ok_or_else(||"The drop helper failed".into())
-}
-
 /// The official Windows host lists drives as `C:\`; this project's Linux host lists `/`.
 fn windows(root:&[Entry])->bool{root.iter().any(|e|{let b=e.path.as_bytes();b.len()==3&&b[0].is_ascii_alphabetic()&&&b[1..]==b":\\"})}
 /// "此电脑" lists the user folders; Desktop keeps its on-disk name on Windows, `桌面` with a Chinese locale.
@@ -132,16 +149,39 @@ fn plan(paths:&[PathBuf],dir:&str,taken:&mut HashSet<String>,fold:bool)->Result<
 }
 
 /// Upload over the desktop session's FILE channel to the folder under the drop point.
-/// Returns the message for the finished transfer.
-pub async fn run(io:Transport,rx:mpsc::Receiver<Packet>,device:&str,mac:bool,paths:Vec<PathBuf>,nx:f64,ny:f64,status:&Status)->Result<String,String>{
-    let(files,mut progress)=Files::new(io,rx);
-    let _=status.send((crate::i18n::s("正在确定放置位置…","Finding where you dropped it…").into(),false));
+/// Returns the message for the finished (or canceled) transfer.
+pub async fn run(io:Transport,mut rx:mpsc::Receiver<Packet>,mac:bool,paths:Vec<PathBuf>,nx:f64,ny:f64,status:&Status,control:watch::Receiver<Control>)->Result<String,String>{
+    // FILE replies go to the transfer; CONTROL and BINARY (the probe's terminal) to the probe.
+    let(file_tx,file_rx)=mpsc::channel(256);let(term_tx,term_rx)=mpsc::channel(256);
+    let demux=tokio::spawn(async move{while let Some((channel,data))=rx.recv().await{
+        if channel==FILE{if file_tx.send((channel,data)).await.is_err(){break}}else{let _=term_tx.try_send((channel,data));}
+    }});
+    let _demux=super::tools::Cancel(demux.abort_handle());
+    let(files,progress)=Files::new(io.clone(),file_rx);let files=Arc::new(files);
+    let watcher={let(files,mut control)=(files.clone(),control.clone());tokio::spawn(async move{loop{
+        let c=*control.borrow_and_update();files.set_paused(c.paused);
+        if c.canceled{files.stop();break}
+        if control.changed().await.is_err(){break}
+    }})};
+    let _watcher=super::tools::Cancel(watcher.abort_handle());
+    let result=transfer(io,term_rx,&files,progress,mac,paths,nx,ny,status,control.clone()).await;
+    if control.borrow().canceled{return Ok(crate::i18n::s("已取消上传","Upload canceled").into())}
+    result
+}
+async fn canceled(mut control:watch::Receiver<Control>){
+    loop{if control.borrow_and_update().canceled{return}if control.changed().await.is_err(){std::future::pending::<()>().await}}
+}
+#[allow(clippy::too_many_arguments)]
+async fn transfer(io:Transport,term_rx:mpsc::Receiver<Packet>,files:&Files,mut progress:mpsc::Receiver<files::Progress>,mac:bool,paths:Vec<PathBuf>,nx:f64,ny:f64,status:&Status,control:watch::Receiver<Control>)->Result<String,String>{
+    let _=status.send(Update::Stage(crate::i18n::s("正在确定放置位置…","Finding where you dropped it…").into()));
     let(dir,fallback)=if mac{("~/Desktop".to_owned(),false)}else{
         let root=files.list_dir(":/").await?;
         let desk=desktop(&root);
-        if windows(&root){
-            match locate(device,nx,ny).await{
-                Ok(t)=>{log::info!("Viewer drop target: kind={}",t.kind);let exact=matches!(t.kind.as_str(),"desktop"|"folder");(t.path,!exact)},
+        if windows(&root)&&std::env::var("UU_VIEWER_DROP_PROBE").as_deref()!=Ok("0"){
+            let probe=tokio::time::timeout(PROBE_LIMIT,target(io,term_rx,nx,ny));
+            let found=tokio::select!{r=probe=>r.unwrap_or_else(|_|Err("The remote did not report the drop location in time".into())),_=canceled(control.clone())=>return Err("File transfer canceled".into())};
+            match found{
+                Ok(t)=>{let d=&t.diag;log::info!("Viewer drop target: kind={} session={} active_session={} system={} cursor={} window={:?}",t.kind,d.sid,d.active,d.sys,d.cursor,d.window.chars().take(8).collect::<String>());let exact=matches!(t.kind.as_str(),"desktop"|"folder");(t.path,!exact)},
                 Err(e)=>{log::warn!("Viewer drop target unknown: {e}");(desk.ok_or("Remote desktop folder not found")?,true)},
             }
         }else{(desk.ok_or("Remote desktop folder not found")?,false)}
@@ -150,14 +190,13 @@ pub async fn run(io:Transport,rx:mpsc::Receiver<Packet>,device:&str,mac:bool,pat
     let mut taken:HashSet<String>=files.list_dir(&dir).await?.iter().map(|e|if fold{e.name.to_lowercase()}else{e.name.clone()}).collect();
     let steps=plan(&paths,&dir,&mut taken,fold)?;
     let total=steps.iter().filter(|s|matches!(s,Step::Put(..))).count();
-    let label=Arc::new(Mutex::new(String::new()));
+    let label=Arc::new(std::sync::Mutex::new(String::new()));
     let(shown,tx)=(label.clone(),status.clone());
     let reporter=tokio::spawn(async move{
         let mut last=Instant::now()-Duration::from_secs(1);
         while let Some(p)=progress.recv().await{
-            if last.elapsed()<Duration::from_millis(250)&&p.transferred<p.total{continue}last=Instant::now();
-            let percent=if p.total>0{p.transferred*100/p.total}else{100};
-            let _=tx.send((format!("{} {percent}%",shown.lock().unwrap()),false));
+            if last.elapsed()<Duration::from_millis(100)&&p.transferred<p.total{continue}last=Instant::now();
+            let _=tx.send(Update::File{label:shown.lock().unwrap().clone(),done:p.transferred,total:p.total});
         }
     });
     let _reporter=super::tools::Cancel(reporter.abort_handle());
@@ -166,8 +205,9 @@ pub async fn run(io:Transport,rx:mpsc::Receiver<Packet>,device:&str,mac:bool,pat
         Step::Mkdir(path)=>files.mkdir(&path).await?,
         Step::Put(local,remote)=>{
             done+=1;let name=local.file_name().map(|n|n.to_string_lossy().into_owned()).unwrap_or_default();
+            let size=std::fs::metadata(&local).map_or(0,|m|m.len());
             *label.lock().unwrap()=if total>1{crate::tr!("正在上传 {name}（{done}/{total}）","Uploading {name} ({done}/{total})")}else{crate::tr!("正在上传 {name}","Uploading {name}")};
-            let _=status.send((format!("{} 0%",label.lock().unwrap()),false));
+            let _=status.send(Update::File{label:label.lock().unwrap().clone(),done:0,total:size});
             files.upload(&local,&remote).await?;
         },
     }}
@@ -179,7 +219,7 @@ pub async fn run(io:Transport,rx:mpsc::Receiver<Packet>,device:&str,mac:bool,pat
     fn entry(kind:u64,name:&str,path:&str)->Entry{Entry{kind,name:name.into(),size:0,modified:0,path:path.into()}}
     #[test] fn probe_is_one_line_and_inflates_to_the_script_with_the_point(){
         use base64::Engine;
-        let line=probe_line(0.25,1.5);assert!(!line.contains(['\n','\r']));assert!(line.len()<2000,"{}",line.len());
+        let line=probe_line(0.25,1.5);assert!(!line.contains(['\n','\r']));assert!(line.len()<3000,"{}",line.len()); // one console line; well under the 8191-character input limit
         let data=line.split('\'').nth(1).unwrap();
         let raw=base64::engine::general_purpose::STANDARD.decode(data).unwrap();
         let mut script=String::new();std::io::Read::read_to_string(&mut flate2::read::DeflateDecoder::new(raw.as_slice()),&mut script).unwrap();
@@ -193,7 +233,9 @@ pub async fn run(io:Transport,rx:mpsc::Receiver<Packet>,device:&str,mac:bool,pat
         let b=base64::engine::general_purpose::STANDARD.encode(json);
         let (a,z)=b.split_at(10);
         let noisy=format!("\x1b]0;powershell.exe\x07\x1b[?25lPS C:\\> iex (...)\r\n\x1b[93mUU\x1b[mDROP:{a}\x1b[?25h\r\n{z}:END\x1b[K\r\nPS C:\\>");
-        assert_eq!(marker(&noisy),Some(Target{kind:"folder".into(),path:"C:\\Users\\k\\Downloads".into()}));
+        assert_eq!(marker(&noisy),Some(Target{kind:"folder".into(),path:"C:\\Users\\k\\Downloads".into(),diag:Diag::default()}));
+        let with=format!("UUDROP:{}:END",base64::engine::general_purpose::STANDARD.encode(r#"{"kind":"other","path":"C:\\x","diag":{"sid":1,"active":1,"sys":false,"cursor":true,"window":"app"}}"#));
+        assert_eq!(marker(&with).unwrap().diag,Diag{sid:1,active:1,sys:false,cursor:true,window:"app".into()});
         assert_eq!(marker("UUDROP:not base64!:END"),None);assert_eq!(marker("PS C:\\> "),None);
     }
     #[test] fn root_listing_tells_windows_and_the_desktop(){
