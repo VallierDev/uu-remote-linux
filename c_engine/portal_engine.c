@@ -680,6 +680,18 @@ int uu_portal_button(struct uu_portal *p, int button, int pressed) {
     if (!code) return 11;
     return notify(p, "NotifyPointerButton", g_variant_new("(o@a{sv}iu)", p->session, empty_options(), code, (guint)!!pressed));
 }
+/* Smooth scroll in stream pixels (positive scrolls down/right, like a touchpad); `finish` ends the
+ * gesture so clients may coast. */
+int uu_portal_scroll(struct uu_portal *p, double dx, double dy, int finish) {
+    if (!p || !isfinite(dx) || !isfinite(dy)) return 11;
+    if (p->logical_width <= 0 || p->logical_height <= 0 || !p->width || !p->height) return 11;
+    int result = prepare_input(p); if (result) return result;
+    double lx = dx * p->logical_width / p->width, ly = dy * p->logical_height / p->height;
+    if (p->ei) return portal_eis_scroll(p, lx, ly, finish);
+    GVariantBuilder options; g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    if (finish) g_variant_builder_add(&options, "{sv}", "finish", g_variant_new_boolean(TRUE));
+    return notify(p, "NotifyPointerAxis", g_variant_new("(oa{sv}dd)", p->session, &options, lx, ly));
+}
 /* One finger (slot 0) in stream pixels: phase 0 down, 1 motion, 2 up. */
 int uu_portal_touch_supported(struct uu_portal *p) { return p && (p->devices & 4); }
 /* The portal offers a touchscreen this session's consent did not grant (restored from before touch). */

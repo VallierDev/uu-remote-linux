@@ -48,11 +48,36 @@ struct HeldInput { buttons: std::collections::BTreeSet<i32>, keys: std::collecti
 struct Shortcuts { modifiers: u8, shifted: std::collections::BTreeSet<i32> }
 /// Mobile viewers in touch mode send a finger as a left-button drag at absolute positions (observed:
 /// Android sends press, a stream of mouse_move_absolute, release), which on a desktop selects text
-/// instead of scrolling. With the portal touchscreen granted those drags are replayed as one finger,
-/// so the desktop scrolls and taps as on a touch screen. `at` is the last absolute position; relative
-/// motion (the viewers' trackpad mode) clears it and keeps mouse buttons.
+/// instead of scrolling. By default (`Gesture`) the host decides per press: moving past `SLOP` before
+/// `HOLD` scrolls smoothly (content follows the finger, also in terminals), holding still selects
+/// like a mouse drag, and a short press is a click. `UU_TOUCH_INPUT=touch` replays drags as one finger
+/// on the portal touchscreen instead; `=0` keeps mouse buttons. `at` is the last absolute position;
+/// relative motion (the viewers' trackpad mode) clears it and keeps mouse buttons.
 #[derive(Default)]
-struct TouchDrag { mobile: bool, at: Option<(i32,i32)>, down: bool }
+struct TouchDrag { mode: TouchMode, at: Option<(i32,i32)>, down: bool, finger: Finger }
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum TouchMode { #[default] Mouse, Gesture, Touch }
+/// A mobile left press in gesture mode: not decided yet, scrolling, or selecting with button 1 down.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Finger { #[default] Up, Pending { start: (i32,i32), at: std::time::Instant }, Scroll { last: (i32,i32) }, Select }
+/// Pixels a finger may wander before a press becomes a scroll, and how long it holds still to select.
+const SLOP: i32 = 12;
+const HOLD: std::time::Duration = std::time::Duration::from_millis(450);
+/// What an absolute position does to the finger: the next state and a scroll from→to or a pointer move.
+#[derive(Debug, PartialEq)]
+enum FingerStep { Scroll((i32,i32),(i32,i32)), Move(i32,i32), Stay }
+fn finger_motion(finger: Finger, to: (i32,i32)) -> (Finger, FingerStep) {
+    match finger {
+        Finger::Pending { start, .. } if (to.0-start.0).abs().max((to.1-start.1).abs()) > SLOP => (Finger::Scroll { last: to }, FingerStep::Scroll(start, to)),
+        Finger::Pending { .. } => (finger, FingerStep::Stay),
+        Finger::Scroll { last } => (Finger::Scroll { last: to }, FingerStep::Scroll(last, to)),
+        Finger::Select | Finger::Up => (finger, FingerStep::Move(to.0, to.1)),
+    }
+}
+/// A pending press held still for `HOLD`: where the selection starts.
+fn finger_held(finger: Finger, now: std::time::Instant) -> Option<(i32,i32)> {
+    match finger { Finger::Pending { start, at } if now.duration_since(at) >= HOLD => Some(start), _ => None }
+}
 /// Viewer platform from the connect header `controller_platform` (website enum: 1 windows, 2 android,
 /// 3 ios, 4 macos, 5 tv).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -137,11 +162,25 @@ impl InputInjector {
         let mut pending = self.pending.lock().unwrap();
         let motion = std::mem::take(&mut *pending);
         pending.scroll = (motion.scroll.0 % 120, motion.scroll.1 % 120);
+        let mut touch = self.touch.lock().unwrap();
         if let Some((x,y)) = motion.absolute {
-            let mut touch = self.touch.lock().unwrap();
-            if touch.down { self.inject_touch(1,x,y); } else { self.inject_move(x,y,false); }
+            if touch.down { self.inject_touch(1,x,y); } else {
+                let (finger, step) = finger_motion(touch.finger, (x,y));
+                touch.finger = finger;
+                match step {
+                    FingerStep::Scroll(from,to) => { self.inject_scroll(from,to,false); },
+                    FingerStep::Move(x,y) => { self.inject_move(x,y,false); },
+                    FingerStep::Stay => {},
+                }
+            }
             touch.at = Some((x,y));
         }
+        // Held still: select from where the finger went down, like a mouse drag.
+        if let Some((x,y)) = finger_held(touch.finger, std::time::Instant::now()) {
+            self.inject_move(x,y,false);
+            touch.finger = if self.inject_button(1,true) == 0 { Finger::Select } else { Finger::Up };
+        }
+        drop(touch);
         if motion.relative != (0,0) {
             self.touch.lock().unwrap().at = None;
             self.inject_move(motion.relative.0 as i32,motion.relative.1 as i32,true);
@@ -206,18 +245,31 @@ impl InputInjector {
     }
 
     /// The current desktop controller's platform (connect header controller_platform).
-    /// `UU_TOUCH_INPUT=0` keeps mobile drags as mouse drags.
+    /// Mobile drags follow `UU_TOUCH_INPUT`: unset = gesture, `touch` = portal touchscreen, `0` = mouse.
     pub fn set_controller(&self, controller: Controller) {
         self.mac_controller.store(controller == Controller::Mac, std::sync::atomic::Ordering::Relaxed);
         *self.cmd.lock().unwrap() = CmdState::default();
         let mut touch = self.touch.lock().unwrap();
-        if touch.down { self.inject_touch(2,0,0); }
-        *touch = TouchDrag { mobile: controller == Controller::Mobile && std::env::var("UU_TOUCH_INPUT").as_deref() != Ok("0"), ..TouchDrag::default() };
+        self.lift_finger(&mut touch);
+        let mode = if controller != Controller::Mobile { TouchMode::Mouse } else {
+            match std::env::var("UU_TOUCH_INPUT").as_deref() { Ok("0") => TouchMode::Mouse, Ok("touch") => TouchMode::Touch, _ => TouchMode::Gesture }
+        };
+        *touch = TouchDrag { mode, ..TouchDrag::default() };
+    }
+    /// Ends whatever a finger holds: the touch point, a selection's button, a scroll gesture.
+    fn lift_finger(&self, touch: &mut TouchDrag) {
+        if std::mem::take(&mut touch.down) { self.inject_touch(2,0,0); }
+        match std::mem::take(&mut touch.finger) {
+            Finger::Select => { self.inject_button(1,false); },
+            Finger::Scroll { last } => { self.inject_scroll(last,last,true); },
+            Finger::Pending { .. } | Finger::Up => {},
+        }
     }
     /// Left button of a mobile controller: a finger down at the last absolute position, or up.
     /// False leaves the button to the mouse path (no touchscreen, trackpad mode, other viewers).
     fn touch_button(&self, pressed: bool) -> bool {
         let mut touch = self.touch.lock().unwrap();
+        if touch.mode == TouchMode::Gesture { return self.gesture_button(&mut touch, pressed) }
         if !pressed {
             if !touch.down { return false; }
             touch.down = false;
@@ -225,7 +277,7 @@ impl InputInjector {
             return true;
         }
         if touch.down { return true; }
-        let Some((x,y)) = touch.at.filter(|_| touch.mobile) else { return false };
+        let Some((x,y)) = touch.at.filter(|_| touch.mode == TouchMode::Touch) else { return false };
         let supported = self.backend == crate::desktop_backend::DesktopBackend::Portal
             && self.portal.lock().unwrap().as_ref().is_some_and(|portal| portal.touch_supported());
         static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -235,6 +287,33 @@ impl InputInjector {
         if !supported { self.offer_touch_consent(); }
         touch.down = supported && self.inject_touch(0,x,y) == 0;
         touch.down
+    }
+    /// Gesture mode (portal only, for its smooth scroll): a press waits for `finger_motion`/`finger_held`
+    /// to decide; releasing an undecided press is a click.
+    fn gesture_button(&self, touch: &mut TouchDrag, pressed: bool) -> bool {
+        if !pressed {
+            return match std::mem::take(&mut touch.finger) {
+                Finger::Up => false,
+                Finger::Pending { start, .. } => {
+                    self.inject_move(start.0,start.1,false);
+                    if self.inject_button(1,true) == 0 { self.inject_button(1,false); }
+                    true
+                },
+                finger => { touch.finger = finger; self.lift_finger(touch); true },
+            };
+        }
+        if touch.finger != Finger::Up { return true }
+        let bound = self.backend == crate::desktop_backend::DesktopBackend::Portal && self.portal.lock().unwrap().is_some();
+        let Some(start) = touch.at.filter(|_| bound) else { return false };
+        static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) { log::info!("Mobile controller drag input: gesture (drag scrolls, hold selects)"); }
+        touch.finger = Finger::Pending { start, at: std::time::Instant::now() };
+        true
+    }
+    /// Content follows the finger: moving it up scrolls down.
+    fn inject_scroll(&self, from: (i32,i32), to: (i32,i32), finish: bool) -> i32 {
+        let Some(portal) = self.portal.lock().unwrap().clone() else { return -1 };
+        self.portal_result("scroll", portal.scroll(f64::from(from.0 - to.0), f64::from(from.1 - to.1), finish))
     }
     /// The portal offers a touchscreen the restored consent lacks: ask the host once per run, in the
     /// background (GNOME's share dialog, visible to the phone too); drags stay mouse drags meanwhile.
@@ -342,7 +421,7 @@ impl InputInjector {
     pub fn release_held(&self) {
         let _serial=self.serial.lock().unwrap();
         self.discard_pointer();
-        { let mut touch=self.touch.lock().unwrap(); if std::mem::take(&mut touch.down) { self.inject_touch(2,0,0); } }
+        { let mut touch=self.touch.lock().unwrap(); self.lift_finger(&mut touch); }
         let mut held=self.held.lock().unwrap();
         if let Some(uinput)=&self.uinput {
             Self::uinput_result(uinput.release_all());
@@ -811,6 +890,20 @@ mod touch_tests {
         assert_eq!(Controller::from_platform(None), Controller::Other);
     }
     #[test]
+    fn a_press_scrolls_past_the_slop_and_selects_when_held() {
+        let t0=std::time::Instant::now();
+        let pending=Finger::Pending{start:(100,100),at:t0};
+        // Small wander stays undecided; past SLOP the content follows the finger from the start.
+        assert_eq!(finger_motion(pending,(105,110)),(pending,FingerStep::Stay));
+        assert_eq!(finger_motion(pending,(100,100+SLOP+1)),(Finger::Scroll{last:(100,113)},FingerStep::Scroll((100,100),(100,113))));
+        assert_eq!(finger_motion(Finger::Scroll{last:(100,113)},(100,90)),(Finger::Scroll{last:(100,90)},FingerStep::Scroll((100,113),(100,90))));
+        assert_eq!(finger_motion(Finger::Select,(7,8)),(Finger::Select,FingerStep::Move(7,8)));
+        assert_eq!(finger_motion(Finger::Up,(7,8)),(Finger::Up,FingerStep::Move(7,8)));
+        assert_eq!(finger_held(pending,t0+HOLD-std::time::Duration::from_millis(1)),None);
+        assert_eq!(finger_held(pending,t0+HOLD),Some((100,100)));
+        assert_eq!(finger_held(Finger::Scroll{last:(1,1)},t0+HOLD*4),None);
+    }
+    #[test]
     fn mobile_drag_without_touchscreen_stays_a_mouse_button() {
         let input=InputInjector::without_desktop();
         input.set_controller(Controller::Mobile);
@@ -821,7 +914,7 @@ mod touch_tests {
         input.mouse_relative(1,1); input.flush_pointer();
         assert!(input.touch.lock().unwrap().at.is_none());
         input.set_controller(Controller::Other);
-        assert!(!input.touch.lock().unwrap().mobile);
+        assert_eq!(input.touch.lock().unwrap().mode,TouchMode::Mouse);
     }
 }
 

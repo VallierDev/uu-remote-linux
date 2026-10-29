@@ -168,7 +168,8 @@ static void handle_server_events(struct harness *h) {
         } else if (type == EIS_EVENT_POINTER_MOTION || type == EIS_EVENT_POINTER_MOTION_ABSOLUTE ||
                    type == EIS_EVENT_BUTTON_BUTTON || type == EIS_EVENT_SCROLL_DISCRETE ||
                    type == EIS_EVENT_KEYBOARD_KEY || type == EIS_EVENT_TOUCH_DOWN ||
-                   type == EIS_EVENT_TOUCH_MOTION || type == EIS_EVENT_TOUCH_UP) {
+                   type == EIS_EVENT_TOUCH_MOTION || type == EIS_EVENT_TOUCH_UP ||
+                   type == EIS_EVENT_SCROLL_DELTA || type == EIS_EVENT_SCROLL_STOP) {
             assert(h->n_events < sizeof(h->events) / sizeof(h->events[0]));
             struct received *got = &h->events[h->n_events++];
             got->type = type;
@@ -188,6 +189,10 @@ static void handle_server_events(struct harness *h) {
             case EIS_EVENT_SCROLL_DISCRETE:
                 got->dx = eis_event_scroll_get_discrete_dx(event);
                 got->dy = eis_event_scroll_get_discrete_dy(event);
+                break;
+            case EIS_EVENT_SCROLL_DELTA:
+                got->x = eis_event_scroll_get_dx(event);
+                got->y = eis_event_scroll_get_dy(event);
                 break;
             case EIS_EVENT_TOUCH_DOWN:
             case EIS_EVENT_TOUCH_MOTION:
@@ -396,6 +401,15 @@ static void run_geometry(const struct geometry *geometry) {
     wait_for_input(&h);
     assert(h.events[0].type == EIS_EVENT_SCROLL_DISCRETE);
     assert(h.events[0].dx == 0 && h.events[0].dy == -120);
+
+    /* Smooth scroll maps like relative motion; finish ends the gesture with a scroll stop. */
+    clear_events(&h);
+    assert(uu_portal_scroll(h.portal, geometry->width / 8.0, -(double)geometry->height / 8.0, 1) == 0);
+    wait_for_input(&h);
+    assert(h.events[0].type == EIS_EVENT_SCROLL_DELTA);
+    assert(fabs(h.events[0].x - geometry->logical_width / 8.0) < 0.001 && fabs(h.events[0].y + geometry->logical_height / 8.0) < 0.001);
+    for (gint64 until = g_get_monotonic_time() + 300000; h.n_events < 2 && g_get_monotonic_time() < until; g_usleep(1000)) pump(&h);
+    assert(h.n_events == 2 && h.events[1].type == EIS_EVENT_SCROLL_STOP);
 
     /* A touch drag lands in the stream's region; motion without a finger down is refused. */
     assert(uu_portal_touch(h.portal, 1, 1, 1) == 11);

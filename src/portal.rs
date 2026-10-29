@@ -38,6 +38,7 @@ mod native {
         fn uu_portal_move(portal: *mut c_void, x: f64, y: f64, relative: i32) -> i32;
         fn uu_portal_button(portal: *mut c_void, button: i32, pressed: i32) -> i32;
         fn uu_portal_key(portal: *mut c_void, keysym: u32, keycode: i32, pressed: i32) -> i32;
+        fn uu_portal_scroll(portal: *mut c_void, dx: f64, dy: f64, finish: i32) -> i32;
         fn uu_portal_touch_supported(portal: *mut c_void) -> i32;
         fn uu_portal_touch_available(portal: *mut c_void) -> i32;
         fn uu_portal_touch(portal: *mut c_void, phase: i32, x: f64, y: f64) -> i32;
@@ -403,6 +404,12 @@ mod native {
             super::check(unsafe { uu_portal_key(handle.0.as_ptr(), symbol, -1, 1) })?;
             super::check(unsafe { uu_portal_key(handle.0.as_ptr(), symbol, -1, 0) })
         }
+        /// Smooth scroll in stream pixels (positive scrolls down/right); `finish` ends the gesture.
+        pub fn scroll(&self, dx: f64, dy: f64, finish: bool) -> Result<(), String> {
+            if *self.locked.borrow() != Some(false) { return Err("Portal input blocked while locked".into()); }
+            let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+            super::check(unsafe { uu_portal_scroll(handle.0.as_ptr(), dx, dy, i32::from(finish)) })
+        }
         /// The portal granted the touchscreen device type (requested where available).
         pub fn touch_supported(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_touch_supported(handle.0.as_ptr()) } != 0)
@@ -735,6 +742,7 @@ impl PortalSession {
     pub fn move_pointer(&self, _: f64, _: f64, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn button(&self, _: i32, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn touch_supported(&self) -> bool { false }
+    pub fn scroll(&self, _: f64, _: f64, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn upgrade_touch(&self) -> Result<bool, String> { Err(error(15)) }
     pub fn type_keysym(&self, _: u32) -> Result<(), String> { Err(error(15)) }
     pub fn touch(&self, _: i32, _: f64, _: f64) -> Result<(), String> { Err(error(15)) }

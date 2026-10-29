@@ -161,6 +161,14 @@ static int portal_eis_button(struct uu_portal *p, int button, int pressed) {
     ei_device_button_button(device, code, !!pressed);
     return portal_eis_frame(p, device);
 }
+static int portal_eis_scroll(struct uu_portal *p, double dx, double dy, int finish) {
+    if (portal_eis_available(p)) return 9;
+    struct ei_device *device = portal_eis_device(p, EI_DEVICE_CAP_SCROLL);
+    if (!device) return 9;
+    if (dx != 0 || dy != 0) ei_device_scroll_delta(device, dx, dy);
+    if (finish) ei_device_scroll_stop(device, true, true);
+    return portal_eis_frame(p, device);
+}
 static int portal_eis_touch(struct uu_portal *p, int phase, double x, double y) {
     if (portal_eis_available(p)) return 9;
     if (phase == 2) {
