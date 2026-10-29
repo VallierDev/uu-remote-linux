@@ -597,7 +597,7 @@ static void open_settings(void) {
     const char *verify[] = {L("仅使用临时验证码", "Temporary code only"), L("仅使用自定义验证码", "Custom code only"), L("临时与自定义验证码", "Temporary and custom codes")};
     host_switch = gtk_switch_new(); gtk_switch_set_active(GTK_SWITCH(host_switch), atomic_load(&host_active));
     g_signal_connect(host_switch, "notify::active", G_CALLBACK(on_host), NULL);
-    GtkWidget *s1[] = { setting_row(L("允许同账号控制本设备", "Allow the same account to control this device"), L("登录后本机会出现在你的设备列表中（uuremote-server 用户服务）", "After sign-in this computer appears in your device list (uuremote-server user service)"), host_switch), setting_row(L("允许他人远程协助", "Allow remote assistance"), NULL, gtk_switch_new()) };
+    GtkWidget *s1[] = { setting_row(L("允许同账号控制本设备", "Allow the same account to control this device"), L("默认关闭。开启后本机会出现在你的设备列表中，可被远程控制（uuremote-server 用户服务）", "Off by default. When on, this computer appears in your device list and can be controlled (uuremote-server user service)"), host_switch), setting_row(L("允许他人远程协助", "Allow remote assistance"), NULL, gtk_switch_new()) };
     GtkWidget *s2[] = { setting_row(L("远程协助连接本设备的验证方式", "Verification for remote assistance"), NULL, combo(verify, 3)) };
     GtkWidget *s3[] = { setting_row(L("客户端锁定", "Lock client"), L("防止客户端设置被修改，保障数据与使用安全。", "Prevents client settings from being changed, keeping data and usage safe."), gtk_switch_new()) };
     gtk_box_pack_start(GTK_BOX(security), settings_card(s1, 2), FALSE, FALSE, 0);

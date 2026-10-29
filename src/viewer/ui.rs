@@ -96,9 +96,8 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
     let mut next_refresh = Instant::now();
     let mut sessions:std::collections::HashMap<String,Running>=Default::default();
     let mut names: std::collections::HashMap<String, String> = Default::default();
-    // Account whose token the local host last went online with; a new sign-in restarts the host.
+    // Account token seen last; a new sign-in restarts a host the user turned on.
     let mut host_token: Option<String> = None;
-    let mut host_failed = false;
     let mut just_logged_in = false;
     unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
     let refresh = |creds: &crate::auth::Credentials| {
@@ -118,15 +117,18 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
             match credentials() {
                 Ok(creds) => {
                     set_login(true, "", "", crate::i18n::s("已登录","Signed in"));
-                    // Like the official client: once signed in, this computer joins the account's device list.
-                    if super::host::managed() && !host_failed && host_token.as_deref() != Some(creds.token.as_str()) {
-                        let restart = host_token.is_some() || std::mem::take(&mut just_logged_in);
-                        match super::host::enable(&exe, restart) {
-                            Ok(()) => { if restart { toast(crate::i18n::s("本机已上线，可在你的其他设备上远程控制","This computer is online; control it from your other devices")); } }
-                            Err(e) => { host_failed = true; log::warn!("Host service not started: {e}"); }
+                    // Hosting is opt-in (Settings switch): signing in never starts the host, but a
+                    // host the user turned on goes online with the new account.
+                    if host_token.as_deref() != Some(creds.token.as_str()) {
+                        let changed = host_token.is_some() || std::mem::take(&mut just_logged_in);
+                        if changed && super::host::managed() && super::host::active() {
+                            match super::host::restart() {
+                                Ok(()) => toast(crate::i18n::s("本机已上线，可在你的其他设备上远程控制","This computer is online; control it from your other devices")),
+                                Err(e) => log::warn!("Host service not restarted: {e}"),
+                            }
+                            unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
                         }
                         host_token = Some(creds.token.clone());
-                        unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
                     }
                     match refresh(&creds).await {
                         Ok(data) => {
@@ -156,7 +158,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                     toast(crate::i18n::s("请重新启动控制端以切换语言","Restart the viewer to switch the language"));
                 }
                 ["host", state] => {
-                    let result = if *state == "on" { host_failed = false; super::host::enable(&exe, false) } else { super::host::disable() };
+                    let result = if *state == "on" { super::host::enable(&exe) } else { super::host::disable() };
                     if let Err(e) = result { toast(&crate::tr!("本机被控设置失败：{e}","Could not change hosting: {e}")); }
                     unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
                 }

@@ -22,3 +22,9 @@ binding response now records `now - request timestamp` on its candidate pair, an
 the latest sample. Keepalive pings only an idle pair, which a streaming session never is, so the
 selected pair is also pinged when its last sample is older than the keepalive interval (a binding
 request, like a consent check from RFC 7675).
+
+The host (`uuremote-server`) uses the same crate, so on the selected pair it also sends one
+binding request per keepalive interval (2 s) while media flows. Checked on the host side with the
+official Android client controlling a Linux host (GNOME, cloud ICE servers incl. TURN) over repeated
+sessions: the client answers every request and sessions stay up. Official Windows/macOS controllers
+have not been tried against the host yet.
