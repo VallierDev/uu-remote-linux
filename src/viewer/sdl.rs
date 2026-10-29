@@ -62,7 +62,7 @@ impl Window {
     pub fn poll(&mut self,input:&mut Input)->(bool,Vec<serde_json::Value>){
         let viewport=self.viewport();
         let mut redraw=false;
-        let events:Vec<Event>=self.events.poll_iter().collect();
+        let events=poll_events(&mut self.events);
         let mut forward=Vec::with_capacity(events.len());
         for event in events {
             if matches!(event,Event::ClipboardUpdate{..}|Event::Window{win_event:WindowEvent::FocusGained,..}){self.clipboard_dirty=true;}
@@ -267,6 +267,24 @@ fn cairo_decorations(){
     }
 }
 const LOADING_BG:sdl2::pixels::Color=sdl2::pixels::Color::RGB(17,19,24);
+/// sdl2 0.37 transmutes every event type into its `SDL_EventType` enum, which is undefined
+/// behaviour for a type SDL 2 does not define (an abort with debug checks). sdl2-compat on SDL3
+/// delivers such types (e.g. 0x207), so drop them before the crate converts the event.
+fn poll_events(_pump:&mut sdl2::EventPump)->Vec<Event>{
+    let mut events=Vec::new();
+    loop{
+        let mut raw=std::mem::MaybeUninit::<sdl2::sys::SDL_Event>::uninit();
+        // SAFETY: the pump proves SDL events are initialised on this thread; SDL_PollEvent fills the event when it returns 1.
+        if unsafe{sdl2::sys::SDL_PollEvent(raw.as_mut_ptr())}!=1 {return events}
+        let raw=unsafe{raw.assume_init()};
+        if sdl2_event_type(unsafe{raw.type_}) {events.push(Event::from_ll(raw));}
+    }
+}
+/// The values of sdl2-sys 0.37 `SDL_EventType`.
+fn sdl2_event_type(t:u32)->bool{
+    matches!(t,0|0x100..=0x107|0x150|0x200|0x201|0x300..=0x305|0x400..=0x403|0x600..=0x607|0x650..=0x659|0x700..=0x702
+        |0x800..=0x802|0x900|0x1000..=0x1003|0x1100|0x1101|0x1200|0x2000|0x2001|0x7F00|0x8000|0xFFFF)
+}
 fn slider(lay:&hud::Layout)->Option<(f32,f32)>{lay.items.iter().find_map(|(_,h)|match h{hud::Hit::Slider(a,len)=>Some((*a,*len)),_=>None})}
 /// Runs `fut` while the window shows the loading animation; closing the window cancels it.
 pub async fn loading<T>(window:Option<&mut Window>,stage:&str,fut:impl std::future::Future<Output=T>)->Result<T,String>{
@@ -277,7 +295,7 @@ pub async fn loading<T>(window:Option<&mut Window>,stage:&str,fut:impl std::futu
     loop {tokio::select!{
         value=&mut fut=>return Ok(value),
         _=tick.tick()=>{
-            for event in window.events.poll_iter().collect::<Vec<_>>() {
+            for event in poll_events(&mut window.events) {
                 if matches!(event,Event::Quit{..}|Event::Window{win_event:WindowEvent::Close,..}) {return Err("Viewer window closed".into())}
                 let _=window.chrome_event(&event);
             }
@@ -718,6 +736,15 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         drop(window);
         assert!(tx.is_closed());drop(bridge);
         let window=Window::new().unwrap();assert!(window.clipboard_bridge().enabled);
+    }
+    #[test] fn only_event_types_sdl2_defines_reach_the_crate(){
+        use sdl2::sys::SDL_EventType as T;
+        for t in [T::SDL_QUIT,T::SDL_LOCALECHANGED,T::SDL_DISPLAYEVENT,T::SDL_WINDOWEVENT,T::SDL_TEXTEDITING_EXT,T::SDL_MOUSEWHEEL,
+            T::SDL_JOYBATTERYUPDATED,T::SDL_CONTROLLERSENSORUPDATE,T::SDL_FINGERMOTION,T::SDL_MULTIGESTURE,T::SDL_CLIPBOARDUPDATE,
+            T::SDL_DROPCOMPLETE,T::SDL_AUDIODEVICEREMOVED,T::SDL_SENSORUPDATE,T::SDL_RENDER_DEVICE_RESET,T::SDL_POLLSENTINEL,T::SDL_USEREVENT]{
+            assert!(sdl2_event_type(t as u32),"{:#x}",t as u32);
+        }
+        for t in [0x151,0x202,0x207,0x306,0x404,0x608,0x65A,0x703,0x901,0x1004,0x1102,0x1201,0x2002,0x8001]{assert!(!sdl2_event_type(t),"{t:#x}");}
     }
     #[test] fn clipboard_text_rejects_invalid_or_large_data_and_keeps_empty_text(){
         assert_eq!(clipboard_text(b""),Some(String::new()));
