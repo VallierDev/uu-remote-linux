@@ -51,7 +51,7 @@ pub enum SignalingEvent {
     BeControlled(Value),
     /// be-controlled with its binary app_data (ConnectOptions): capture type and the
     /// ice_id it announces, when present.
-    ConnectRequest { capture_type: u64, ice_id: Option<String>, transport:crate::session_ice::SessionIce, controller_mac: bool },
+    ConnectRequest { capture_type: u64, ice_id: Option<String>, transport:crate::session_ice::SessionIce, controller: crate::input::Controller },
     Soac(SoacMessage),
     Released(Value),
     Left(Value),
@@ -513,10 +513,9 @@ impl SignalingClient {
                                 if !caps.is_empty() { log::info!("Viewer decoder caps (fps,codec,w,h,chroma fields): {:?}", caps); }
                                 // Viewer platform (website enum: 1 windows, 2 android, 3 ios, 4 macos, 5 tv).
                                 let platform = header.get("controller_platform").or_else(|| header.get("data").and_then(|d| d.get("controller_platform")));
-                                let controller_mac = platform.is_some_and(|v| v.as_i64() == Some(4)
-                                    || v.as_str().is_some_and(|s| s == "4" || s.to_ascii_lowercase().contains("mac") || s.to_ascii_lowercase().contains("darwin")));
-                                log::info!("Controller platform: {} mac={}", platform.map(|v| v.to_string()).unwrap_or_default().chars().take(24).collect::<String>(), controller_mac);
-                                if !send_event(&event_sender, SignalingEvent::ConnectRequest { capture_type, ice_id, transport:crate::session_ice::SessionIce::from_header(&header), controller_mac }).await { break; }
+                                let controller = crate::input::Controller::from_platform(platform);
+                                log::info!("Controller platform: {} controller={:?}", platform.map(|v| v.to_string()).unwrap_or_default().chars().take(24).collect::<String>(), controller);
+                                if !send_event(&event_sender, SignalingEvent::ConnectRequest { capture_type, ice_id, transport:crate::session_ice::SessionIce::from_header(&header), controller }).await { break; }
                             }
                         }
                     }

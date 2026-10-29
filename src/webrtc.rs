@@ -111,7 +111,7 @@ pub struct WebRtcSession {
     /// The role this peer was offered with; `role` also covers a later capture_desktop.
     pub desktop: bool,
     pub role: Arc<DesktopRole>,
-    pub controller_mac: bool,
+    pub controller: crate::input::Controller,
     pub context: Arc<Mutex<SessionContext>>,
     actions: Arc<crate::system_actions::PeerActions>,
 }
@@ -1454,7 +1454,7 @@ impl WebRtcSession {
             input,
             desktop,
             role,
-            controller_mac: false,
+            controller: crate::input::Controller::Other,
             context,
             actions: session_actions,
         })

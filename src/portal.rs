@@ -38,6 +38,9 @@ mod native {
         fn uu_portal_move(portal: *mut c_void, x: f64, y: f64, relative: i32) -> i32;
         fn uu_portal_button(portal: *mut c_void, button: i32, pressed: i32) -> i32;
         fn uu_portal_key(portal: *mut c_void, keysym: u32, keycode: i32, pressed: i32) -> i32;
+        fn uu_portal_touch_supported(portal: *mut c_void) -> i32;
+        fn uu_portal_touch_available(portal: *mut c_void) -> i32;
+        fn uu_portal_touch(portal: *mut c_void, phase: i32, x: f64, y: f64) -> i32;
         fn uu_portal_stream_position(portal: *mut c_void, x: *mut i32, y: *mut i32) -> i32;
         fn uu_portal_monitors(out: *mut libc::c_char, length: usize) -> i32;
         fn uu_portal_end(portal: *mut c_void);
@@ -114,7 +117,8 @@ mod native {
         }
         /// Opens a session for `monitor` (a Mutter connector) with that monitor's saved consent;
         /// None means the screen currently selected, or the only monitor.
-        fn open_inner(cancelled: Option<&std::sync::atomic::AtomicBool>, monitor: Option<&str>) -> Result<Self, super::PortalError> {
+        /// `fresh` asks the host again instead of restoring the saved consent (which stays saved).
+        fn open_inner(cancelled: Option<&std::sync::atomic::AtomicBool>, monitor: Option<&str>, fresh: bool) -> Result<Self, super::PortalError> {
             extern "C" fn is_cancelled(data: *mut c_void) -> i32 {
                 let cancelled = unsafe { &*(data as *const std::sync::atomic::AtomicBool) };
                 i32::from(cancelled.load(std::sync::atomic::Ordering::Acquire))
@@ -129,7 +133,7 @@ mod native {
             let key = super::permissions::desktop_key();
             let wanted = monitor.map(str::to_owned).or_else(crate::wayland::portal_monitor);
             // Each monitor has its own consent; the desktop-wide key is the single-monitor one.
-            let token = directory.as_deref().and_then(|dir| {
+            let token = directory.as_deref().filter(|_| !fresh).and_then(|dir| {
                 wanted.as_deref().and_then(|name| super::permissions::take(dir, &super::permissions::monitor_key(name)))
                     .or_else(|| super::permissions::take(dir, key))
             }).and_then(|value| std::ffi::CString::new(value).ok());
@@ -188,7 +192,7 @@ mod native {
         /// time GNOME asks on the host) and swap it in, so every holder of this Arc follows.
         pub fn switch_to(&self, connector: &str) -> Result<(), String> {
             if self.monitor().as_deref() == Some(connector) { return Ok(()); }
-            let replacement = Self::open_inner(None, Some(connector)).map_err(|error| error.to_string())?;
+            let replacement = Self::open_inner(None, Some(connector), false).map_err(|error| error.to_string())?;
             if replacement.monitor().as_deref() != Some(connector) {
                 return Err("Another monitor was shared; choose this monitor in the host dialog".into());
             }
@@ -204,10 +208,29 @@ mod native {
             Ok(())
         }
         pub fn open() -> Result<Self, String> {
-            Self::open_inner(None, None).map_err(|error| error.to_string())
+            Self::open_inner(None, None, false).map_err(|error| error.to_string())
+        }
+        /// A consent saved before touch support restores keyboard and pointer only. Ask the host once
+        /// more (GNOME shows its share dialog; the consent timeout closes it) and swap the new session
+        /// in when it grants the touchscreen for this monitor at this size; until then, and on any
+        /// refusal, this session and its saved consent stay as they are. Ok(false): nothing to do.
+        pub fn upgrade_touch(&self) -> Result<bool, String> {
+            let available = self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_touch_available(handle.0.as_ptr()) } != 0);
+            if !available || self.touch_supported() { return Ok(false); }
+            log::info!("Portal touch consent: asking the host again for the touchscreen");
+            let monitor = self.monitor();
+            let replacement = Self::open_inner(None, monitor.as_deref(), true).map_err(|error| error.to_string())?;
+            // The new consent is saved for whichever monitor was granted, so a later connection uses it.
+            if replacement.monitor() != monitor { return Err("another monitor was shared".into()); }
+            if !replacement.touch_supported() { return Err("the touchscreen was not granted".into()); }
+            self.check_geometry(&replacement).map_err(|error| error.to_string())?;
+            let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?;
+            let previous = std::mem::replace(&mut *self.handle.lock().map_err(|_| "Portal session lock poisoned")?, next);
+            drop(previous);
+            Ok(true)
         }
         pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, super::PortalError> {
-            Self::open_inner(Some(cancelled), None)
+            Self::open_inner(Some(cancelled), None, false)
         }
         pub fn recover(&self, cancelled: &std::sync::atomic::AtomicBool) -> Result<bool, super::PortalError> {
             use std::sync::atomic::Ordering;
@@ -305,7 +328,7 @@ mod native {
                         self.was_locked.store(true, std::sync::atomic::Ordering::Release);
                         false
                     }) { return Ok(None); }
-                    let replacement = match Self::open_inner(None, self.monitor().as_deref()) {
+                    let replacement = match Self::open_inner(None, self.monitor().as_deref(), false) {
                         Ok(value) => value,
                         Err(error) => {
                             log::warn!("Portal capture recovery deferred: {error}");
@@ -371,6 +394,16 @@ mod native {
             if pressed && *self.locked.borrow() != Some(false) { return Err("Portal input blocked while locked".into()); }
             let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
             super::check(unsafe { uu_portal_button(handle.0.as_ptr(), button, i32::from(pressed)) })
+        }
+        /// The portal granted the touchscreen device type (requested where available).
+        pub fn touch_supported(&self) -> bool {
+            self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_touch_supported(handle.0.as_ptr()) } != 0)
+        }
+        /// One finger in stream pixels: phase 0 down, 1 motion, 2 up.
+        pub fn touch(&self, phase: i32, x: f64, y: f64) -> Result<(), String> {
+            if phase != 2 && *self.locked.borrow() != Some(false) { return Err("Portal input blocked while locked".into()); }
+            let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+            super::check(unsafe { uu_portal_touch(handle.0.as_ptr(), phase, x, y) })
         }
         pub fn key(&self, symbol: u64, pressed: bool) -> Result<(), String> {
             if pressed && *self.locked.borrow() != Some(false) { return Err("Portal input blocked while locked".into()); }
@@ -693,6 +726,9 @@ impl PortalSession {
     pub fn capture_changed(&self, _: &mut [u8], _: &mut Option<FrameVersion>) -> Result<bool, String> { Err(error(15)) }
     pub fn move_pointer(&self, _: f64, _: f64, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn button(&self, _: i32, _: bool) -> Result<(), String> { Err(error(15)) }
+    pub fn touch_supported(&self) -> bool { false }
+    pub fn upgrade_touch(&self) -> Result<bool, String> { Err(error(15)) }
+    pub fn touch(&self, _: i32, _: f64, _: f64) -> Result<(), String> { Err(error(15)) }
     pub fn key(&self, _: u64, _: bool) -> Result<(), String> { Err(error(15)) }
 }
 

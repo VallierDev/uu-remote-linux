@@ -58,8 +58,10 @@ struct uu_portal {
     uint32_t node, width, height;
     int logical_width, logical_height, position_x, position_y, has_position;
     int absolute_stream_pixels;
+    uint32_t devices, available;
     struct ei *ei;
     GList *ei_devices;
+    struct ei_touch *ei_touch;
     char *mapping_id;
     uint32_t ei_sequence;
     atomic_int ei_failed;
@@ -81,6 +83,19 @@ static int open_cancelled(struct uu_portal *p) {
 }
 static int wait_for_first_frame(struct uu_portal *p);
 #include "portal_eis.inc"
+/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes); 0 when unreadable. */
+static guint remote_property(struct uu_portal *p, const char *name) {
+    GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH,
+        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", REMOTE, name),
+        G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
+    guint result = 0;
+    if (reply) {
+        GVariant *value; g_variant_get(reply, "(v)", &value);
+        if (g_variant_is_of_type(value, G_VARIANT_TYPE_UINT32)) result = g_variant_get_uint32(value);
+        g_variant_unref(value); g_variant_unref(reply);
+    }
+    return result;
+}
 static void fail(struct uu_portal *p, int error) {
     pthread_mutex_lock(&p->lock);
     if (!p->error) p->error = error;
@@ -365,6 +380,7 @@ static int read_stream_result(struct uu_portal *p, GVariant *results) {
     if (!has_devices || (devices & 3) != 3 || !streams || g_variant_n_children(streams) != 1) {
         error = 6;
     } else {
+        p->devices = devices;
         GVariant *entry = g_variant_get_child_value(streams, 0), *properties;
         g_variant_get(entry, "(u@a{sv})", &p->node, &properties);
         /* Optional 'size' is compositor logical coordinates, not frame pixels. */
@@ -413,16 +429,10 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     p->closed_subscription = g_dbus_connection_signal_subscribe(p->bus, DEST, SESSION, "Closed", p->session,
         NULL, G_DBUS_SIGNAL_FLAGS_NONE, session_closed, p, NULL);
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(3));
-    GVariant *version_reply = g_dbus_connection_call_sync(p->bus, DEST, PATH,
-        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", REMOTE, "version"),
-        G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
-    guint version = 0;
-    if (version_reply) {
-        GVariant *value; g_variant_get(version_reply, "(v)", &value);
-        if (g_variant_is_of_type(value, G_VARIANT_TYPE_UINT32)) version = g_variant_get_uint32(value);
-        g_variant_unref(value); g_variant_unref(version_reply);
-    }
+    /* Keyboard and pointer, plus the touchscreen (4) where the portal offers one (mobile viewers). */
+    p->available = remote_property(p, "AvailableDeviceTypes");
+    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(3 | (p->available & 4)));
+    guint version = remote_property(p, "version");
     if (version >= 2) {
         g_variant_builder_add(&options, "{sv}", "persist_mode", g_variant_new_uint32(2));
         if (restore && *restore) g_variant_builder_add(&options, "{sv}", "restore_token", g_variant_new_string(restore));
@@ -669,6 +679,21 @@ int uu_portal_button(struct uu_portal *p, int button, int pressed) {
     int code = button == 1 ? 0x110 : button == 2 ? 0x112 : button == 3 ? 0x111 : button == 8 ? 0x113 : button == 9 ? 0x114 : 0;
     if (!code) return 11;
     return notify(p, "NotifyPointerButton", g_variant_new("(o@a{sv}iu)", p->session, empty_options(), code, (guint)!!pressed));
+}
+/* One finger (slot 0) in stream pixels: phase 0 down, 1 motion, 2 up. */
+int uu_portal_touch_supported(struct uu_portal *p) { return p && (p->devices & 4); }
+/* The portal offers a touchscreen this session's consent did not grant (restored from before touch). */
+int uu_portal_touch_available(struct uu_portal *p) { return p && (p->available & 4); }
+int uu_portal_touch(struct uu_portal *p, int phase, double x, double y) {
+    if (!uu_portal_touch_supported(p) || phase < 0 || phase > 2) return 11;
+    if (phase != 2 && (!isfinite(x) || !isfinite(y) || p->logical_width <= 0 || p->logical_height <= 0 ||
+        !p->width || !p->height || x < 0 || y < 0 || x >= p->width || y >= p->height)) return 11;
+    int result = prepare_input(p); if (result) return result;
+    if (p->ei) return portal_eis_touch(p, phase, x, y);
+    if (phase == 2) return notify(p, "NotifyTouchUp", g_variant_new("(o@a{sv}u)", p->session, empty_options(), 0u));
+    return notify(p, phase ? "NotifyTouchMotion" : "NotifyTouchDown", g_variant_new("(o@a{sv}uudd)", p->session, empty_options(), p->node, 0u,
+        p->absolute_stream_pixels ? x : x * p->logical_width / p->width,
+        p->absolute_stream_pixels ? y : y * p->logical_height / p->height));
 }
 int uu_portal_key(struct uu_portal *p, uint32_t symbol, int keycode, int pressed) {
     if (!p || !symbol || symbol > INT32_MAX) return 11;

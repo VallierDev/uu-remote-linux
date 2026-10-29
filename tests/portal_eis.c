@@ -23,7 +23,7 @@ static GVariant *test_call_with_unix_fd_list_sync(GDBusConnection *connection,
 #define CAP_MASK (EI_DEVICE_CAP_POINTER | EI_DEVICE_CAP_POINTER_ABSOLUTE | \
     EI_DEVICE_CAP_BUTTON | EI_DEVICE_CAP_SCROLL | EI_DEVICE_CAP_KEYBOARD)
 #define EVENT_CAP_MASK (EIS_DEVICE_CAP_POINTER | EIS_DEVICE_CAP_POINTER_ABSOLUTE | \
-    EIS_DEVICE_CAP_BUTTON | EIS_DEVICE_CAP_SCROLL | EIS_DEVICE_CAP_KEYBOARD)
+    EIS_DEVICE_CAP_BUTTON | EIS_DEVICE_CAP_SCROLL | EIS_DEVICE_CAP_KEYBOARD | EIS_DEVICE_CAP_TOUCH)
 
 static const unsigned capabilities[] = {
     EIS_DEVICE_CAP_POINTER,
@@ -31,6 +31,7 @@ static const unsigned capabilities[] = {
     EIS_DEVICE_CAP_BUTTON,
     EIS_DEVICE_CAP_SCROLL,
     EIS_DEVICE_CAP_KEYBOARD,
+    EIS_DEVICE_CAP_TOUCH,
 };
 
 struct received {
@@ -166,7 +167,8 @@ static void handle_server_events(struct harness *h) {
             h->stops++;
         } else if (type == EIS_EVENT_POINTER_MOTION || type == EIS_EVENT_POINTER_MOTION_ABSOLUTE ||
                    type == EIS_EVENT_BUTTON_BUTTON || type == EIS_EVENT_SCROLL_DISCRETE ||
-                   type == EIS_EVENT_KEYBOARD_KEY) {
+                   type == EIS_EVENT_KEYBOARD_KEY || type == EIS_EVENT_TOUCH_DOWN ||
+                   type == EIS_EVENT_TOUCH_MOTION || type == EIS_EVENT_TOUCH_UP) {
             assert(h->n_events < sizeof(h->events) / sizeof(h->events[0]));
             struct received *got = &h->events[h->n_events++];
             got->type = type;
@@ -186,6 +188,11 @@ static void handle_server_events(struct harness *h) {
             case EIS_EVENT_SCROLL_DISCRETE:
                 got->dx = eis_event_scroll_get_discrete_dx(event);
                 got->dy = eis_event_scroll_get_discrete_dy(event);
+                break;
+            case EIS_EVENT_TOUCH_DOWN:
+            case EIS_EVENT_TOUCH_MOTION:
+                got->x = eis_event_touch_get_x(event);
+                got->y = eis_event_touch_get_y(event);
                 break;
             case EIS_EVENT_KEYBOARD_KEY:
                 got->code = eis_event_keyboard_get_key(event);
@@ -295,6 +302,7 @@ static void run_geometry(const struct geometry *geometry) {
     h.portal->mapping_id = g_strdup("synthetic-screen");
     h.portal->session = strdup("/synthetic/session");
     h.portal->absolute_stream_pixels = 1;
+    h.portal->devices = 7;
 
     h.server = eis_new(NULL);
     assert(h.server && eis_setup_backend_fd(h.server) == 0);
@@ -379,6 +387,26 @@ static void run_geometry(const struct geometry *geometry) {
     wait_for_input(&h);
     assert(h.events[0].type == EIS_EVENT_SCROLL_DISCRETE);
     assert(h.events[0].dx == 0 && h.events[0].dy == -120);
+
+    /* A touch drag lands in the stream's region; motion without a finger down is refused. */
+    assert(uu_portal_touch(h.portal, 1, 1, 1) == 11);
+    clear_events(&h);
+    assert(uu_portal_touch(h.portal, 0, geometry->width / 2.0, geometry->height / 2.0) == 0);
+    wait_for_input(&h);
+    assert(h.events[0].type == EIS_EVENT_TOUCH_DOWN);
+    assert(h.events[0].x == geometry->x + geometry->logical_width / 2.0);
+    assert(h.events[0].y == geometry->y + geometry->logical_height / 2.0);
+    clear_events(&h);
+    assert(uu_portal_touch(h.portal, 1, 0, 0) == 0);
+    wait_for_input(&h);
+    assert(h.events[0].type == EIS_EVENT_TOUCH_MOTION);
+    assert(h.events[0].x == geometry->x && h.events[0].y == geometry->y);
+    assert(uu_portal_touch(h.portal, 1, geometry->width, 0) == 11);
+    clear_events(&h);
+    assert(uu_portal_touch(h.portal, 2, 0, 0) == 0);
+    wait_for_input(&h);
+    assert(h.events[0].type == EIS_EVENT_TOUCH_UP && !h.portal->ei_touch);
+    assert(uu_portal_touch(h.portal, 2, 0, 0) == 0);
 
     uint8_t storage[256];
     struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));

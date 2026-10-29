@@ -26,7 +26,16 @@ static GVariant *test_call(GDBusConnection *bus, const gchar *dest, const gchar 
     assert(!strcmp(interface, REMOTE));
     assert(!strcmp(method, "NotifyKeyboardKeysym") || !strcmp(method, "NotifyPointerButton") ||
         !strcmp(method, "NotifyPointerAxisDiscrete") || !strcmp(method, "NotifyPointerMotion") ||
-        !strcmp(method, "NotifyPointerMotionAbsolute"));
+        !strcmp(method, "NotifyPointerMotionAbsolute") || !strcmp(method, "NotifyTouchDown") ||
+        !strcmp(method, "NotifyTouchMotion") || !strcmp(method, "NotifyTouchUp"));
+    if (!strcmp(method, "NotifyTouchDown") || !strcmp(method, "NotifyTouchMotion")) {
+        assert(g_variant_is_of_type(parameters, G_VARIANT_TYPE("(oa{sv}uudd)")));
+        GVariant *x = g_variant_get_child_value(parameters, 4);
+        GVariant *y = g_variant_get_child_value(parameters, 5);
+        last_x = g_variant_get_double(x); last_y = g_variant_get_double(y);
+        g_variant_unref(x); g_variant_unref(y);
+    }
+    if (!strcmp(method, "NotifyTouchUp")) assert(g_variant_is_of_type(parameters, G_VARIANT_TYPE("(oa{sv}u)")));
     if (!strcmp(method, "NotifyPointerMotion") || !strcmp(method, "NotifyPointerMotionAbsolute")) {
         unsigned offset = !strcmp(method, "NotifyPointerMotion") ? 2 : 3;
         GVariant *x = g_variant_get_child_value(parameters, offset);
@@ -93,6 +102,20 @@ static void legacy_input(struct uu_portal *p) {
     assert(legacy_calls == 7 && uu_portal_alive(p) && !p->ei);
 }
 
+/* Touch needs the granted touchscreen type and uses the same stream mapping as absolute motion. */
+static void legacy_touch(struct uu_portal *p) {
+    p->devices = 3;
+    assert(uu_portal_touch(p, 0, 10, 10) == 11 && legacy_calls == 7);
+    p->devices = 7;
+    assert(uu_portal_touch(p, 0, 1920, 1080) == 0);
+    assert(last_x == (p->absolute_stream_pixels ? 1920 : 960));
+    assert(last_y == (p->absolute_stream_pixels ? 1080 : 540));
+    assert(uu_portal_touch(p, 1, 3840, 0) == 11);
+    assert(uu_portal_touch(p, 1, 0, 0) == 0 && last_x == 0 && last_y == 0);
+    assert(uu_portal_touch(p, 2, 0, 0) == 0);
+    assert(legacy_calls == 10 && !p->ei);
+}
+
 int main(void) {
     struct uu_portal *p = session(1, 1, 0);
     legacy_input(p);
@@ -107,10 +130,12 @@ int main(void) {
     }
     p = session(0, 1, 1); /* Unscaled GNOME keeps Notify*. */
     legacy_input(p);
+    legacy_touch(p);
     assert(!connects);
     uu_portal_close(p);
     p = session(1, 0, 1); /* KDE keeps its compositor-logical mapping. */
     legacy_input(p);
+    legacy_touch(p);
     assert(!connects);
     uu_portal_close(p);
 
