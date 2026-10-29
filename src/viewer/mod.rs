@@ -21,6 +21,7 @@ pub mod thumbs;
 #[cfg(uu_gtk)] pub mod host;
 
 pub mod tools;
+pub mod drop_upload;
 
 pub mod clipboard;
 pub mod power;

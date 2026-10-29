@@ -9,6 +9,12 @@ pub struct Progress {pub task:u64,pub transferred:u64,pub total:u64}
 // Keep request/task ids unique when a desktop file window is reopened.
 static NEXT:AtomicU64=AtomicU64::new(100);
 pub struct Files {io:Transport,rx:AsyncMutex<mpsc::Receiver<Packet>>,next:&'static AtomicU64,canceled:AtomicBool,poisoned:AtomicBool,wake:Notify,progress:mpsc::Sender<Progress>}
+/// Last path component for either separator; hosts may be Windows (`C:\x`) or Unix.
+pub fn base_name(path:&str)->&str{path.trim_end_matches(['/','\\']).rsplit(['/','\\']).next().filter(|s|!s.is_empty()).unwrap_or(path)}
+pub fn remote_join(dir:&str,name:&str)->String{
+    let sep=if dir.contains('\\') && !dir.contains('/'){'\\'}else{'/'};
+    if dir.ends_with(['/','\\']){format!("{dir}{name}")}else{format!("{dir}{sep}{name}")}
+}
 fn check(code:u64)->Result<(),String>{if code==1{Ok(())}else{Err(format!("File transfer error code {code}"))}}
 fn id(task:u64,index:u64)->Vec<u8>{nested(1,&ints(&[(1,task),(2,index)]))}
 fn all(data:&[u8],n:u32)->Result<Vec<&[u8]>,String>{Ok(decode_wire(data).map_err(|_|"Invalid file protobuf")?.into_iter().filter_map(|f|match(f.number,f.value){(k,WireValue::Bytes(b))if k==n=>Some(b),_=>None}).collect())}

@@ -33,12 +33,7 @@ fn start(kind:&str,name:&str)->Result<(),String>{
     let(k,n)=(c(kind),c(name));
     if unsafe{uu_tools_ui_start(k.as_ptr(),n.as_ptr())}!=0{return Err("Cannot open the window (GTK3 and a graphical session are required)".into())}Ok(())
 }
-/// Last path component for either separator; hosts may be Windows (`C:\x`) or Unix.
-pub fn base_name(path:&str)->&str{path.trim_end_matches(['/','\\']).rsplit(['/','\\']).next().filter(|s|!s.is_empty()).unwrap_or(path)}
-pub fn remote_join(dir:&str,name:&str)->String{
-    let sep=if dir.contains('\\') && !dir.contains('/'){'\\'}else{'/'};
-    if dir.ends_with(['/','\\']){format!("{dir}{name}")}else{format!("{dir}{sep}{name}")}
-}
+pub use super::tools::files::{base_name,remote_join};
 /// First free `name`, `name (1)`, ... in `dir` so a download never replaces a local file.
 pub fn free_local(dir:&std::path::Path,name:&str)->std::path::PathBuf{
     let(stem,ext)=match name.rfind('.'){Some(i) if i>0=>(&name[..i],&name[i..]),_=>(name,"")};

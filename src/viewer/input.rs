@@ -52,9 +52,14 @@ impl Viewport {
         let (w,h)=(frame.0 as f64*scale,frame.1 as f64*scale);
         Self{x:(window.0 as f64-w)/2.,y:(window.1 as f64-h)/2.,width:w,height:h}
     }
-    pub fn motion(self,x:f64,y:f64)->Option<Value> {
+    /// Window point as 0..1 of the remote picture, as `mouse_move_absolute` sends it.
+    pub fn normalized(self,x:f64,y:f64)->Option<(f64,f64)> {
         if self.width<=0. || self.height<=0. || !x.is_finite() || !y.is_finite() {return None}
-        Some(json!({"action":"mouse_move_absolute","abs_x":((x-self.x)/self.width).clamp(0.,1.),"abs_y":((y-self.y)/self.height).clamp(0.,1.)}))
+        Some((((x-self.x)/self.width).clamp(0.,1.),((y-self.y)/self.height).clamp(0.,1.)))
+    }
+    pub fn motion(self,x:f64,y:f64)->Option<Value> {
+        let(x,y)=self.normalized(x,y)?;
+        Some(json!({"action":"mouse_move_absolute","abs_x":x,"abs_y":y}))
     }
 }
 #[derive(Default)]
