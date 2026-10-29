@@ -166,9 +166,18 @@ pub fn normalize(path: &str) -> PathBuf {
 
 fn home() -> PathBuf { std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")) }
 
+fn windows_ftp_paths() -> bool { std::env::var("UU_FTP_WINDOWS_PATHS").is_ok_and(|v| v == "1") }
+
+fn windows_ftp_path(path: &str) -> String {
+    if path.starts_with('/') { format!("C:{}", path.replace('/', "\\")) } else { path.to_owned() }
+}
+
 /// GvPb_FileEntry {1 entry_type, 2 name, 3 size, 4 modified_time, 5 full_path, 6 icon_type}
 fn entry(kind: u64, name: &str, size: u64, modified: u64, full: &str) -> Enc {
-    Enc::default().uint(1, kind).text(2, name).uint(3, size).uint(4, modified).text(5, full)
+    // The host is advertised as a PC. Opt-in drive paths round-trip through normalize()
+    // without changing the filesystem or the authenticated user's permissions.
+    let full = if windows_ftp_paths() { windows_ftp_path(full) } else { full.to_owned() };
+    Enc::default().uint(1, kind).text(2, name).uint(3, size).uint(4, modified).text(5, &full)
 }
 
 /// The viewer treats this host as a PC and opens "此电脑" by asking for the bare drive root
@@ -201,7 +210,7 @@ fn this_pc() -> Vec<Enc> {
         if let Some(dir) = xdg_dir(key) { out.push(entry(FT_DIR, &name(&dir), 0, modified(&dir), &dir.to_string_lossy())); }
     }
     out.push(entry(FT_DIR, &name(&home), 0, modified(&home), &home.to_string_lossy()));
-    out.push(entry(FT_DIR_DRIVE, "/", 0, 0, "/"));
+    out.push(entry(FT_DIR_DRIVE, if windows_ftp_paths() { "C:" } else { "/" }, 0, 0, "/"));
     out
 }
 
@@ -266,6 +275,7 @@ pub struct FileSession {
     out: mpsc::UnboundedSender<Vec<u8>>,
     seq: Arc<AtomicU64>,
     next_request: AtomicU64,
+    windows_mode: bool,
     /// Like the official host's FileTransferDownloadResponseKey: replies are matched by
     /// (response case, task, file index, block id) because the viewer's RpcResponse header
     /// does not echo the host's request_id (observed 0).
@@ -280,7 +290,8 @@ fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EP
 
 impl FileSession {
     pub fn new(out: mpsc::UnboundedSender<Vec<u8>>, seq: Arc<AtomicU64>) -> Arc<Self> {
-        Arc::new(Self { out, seq, next_request: AtomicU64::new(1 << 32), pending: Mutex::new(HashMap::new()),
+        Arc::new(Self { out, seq, next_request: AtomicU64::new(1 << 32),
+            windows_mode: std::env::var("UU_FTP_WINDOWS_MODE").is_ok_and(|v| v == "1"), pending: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()), downloading: Arc::new(Default::default()), first_upload_block: Mutex::new(None) })
     }
 
@@ -295,7 +306,7 @@ impl FileSession {
     }
     /// Host-initiated RpcRequest{1 header, 8 ftp{case}}; resolves with the response's ftp payload.
     async fn request(&self, case: u32, body: Enc, key: (u32, u64, u64, u64)) -> Option<Vec<u8>> {
-        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let id = self.request_id(key.1);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(key, tx);
         let header = Enc::default().uint(1, id);
@@ -304,6 +315,17 @@ impl FileSession {
             Ok(Ok(v)) => Some(v),
             _ => { self.pending.lock().unwrap().remove(&key); None }
         }
+    }
+
+    fn request_id(&self, task: u64) -> u64 {
+        // Windows dispatches sender-initiated FTP requests by task ID, not a fresh RPC ID.
+        // Interop reference: djkcyl/farwing, file_transfer/host/transfer.rs (official 4.41).
+        if self.windows_mode { u64::from(task as u32) } else { self.next_request.fetch_add(1, Ordering::Relaxed) }
+    }
+
+    fn notify_complete(&self, id: TaskId, error: u64) {
+        self.send(21, Enc::default().msg(1, Enc::default().uint(1, self.request_id(id.task)))
+            .msg(8, Enc::default().msg(9, Enc::default().msg(1, id.enc()).uint(2, error))));
     }
 
     /// Key of a FileTransferFtpResponse: 3 file_confirm{id}, 4 block_confirm{id, block_id}, 6 result{id}.
@@ -315,6 +337,16 @@ impl FileSession {
         let id = TaskId::parse(&inner);
         let block = if case.number == 4 { get_uint(&inner, 2) } else { 0 };
         Some((case.number, id.task, id.index, block))
+    }
+
+    fn pending_response(&self, key: (u32, u64, u64, u64)) -> Option<oneshot::Sender<Vec<u8>>> {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(tx) = pending.remove(&key) { return Some(tx); }
+        // Windows confirmations may omit the file index. Accept only one outstanding match
+        // for this task, response case and block; never guess across files or tasks.
+        if !self.windows_mode || key.2 != 0 || !matches!(key.0, 3 | 4 | 6) { return None; }
+        let matches: Vec<_> = pending.keys().filter(|k| k.0 == key.0 && k.1 == key.1 && k.3 == key.3).take(2).copied().collect();
+        if matches.len() == 1 { pending.remove(&matches[0]) } else { None }
     }
 
     /// Handles one decoded Message. Returns true when it carried file-transfer RPC.
@@ -334,7 +366,7 @@ impl FileSession {
                     let Some(ftp) = get_bytes(&rpc, 4) else { continue };
                     handled = true;
                     match Self::response_key(ftp) {
-                        Some(key) => match self.pending.lock().unwrap().remove(&key) {
+                        Some(key) => match self.pending_response(key) {
                             Some(tx) => { let _ = tx.send(ftp.to_vec()); }
                             None => log::info!("File transfer response without pending request: case={} task={} index={} block={}", key.0, key.1, key.2, key.3),
                         },
@@ -562,7 +594,8 @@ impl FileSession {
         let id = TaskId::parse(f);
         let raw = get_text(f, 2);
         let path = normalize(&raw);
-        let collected = collect_download(&path).map_err(|e| io_error(&e));
+        // An empty Windows selection must not become a recursive filesystem-root download.
+        let collected = if raw.is_empty() { Err(FT_PROTOCOL) } else { collect_download(&path).map_err(|e| io_error(&e)) };
         let mut body = Enc::default().msg(1, id.enc());
         match collected {
             Ok((folder, files)) => {
@@ -592,8 +625,7 @@ impl FileSession {
         // last file it sends, without waiting, complete{id{task, file_index = -1}, error}. The viewer
         // treats an index past its list as the task end and marks the download accepted.
         let id = TaskId { task, index: u64::MAX }; // int32 -1, sign-extended varint
-        self.send(21, Enc::default().msg(1, Enc::default().uint(1, self.next_request.fetch_add(1, Ordering::Relaxed)))
-            .msg(8, Enc::default().msg(9, Enc::default().msg(1, id.enc()).uint(2, if ok { FT_SUCCEEDED } else { FT_UNEXPECTED }))));
+        self.notify_complete(id, if ok { FT_SUCCEEDED } else { FT_UNEXPECTED });
         log::info!("File transfer download task done: task={} files={} ok={}", task, files.len(), ok);
     }
 
@@ -610,13 +642,23 @@ impl FileSession {
             let skip = skip != 0;
             log::info!("File transfer download file_confirm: task={} index={} skip={} err={} resume={}", task, index, skip, err, resume);
             if err == FT_CANCELED { return false; }
-            if skip || (err != FT_SUCCEEDED && err != 0) { continue; }
+            if err != FT_SUCCEEDED && err != 0 { return false; }
+            if skip { continue; }
             let result = self.send_file(id, path, resume.min(info.size), first_block).await;
             let code = match result { Ok(()) => FT_SUCCEEDED, Err(c) => c };
+            // Basic Windows FTP acknowledges each block, but completion is a notification.
+            // Do not turn a fully acknowledged transfer into a 30-second final-RPC timeout.
+            if self.windows_mode {
+                self.notify_complete(id, code);
+                log::info!("File transfer download file sent: task={} index={} bytes={} result={} blocks_confirmed={}", task, index, info.size, code, code == FT_SUCCEEDED);
+                if code != FT_SUCCEEDED { return false; }
+                continue;
+            }
             let reply = self.request(9, Enc::default().msg(1, id.enc()).uint(2, code), (6, id.task, id.index, 0)).await;
+            let confirmed = reply.is_some();
             let r = reply.map(|r| case_uints(&r, 6, [2])[0]).unwrap_or(0);
             log::info!("File transfer download file done: task={} index={} bytes={} result={} viewer_result={}", task, index, info.size, code, r);
-            if code == FT_CANCELED { return false; }
+            if code != FT_SUCCEEDED || !confirmed || (r != FT_SUCCEEDED && r != 0) { return false; }
         }
         true
     }
@@ -624,14 +666,16 @@ impl FileSession {
     async fn send_file(self: &Arc<Self>, id: TaskId, path: &Path, resume: u64, first_block: u64) -> Result<(), u64> {
         let mut file = std::fs::File::open(path).map_err(|e| io_error(&e))?;
         file.seek(SeekFrom::Start(resume)).map_err(|e| io_error(&e))?;
-        let mut block_id = first_block + resume / DOWNLOAD_BLOCK as u64;
+        // Basic Windows FTP numbers blocks from one, resetting after a resume; FTP2 is not advertised.
+        let mut block_id = if self.windows_mode { 1 } else { first_block + resume / DOWNLOAD_BLOCK as u64 };
+        let window = if self.windows_mode { 1 } else { DOWNLOAD_WINDOW };
         let mut inflight = tokio::task::JoinSet::new();
         loop {
             let mut buf = vec![0u8; DOWNLOAD_BLOCK];
             let n = file.read(&mut buf).map_err(|e| io_error(&e))?;
             if n == 0 { break; }
             buf.truncate(n);
-            while inflight.len() >= DOWNLOAD_WINDOW {
+            while inflight.len() >= window {
                 if let Some(Ok(code)) = inflight.join_next().await { if code != FT_SUCCEEDED { return Err(code); } }
             }
             let me = self.clone();
@@ -676,6 +720,15 @@ mod tests {
         assert_eq!(normalize("/tmp/a:b"), PathBuf::from("/tmp/a:b"));
     }
     #[test]
+    fn windows_ftp_paths_round_trip_without_changing_targets() {
+        assert_eq!(windows_ftp_path("/"), "C:\\");
+        assert_eq!(windows_ftp_path("/tmp/a b.txt"), "C:\\tmp\\a b.txt");
+        for path in ["/", "/tmp/a b.txt", "/tmp/a:b", "/tmp/\u{6587}\u{6863}.md"] {
+            assert_eq!(normalize(&windows_ftp_path(path)), PathBuf::from(path));
+        }
+        assert_eq!(windows_ftp_path("C:\\tmp\\a.txt"), "C:\\tmp\\a.txt");
+    }
+    #[test]
     fn read_dir_round_trip_uses_official_field_numbers() {
         let dir = std::env::temp_dir().join(format!("uu-ft-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -713,6 +766,132 @@ mod tests {
         let mut plain = Enc::default(); plain = plain.msg(1, files[0].enc());
         gz.write_all(&plain.0).unwrap();
         assert_eq!(parse_files(vec![], Some(&gz.finish().unwrap())), files);
+    }
+    #[test]
+    fn empty_download_request_is_not_a_root_download() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let s = FileSession::new(tx, Arc::new(AtomicU64::new(1)));
+        let request = Enc::default().msg(1, TaskId { task: 42, index: 0 }.enc());
+        s.send_request(7, &decode_wire(&request.0).unwrap());
+        let reply = rx.try_recv().unwrap();
+        let outer = decode_wire(&reply).unwrap();
+        let rpc = decode_wire(get_bytes(&outer, 22).unwrap()).unwrap();
+        let ftp = decode_wire(get_bytes(&rpc, 4).unwrap()).unwrap();
+        let body = decode_wire(get_bytes(&ftp, 2).unwrap()).unwrap();
+        assert_eq!(get_uint(&body, 2), FT_PROTOCOL);
+        assert!(get_all(&body, 3).is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+    fn download_request(message: &[u8]) -> (u64, u32, Vec<u8>) {
+        let outer = decode_wire(message).unwrap();
+        let rpc = decode_wire(get_bytes(&outer, 21).unwrap()).unwrap();
+        let header = decode_wire(get_bytes(&rpc, 1).unwrap()).unwrap();
+        let ftp = decode_wire(get_bytes(&rpc, 8).unwrap()).unwrap();
+        let case = ftp.iter().find(|f| matches!(f.value, WireValue::Bytes(_))).unwrap();
+        (get_uint(&header, 1), case.number, get_bytes(&ftp, case.number).unwrap().to_vec())
+    }
+    fn download_reply(session: &Arc<FileSession>, case: u32, body: Enc) {
+        let rpc = Enc::default().msg(1, Enc::default()).msg(4, Enc::default().msg(case, body));
+        assert!(session.handle(&decode_wire(&crate::initialization::envelope(1, 1, 22, &rpc.0)).unwrap()));
+    }
+    async fn next_download(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await.unwrap().unwrap()
+    }
+    #[tokio::test]
+    async fn windows_download_preserves_task_correlation_and_file_bytes() {
+        let dir = std::env::temp_dir().join(format!("uu-down-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("download.bin");
+        let data: Vec<u8> = (0..DOWNLOAD_BLOCK * 2 + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut s = FileSession::new(tx, Arc::new(AtomicU64::new(1)));
+        Arc::get_mut(&mut s).unwrap().windows_mode = true;
+        let initial = Enc::default().msg(1, TaskId { task: 71, index: u64::MAX }.enc()).text(2, &path.to_string_lossy());
+        s.send_request(99, &decode_wire(&initial.0).unwrap());
+        let reply = next_download(&mut rx).await;
+        let outer = decode_wire(&reply).unwrap();
+        let rpc = decode_wire(get_bytes(&outer, 22).unwrap()).unwrap();
+        assert_eq!(get_uint(&decode_wire(get_bytes(&rpc, 1).unwrap()).unwrap(), 1), 99);
+        let mut blocks = std::collections::BTreeMap::new();
+        let mut completed = false;
+        loop {
+            let message = next_download(&mut rx).await;
+            let (rid, case, bytes) = download_request(&message);
+            assert_eq!(rid, 71);
+            let body = decode_wire(&bytes).unwrap();
+            let id = TaskId::parse(&body);
+            assert_eq!(id.task, 71);
+            if case == 9 && id.index == u64::MAX {
+                assert!(completed);
+                assert_eq!(get_uint(&body, 2), FT_SUCCEEDED);
+                break;
+            }
+            assert_eq!(id.index, 1);
+            match case {
+                3 => {
+                    assert_eq!(get_uint(&body, 3), data.len() as u64);
+                    let reply_id = TaskId { index: 0, ..id };
+                    download_reply(&s, 3, Enc::default().msg(1, reply_id.enc()).uint(3, FT_SUCCEEDED));
+                }
+                4 => {
+                    let block = get_uint(&body, 2);
+                    assert!(block >= 1);
+                    let chunk = get_bytes(&body, 3).unwrap().to_vec();
+                    assert!(blocks.insert(block, chunk.clone()).is_none());
+                    tokio::task::yield_now().await;
+                    assert!(rx.try_recv().is_err());
+                    let reply_id = TaskId { index: 0, ..id };
+                    download_reply(&s, 4, Enc::default().msg(1, reply_id.enc()).uint(2, block).uint(3, FT_SUCCEEDED).uint(4, chunk.len() as u64));
+                }
+                9 => {
+                    assert_eq!(get_uint(&body, 2), FT_SUCCEEDED);
+                    completed = true;
+                }
+                _ => panic!("unexpected download request"),
+            }
+        }
+        assert_eq!(blocks.into_values().flatten().collect::<Vec<u8>>(), data);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn zero_index_confirmation_must_be_unique_and_task_scoped() {
+        let (out, _rx) = mpsc::unbounded_channel();
+        let mut s = FileSession::new(out, Arc::new(AtomicU64::new(1)));
+        Arc::get_mut(&mut s).unwrap().windows_mode = true;
+        let (a, _) = oneshot::channel();
+        let (b, _) = oneshot::channel();
+        s.pending.lock().unwrap().insert((4, 71, 1, 1), a);
+        s.pending.lock().unwrap().insert((4, 71, 2, 1), b);
+        assert!(s.pending_response((4, 71, 0, 1)).is_none());
+        assert!(s.pending_response((4, 72, 0, 1)).is_none());
+        assert!(s.pending_response((4, 71, 0, 2)).is_none());
+        assert_eq!(s.pending.lock().unwrap().len(), 2);
+        assert!(s.pending_response((4, 71, 1, 1)).is_some());
+        assert!(s.pending_response((4, 71, 0, 1)).is_some());
+        assert!(s.pending.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn rejected_download_is_not_reported_successful() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut s = FileSession::new(tx, Arc::new(AtomicU64::new(1)));
+        Arc::get_mut(&mut s).unwrap().windows_mode = true;
+        let worker = s.clone();
+        let task = tokio::spawn(async move {
+            worker.run_download(72, vec![(FileInfo { rel_path: "x.bin".into(), size: 3, modified: 0 }, PathBuf::from("unused"))]).await;
+        });
+        let message = next_download(&mut rx).await;
+        let (rid, case, body) = download_request(&message);
+        assert_eq!((rid, case), (72, 3));
+        let id = TaskId::parse(&decode_wire(&body).unwrap());
+        download_reply(&s, 3, Enc::default().msg(1, id.enc()).uint(3, FT_PERMISSION));
+        let message = next_download(&mut rx).await;
+        let (rid, case, body) = download_request(&message);
+        assert_eq!((rid, case), (72, 9));
+        let fields = decode_wire(&body).unwrap();
+        assert_eq!(TaskId::parse(&fields).index, u64::MAX);
+        assert_eq!(get_uint(&fields, 2), FT_UNEXPECTED);
+        task.await.unwrap();
     }
     #[test]
     fn upload_writes_blocks_and_confirms() {

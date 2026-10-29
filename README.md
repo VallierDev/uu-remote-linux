@@ -324,11 +324,15 @@ systemctl --user restart uuremote-native.service
 
 ## 配置
 
+如果官方 Windows 控制端能列出文件，但下载报权限错误或停在 0 KB，可同时设置 `UU_FTP_WINDOWS_PATHS=1` 和 `UU_FTP_WINDOWS_MODE=1`，再重启被控端服务。两项兼容设置默认关闭。
+
 常用环境变量：
 
 | 变量 | 作用 |
 |---|---|
 | `UU_CONFIG` | 配置文件路径（默认 `~/.config/uuremote/config.json`） |
+| `UU_FTP_WINDOWS_PATHS=1` | 文件列表以 `C:\...` 形式显示 Linux 路径，接收路径仍映射回原 Linux 文件；不移动文件或放宽权限，默认关闭 |
+| `UU_FTP_WINDOWS_MODE=1` | Windows 基础文件传输兼容：以任务号关联请求、使用 TEXT 通道、从 1 开始逐块确认、完成通知不强制等待额外回包；默认关闭，不启用 FTP2。已实测官方 Windows 客户端下载小文件，反向上传和大目录未实机验证 |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
 | `UU_DESKTOP_RESIZE=0` | X11 下控制端切换分辨率时不改桌面分辨率，只缩放编码画面 |
 | `UU_NVENC_RGB=0` / `=1` | NVENC 直接编码 BGRA（省 CPU）。显示器接在 NVIDIA 卡上时默认关闭（同卡合成时直吃反而更慢），`0` 强制关，`1` 强制开 |

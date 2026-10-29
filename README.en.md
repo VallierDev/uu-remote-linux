@@ -357,11 +357,15 @@ kernel parameter `drm.edid_firmware=`, then install as for a normal X11 desktop.
 
 ## Configuration
 
+If the official Windows viewer can browse files but downloads fail with a permission error or remain at 0 KB, enable both `UU_FTP_WINDOWS_PATHS=1` and `UU_FTP_WINDOWS_MODE=1`, then restart the host service. Both compatibility options are off by default.
+
 Common environment variables:
 
 | Variable | Purpose |
 |---|---|
 | `UU_CONFIG` | Config file path (default `~/.config/uuremote/config.json`) |
+| `UU_FTP_WINDOWS_PATHS=1` | Export Linux file-list paths as `C:\...`, translating incoming paths back to the same Linux files; no file moves or permission changes. Off by default |
+| `UU_FTP_WINDOWS_MODE=1` | Basic Windows FTP compatibility: task-correlated requests, TEXT transport, one-based acknowledged blocks and completion notifications without a mandatory extra reply. Off by default; does not enable FTP2. Small downloads tested with the official Windows viewer; uploads and large directories not tested live |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
 | `UU_DESKTOP_RESIZE=0` | on X11, keep the desktop resolution and only scale the encoded stream when the viewer picks a resolution |
 | `UU_NVENC_RGB=0` / `=1` | NVENC encodes BGRA directly (saves CPU). Off by default when a monitor is connected to the NVIDIA card (slower when the desktop is composited on the same GPU); `0` forces off, `1` forces on |

@@ -483,10 +483,10 @@ impl WebRtcSession {
         // session, otherwise the global lock watcher. Unknown state fails closed below.
         let channel_lock_state = portal_desktop.as_ref().map_or_else(
             crate::session_lock::watch_locked, |manager| manager.lock_state());
-        // One file-transfer session per peer. The viewer may send FileTransferFtp RPCs on CONTROL,
-        // but it receives file traffic only through streamerDidReceiveFileData, so every reply and
-        // host-initiated request goes out on FILE_DATA_CHANNEL.
+        // The Mac viewer uses FILE for everything. Basic Windows FTP uses TEXT; only FTP2 blocks
+        // use FILE (djkcyl/farwing file_transfer/host.rs). FTP2 is not advertised here.
         let file_channel: Arc<std::sync::Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(std::sync::Mutex::new(None));
+        let file_request_channel: Arc<std::sync::Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(std::sync::Mutex::new(None));
         let (file_tx, mut file_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let peer_files = crate::file_trans::FileSession::new(file_tx, control_sequence.clone());
         // 端口映射 frames (Message 27) also travel on FILE_DATA_CHANNEL; one session per peer.
@@ -503,16 +503,19 @@ impl WebRtcSession {
         }
         {
             let slot = file_channel.clone();
+            let request_slot = file_request_channel.clone();
+            let windows_mode = std::env::var("UU_FTP_WINDOWS_MODE").is_ok_and(|v| v == "1");
             tokio::spawn(async move {
                 while let Some(message) = file_rx.recv().await {
+                    let (slot, label) = if windows_mode { (&request_slot, "TEXT_DATA_CHANNEL") } else { (&slot, "FILE_DATA_CHANNEL") };
                     let mut channel = slot.lock().unwrap().clone();
                     for _ in 0..100 {
                         if channel.is_some() { break; }
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         channel = slot.lock().unwrap().clone();
                     }
-                    let Some(channel) = channel else { log::warn!("File transfer reply dropped: no FILE_DATA_CHANNEL"); continue; };
-                    if let Err(e) = channel.send(&bytes::Bytes::from(message)).await { log::warn!("FILE_DATA_CHANNEL send failed: {}", e); }
+                    let Some(channel) = channel else { log::warn!("File transfer reply dropped: no {}", label); continue; };
+                    if channel.send(&bytes::Bytes::from(message)).await.is_err() { log::warn!("File transfer channel send failed: channel={}", label); }
                 }
             });
         }
@@ -544,6 +547,7 @@ impl WebRtcSession {
             let peer_selection = video_selection;
             let chroma_sync_rx = chroma_sync_rx.clone();
             if label == "FILE_DATA_CHANNEL" { *file_channel.lock().unwrap() = Some(d.clone()); }
+            if label == "TEXT_DATA_CHANNEL" { *file_request_channel.lock().unwrap() = Some(d.clone()); }
 
             Box::pin(async move {
                 let lbl = label.clone();
