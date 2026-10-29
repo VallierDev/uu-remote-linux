@@ -117,7 +117,11 @@ impl Terminal {
         if let Some(shell)=shell {open["shell"]=json!(shell);}
         let b=self.request((OPEN_RESP,0),BINARY,encode(OPEN,id,open.to_string().as_bytes())).await?;
         let v:Value=serde_json::from_slice(&b).map_err(|_|"Invalid terminal open response")?;
-        if v["code"].as_i64()!=Some(0){return Err("Terminal open rejected".into())}
+        if v["code"].as_i64()!=Some(0){
+            // The host's own error text (no user data), short, to see which shells it accepts.
+            if shell.is_some() {log::info!("Terminal open with a shell rejected: code={:?} message={:?}",v["code"].as_i64(),v["message"].as_str().map(|m|m.chars().take(80).collect::<String>()));}
+            return Err("Terminal open rejected".into())
+        }
         let id=v["session_id"].as_u64().or_else(||v["session_id"].as_str().and_then(|s|s.parse().ok())).and_then(|n|u32::try_from(n).ok()).filter(|n|*n!=0);
         // The official Windows host answers {"code":0,"message"} with header 0 and keeps one terminal per
         // connection addressed as session 0 (it then prints "[terminal] resumed existing session").

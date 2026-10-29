@@ -92,7 +92,8 @@ pub async fn target(io:Transport,rx:mpsc::Receiver<Packet>,nx:f64,ny:f64)->Resul
     let(t,mut output)=Terminal::new(io,rx);
     // Typed into PowerShell, the probe would land in PSReadLine's history file on every drop. cmd keeps
     // its history in memory only, and `powershell -Command` loads no PSReadLine.
-    let id=t.open_shell(COLS,40,"cmd.exe").await?;
+    // The official Windows host accepts "cmd" (observed; "cmd.exe" and a full path are rejected).
+    let id=t.open_shell(COLS,40,"cmd").await?;
     let line=format!("powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{}\"\r",probe_line(nx,ny));
     let result=async{
         let(start,mut last)=(Instant::now(),Instant::now());let mut text=String::new();let mut sent:Option<Instant>=None;let mut resent=false;
