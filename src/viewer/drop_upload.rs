@@ -3,9 +3,11 @@
 //! remote PowerShell which window lies under the point (desktop or an Explorer folder). It runs on
 //! the desktop connection's own BINARY channel: a second connection would join the device's room
 //! again, and the cloud then ends the desktop session (observed: `leave` with the desktop's ice_id).
+//! The terminal is opened as cmd and the probe runs as `powershell -Command`, so it never enters the
+//! remote user's PSReadLine history; a host that opens another shell gets nothing typed (Desktop).
 //! Windows 11 hands that console to a visible Windows Terminal window, which then covers the drop
-//! point (observed: CASCADIA_HOSTING_WINDOW_CLASS under the point): the probe minimizes its own or the
-//! foreground terminal window (never closes one) and skips every terminal window while walking top-down.
+//! point (observed: CASCADIA_HOSTING_WINDOW_CLASS under the point): the probe skips every terminal window
+//! while walking top-down and minimizes only its own console window, never the user's terminals.
 //! `UU_VIEWER_DROP_PROBE=0` skips it (always the remote Desktop). Paths and file names never enter logs.
 use super::tools::{Packet,Transport,FILE,files::{self,Entry,Files},terminal::{Event,Terminal}};
 use std::{collections::HashSet,path::PathBuf,sync::Arc,time::{Duration,Instant}};
@@ -30,11 +32,10 @@ const PROBE_LIMIT:Duration=Duration::from_secs(20);
 /// One statement per line, no here-strings: the host's PSReadLine reads the decoded text through `iex`.
 /// `{NX}`/`{NY}` are the drop point relative to the monitor that holds the remote cursor (the streamed one).
 const PROBE:&str=r##"$ErrorActionPreference='Stop'
-if(-not ('UuDrop.D' -as [type])){Add-Type -Name D -Namespace UuDrop -MemberDefinition '[StructLayout(LayoutKind.Sequential)] public struct P{public int X;public int Y;} [StructLayout(LayoutKind.Sequential)] public struct R{public int L;public int T;public int Rt;public int B;} [StructLayout(LayoutKind.Sequential)] public struct MI{public int Size;public R Mon;public R Work;public int Flags;} [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c); [DllImport("user32.dll")] public static extern bool GetCursorPos(out P p); [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(P p,uint f); [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr m,ref MI i); [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(P p); [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h,uint f); [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,System.Text.StringBuilder s,int n); [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,System.Text.StringBuilder s,int n); [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId(); [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h); [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h,uint c); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out R r); [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h,int i); [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h,int a,out int v,int n); [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int c); [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();'}
+if(-not ('UuDrop.D' -as [type])){Add-Type -Name D -Namespace UuDrop -MemberDefinition '[StructLayout(LayoutKind.Sequential)] public struct P{public int X;public int Y;} [StructLayout(LayoutKind.Sequential)] public struct R{public int L;public int T;public int Rt;public int B;} [StructLayout(LayoutKind.Sequential)] public struct MI{public int Size;public R Mon;public R Work;public int Flags;} [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c); [DllImport("user32.dll")] public static extern bool GetCursorPos(out P p); [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(P p,uint f); [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr m,ref MI i); [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(P p); [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h,uint f); [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,System.Text.StringBuilder s,int n); [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h,System.Text.StringBuilder s,int n); [DllImport("kernel32.dll")] public static extern uint WTSGetActiveConsoleSessionId(); [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h); [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h,uint c); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h,out R r); [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h,int i); [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h,int a,out int v,int n); [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int c);'}
 function UuClass($x){$b=New-Object Text.StringBuilder 64;[UuDrop.D]::GetClassName($x,$b,64)|Out-Null;$b.ToString()}
 $term=@('CASCADIA_HOSTING_WINDOW_CLASS','ConsoleWindowClass','PseudoConsoleWindow')
-$own=[UuDrop.D]::GetAncestor([UuDrop.D]::GetConsoleWindow(),3);$fg=[UuDrop.D]::GetForegroundWindow()
-foreach($x in @($own,$fg)){if($x -ne [IntPtr]::Zero -and $term -contains (UuClass $x)){[UuDrop.D]::ShowWindow($x,7)|Out-Null}}
+$own=[UuDrop.D]::GetAncestor([UuDrop.D]::GetConsoleWindow(),3);if($own -ne [IntPtr]::Zero -and $term -contains (UuClass $own)){[UuDrop.D]::ShowWindow($own,7)|Out-Null}
 try{$a=[UuDrop.D]::SetThreadDpiAwarenessContext([IntPtr](-4))}catch{$a=[IntPtr]::Zero};if($a -eq [IntPtr]::Zero){[UuDrop.D]::SetProcessDPIAware()|Out-Null}
 $c=New-Object UuDrop.D+P;$cur=[UuDrop.D]::GetCursorPos([ref]$c)
 $i=New-Object UuDrop.D+MI;$i.Size=40;[UuDrop.D]::GetMonitorInfo([UuDrop.D]::MonitorFromPoint($c,2),[ref]$i)|Out-Null
@@ -75,6 +76,11 @@ fn plain(text:&str)->String{
     }}
     out
 }
+/// The settled output ends at a cmd prompt (`C:\…>`), not PowerShell's (`PS C:\…>`).
+fn cmd_prompt(text:&str)->bool{
+    let text=plain(text);let text=text.trim_end();
+    text.ends_with('>') && !text.contains("PS ") && !text.contains("PowerShell")
+}
 fn marker(text:&str)->Option<Target>{
     use base64::Engine;
     let text=plain(text);let start=text.find("UUDROP:")?+7;let end=start+text[start..].find(":END")?;
@@ -84,8 +90,10 @@ fn marker(text:&str)->Option<Target>{
 pub async fn target(io:Transport,rx:mpsc::Receiver<Packet>,nx:f64,ny:f64)->Result<Target,String>{
     // No check_env: the official Windows host has none and would only cost its 3 s timeout.
     let(t,mut output)=Terminal::new(io,rx);
-    let id=t.open(COLS,40).await?;
-    let line=probe_line(nx,ny)+"\r";
+    // Typed into PowerShell, the probe would land in PSReadLine's history file on every drop. cmd keeps
+    // its history in memory only, and `powershell -Command` loads no PSReadLine.
+    let id=t.open_shell(COLS,40,"cmd.exe").await?;
+    let line=format!("powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{}\"\r",probe_line(nx,ny));
     let result=async{
         let(start,mut last)=(Instant::now(),Instant::now());let mut text=String::new();let mut sent:Option<Instant>=None;let mut resent=false;
         loop{
@@ -100,7 +108,11 @@ pub async fn target(io:Transport,rx:mpsc::Receiver<Packet>,nx:f64,ny:f64)->Resul
             }
             // Type only once the prompt has settled; input that arrives while it redraws is dropped.
             match sent{
-                None if (!text.is_empty()&&last.elapsed()>=Duration::from_millis(700))||start.elapsed()>=Duration::from_secs(8)=>{t.write(id,line.as_bytes()).await?;sent=Some(Instant::now());},
+                None if (!text.is_empty()&&last.elapsed()>=Duration::from_millis(700))||start.elapsed()>=Duration::from_secs(8)=>{
+                    let cmd=cmd_prompt(&text);log::info!("Viewer drop probe shell: cmd={cmd}");
+                    if !cmd {break Err("The remote did not open cmd; the probe is not typed into another shell".into())}
+                    t.write(id,line.as_bytes()).await?;sent=Some(Instant::now());
+                },
                 Some(at) if !resent&&at.elapsed()>=Duration::from_secs(10)=>{t.write(id,line.as_bytes()).await?;resent=true;},
                 _=>{},
             }
@@ -237,6 +249,12 @@ async fn transfer(io:Transport,term_rx:mpsc::Receiver<Packet>,files:&Files,mut p
         let with=format!("UUDROP:{}:END",base64::engine::general_purpose::STANDARD.encode(r#"{"kind":"other","path":"C:\\x","diag":{"sid":1,"active":1,"sys":false,"cursor":true,"window":"app"}}"#));
         assert_eq!(marker(&with).unwrap().diag,Diag{sid:1,active:1,sys:false,cursor:true,window:"app".into()});
         assert_eq!(marker("UUDROP:not base64!:END"),None);assert_eq!(marker("PS C:\\> "),None);
+    }
+    #[test] fn only_a_cmd_prompt_gets_the_probe(){
+        assert!(cmd_prompt("Microsoft Windows [Version 10.0.22631]\r\n(c) Microsoft Corporation.\r\n\r\nC:\\Users\\k>"));
+        assert!(cmd_prompt("\x1b[?25lC:\\Windows\\system32>\x1b[?25h "));
+        assert!(!cmd_prompt("Windows PowerShell\r\nCopyright (C) Microsoft Corporation.\r\n\r\nPS C:\\Users\\k> "));
+        assert!(!cmd_prompt("PS C:\\> "));assert!(!cmd_prompt(""));assert!(!cmd_prompt("loading"));
     }
     #[test] fn root_listing_tells_windows_and_the_desktop(){
         let win=[entry(3," (C:)","C:\\"),entry(0,"Documents","C:\\Users\\k\\Documents"),entry(0,"Desktop","C:\\Users\\k\\Desktop")];
