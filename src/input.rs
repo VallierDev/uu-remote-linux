@@ -568,8 +568,16 @@ impl InputInjector {
             }
         } else if self.backend==crate::desktop_backend::DesktopBackend::Portal {
             if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
-            if self.paste_text_via_clipboard(text) {
-                log::info!("Desktop text input (Portal clipboard paste): chars={} result=ok", text.chars().count());
+            // Shift+Insert pastes the PRIMARY selection in VTE terminals, not the clipboard just set:
+            // type what the active layout has as keys and paste only the rest.
+            let typed=self.type_portal_keysyms(text);
+            if typed==text.chars().count() {
+                log::info!("Desktop text input (Portal keysyms): chars={typed}");
+                return;
+            }
+            let rest:String=text.chars().skip(typed).collect();
+            if self.paste_text_via_clipboard(&rest) {
+                log::info!("Desktop text input (Portal clipboard paste): chars={} typed={typed} result=ok", text.chars().count());
                 return;
             }
             static WARNED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
@@ -582,6 +590,14 @@ impl InputInjector {
                 log::warn!("Mobile text input is not supported on the {:?} backend yet", self.backend);
             }
         }
+    }
+    /// Types `text` as portal keysyms when it is all printable ASCII (or newline/tab) and GNOME's
+    /// active input source is a Latin xkb layout; returns how many characters were typed.
+    fn type_portal_keysyms(&self, text: &str) -> usize {
+        let Some(symbols)=ascii_keysyms(text) else { return 0 };
+        if !gnome_layout_types_ascii() { return 0; }
+        let Some(portal)=self.portal.lock().unwrap().clone() else { return 0 };
+        symbols.iter().take_while(|&&symbol| portal.type_keysym(symbol).is_ok()).count()
     }
     pub fn key_event(&self, keycode: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
@@ -721,6 +737,63 @@ impl InputInjector {
             portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::DesktopBackend::Portal,
             pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()),
             touch:std::sync::Mutex::new(TouchDrag::default()) }
+    }
+}
+
+/// Keysyms for mobile IME text: printable ASCII is its own keysym, newline is Return, tab is Tab.
+fn ascii_keysyms(text: &str) -> Option<Vec<u32>> {
+    text.chars().map(|c| match c { '\n' => Some(0xff0d), '\t' => Some(0xff09), ' '..='~' => Some(c as u32), _ => None }).collect()
+}
+/// Whether an `org.gnome.desktop.input-sources` source list starts with an xkb layout that has
+/// printable ASCII in its first group. Mutter drops keysyms the active layout lacks, and an IBus
+/// engine (pinyin, ...) would compose the keys instead.
+fn first_source_types_ascii(sources: &str) -> bool {
+    let Some(start)=sources.find('(') else { return false };
+    let Some(end)=sources[start..].find(')') else { return false };
+    let fields:Vec<&str>=sources[start+1..start+end].split(',').map(|f| f.trim().trim_matches('\'')).collect();
+    let [kind, layout]=fields[..] else { return false };
+    let (base, variant)=layout.split_once('+').unwrap_or((layout, ""));
+    const NON_LATIN: &[&str]=&["af","am","ara","bd","bg","bt","by","eg","et","ge","gr","il","in","iq","ir","kg","kh","kz","la","lk","mk","mm","mn","mv","np","ru","sy","th","tj","ua"];
+    kind=="xkb" && !NON_LATIN.contains(&base) && !variant.contains("cyrillic") && (base!="rs" || variant.contains("latin"))
+}
+/// GNOME's active input source is the first of `mru-sources` (else of `sources`). Cached for 2 s.
+fn gnome_layout_types_ascii() -> bool {
+    #[cfg(test)]
+    { false }
+    #[cfg(not(test))]
+    {
+        static CACHE: std::sync::Mutex<Option<(std::time::Instant,bool)>> = std::sync::Mutex::new(None);
+        let mut cache=CACHE.lock().unwrap();
+        if let Some((at,value))=*cache { if at.elapsed()<std::time::Duration::from_secs(2) { return value; } }
+        let read=|key: &str| std::process::Command::new("gsettings").args(["get","org.gnome.desktop.input-sources",key])
+            .stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).filter(|s| s.contains('('));
+        let value=read("mru-sources").or_else(|| read("sources")).is_some_and(|s| first_source_types_ascii(&s));
+        *cache=Some((std::time::Instant::now(),value));
+        value
+    }
+}
+
+#[cfg(test)]
+mod text_keysym_tests {
+    use super::*;
+    #[test]
+    fn ascii_text_becomes_keysyms_and_other_text_does_not() {
+        assert_eq!(ascii_keysyms("Hi!\n\t~"), Some(vec![0x48,0x69,0x21,0xff0d,0xff09,0x7e]));
+        assert_eq!(ascii_keysyms("čaj"), None);
+        assert_eq!(ascii_keysyms("测试"), None);
+    }
+    #[test]
+    fn only_latin_xkb_layouts_type_ascii() {
+        assert!(first_source_types_ascii("[('xkb', 'us'), ('ibus', 'libpinyin'), ('xkb', 'rs+latin')]"));
+        assert!(first_source_types_ascii("[('xkb', 'rs+latin')]"));
+        assert!(first_source_types_ascii("[('xkb', 'de+nodeadkeys')]"));
+        assert!(!first_source_types_ascii("[('ibus', 'libpinyin'), ('xkb', 'us')]"));
+        assert!(!first_source_types_ascii("[('xkb', 'rs')]"));
+        assert!(!first_source_types_ascii("[('xkb', 'ru')]"));
+        assert!(first_source_types_ascii("[('xkb', 'ba+unicodeus')]"));
+        assert!(!first_source_types_ascii("[('xkb', 'me+cyrillic')]"));
+        assert!(!first_source_types_ascii("@a(ss) []"));
     }
 }
 

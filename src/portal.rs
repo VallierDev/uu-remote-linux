@@ -395,6 +395,14 @@ mod native {
             let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
             super::check(unsafe { uu_portal_button(handle.0.as_ptr(), button, i32::from(pressed)) })
         }
+        /// Press and release a keysym through Notify*: the compositor picks the key and level of
+        /// the active layout. Under EIS (keycodes only) it fails before typing anything.
+        pub fn type_keysym(&self, symbol: u32) -> Result<(), String> {
+            if *self.locked.borrow() != Some(false) { return Err("Portal input blocked while locked".into()); }
+            let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+            super::check(unsafe { uu_portal_key(handle.0.as_ptr(), symbol, -1, 1) })?;
+            super::check(unsafe { uu_portal_key(handle.0.as_ptr(), symbol, -1, 0) })
+        }
         /// The portal granted the touchscreen device type (requested where available).
         pub fn touch_supported(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_touch_supported(handle.0.as_ptr()) } != 0)
@@ -728,6 +736,7 @@ impl PortalSession {
     pub fn button(&self, _: i32, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn touch_supported(&self) -> bool { false }
     pub fn upgrade_touch(&self) -> Result<bool, String> { Err(error(15)) }
+    pub fn type_keysym(&self, _: u32) -> Result<(), String> { Err(error(15)) }
     pub fn touch(&self, _: i32, _: f64, _: f64) -> Result<(), String> { Err(error(15)) }
     pub fn key(&self, _: u64, _: bool) -> Result<(), String> { Err(error(15)) }
 }
