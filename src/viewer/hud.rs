@@ -137,8 +137,8 @@ pub enum Command {
     Quality(u64), Fps(u32), Chroma(u32), FollowRemote(bool), OneToOne(bool), Volume(u8),
     AutoLock(bool), HostMute(bool), GrabKeys(bool), Files, Watch(bool), Stats(bool), HideTab(bool), Fullscreen, Disconnect,
 }
-/// What the menu shows as selected. Remote settings start at the official viewer's defaults and
-/// reflect only this session's choices; the host does not report them back.
+/// What the menu shows as selected. The host does not report remote settings back; quality, frame
+/// rate and color are saved and sent again when the next session's CONTROL is ready.
 #[derive(Clone, PartialEq)]
 pub struct State {
     pub quality: u64, pub fps: u32, pub chroma: u32, pub follow_remote: bool, pub one_to_one: bool, pub volume: u8,
@@ -328,11 +328,15 @@ pub fn load_prefs(st: &mut State) {
     if let Some(b) = v["hide_tab_fullscreen"].as_bool() { st.hide_tab = b; }
     if let Some(b) = v["one_to_one"].as_bool() { st.one_to_one = b; }
     if let Some(n) = v["volume"].as_u64() { st.volume = n.min(100) as u8; }
+    if let Some(q) = v["quality"].as_u64().filter(|q| (2..=5).contains(q)) { st.quality = q; }
+    if let Some(f) = v["fps"].as_u64().filter(|f| [30, 60, 90, 144].contains(f)) { st.fps = f as u32; }
+    if let Some(c) = v["chroma"].as_u64().filter(|c| [1, 3].contains(c)) { st.chroma = c as u32; }
 }
 pub fn save_prefs(st: &State) {
     let path = prefs_path();
     if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
-    let v = serde_json::json!({"stats": st.stats, "hide_tab_fullscreen": st.hide_tab, "one_to_one": st.one_to_one, "volume": st.volume});
+    let v = serde_json::json!({"stats": st.stats, "hide_tab_fullscreen": st.hide_tab, "one_to_one": st.one_to_one, "volume": st.volume,
+        "quality": st.quality, "fps": st.fps, "chroma": st.chroma});
     let _ = std::fs::write(path, v.to_string());
 }
 fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_else(|| "viewer.json".into(), |d| d.join("viewer.json")) }

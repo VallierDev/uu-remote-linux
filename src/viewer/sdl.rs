@@ -139,7 +139,8 @@ impl Window {
     fn command(&mut self,command:hud::Command){
         let st=&mut self.chrome.state;
         match command {
-            hud::Command::Quality(q)=>st.quality=q, hud::Command::Fps(f)=>st.fps=f, hud::Command::Chroma(c)=>st.chroma=c,
+            hud::Command::Quality(q)=>{st.quality=q;hud::save_prefs(st)}, hud::Command::Fps(f)=>{st.fps=f;hud::save_prefs(st)},
+            hud::Command::Chroma(c)=>{st.chroma=c;hud::save_prefs(st)},
             hud::Command::FollowRemote(b)=>st.follow_remote=b, hud::Command::Volume(v)=>st.volume=v,
             hud::Command::AutoLock(b)=>st.auto_lock=b, hud::Command::HostMute(b)=>st.host_mute=b, hud::Command::Watch(b)=>st.watch=b,
             hud::Command::OneToOne(b)=>{st.one_to_one=b;hud::save_prefs(st)},
@@ -156,6 +157,13 @@ impl Window {
         self.chrome.commands.push(command);
     }
     pub fn take_commands(&mut self)->Vec<hud::Command>{std::mem::take(&mut self.chrome.commands)}
+    /// The host starts every session at the official defaults; repeat the saved choices that differ.
+    pub fn restore_remote_settings(&mut self){
+        let(st,d)=(&self.chrome.state,hud::State::default());let c=&mut self.chrome.commands;
+        if st.quality!=d.quality {c.push(hud::Command::Quality(st.quality));}
+        if st.fps!=d.fps {c.push(hud::Command::Fps(st.fps));}
+        if st.chroma!=d.chroma {c.push(hud::Command::Chroma(st.chroma));}
+    }
     pub fn state(&self)->&hud::State{&self.chrome.state}
     pub fn sync_chroma(&mut self,chroma:u32){if chroma!=0 {self.chrome.state.chroma=chroma;}}
     pub fn set_stage(&mut self,stage:&str){self.chrome.stage=stage.into();}
@@ -391,7 +399,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
         }
         Err(e)=>{ log::warn!("Type IPC not started: {e}"); None }
     };
-    let mut command_open=true;let mut requested=false;let mut type_requested=false;
+    let mut command_open=true;let mut requested=false;let mut type_requested=false;let mut restored=false;
     let mut type_job:Option<TypeJob>=None;
     let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
     let mut audio=super::audio::Playback::new(&window._sdl,session.peer.audio.clone());
@@ -464,6 +472,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                 if let Some(playback)=audio.as_mut(){if playback.pump().is_err(){log::warn!("Viewer audio playback stopped");audio=None;}}
                 let (quit,mut messages)=window.poll(&mut input);
                 if !window.has_picture() {window.loading_frame(false);}
+                if !restored && session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false) {restored=true;window.restore_remote_settings();}
                 for command in window.take_commands() {
                     seq+=1;
                     let control=match command {
