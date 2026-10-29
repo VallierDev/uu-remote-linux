@@ -413,7 +413,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let mut last=(0u64,0u64,0u64,0u64,std::time::Instant::now());
     let mut codec_name="--";
     // After a local drop the decoder has no reference picture; P-frames would only smear blocks.
-    let mut await_key=false;
+    let mut key_gate=super::desktop::KeyGate::new();
     let mut next_thumb=std::time::Instant::now()+std::time::Duration::from_secs(5);
     let result=async {
         loop {tokio::select!{
@@ -542,10 +542,9 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                 if quit{return Ok(())}
                 // At most one AU per iteration keeps local event polling responsive.
                 if let Some(au)=session.peer.desktop.units.pop(){
-                    if session.peer.desktop.reset.swap(false,std::sync::atomic::Ordering::AcqRel){decoder.reset();await_key=true;}
-                    if await_key && !super::desktop::is_key_frame(au.codec,&au.data) {session.peer.desktop.pli.store(true,std::sync::atomic::Ordering::Release);}
+                    if session.peer.desktop.reset.swap(false,std::sync::atomic::Ordering::AcqRel){decoder.reset();key_gate.arm();}
+                    if !key_gate.admit(au.codec,&au.data) {session.peer.desktop.pli.store(true,std::sync::atomic::Ordering::Release);super::desktop::drain(decoder,window)?;}
                     else {
-                        await_key=false;
                         decoder.set_codec(au.codec)?;
                         codec_name=if au.codec==super::media::Codec::H265 {"H.265"} else {"H.264"};
                         super::desktop::display(decoder,window,&au.data,au.codec,&session.peer.desktop.pli)?;

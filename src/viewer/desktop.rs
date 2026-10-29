@@ -15,12 +15,41 @@ pub trait FrameSink { fn present(&mut self,frame:&Frame)->Result<(),String>; }
 /// Counts only (access units, presented frames, decode errors) for the periodic stats line.
 pub static STATS:[std::sync::atomic::AtomicU64;3]=[std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0)];
 fn wants_key_frame(units:u64,presented:u64)->bool {presented==0 && units%30==0}
-/// True when an Annex-B access unit carries an IDR/IRAP slice the decoder can restart from.
+/// True when an Annex-B access unit carries a picture the decoder can restart from: an IDR/IRAP,
+/// an H.264 recovery-point SEI or an H.264 I slice (some hosts answer PLI without an IDR, #136).
 pub fn is_key_frame(codec:super::media::Codec,au:&[u8])->bool {
-    au.windows(4).enumerate().filter(|(_,w)|w[..3]==[0,0,1]).any(|(_,w)|match codec {
-        super::media::Codec::H264=>w[3]&0x1f==5,
+    au.windows(4).enumerate().filter(|(_,w)|w[..3]==[0,0,1]).any(|(i,w)|match codec {
+        super::media::Codec::H264=>match w[3]&0x1f {5=>true,6=>au.get(i+4)==Some(&6),1=>h264_i_slice(&au[i+4..]),_=>false},
         super::media::Codec::H265=>(16..=21).contains(&((w[3]>>1)&0x3f)),
     })
+}
+/// Reads first_mb_in_slice and slice_type (both ue(v)) from a slice header; I = 2 or 7.
+fn h264_i_slice(rbsp:&[u8])->bool {
+    let mut bit=0usize;
+    let mut ue=||->Option<u32>{
+        let mut zeros=0;
+        while (rbsp.get(bit/8)?>>(7-bit%8))&1==0 {zeros+=1;bit+=1;if zeros>31 {return None}}
+        bit+=1;let mut v=0u32;
+        for _ in 0..zeros {v=(v<<1)|u32::from((rbsp.get(bit/8)?>>(7-bit%8))&1);bit+=1;}
+        Some((1u32<<zeros)-1+v)
+    };
+    ue().is_some() && matches!(ue(),Some(2|7))
+}
+/// After a local reset, holds back pictures until a restart point arrives, but never longer
+/// than `limit`: a host that ignores PLI must not leave the window blank (#136).
+pub struct KeyGate { since:Option<std::time::Instant>, limit:std::time::Duration }
+impl KeyGate {
+    pub fn new()->Self {Self{since:None,limit:std::time::Duration::from_millis(1500)}}
+    pub fn arm(&mut self) {self.since.get_or_insert_with(std::time::Instant::now);}
+    /// False = drop this unit and keep asking for a key frame.
+    pub fn admit(&mut self,codec:super::media::Codec,au:&[u8])->bool {
+        let Some(since)=self.since else {return true};
+        let timed_out=since.elapsed()>=self.limit;
+        if timed_out || is_key_frame(codec,au) {
+            if timed_out {log::debug!("Viewer desktop: no key frame within {:?} after reset; decoding on",self.limit);}
+            self.since=None;true
+        } else {false}
+    }
 }
 /// Shows the newest frame a decoder finished between access units.
 pub fn drain(decoder:&mut dyn Decoder,sink:&mut dyn FrameSink)->Result<(),String> {
@@ -56,6 +85,19 @@ pub fn display(decoder:&mut dyn Decoder,sink:&mut dyn FrameSink,au:&[u8],codec:s
         assert!(!super::is_key_frame(Codec::H264,&[0,0,0,1,0x61,1]));
         assert!(super::is_key_frame(Codec::H265,&[0,0,0,1,0x40,1,0,0,1,0x26,1,3]));
         assert!(!super::is_key_frame(Codec::H265,&[0,0,0,1,0x02,1]));
+        // I slice (first_mb=0 '1', slice_type=7 '0001000') and P slice (slice_type=5 '00110').
+        assert!(super::is_key_frame(Codec::H264,&[0,0,0,1,0x41,0b1000_1000,0]));
+        assert!(!super::is_key_frame(Codec::H264,&[0,0,0,1,0x41,0b1001_1000]));
+        // Recovery-point SEI (payload type 6).
+        assert!(super::is_key_frame(Codec::H264,&[0,0,0,1,0x06,0x06,1,0x80]));
+    }
+    #[test] fn key_gate_waits_then_gives_up(){
+        use crate::viewer::media::Codec;
+        let mut g=super::KeyGate::new();let p=[0,0,0,1,0x41,0b1001_1000];
+        assert!(g.admit(Codec::H264,&p));
+        g.arm();assert!(!g.admit(Codec::H264,&p));
+        assert!(g.admit(Codec::H264,&[0,0,0,1,0x65,0x88]));assert!(g.admit(Codec::H264,&p));
+        g.limit=std::time::Duration::ZERO;g.arm();assert!(g.admit(Codec::H264,&p));
     }
     use super::*;
     struct Mock(bool);impl Decoder for Mock {fn set_codec(&mut self,_:crate::viewer::media::Codec)->Result<(),String>{Ok(())} fn decode(&mut self,_:&[u8])->Result<Vec<Frame>,String>{if self.0{Err("synthetic".into())}else{Ok(vec![Frame{width:1,height:1,rgb:vec![0;3],content:None}])}} fn reset(&mut self){self.0=false;}}
