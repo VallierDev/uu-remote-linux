@@ -3,11 +3,15 @@ use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum
 #[derive(Debug)] enum Command { Files, Type }
 pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest>,
-    pub last_frame:Option<Frame>, chrome:Chrome }
+    pub last_frame:Option<Frame>, chrome:Chrome, dropping:Dropping, dropped:Option<(Vec<std::path::PathBuf>,f64,f64)> }
+/// Files arriving from a drag. SDL2 drop events carry no position; the pointer re-enters at the
+/// drop point when the drag ends, so the next motion (or the mouse state) is where it was dropped.
+#[derive(Default)] struct Dropping { files:Vec<std::path::PathBuf>, batch:bool, done:Option<std::time::Instant>, at:Option<(i32,i32)> }
 /// In-window chrome state (src/viewer/hud.rs): menu, network panel, loading screen.
 struct Chrome { font:Option<ab_glyph::FontVec>, scale:f32, pub state:hud::State, menu:hud::Menu, net:Option<hud::NetStats>, tab_hover:bool, tab_down:bool,
     commands:Vec<hud::Command>, started:std::time::Instant, last_loading:std::time::Instant, title:String, stage:String, labels:std::collections::HashMap<(String,u32,u32),hud::Layer>,
-    menu_cache:Option<(hud::State,hud::Menu,f32,hud::Layer)> }
+    menu_cache:Option<(hud::State,hud::Menu,f32,hud::Layer)>, notice:Option<(String,Option<std::time::Instant>)>,
+    transfer:Option<hud::Transfer>, transfer_hits:Vec<(hud::Rect,hud::TransferHit)>, transfer_down:bool, transfer_actions:Vec<hud::TransferHit> }
 use super::hud;
 impl Window {
     pub fn new()->Result<Self,String>{
@@ -26,10 +30,11 @@ impl Window {
         let mut state=hud::State::default();hud::load_prefs(&mut state);
         let now=std::time::Instant::now();
         let chrome=Chrome{font:hud::load_font(),scale,state,menu:hud::Menu::default(),net:None,tab_hover:false,tab_down:false,commands:Vec::new(),started:now,last_loading:now-std::time::Duration::from_secs(1),
-            title:crate::tr!("正在连接 {name}","Connecting to {name}"),stage:crate::i18n::s("正在连接远端设备…","Contacting the remote device…").into(),labels:Default::default(),menu_cache:None};
+            title:crate::tr!("正在连接 {name}","Connecting to {name}"),stage:crate::i18n::s("正在连接远端设备…","Contacting the remote device…").into(),labels:Default::default(),menu_cache:None,notice:None,
+            transfer:None,transfer_hits:Vec::new(),transfer_down:false,transfer_actions:Vec::new()};
         let events=sdl.event_pump()?;let clipboard=video.clipboard();
         let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
-        Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
+        Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome,dropping:Dropping::default(),dropped:None})
     }
     pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone())}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
@@ -65,11 +70,24 @@ impl Window {
         let events=poll_events(&mut self.events);
         let mut forward=Vec::with_capacity(events.len());
         for event in events {
+            match &event {
+                Event::DropBegin{..}=>{self.dropping=Dropping{batch:true,..Default::default()};continue},
+                Event::DropFile{filename,..}=>{self.dropping.files.push(filename.into());if !self.dropping.batch{self.dropping.done.get_or_insert_with(std::time::Instant::now);}continue},
+                Event::DropComplete{..}=>{self.dropping.done=Some(std::time::Instant::now());continue},
+                Event::DropText{..}=>continue,
+                Event::MouseMotion{x,y,..} if self.dropping.done.is_some()=>self.dropping.at=Some((*x,*y)),
+                _=>{},
+            }
             if matches!(event,Event::ClipboardUpdate{..}|Event::Window{win_event:WindowEvent::FocusGained,..}){self.clipboard_dirty=true;}
             redraw|=needs_redraw(&event);
             let (consumed,changed)=self.chrome_event(&event);redraw|=changed;
             if !consumed {forward.push(event);}
         }
+        if let Some(done)=self.dropping.done { if self.dropping.at.is_some() || done.elapsed()>=std::time::Duration::from_millis(400) {
+            let d=std::mem::take(&mut self.dropping);
+            let(x,y)=d.at.unwrap_or_else(||{let m=self.events.mouse_state();(m.x(),m.y())});
+            if let Some((nx,ny))=viewport.normalized(f64::from(x),f64::from(y)).filter(|_|!d.files.is_empty()) {self.dropped=Some((d.files,nx,ny));}
+        }}
         let result=translate_actions(forward,input,viewport,&mut self.focused,&mut self.files);
         // A compositor resize (tiling, maximize) leaves the surface without a buffer of the new size
         // until the next frame; a static remote desktop sends none, so repaint the last frame now.
@@ -95,6 +113,7 @@ impl Window {
             }}
             if self.chrome.menu.open { if *code==Scancode::Escape {self.chrome.menu.open=false;} return (true,true) }
         }
+        if !self.chrome.menu.open { if let Some(result)=self.transfer_event(event) {return result} }
         if !self.chrome.menu.open {
             return match *event {
                 Event::MouseMotion{x,y,..}=>{let h=tab_visible&&tab.contains(x as f32,y as f32);let changed=h!=self.chrome.tab_hover;self.chrome.tab_hover=h;(false,changed)},
@@ -157,6 +176,45 @@ impl Window {
         self.chrome.commands.push(command);
     }
     pub fn take_commands(&mut self)->Vec<hud::Command>{std::mem::take(&mut self.chrome.commands)}
+    pub fn take_drop(&mut self)->Option<(Vec<std::path::PathBuf>,f64,f64)>{self.dropped.take()}
+    /// One-line message above the bottom edge; a final one disappears after a few seconds.
+    pub fn notify(&mut self,text:String,last:bool){
+        self.chrome.notice=Some((text,last.then(||std::time::Instant::now()+std::time::Duration::from_secs(5))));self.redraw();
+    }
+    pub fn expire_notice(&mut self){
+        if self.chrome.notice.as_ref().is_some_and(|(_,until)|until.is_some_and(|u|std::time::Instant::now()>=u)) {self.chrome.notice=None;self.redraw();}
+    }
+    /// The transfer card: a stage line (no progress yet) or the current file's bytes.
+    pub fn transfer_stage(&mut self,label:String){
+        let t=self.chrome.transfer.get_or_insert_with(Default::default);
+        t.label=label;t.sized=false;t.done=0;t.total=0;self.redraw();
+    }
+    pub fn transfer_file(&mut self,label:String,done:u64,total:u64){
+        let t=self.chrome.transfer.get_or_insert_with(Default::default);
+        t.label=label;t.sized=true;t.done=done;t.total=total;self.redraw();
+    }
+    pub fn transfer_paused(&mut self,paused:bool){if let Some(t)=self.chrome.transfer.as_mut(){t.paused=paused;self.redraw();}}
+    pub fn transfer_end(&mut self){self.chrome.transfer=None;self.chrome.transfer_hits.clear();self.chrome.transfer_down=false;self.redraw();}
+    pub fn take_transfer_actions(&mut self)->Vec<hud::TransferHit>{std::mem::take(&mut self.chrome.transfer_actions)}
+    /// Pointer over the transfer card: hover on its buttons, clicks stay local (never reach the remote).
+    fn transfer_event(&mut self,event:&Event)->Option<(bool,bool)>{
+        let hit=|hits:&[(hud::Rect,hud::TransferHit)],x:i32,y:i32|hits.iter().find(|(r,_)|r.contains(x as f32,y as f32)).map(|(_,h)|*h);
+        let t=self.chrome.transfer.as_mut()?;
+        match *event {
+            Event::MouseMotion{x,y,..}=>{
+                let hover=hit(&self.chrome.transfer_hits,x,y).filter(|h|*h!=hud::TransferHit::Card);
+                if hover==t.hover {return None}
+                t.hover=hover;Some((false,true))
+            },
+            Event::MouseButtonDown{x,y,mouse_btn,..}=>{
+                let h=hit(&self.chrome.transfer_hits,x,y)?;
+                if mouse_btn==MouseButton::Left && h!=hud::TransferHit::Card {self.chrome.transfer_actions.push(h);}
+                self.chrome.transfer_down=true;Some((true,false))
+            },
+            Event::MouseButtonUp{..} if self.chrome.transfer_down=>{self.chrome.transfer_down=false;Some((true,false))},
+            _=>None,
+        }
+    }
     /// The host starts every session at the official defaults; repeat the saved choices that differ.
     pub fn restore_remote_settings(&mut self){
         let(st,d)=(&self.chrome.state,hud::State::default());let c=&mut self.chrome.commands;
@@ -207,6 +265,19 @@ impl Window {
             let layer=hud::stats_layer(self.chrome.font.as_ref(),&hud::stats_lines(&net),scale);
             self.blit(&layer,size.0 as i32-layer.w as i32-(12.*scale) as i32,size.1 as i32-layer.h as i32-(12.*scale) as i32)?;
         }}
+        // The transfer card sits above the bottom edge; a notice goes above it while both show.
+        let mut bottom=size.1 as i32-(24.*scale) as i32;
+        if let Some(t)=self.chrome.transfer.clone() {
+            let (layer,hits)=hud::transfer_layer(self.chrome.font.as_ref(),&t,scale);
+            let (x,y)=((size.0 as i32-layer.w as i32)/2,size.1 as i32-layer.h as i32-(10.*scale) as i32);
+            self.chrome.transfer_hits=hits.into_iter().map(|(r,h)|(hud::Rect{x:r.x+x as f32,y:r.y+y as f32,w:r.w,h:r.h},h)).collect();
+            self.blit(&layer,x,y)?;
+            bottom=y+(8.*scale) as i32;
+        }
+        if let Some((text,_))=self.chrome.notice.clone() {
+            let layer=hud::stats_layer(self.chrome.font.as_ref(),&[text],scale);
+            self.blit(&layer,(size.0 as i32-layer.w as i32)/2,bottom-layer.h as i32)?;
+        }
         if self.tab_visible() {
             let r=hud::tab_rect(self.chrome.font.as_ref(),size,scale);
             let layer=hud::tab_layer(self.chrome.font.as_ref(),scale,self.chrome.tab_hover||self.chrome.menu.open);
@@ -376,6 +447,7 @@ impl FrameSink for Window {
 pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super::desktop::Decoder,view_only:bool,device:&str)->Result<(),String>{
     #[cfg(uu_gtk)]
     let mut files:Option<tokio::task::JoinHandle<Result<(),String>>>=None;
+    let mut drop_job:Option<(tokio::task::JoinHandle<()>,tokio::sync::mpsc::UnboundedReceiver<super::drop_upload::Update>,tokio::sync::watch::Sender<super::drop_upload::Control>)>=None;
     let(tx,mut commands)=tokio::sync::mpsc::channel::<Command>(8);
     if std::env::var("UU_VIEWER_COMMANDS").as_deref()==Ok("1") {
         std::thread::spawn(move||{
@@ -494,8 +566,49 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                     };
                     if let Some(data)=control { if let Err(e)=session.peer.send_control(data).await {log::warn!("Viewer control command not sent: {e}");} }
                 }
-                window.poll_clipboard();
+                window.poll_clipboard();window.expire_notice();
+                if let Some((paths,nx,ny))=window.take_drop() {
+                    log::info!("Viewer drop: files={} at=({nx:.3},{ny:.3})",paths.len());
+                    let open=session.peer.channels[super::tools::FILE].ready_state()==webrtc::data_channel::data_channel_state::RTCDataChannelState::Open;
+                    if !input.enabled() {window.notify(crate::i18n::s("观看模式下不发送文件","Watch mode: files are not sent").into(),true);}
+                    else if drop_job.is_some()||session.peer.tools.lock().unwrap().is_some() {window.notify(crate::i18n::s("请先关闭文件传输窗口","Close the file transfer window first").into(),true);}
+                    else if !open {window.notify(crate::i18n::s("文件传输尚未就绪","File transfer is not ready yet").into(),true);}
+                    else { match super::tools::attach(&session.peer) {
+                        Ok((io,rx))=>{
+                            use super::drop_upload::{Control,Update};
+                            let(tx,status)=tokio::sync::mpsc::unbounded_channel();let mac=window.mac;
+                            let(control,controls)=tokio::sync::watch::channel(Control::default());
+                            window.transfer_stage(crate::i18n::s("正在确定放置位置…","Finding where you dropped it…").into());
+                            let job=tokio::spawn(async move{
+                                let result=super::drop_upload::run(io,rx,mac,paths,nx,ny,&tx,controls).await;
+                                let _=tx.send(Update::Finished(match result{Ok(m)=>m,Err(e)=>{log::warn!("Viewer drop upload failed: {e}");crate::tr!("文件传输失败：{e}","File transfer failed: {e}")}}));
+                            });
+                            drop_job=Some((job,status,control));
+                        },
+                        Err(e)=>window.notify(crate::tr!("文件传输失败：{e}","File transfer failed: {e}"),true),
+                    }}
+                }
+                if let Some((job,status,control))=drop_job.as_mut() {
+                    use super::drop_upload::Update;
+                    for action in window.take_transfer_actions() {match action {
+                        hud::TransferHit::Pause=>{let mut paused=false;control.send_modify(|c|{c.paused^=true;paused=c.paused;});window.transfer_paused(paused);},
+                        hud::TransferHit::Cancel=>{control.send_modify(|c|c.canceled=true);window.transfer_paused(false);window.transfer_stage(crate::i18n::s("正在取消…","Canceling…").into());},
+                        hud::TransferHit::Card=>{},
+                    }}
+                    // Checked before draining: a finished job has sent its last message.
+                    let finished=job.is_finished();
+                    while let Ok(update)=status.try_recv(){match update {
+                        // After Cancel the card keeps saying so until the job ends.
+                        Update::Stage(_)|Update::File{..} if control.borrow().canceled=>{},
+                        Update::Stage(text)=>window.transfer_stage(text),
+                        Update::File{label,done,total}=>window.transfer_file(label,done,total),
+                        Update::Finished(text)=>{window.transfer_end();window.notify(text,true);},
+                    }}
+                    if finished {window.transfer_end();drop_job=None;session.peer.tools.lock().unwrap().take();}
+                }else{window.take_transfer_actions();}
                 requested|=std::mem::take(&mut window.files);
+                // The FILE channel serves one tool at a time; opening the window now would end the session.
+                if requested && drop_job.is_some() {requested=false;window.notify(crate::i18n::s("拖放的文件上传完成后再打开文件传输","Open file transfer after the dropped files finish").into(),true);}
                 #[cfg(uu_gtk)] {
                     if files.as_ref().is_some_and(|f|f.is_finished()){
                         if let Some(f)=files.take(){let _=f.await;}session.peer.tools.lock().unwrap().take();

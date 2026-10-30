@@ -67,7 +67,7 @@ async fn run(args:&[String])->Result<(),String> {
             let session=if args.len()==3{Some(args[2].parse::<u32>().ok().filter(|n|*n!=0).ok_or("Invalid terminal session id")?)}else{None};
             viewer::tools::terminal_ipc::client(std::path::Path::new(&args[1]),session).await
         },
-        Some("terminal"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui")=>tool_command(args).await,
+        Some("terminal"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui"|"drop-target")=>tool_command(args).await,
         Some("assist") if args.len()==2=> {
             let code=viewer::assist::read_code(std::io::stdin().lock())?;
             desktop_command(&["connect".into(),args[1].clone(),"false".into(),"-".into(),"echo".into(),"legacy".into()],Some(code)).await.map_err(|e|crate::tr!("协助连接失败：{e}","Assistance connection failed: {e}"))
@@ -257,9 +257,11 @@ mod cli_tests {
 }
 
 async fn tool_command(args:&[String])->Result<(),String>{
-    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-ui" if args.len()==3=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if args.len()==5=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
+    let capture=match args[0].as_str(){"terminal" if args.len()==2 || args.len()==3=>8,"terminal-ui" if args.len()==3=>8,"drop-target" if args.len()==4=>8,"files" if (args.len()==4 && args[2]=="ls") || (args.len()==5 && ["get","put"].contains(&args[2].as_str()))=>5,"portmap" if args.len()==5=>9,"files-ui" if args.len()==3=>5,"portmap-ui" if args.len()==3=>9,_=>return Err(HELP.into())};
     let terminal_session=if args[0]=="terminal" && args.len()==3{Some(args[2].parse::<u32>().ok().filter(|n|*n!=0).ok_or("Invalid terminal session id")?)}else{None};
     #[cfg(not(uu_gtk))] if args[0].ends_with("-ui"){return Err("Tool windows require the GTK build".into())}
+    // Internal helper of the desktop window: DEVICE X Y, the drop point relative to the remote screen.
+    let point=if args[0]=="drop-target"{let n=|s:&str|s.parse::<f64>().ok().filter(|v|(0.0..=1.0).contains(v)).ok_or("Invalid drop point");Some((n(&args[2])?,n(&args[3])?))}else{None};
     let ports=if args[0]=="portmap"{Some((args[2].parse::<u16>().map_err(|_|"Invalid local port")?,args[4].parse::<u16>().map_err(|_|"Invalid target port")?))}else{None};
     if ports.is_some_and(|(_,port)|port==0) || (args[0]=="portmap" && args[3].trim().is_empty()){return Err("Invalid forwarding target".into())}
     let mut shape:Shape=serde_json::from_str(DEFAULT_SHAPE).map_err(|_|"Invalid built-in tool shape")?;
@@ -277,6 +279,7 @@ async fn tool_command(args:&[String])->Result<(),String>{
         };
         tokio::time::timeout(Duration::from_secs(30),ready).await.map_err(|_|"Tool connection timed out")??;
         let operation=async{match args[0].as_str(){"terminal"=>viewer::tools::cli::terminal(io,rx,terminal_session).await,"files"=>viewer::tools::cli::files(io,rx,&args[2..]).await,
+            "drop-target"=>{let(x,y)=point.unwrap();let t=viewer::drop_upload::target(io,rx,x,y).await?;println!("{}",serde_json::to_string(&t).map_err(|_|"Invalid drop target")?);Ok(())},
             #[cfg(uu_gtk)] "terminal-ui"=>viewer::tools_ui::terminal(io,rx,&args[1],&args[2]).await,
             #[cfg(uu_gtk)] "files-ui"=>viewer::tools_ui::files(io,rx,&args[2]).await,
             #[cfg(uu_gtk)] "portmap-ui"=>viewer::tools_ui::portmap(io,rx,&args[2]).await,

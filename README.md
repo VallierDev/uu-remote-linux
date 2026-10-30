@@ -539,6 +539,8 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
   **布局**：字符按 **US QWERTY** 物理键位映射（非美式布局的符号/字母可能对不上）。
   **Windows 数字 PIN**：输满位数后系统常会自动提交，一般不必再发 `{Enter}`；若只想填入、不登录，用 `--omit-last N` 省略最后 N 个字符。
   日志与 `--dry-run` 输出只含长度/事件数，不含明文。复用会话时，发送约 1 秒后会保存一帧 PNG（默认写在 `$XDG_RUNTIME_DIR/uu-viewer-type/`，权限 0600），路径打在日志并打印 `snapshot=…`。
+- 把文件或文件夹拖进桌面窗口即上传（复用同一连接的 FILE 通道）。Windows 被控端会放到光标下的资源管理器文件夹或桌面：通过同一连接上的临时终端查询光标下的窗口（Windows 11 会把它显示在 Windows Terminal 窗口里，查询时自动最小化；`UU_VIEWER_DROP_PROBE=0` 关闭查询，总是放到桌面），其他被控端放到桌面。同名文件自动加「 (n)」。底部进度卡片显示文件、进度和大小，可暂停/继续或取消（取消会通知被控端中止当前文件）。
+- 启动窗口把每个会话的日志（不含文件名、路径和输入内容）保存在 `$XDG_STATE_HOME/uuremote/viewer-session.log`（0600，超过 8 MiB 重新开始），便于排查断线。
 - 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
   `UU_VIEWER_VIEW_ONLY=1` 只看不控，`UU_VIEWER_FFMPEG` 指定 ffmpeg 路径。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。

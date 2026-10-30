@@ -100,18 +100,28 @@ impl Terminal {
         serde_json::from_slice(&self.request((LIST_RESP,id as u64),BINARY,encode(LIST_REQ,id,&[])).await?).map_err(|_|"Invalid terminal session list".into())
     }
     pub async fn open(&self,cols:u16,rows:u16)->Result<u32,String>{
-        self.open_session(0,cols,rows).await
+        self.open_session(0,cols,rows,None).await
+    }
+    /// A new session running `shell` (the open request's "shell" field) instead of the host's default.
+    pub async fn open_shell(&self,cols:u16,rows:u16,shell:&str)->Result<u32,String>{
+        self.open_session(0,cols,rows,Some(shell)).await
     }
     pub async fn attach(&self,id:u32,cols:u16,rows:u16)->Result<u32,String>{
         if id==0 || !self.list_sessions().await?.iter().any(|s|s["session_id"].as_u64()==Some(id as u64)){return Err("Terminal session no longer exists".into())}
-        self.open_session(id,cols,rows).await
+        self.open_session(id,cols,rows,None).await
     }
-    async fn open_session(&self,id:u32,cols:u16,rows:u16)->Result<u32,String>{
+    async fn open_session(&self,id:u32,cols:u16,rows:u16,shell:Option<&str>)->Result<u32,String>{
         // Host TerminalConn handles OPEN(nonzero) as reattachment. The official Windows host rejects an OPEN
         // without "option" ("terminal open: missing 'option' field", kError 1004); "none" is its plain mode.
-        let b=self.request((OPEN_RESP,0),BINARY,encode(OPEN,id,json!({"cols":cols.max(1),"rows":rows.max(1),"option":"none"}).to_string().as_bytes())).await?;
+        let mut open=json!({"cols":cols.max(1),"rows":rows.max(1),"option":"none"});
+        if let Some(shell)=shell {open["shell"]=json!(shell);}
+        let b=self.request((OPEN_RESP,0),BINARY,encode(OPEN,id,open.to_string().as_bytes())).await?;
         let v:Value=serde_json::from_slice(&b).map_err(|_|"Invalid terminal open response")?;
-        if v["code"].as_i64()!=Some(0){return Err("Terminal open rejected".into())}
+        if v["code"].as_i64()!=Some(0){
+            // The host's own error text (no user data), short, to see which shells it accepts.
+            if shell.is_some() {log::info!("Terminal open with a shell rejected: code={:?} message={:?}",v["code"].as_i64(),v["message"].as_str().map(|m|m.chars().take(80).collect::<String>()));}
+            return Err("Terminal open rejected".into())
+        }
         let id=v["session_id"].as_u64().or_else(||v["session_id"].as_str().and_then(|s|s.parse().ok())).and_then(|n|u32::try_from(n).ok()).filter(|n|*n!=0);
         // The official Windows host answers {"code":0,"message"} with header 0 and keeps one terminal per
         // connection addressed as session 0 (it then prints "[terminal] resumed existing session").
