@@ -587,7 +587,8 @@ terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsd
 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`.
 
 SDL clipboard access reuses the desktop window to avoid temporary-window Dock churn on GNOME Wayland (#37).
-Synchronization runs only while that window is focused and keeps the 30 KiB text limit. Selections without a supported
+On niri, data-control-capable `wl-clipboard` is used instead, so synchronization does not require window focus.
+Other SDL backends synchronize only while that window is focused. The 30 KiB text limit applies. Selections without a supported
 text format are skipped; empty-text detection depends on the SDL2 backend. Builds without SDL retain the command backend.
 SDL2 reads selections synchronously, so a slow selection owner can temporarily block the window; the bridge timeout cannot interrupt it.
 GNOME-to-official-Mac bidirectional clipboard synchronization is still unverified; this change does not resolve host compatibility.

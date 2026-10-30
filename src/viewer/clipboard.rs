@@ -156,6 +156,16 @@ async fn send(channel:&RTCDataChannel,message:Vec<u8>)->Result<(),()>{
     tokio::time::timeout(Duration::from_secs(2),channel.send(&bytes::Bytes::from(message))).await.map_err(|_|())?.map_err(|_|())?;Ok(())
 }
 pub struct Bridge {backend:Option<Backend>,pub enabled:bool,tx:Option<mpsc::Sender<Vec<u8>>>,task:Option<tokio::task::JoinHandle<()>>,target_mac:Option<bool>}
+#[cfg(feature="viewer-sdl")]
+fn sdl_backend(wayland:bool,niri:bool,tx:mpsc::Sender<ClipboardRequest>,find:impl Fn(&str)->Option<PathBuf>)->Option<Backend>{
+    if wayland && niri {
+        // SDL3 only retains a Wayland selection offer associated with its seat;
+        // niri's regular clipboard is not exposed through that seat state.
+        // Unlike GNOME, niri supports data-control, so polling wl-clipboard
+        // neither requires a focused toplevel nor creates transient windows.
+        CommandBackend::select(true,find).map(Backend::Command).or(Some(Backend::Sdl(tx)))
+    }else{Some(Backend::Sdl(tx))}
+}
 impl Bridge {
     pub fn new(desktop:bool)->Self{
         let backend=if desktop{Backend::detect()}else{None};let enabled=backend.is_some();
@@ -163,7 +173,9 @@ impl Bridge {
     }
     #[cfg(feature="viewer-sdl")]
     pub fn sdl(tx:mpsc::Sender<ClipboardRequest>)->Self{
-        let backend=(std::env::var("UU_VIEWER_CLIPBOARD").as_deref()!=Ok("0")).then_some(Backend::Sdl(tx));
+        let wayland=std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v|!v.is_empty());
+        let backend=(std::env::var("UU_VIEWER_CLIPBOARD").as_deref()!=Ok("0"))
+            .then(||sdl_backend(wayland,std::env::var_os("NIRI_SOCKET").is_some(),tx,executable)).flatten();
         Self{enabled:backend.is_some(),backend,tx:None,task:None,target_mac:None}
     }
     pub fn set_target_mac(&mut self,mac:Option<bool>){self.target_mac=mac;}
@@ -247,6 +259,15 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         assert_eq!(select(true,&["wl-copy","xclip","xsel"]).unwrap().write,PathBuf::from("xclip"));
         assert_eq!(select(true,&["xsel"]).unwrap().write,PathBuf::from("xsel"));
         assert!(select(true,&[]).is_none());
+    }
+    #[cfg(feature="viewer-sdl")]
+    #[test] fn niri_command_backend_avoids_sdl_seat_selection(){
+        let(tx,_rx)=mpsc::channel(1);
+        let find=|n:&str|n.starts_with("wl-").then(||PathBuf::from(n));
+        assert!(matches!(sdl_backend(true,true,tx.clone(),find),Some(Backend::Command(_))));
+        assert!(matches!(sdl_backend(true,true,tx.clone(),|_|None),Some(Backend::Sdl(_))));
+        assert!(matches!(sdl_backend(true,false,tx.clone(),find),Some(Backend::Sdl(_))));
+        assert!(matches!(sdl_backend(false,true,tx,find),Some(Backend::Sdl(_))));
     }
     #[cfg(feature="viewer-sdl")]
     #[tokio::test] async fn unfocused_write_does_not_mark_remote_text_as_applied(){
