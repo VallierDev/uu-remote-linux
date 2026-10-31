@@ -579,6 +579,8 @@ No official "no desktop" error code was found for headless desktop offers, so th
 
 ## Experimental native viewer (uuremote-viewer)
 
+The SDL viewer now processes compressed video in bounded FIFO batches and presents only the newest decoded picture per tick to prevent scheduling-induced queue overflow at high input rates ([details and limits](docs/viewer-video-scheduling.md)).
+
 `uuremote-viewer` is a Linux **viewer/controller**: it connects to and controls other devices on your UU account (official Windows / Mac
 hosts or this project's Linux host), and can start remote assistance with someone's device ID and code. It is experimental and
 separate from the host `uuremote-server`; the default host build and behaviour are unchanged.

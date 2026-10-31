@@ -507,6 +507,8 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 
 ## 实验性原生控制端（uuremote-viewer）
 
+SDL 控制端现在按顺序分批处理压缩视频，每轮仅显示最新解码画面，修复高帧率输入下调度导致的队列溢出（[说明与限制](docs/viewer-video-scheduling.md)）。
+
 `uuremote-viewer` 是 Linux 上的**控制端**：用你的 UU 账号连接并控制其他设备（官方 Windows / Mac 被控端，或本项目的 Linux 主机），
 也可以凭对方的设备 ID 和验证码发起远程协助。它是实验性功能，与主机 `uuremote-server` 相互独立，默认主机构建和行为不变。
 
