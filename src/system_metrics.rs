@@ -25,20 +25,23 @@ pub fn payload_with_location(capture: Permission, operation: Permission, control
 }
 
 /// Optional host settings the viewer shows in 声音 / 安全 (SettingMetric 1 keep_mute,
-/// 2 mute_permanent, 3 auto_lock; GeneralMetric 2 system_sound_support).
+/// 2 mute_permanent, 3 auto_lock; GeneralMetric 2 system_sound_support), and 防窥 when the host
+/// supports it (SettingMetric 4 private_screen on, 7 private_screen_type).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct Settings { pub sound: bool, pub keep_mute: bool, pub mute_permanent: bool, pub auto_lock: bool }
+pub struct Settings { pub sound: bool, pub keep_mute: bool, pub mute_permanent: bool, pub auto_lock: bool, pub private_screen: Option<(bool, u64)> }
 
 pub fn payload_with_settings(capture: Permission, operation: Permission, control: Permission, location: &str, settings: &Settings) -> Vec<u8> {
     let mut setting = Vec::new();
     for (field, on) in [(1u8, settings.keep_mute), (2, settings.mute_permanent), (3, settings.auto_lock)] {
         if on { setting.push(field << 3); setting.push(1); }
     }
+    if let Some((true, _)) = settings.private_screen { setting.extend_from_slice(&[4 << 3, 1]); }
     if !location.is_empty() {
         setting.push(5 << 3 | 2);
         varint(location.len() as u64, &mut setting);
         setting.extend_from_slice(location.as_bytes());
     }
+    if let Some((_, kind)) = settings.private_screen { setting.push(7 << 3); varint(kind, &mut setting); }
     for (field, state) in [(8u8, capture), (9u8, operation), (10u8, control)] {
         if state != Permission::Unknown {
             setting.push(field << 3);
@@ -48,7 +51,7 @@ pub fn payload_with_settings(capture: Permission, operation: Permission, control
     // SystemMetrics.general: system_sound_support = SS_SUPPORT (2) when desktop audio is streamed
     // (GvPb_SystemSoundSupport: 0 unknown, 1 nonsupport, 2 support).
     let mut out = if settings.sound { vec![26, 2, 16, 2] } else { vec![26, 0] };
-    // No support_touch, sound capability, win_os_ver, private-screen, virtual
+    // No support_touch, sound capability, win_os_ver, virtual
     // mouse, auto-lock, file path or optional feature claims are fabricated.
     out.push(34); // SystemMetrics.setting field 4
     varint(setting.len() as u64, &mut out);

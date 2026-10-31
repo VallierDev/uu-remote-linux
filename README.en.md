@@ -144,7 +144,7 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
-| Privacy screen on the host | Not implemented |
+| Privacy screen on the host | 🧪 Experimental, X11 only: output brightness (gamma) is set to 0 so the physical monitors go black while the remote picture stays normal; normal privacy (black) only, no wallpaper mode; not on Wayland. Restored when the session ends or the service stops/restarts. Overrides custom gamma such as night light; local mouse/keyboard stay active |
 | Microphone (viewer audio played on the host) | Not implemented (needs a virtual sound card) |
 | Plugins such as the WoW queue notifier | Not supported; the client is told that no plugins exist |
 | Linux login screen | The system login screen (before anyone logs in to the Linux desktop) cannot be controlled yet; use headless mode or a virtual desktop (see below). This is about the Linux login: **without a UU account** the host can now be used through remote assistance |
