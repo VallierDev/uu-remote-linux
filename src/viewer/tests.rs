@@ -250,12 +250,14 @@ async fn desktop_file_window_reattaches_without_replacing_peer(){
         let mut engine=MediaEngine::default();engine.register_default_codecs().unwrap();
         let host=Arc::new(APIBuilder::new().with_media_engine(engine).with_setting_engine(host_settings).build().new_peer_connection(RTCConfiguration::default()).await.unwrap());
         let file:Arc<std::sync::Mutex<Option<Arc<webrtc::data_channel::RTCDataChannel>>>>=Default::default();
+        let control:Arc<std::sync::Mutex<Option<Arc<webrtc::data_channel::RTCDataChannel>>>>=Default::default();
+        let control_out=control.clone();
         let(tx,mut received)=mpsc::channel(32);
         let opened=Arc::new(AtomicUsize::new(0));let count=opened.clone();
-        host.on_data_channel(Box::new(move|channel|{let(tx,file,count)=(tx.clone(),file.clone(),count.clone());Box::pin(async move{
+        host.on_data_channel(Box::new(move|channel|{let(tx,file,count,control)=(tx.clone(),file.clone(),count.clone(),control.clone());Box::pin(async move{
             count.fetch_add(1,Ordering::Relaxed);
             if channel.label()==wire::CHANNELS[tools::FILE]{*file.lock().unwrap()=Some(channel.clone());}
-            if channel.label()==wire::CHANNELS[tools::CONTROL]{channel.on_message(Box::new(move|m|{
+            if channel.label()==wire::CHANNELS[tools::CONTROL]{*control.lock().unwrap()=Some(channel.clone());channel.on_message(Box::new(move|m|{
                 let(tx,file)=(tx.clone(),file.clone());Box::pin(async move{
                     if let Some(r)=tools::blob(&m.data,21){
                         if tools::blob(r,8).and_then(|b|tools::blob(b,10)).is_some(){
@@ -277,6 +279,7 @@ async fn desktop_file_window_reattaches_without_replacing_peer(){
         peer.pc.set_remote_description(host.local_description().await.unwrap()).await.unwrap();
         while opened.load(Ordering::Relaxed)!=5 || peer.channels.iter().any(|c|c.ready_state()!=webrtc::data_channel::data_channel_state::RTCDataChannelState::Open){tokio::time::sleep(Duration::from_millis(10)).await;}
         let pc=peer.pc.clone();
+        peer.rumble.set_active(true);
         for _ in 0..2{
             let(io,rx)=tools::attach(&peer).unwrap();assert!(tools::attach(&peer).is_err());
             let(f,_)=Files::new(io,rx);assert!(f.list_dir(":/").await.unwrap().is_empty());drop(f);
@@ -284,6 +287,21 @@ async fn desktop_file_window_reattaches_without_replacing_peer(){
             assert!(Arc::ptr_eq(&pc,&peer.pc));
             let heartbeat=super::input::Input::heartbeat();peer.send_input(&heartbeat).await.unwrap();
             loop{if serde_json::from_slice::<Value>(&received.recv().await.unwrap()).ok()==Some(heartbeat.clone()){break}}
+            // Native gamepad shares CONTROL and must not open a new channel/peer.
+            use super::native_gamepad::{self,State};
+            for message in [native_gamepad::connect(),State{buttons:0x1000,..Default::default()}.json(),
+                State::default().json(),native_gamepad::disconnect()] {
+                peer.send_input(&message).await.unwrap();
+                loop {if serde_json::from_slice::<Value>(&received.recv().await.unwrap()).ok()==Some(message.clone()){break}}
+            }
+            // Host feedback shares the same peer/channel; file detach must not steal it.
+            let control=control_out.lock().unwrap().clone().unwrap();
+            for (left,right) in [(255u8,128u8),(0,0)] {
+                let feedback=json!({"action":"gpd_vibration","index":0,"left_motor":left,"right_motor":right});
+                control.send(&bytes::Bytes::from(feedback.to_string())).await.unwrap();
+                let received=loop {if let Some((m,_))=peer.rumble.take(){break m}tokio::time::sleep(Duration::from_millis(5)).await;};
+                assert_eq!(received,super::native_rumble::Motors{left:u16::from(left)*257,right:u16::from(right)*257});
+            }
         }
         assert_eq!(opened.load(Ordering::Relaxed),5);
         peer.close().await;host.close().await.unwrap();router.lock().await.stop().await.unwrap();

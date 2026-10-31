@@ -568,3 +568,11 @@ Mac 目标使用 macOS 原生键码，Windows / Linux 目标保留 Windows VK。
 | Wayland 下的桌面窗口与剪贴板 | — | — | ✅ Hyprland、KDE；GNOME 窗口正常，剪贴板已于 v0.2.3 改为 SDL 直连（#37，最终版本未重新实机验收） |
 
 「—」表示尚未测试。重启/关机只应在可以重启的机器上使用。**未实测**：官方被控端的 H.265 / 4:4:4、多显示器。日志只记录字段号、大小和状态，不记录键盘、剪贴板、文件内容、验证码或凭据。
+
+### 原生手柄与震动（实验性）
+
+SDL 控制端可通过现有桌面 CONTROL 通道向 Windows 被控端转发一个映射手柄，并接收普通双路震动。
+默认关闭：`UU_VIEWER_NATIVE_GAMEPAD=1` 启用手柄，`UU_VIEWER_NATIVE_RUMBLE=0` 可独立关闭震动。
+不支持 Guide 键、多手柄和自适应扳机；休眠、强制退出及断网恢复尚未全面验证。
+一名报告用户在一组 Windows + Steam Deck 上测试了输入、手机热点、重连与震动。
+详见[协议证据、设计与限制](docs/deckpad-native-gamepad.md)。

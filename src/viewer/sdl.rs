@@ -399,6 +399,10 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
         }
         Err(e)=>{ log::warn!("Type IPC not started: {e}"); None }
     };
+    let mut native_gamepad=if super::native_gamepad::enabled(){
+        if window.mac{return Err(crate::i18n::s("原生手柄实验仅支持 Windows 被控端","Native gamepad experiment requires a Windows host").into())}
+        Some(super::native_gamepad::NativeGamepad::new(&window._sdl,session.peer.rumble.clone())?)
+    }else{None};
     let mut command_open=true;let mut requested=false;let mut type_requested=false;let mut restored=false;
     let mut type_job:Option<TypeJob>=None;
     let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
@@ -537,6 +541,13 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                         type_job=None;
                     }
                 }
+                if let Some(pad)=native_gamepad.as_mut(){
+                    let active=!quit&&window.focused&&input.enabled()&&!window.chrome.menu.open&&type_job.is_none()
+                        &&session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false)
+                        &&session.peer.observed.control_open.load(std::sync::atomic::Ordering::Acquire)
+                        &&session.peer.pc.connection_state()==webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Connected;
+                    messages.extend(pad.poll(active));
+                }
                 if session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false){for m in messages{session.peer.send_input(&m).await?;}}
                 else {input.release_all();}
                 if quit{return Ok(())}
@@ -558,6 +569,9 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     if let Some(frame)=window.last_frame.as_ref() {if let Err(e)=super::thumbs::save(device,frame){log::debug!("Viewer thumbnail not saved: {e}");}}
     #[cfg(uu_gtk)] if let Some(f)=files {f.abort();let _=f.await;super::tools_ui::hide();session.peer.tools.lock().unwrap().take();}
     if let Some(t)=type_ipc {t.abort();let _=t.await;}
+    if let Some(pad)=native_gamepad.as_mut(){for m in pad.close(){
+        let _=tokio::time::timeout(std::time::Duration::from_millis(300),session.peer.send_input(&m)).await;
+    }}
     for m in input.release_all(){let _=session.peer.send_input(&m).await;}
     result
 }

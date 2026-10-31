@@ -648,3 +648,11 @@ assistance and ISO / JIS keyboards have not been tested live.
 
 "—" = not tested yet. Only use reboot/shutdown on machines you can restart. **Not tested live**: H.265 / 4:4:4 with official hosts, multiple monitors. Logs carry field
 numbers, sizes and states only, never keystrokes, clipboard or file contents, codes or credentials.
+
+### Native gamepad and rumble (experimental)
+
+The SDL viewer forwards one mapped controller and ordinary two-motor rumble through the existing desktop CONTROL channel to a Windows host.
+Default OFF: set `UU_VIEWER_NATIVE_GAMEPAD=1` to enable input; `UU_VIEWER_NATIVE_RUMBLE=0` disables feedback independently.
+Guide forwarding, multiple controllers and adaptive triggers are unsupported; suspend, forced exit and network recovery are not comprehensively verified.
+One reporting user tested input, phone-hotspot WAN, reconnect and rumble on one Windows/Steam Deck pair.
+See [protocol evidence, design and limits](docs/deckpad-native-gamepad.md).
