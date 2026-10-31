@@ -540,18 +540,9 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                 if session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false){for m in messages{session.peer.send_input(&m).await?;}}
                 else {input.release_all();}
                 if quit{return Ok(())}
-                // At most one AU per iteration keeps local event polling responsive.
-                if let Some(au)=session.peer.desktop.units.pop(){
-                    if session.peer.desktop.reset.swap(false,std::sync::atomic::Ordering::AcqRel){decoder.reset();key_gate.arm();}
-                    if !key_gate.admit(au.codec,&au.data) {session.peer.desktop.pli.store(true,std::sync::atomic::Ordering::Release);super::desktop::drain(decoder,window)?;}
-                    else {
-                        decoder.set_codec(au.codec)?;
-                        codec_name=if au.codec==super::media::Codec::H265 {"H.265"} else {"H.264"};
-                        super::desktop::display(decoder,window,&au.data,au.codec,&session.peer.desktop.pli)?;
-                    }}
-                // A picture can finish after its access unit was written; show it without waiting
-                // for the next one (a single keystroke may change the remote screen only once).
-                else {super::desktop::drain(decoder,window)?;}
+                if let Some(codec)=super::desktop::pump(&session.peer.desktop,decoder,window,&mut key_gate)? {
+                    codec_name=if codec==super::media::Codec::H265 {"H.265"} else {"H.264"};
+                }
             }
         }}
     }.await;
