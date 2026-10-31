@@ -651,11 +651,8 @@ numbers, sizes and states only, never keystrokes, clipboard or file contents, co
 
 ### Native gamepad and rumble (experimental)
 
-The SDL viewer can send native gamepad input and receive ordinary two-motor rumble through the existing UU desktop connection to a Windows host.
-Opt in with `UU_VIEWER_NATIVE_GAMEPAD=1 target/release/uuremote-viewer ui`; no separate Windows receiver or SSH tunnel is required.
-Set `UU_VIEWER_NATIVE_RUMBLE=0` to disable feedback independently. Only one mapped controller is opened; release all controls before entry/re-entry.
-Back+Start toggles pause. Focus loss, view-only mode and normal exit release input and stop rumble.
-
-Input, phone-hotspot WAN, reconnect and rumble were user-reported working on one Windows/Steam Deck pair; display restoration has a small delay.
-Guide forwarding, multiple controllers and adaptive triggers are not supported. Suspend, forced exit and all network recovery patterns are not comprehensively verified.
-Implementation was assisted by OpenAI Codex and hardware-tested by the user. See [protocol evidence, design and tests](docs/deckpad-native-gamepad.md).
+The SDL viewer forwards one mapped controller and ordinary two-motor rumble through the existing desktop CONTROL channel to a Windows host.
+Default OFF: set `UU_VIEWER_NATIVE_GAMEPAD=1` to enable input; `UU_VIEWER_NATIVE_RUMBLE=0` disables feedback independently.
+Guide forwarding, multiple controllers and adaptive triggers are unsupported; suspend, forced exit and network recovery are not comprehensively verified.
+One reporting user tested input, phone-hotspot WAN, reconnect and rumble on one Windows/Steam Deck pair.
+See [protocol evidence, design and limits](docs/deckpad-native-gamepad.md).

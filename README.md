@@ -571,11 +571,8 @@ Mac 目标使用 macOS 原生键码，Windows / Linux 目标保留 Windows VK。
 
 ### 原生手柄与震动（实验性）
 
-SDL 控制端可以通过现有 UU 桌面连接向 Windows 被控端发送原生手柄输入，并接收普通双路震动反馈。
-默认关闭，用 `UU_VIEWER_NATIVE_GAMEPAD=1 target/release/uuremote-viewer ui` 启用；无需额外 Windows 接收器或 SSH 隧道。
-`UU_VIEWER_NATIVE_RUMBLE=0` 可独立关闭震动。仅打开一个映射手柄；进入/恢复前松开按键、扳机和摇杆。
-`Back + Start` 暂停/恢复。失焦、只读模式及退出会释放输入并停止震动。
-
-已由用户在一组 Windows + Steam Deck 上报告输入、手机热点、重连和震动可用；屏幕恢复稍有延迟。
-不支持 Guide 键、多手柄和自适应扳机。休眠、强制退出与所有断网恢复场景尚未全面验证。
-该功能由 OpenAI Codex 协助实现，并经用户实机测试；详见[协议证据、设计与测试](docs/deckpad-native-gamepad.md)。
+SDL 控制端可通过现有桌面 CONTROL 通道向 Windows 被控端转发一个映射手柄，并接收普通双路震动。
+默认关闭：`UU_VIEWER_NATIVE_GAMEPAD=1` 启用手柄，`UU_VIEWER_NATIVE_RUMBLE=0` 可独立关闭震动。
+不支持 Guide 键、多手柄和自适应扳机；休眠、强制退出及断网恢复尚未全面验证。
+一名报告用户在一组 Windows + Steam Deck 上测试了输入、手机热点、重连与震动。
+详见[协议证据、设计与限制](docs/deckpad-native-gamepad.md)。

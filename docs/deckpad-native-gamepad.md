@@ -1,9 +1,9 @@
 # UU native gamepad experiment / 原生手柄实验
 
-Status: **v0.5 user acceptance passed** for input, phone-hotspot WAN, normal exit/display recovery
-(with some delay) and reconnect. **v0.5.1 rumble was reported working by the user**.
-No claim of compatibility with every official UU version. Default OFF; explicitly opt in with
-`UU_VIEWER_NATIVE_GAMEPAD=1`. Legacy DeckPad tunnel experiments are not included in this fork.
+Status: experimental and default OFF; opt in with `UU_VIEWER_NATIVE_GAMEPAD=1`.
+One reporting user tested input, phone-hotspot WAN, reconnect and rumble on one
+Windows/Steam Deck pair; the upstream maintainer has not independently tested it.
+This does not establish compatibility with every official UU version.
 
 ## Evidence (2026-10-31)
 
@@ -39,7 +39,7 @@ Official viewer corroboration:
   Viewer 0x10331a0 parses index/left_motor/right_motor into three bytes.
 
 This supports sending JSON through the existing binary CONTROL input path (`Peer::send_input`),
-and v0.5 input acceptance has been reported by the user on their Windows/Deck pair.
+with input reported working by the reporting user on their Windows/Deck pair.
 No guessed new protobuf feature flags are advertised. Existing desktop negotiation is retained.
 
 ## Implementation and limits
@@ -52,16 +52,16 @@ More than one mapped controller at discovery is deliberately ambiguous and none 
 Focus loss, local control menu, view-only, unplug or normal shutdown: send neutral then disconnect.
 On entry/re-entry, require released buttons/triggers/sticks before arming. Back+Start toggles pause.
 Normal cleanup uses bounded send attempts. Host behavior after SIGKILL/network loss remains
-unverified; no promise that the native protocol has our previous 300 ms receiver watchdog.
+unverified; no host-side input watchdog interval has been established.
 Very short taps entirely between SDL samples can be missed. Multi-controller is not implemented.
 Logged markers describe local activity only; CONNECT_QUEUED is not an ACK.
 
-## v0.5.1 rumble / 震动回传
+## Rumble / 震动回传
 
 `native_rumble.rs` parses the verified flat JSON `{action:"gpd_vibration",index:0,left_motor:0..255,right_motor:0..255}`
 on the existing peer's CONTROL channel. It rejects malformed/duplicate fields, wrong types/ranges,
 nonzero slot and messages over 512 bytes. The exact shape is backed by static inspection; receipt
-on the CONTROL hook must still be verified on other Windows/Deck configurations; the maintainer has reported successful rumble on their pair.
+on the CONTROL hook must still be verified on other Windows/Deck configurations; the reporting user has reported successful rumble on their pair.
 Only the current focused, armed SDL controller enables its peer-local inbox; a single latest-value slot
 prevents a backlog from replaying after a pause. Feedback for inactive sessions is discarded.
 
@@ -81,51 +81,20 @@ does not prove the hardware moved. Steam Input/SteamOS rumble configuration and 
 feedback remain dependent on each installation. This implements ordinary two-motor rumble, not adaptive
 triggers or arbitrary touchpad haptic waveforms. `UU_VIEWER_NATIVE_RUMBLE=0` disables feedback.
 
-The downloadable v0.5.1 test package included a one-time Windows XInputSetState test; its
-left/right pulses were 35% and its combined pulse was 45%. The user reported working feedback.
-The cloud test suite does not execute Windows XInput or physical controller hardware.
-
 Markers (no payload values): RUMBLE_SUPPORTED/UNAVAILABLE describe SDL capabilities;
 RUMBLE_RECEIVED means a valid active-session message arrived; RUMBLE_APPLIED means SDL returned
 success for a nonzero effect; RUMBLE_OUTPUT_FAILED means the output API failed. All have DECKPAD_ prefix.
 
-## Acceptance / 验收
+## Validation / 验证
 
-1. Exit the old Steam entry; stop Windows Python receiver (foreground or background).
-2. Start the native test viewer through the existing Steam entry; connect only one Windows PC.
-3. Open Windows `joy.cpl`, controller Properties/Test. No `start_receiver.cmd` or reverse SSH tunnel.
-4. Release all controls, then press A/B, move both sticks, and test both triggers independently.
-5. Hold A, open Steam overlay / change focus / disconnect: confirm release; re-enter and test again.
-6. Repeat via phone hotspot. Confirm no Python receiver process is needed on Windows.
-7. Test reconnect and full exit; confirm controller cleanup and physical display restoration.
+Use the CI checks on the current PR head as the automated validation record.
+The tests cover protocol fields and ranges, activation/release gating, bounded
+feedback delivery, finite rumble effects and shared CONTROL delivery alongside
+file operations. Automated tests do not exercise physical controller feedback
+or establish official-host compatibility.
 
-If no input appears, preserve the known-working v0.4.1 path and collect native markers plus official
-Windows UU version/driver diagnostics. Do not silently fall back to the old receiver: that would
-invalidate the test of native compatibility.
-
-## Local validation for this experiment
-
-- Clean upstream PR branch: 193 release-viewer tests passed, 1 pre-existing ignored,
-  2 sandbox-restricted Unix IPC tests excluded. The two tests belonging solely to the former
-  shared port-map experiment were removed with that experiment. CI keeps its full test command.
-- v0.5.1: release viewer suite 195 passed, 1 pre-existing ignored, the same 2 Unix IPC tests
-  excluded. Four new rumble tests cover strict parsing/scaling, slot isolation, bounded latest-stop
-  delivery, focus/re-entry and finite-effect refresh. The existing virtual WebRTC/file-reattach test
-  now also checks host-to-viewer nonzero and zero rumble feedback twice on the same CONTROL channel.
-- v0.5.1: Python installer/marker tests 4 passed; shell syntax, release build and help smoke test.
-  No physical controller, Windows XInput execution or official host rumble was exercised here.
-- Release viewer tests: 191 passed, 1 pre-existing ignored, 2 local Unix IPC tests excluded
-  (`server_client_roundtrip_and_uid_gate`, `oversized_frame_rejected`; these failed with socket
-  permission restrictions during the earlier cloud build).
-- This includes native JSON/range/state-gate tests and virtual WebRTC delivery of connect,
-  A-down, neutral, disconnect over the existing CONTROL channel, interleaved with file RPCs.
-- Final native module was also compiled directly as a Rust test crate with `viewer-sdl` enabled:
-  3 passed after the hot-unplug/replacement ordering fix.
-- Python installer/marker tests: 4 passed. No account, Windows host or physical controller used.
-- Release binary build and `--help` smoke test are performed before packaging.
-
-These results do NOT prove official Windows acceptance, actual Steam Deck input detection,
-focus behavior of Steam overlay, rumble, WAN performance, or cleanup after forced exit.
+自动验证以当前 PR 提交的 CI 结果为准；实机结果来自报告用户，不能视为上游维护者
+已验收，也不涵盖全部主机版本、休眠、强制退出和断网恢复场景。
 
 ## Attribution / AI assistance
 
