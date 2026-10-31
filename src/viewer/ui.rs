@@ -32,7 +32,7 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
                 }
                 status = child.wait() => break status,
                 line = async { match lines.as_mut() { Some(l) => l.next_line().await, None => std::future::pending().await } } => match line {
-                    Ok(Some(l)) => { if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); } }
+                    Ok(Some(l)) => { if l.starts_with("DECKPAD_"){eprintln!("{l}");} else if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); } }
                     _ => lines = None,
                 },
             }

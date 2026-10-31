@@ -44,6 +44,7 @@ pub struct Observed {
 pub struct Peer {
     clipboard:super::clipboard::Bridge,
     pub tools:super::tools::Inbox,
+    pub rumble:super::native_rumble::Feedback,
     pub pc:Arc<RTCPeerConnection>,
     pub channels:Vec<Arc<RTCDataChannel>>,
     pub observed:Arc<Observed>,
@@ -78,6 +79,7 @@ impl Peer {
         let api=APIBuilder::new().with_media_engine(engine).with_setting_engine(settings).with_interceptor_registry(registry).build();
         let pc=Arc::new(api.new_peer_connection(config).await.map_err(|e|format!("Peer creation failed: {}",crate::auth::transport_error(&e)))?);
         let tools:super::tools::Inbox=Arc::new(std::sync::Mutex::new(None));
+        let rumble=super::native_rumble::Feedback::default();
         let inbox=tools.clone();
         pc.on_peer_connection_state_change(Box::new(move |state|{
             use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -197,15 +199,17 @@ impl Peer {
                         }
                     })));
                 }
-                let closed=tools.clone();let state=observed.clone();
-                channel.on_close(Box::new(move ||{let closed=closed.clone();let state=state.clone();Box::pin(async move {
-                    if index==0 {state.control_open.store(false,Ordering::Release);}
+                let closed=tools.clone();let state=observed.clone();let rumble_closed=rumble.clone();
+                channel.on_close(Box::new(move ||{let closed=closed.clone();let state=state.clone();let rumble_closed=rumble_closed.clone();Box::pin(async move {
+                    if index==0 {state.control_open.store(false,Ordering::Release);rumble_closed.set_active(false);}
                     if [0,3,4].contains(&index){closed.lock().unwrap().take();}
                 })}));
                 let state=observed.clone();let inbox=tools.clone();let clipboard_tx=clipboard.sender();
+                let feedback=rumble.clone();
                 let control_for_echo=if index==0 {Arc::downgrade(&channel)} else {std::sync::Weak::new()};
-                channel.on_message(Box::new(move |message| {let state=state.clone();let inbox=inbox.clone();let control_for_echo=control_for_echo.clone();let clipboard_tx=clipboard_tx.clone();Box::pin(async move {
+                channel.on_message(Box::new(move |message| {let state=state.clone();let inbox=inbox.clone();let control_for_echo=control_for_echo.clone();let clipboard_tx=clipboard_tx.clone();let feedback=feedback.clone();Box::pin(async move {
                     if index==0 {
+                        feedback.receive(&message.data);
                         let (codecs,chroma)=wire::media_control(&message.data);
                         if let Some(codecs)=codecs {state.encoder_codecs.store(codecs,Ordering::Release);}
                         if let Some(chroma)=chroma {
@@ -253,7 +257,7 @@ impl Peer {
             Ok::<_,String>((channels,tools,clipboard))
         }.await;
         match result {
-            Ok((channels,tools,clipboard))=>Ok(Self{clipboard,tools,pc,channels,observed,desktop,audio,answered:false,early:Vec::new(),app_id:app_id.into(),ice_id:ice_id.into(),remote_client:remote_client.into()}),
+            Ok((channels,tools,clipboard))=>Ok(Self{clipboard,tools,rumble,pc,channels,observed,desktop,audio,answered:false,early:Vec::new(),app_id:app_id.into(),ice_id:ice_id.into(),remote_client:remote_client.into()}),
             Err(e)=>{let _=pc.close().await;Err(e)},
         }
     }
@@ -329,7 +333,7 @@ impl Peer {
         let rtt=(pair.current_round_trip_time>0.).then(||(pair.current_round_trip_time*1000.).round() as u32);
         (rtt,format!("{} · {}",if tcp{"TCP"}else{"UDP"},if relay{"relay"}else{"direct"}))
     }
-    pub async fn close(&self) {self.clipboard.stop();self.tools.lock().unwrap().take();let _=self.pc.close().await;}
+    pub async fn close(&self) {self.rumble.set_active(false);self.clipboard.stop();self.tools.lock().unwrap().take();let _=self.pc.close().await;}
 }
 fn answer_sdp(body:&Value)->Result<String,String> {
     if let Some(s)=body.get("sdp").and_then(Value::as_str) {if s.len()<=1024*1024{return Ok(s.into())}}
