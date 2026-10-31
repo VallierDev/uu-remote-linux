@@ -46,6 +46,7 @@ mod capture_setting;
 mod audio;
 mod virtual_audio;
 mod system_actions;
+mod privacy_screen;
 mod capability;
 mod protocol;
 mod control_protocol;
@@ -656,6 +657,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = Arc::new(InputInjector::new());
     input.bind_portal(capture.portal.clone());
     input.release_held(); // recover stale input before accepting any peer
+    privacy_screen::recover(); // monitors a previous run left black
     let _pointer_worker = input.start_pointer_worker();
     let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
     let shutdown_input = input.clone();
@@ -668,6 +670,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(target_os="linux"))]
         let _ = tokio::signal::ctrl_c().await;
+        let _ = tokio::task::spawn_blocking(privacy_screen::disable).await;
         if !assist_enabled { shutdown_input.shutdown(); virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
         let _ = signal_tx.send(true);
     });
