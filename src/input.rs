@@ -322,7 +322,8 @@ impl InputInjector {
             };
         }
         if touch.finger != Finger::Up { return true }
-        let bound = self.backend == crate::desktop_backend::DesktopBackend::Portal && self.portal.lock().unwrap().is_some();
+        // Gesture scrolling is portal-only; on the privacy screen's virtual share drags stay mouse drags.
+        let bound = self.backend == crate::desktop_backend::DesktopBackend::Portal && self.portal.lock().unwrap().is_some() && !self.virtual_uinput();
         let Some(start) = touch.at.filter(|_| bound) else { return false };
         static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) { log::info!("Mobile controller drag input: gesture (drag scrolls, hold selects)"); }
@@ -521,7 +522,12 @@ impl InputInjector {
         // Portal (GNOME/KDE): absolute motion is addressed to the shared stream, i.e. the captured
         // monitor; a uinput tablet would stretch the point across every monitor of the desktop.
         if !relative && self.backend==crate::desktop_backend::DesktopBackend::Portal {
-            if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("motion", portal.move_pointer(f64::from(x),f64::from(y),false)); }
+            // Privacy screen: KDE accepts absolute motion for a virtual-output stream but does not
+            // move the pointer. The physical outputs are disabled then, so the uinput tablet's
+            // desktop-wide axes cover exactly the virtual output.
+            if !self.virtual_uinput() {
+                if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("motion", portal.move_pointer(f64::from(x),f64::from(y),false)); }
+            }
         }
         // X11 multi-screen: the point is inside the selected monitor; XTest and uinput span the root.
         let placement=if relative || self.backend!=crate::desktop_backend::DesktopBackend::X11 {None} else {crate::wayland::x11_placement()};
@@ -531,6 +537,11 @@ impl InputInjector {
             let (w,h)=placement.and_then(|_|crate::capture::x11_last_size()).unwrap_or(*self.screen.lock().unwrap());
             if w > 1 && h > 1 {
                 let scale = |v: i32, extent: u32| (i64::from(v) * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
+                // Privacy wallpaper mode: the axes span the physical outputs too; aim inside the virtual one.
+                if let Some([rx,ry,rw,rh])=crate::privacy_screen::pointer_region().filter(|_| self.virtual_uinput()) {
+                    let abs = |v: i32, extent: u32, o: f64, span: f64| ((o + f64::from(v) / f64::from(extent - 1) * span) * f64::from(crate::uinput::ABS_MAX)).round() as i32;
+                    return Self::uinput_result(uinput.move_absolute(abs(x,w,rx,rw),abs(y,h,ry,rh)));
+                }
                 return Self::uinput_result(uinput.move_absolute(scale(x,w),scale(y,h)));
             }
         }
@@ -540,10 +551,15 @@ impl InputInjector {
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::move_pointer(x,y,relative) }
         else if relative { unsafe { x11_mouse_relative(x,y) } } else { unsafe { x11_mouse_move(x,y) } }
     }
+    /// Privacy screen: KDE ignores portal pointer events (motion and buttons) on a virtual-output
+    /// share, so the pointer uses uinput, whose axes then span just the virtual output.
+    fn virtual_uinput(&self)->bool {
+        self.uinput.is_some() && self.portal.lock().unwrap().as_ref().is_some_and(|p| p.is_virtual())
+    }
     fn inject_button(&self,button:i32,pressed:bool)->i32 {
         // Portal: clicks follow absolute motion on the same session, so a tap cannot land
         // before the compositor has moved the pointer there (uinput is a separate queue).
-        if !self.uinput_pointer && self.backend==crate::desktop_backend::DesktopBackend::Portal {
+        if !self.uinput_pointer && self.backend==crate::desktop_backend::DesktopBackend::Portal && !self.virtual_uinput() {
             if let Some(portal)=self.portal.lock().unwrap().as_ref() { return self.portal_result("button", portal.button(button,pressed)); }
         }
         if let Some(uinput)=&self.uinput {
@@ -755,8 +771,26 @@ impl InputInjector {
     fn type_portal_keysyms(&self, text: &str) -> usize {
         let Some(symbols)=ascii_keysyms(text) else { return 0 };
         if !gnome_layout_types_ascii() { return 0; }
+        if self.virtual_uinput() { return self.type_uinput_ascii(&symbols); }
         let Some(portal)=self.portal.lock().unwrap().clone() else { return 0 };
         symbols.iter().take_while(|&&symbol| portal.type_keysym(symbol).is_ok()).count()
+    }
+    /// Privacy screen: KDE ignores portal keysyms on a virtual-output share. Type through uinput
+    /// on the US layout the keysym path already requires, adding Shift for shifted characters.
+    fn type_uinput_ascii(&self, symbols: &[u32]) -> usize {
+        const SHIFTED: &str = "~!@#$%^&*()_+{}|:\"<>?";
+        const BASE: &str = "`1234567890-=[]\\;',./";
+        symbols.iter().take_while(|&&symbol| {
+            let c=char::from_u32(symbol).unwrap_or('\0');
+            let (base, shift)=if c.is_ascii_uppercase() { (c.to_ascii_lowercase() as u64, true) }
+                else if let Some(i)=SHIFTED.find(c) { (BASE.as_bytes()[i] as u64, true) }
+                else { (u64::from(symbol), false) };
+            if crate::uinput::keysym_to_evdev(base).is_none() { return false; }
+            if shift && self.inject_key(0xffe1, true)!=0 { return false; }
+            let ok=self.inject_key(base, true)==0 && self.inject_key(base, false)==0;
+            if shift { self.inject_key(0xffe1, false); }
+            ok
+        }).count()
     }
     pub fn key_event(&self, keycode: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();

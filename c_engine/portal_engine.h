@@ -8,6 +8,7 @@ typedef int (*uu_portal_cancelled_fn)(void *data);
 /* One object owns one consent/session and one PipeWire stream. */
 struct uu_portal *uu_portal_open(int *error, uint32_t *width, uint32_t *height);
 /* Saves the rotated token immediately after Start, before video initialization. */
+struct uu_portal *uu_portal_open_virtual(const char *restore, void (*save_token)(const char *, void *), void *data, int *error, uint32_t *width, uint32_t *height);
 struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *), void *data, int *error, uint32_t *width, uint32_t *height);
 /* The cancellation callback and data are used only until this call returns. */
 struct uu_portal *uu_portal_open_persist_cancellable(const char *restore, void (*save_token)(const char *, void *), void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int *error, uint32_t *width, uint32_t *height);

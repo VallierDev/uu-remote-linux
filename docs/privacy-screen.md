@@ -1,0 +1,91 @@
+# 实验性防窥 / Experimental privacy screen
+
+仅支持 KDE Plasma Wayland（portal 后端）。开启后，采集和输入切换到 KWin 虚拟输出
+（portal ScreenCast 的 VIRTUAL 源），再用 `kscreen-doctor` 禁用物理屏；远程操作不会点亮
+本机屏幕。关闭、最后一个桌面连接断开或正常退出时，先重新启用物理屏，再结束虚拟输出、切回物理屏采集。
+顺序参考 KRdp 虚拟显示器的 replace 策略和 Sunshine 的 KDE 方案：创建虚拟输出前记录物理屏，
+从不禁用虚拟输出本身（KWin bug 527747）。GNOME、其他 Wayland 桌面和 X11 不支持。
+
+壁纸模式：窗口随物理屏禁用迁到虚拟输出后，重新启用物理屏，把虚拟输出设为主屏、用 KWin 脚本把窗口
+留在虚拟输出上，再由 `privacy-wallpaper` 子进程在每块物理屏上全屏置顶显示 Plasma 当前桌面壁纸和
+“此设备正在被远程控制”。物理屏开着时 uinput 绝对坐标覆盖整个布局，主机按虚拟输出在布局中的位置换算。
+需要 GTK3。
+
+KDE Plasma Wayland only (portal backend). Enabling moves capture and input to a KWin virtual
+output (portal ScreenCast VIRTUAL source) and disables the physical outputs with `kscreen-doctor`,
+so remote input cannot wake them. Disabling, the last desktop disconnect or a normal exit re-enables
+the physical outputs first, then ends the virtual share and returns to the monitor. Physical outputs
+are recorded before the virtual one exists; the virtual output itself is never disabled (KWin bug
+527747). GNOME, other Wayland desktops and X11 are unsupported.
+
+Wallpaper mode: after the windows have moved to the virtual output, the physical outputs are turned
+back on as secondary outputs, a KWin script keeps the windows on the virtual one, and the
+`privacy-wallpaper` child process covers each physical output with Plasma's desktop wallpaper and a
+notice (fullscreen, keep-above). uinput's absolute axes then span the whole layout, so pointer input
+is aimed at the virtual output's region. Needs GTK3.
+
+注意 / Notes:
+
+- 虚拟屏分辨率由 KDE 决定（默认 1920x1080，首次可能在本机弹窗选择，之后沿用保存的授权
+  `portal-permissions/kde-virtual`）。窗口会被 KWin 移到虚拟屏，恢复后位置可能变化。
+  The virtual size is KDE's (1920x1080 by default; the first share may ask on the host, later ones
+  reuse `portal-permissions/kde-virtual`). KWin moves windows to it; positions may change on restore.
+- KDE 不处理虚拟输出共享上的 portal 输入，防窥期间指针、按键和文字改走 uinput（需要 `/dev/uinput`
+  权限，见 README）；手机拖动手势在此期间按普通鼠标拖动处理。
+  KDE ignores portal input on a virtual-output share, so pointer, keys and text use uinput while the
+  privacy screen is on (`/dev/uinput` access required); mobile drag gestures act as plain mouse drags.
+- 开启期间通过 KWin 的 InputDevice 接口禁用本地键盘、鼠标、触摸板和触摸屏（含手势守护进程、ydotoold
+  等由本机驱动的虚拟设备），保留电源键、合盖开关和主机自己的 uinput 设备；`UU_PRIVACY_BLOCK_INPUT=0` 关闭此项。
+  KWin 会保存设备开关，所以主机另起 `privacy-guard` 子进程：主机以任何方式结束（包括 SIGKILL）都会按恢复记录
+  重新启用设备和物理屏；下次启动也会重试。防窥期间新插入的设备不会被禁用。
+  While on, local keyboards, pointers, touchpads and touchscreens are disabled through KWin's
+  InputDevice interface (including software devices fed by local hardware such as gesture daemons and
+  ydotoold); the power button, lid switch and the host's own uinput devices stay. Set
+  `UU_PRIVACY_BLOCK_INPUT=0` to keep local input. KWin saves the device flag, so a `privacy-guard`
+  child restores devices and outputs from the record whenever the host ends, including SIGKILL; the
+  next start retries too. Devices plugged in during privacy are not blocked.
+- 这是尽力而为的遮挡，不是保密边界。/ This is best-effort obscuring, not a confidentiality boundary.
+- 恢复记录保存在配置文件旁的 `privacy-power.json`（0600）；崩溃后下次启动重新启用记录的物理屏。
+  若主机无法启动，可在本机终端执行 `kscreen-doctor output.<name>.enable`。
+  The recovery record `privacy-power.json` (0600) re-enables the recorded outputs at the next start
+  after a crash; manually: `kscreen-doctor output.<name>.enable`.
+- 需要 coreutils `timeout` 和 `gdbus`。/ Requires coreutils `timeout` and `gdbus`.
+
+## 本机诊断 / Local diagnostic
+
+禁用物理屏 5 秒后恢复，不登录、不启动第二个主机；先停止使用同一配置目录的主机。
+Disables the physical outputs for five seconds, then restores them. Stop the host first.
+
+```sh
+cargo build --locked --features wayland,portal --bin uuremote-server
+target/debug/uuremote-server privacy-screen-probe
+UU_PRIVACY_PROBE_WALLPAPER=1 target/debug/uuremote-server privacy-screen-probe   # 壁纸模式 / wallpaper mode
+```
+
+## 代码结构 / Code layout
+
+`src/privacy_screen/` 分两层：与桌面无关的控制器和共享部件，以及每种桌面一个后端。
+The module has a desktop-independent controller with shared parts, and one backend per desktop.
+
+| 文件 / File | 职责 / Responsibility |
+|---|---|
+| `mod.rs` | 控制器：桌面会话计数、模式切换（先恢复再进入）、失败回滚、崩溃恢复、probe / controller: sessions, mode switch (leave, then enter), rollback, crash recovery, probe |
+| `mode.rs` | `Mode { Picture, ScreenOff }` ↔ 协议 `privacy_type` 1 关 / 2 隐私 / 3 关屏 |
+| `protocol.rs` | RPC 7 请求解析与 RpcResponse 3 编码 / request parsing and response encoding |
+| `backend.rs` | `Backend` trait 与按桌面选择后端 / the trait and backend selection |
+| `record.rs` | 恢复记录 `{backend, mode, data}`、进程锁、`Journal` / recovery record, process lock, journal |
+| `guard.rs` | `privacy-guard` 子进程：主机以任何方式结束都按记录恢复 / restores from the record however the host ends |
+| `cover.rs` | `privacy-wallpaper` 子进程：GTK 全屏遮挡窗口 / GTK cover window process |
+| `tool.rs` | 带超时的外部命令、gdbus、等待生效 / bounded tool calls, gdbus, wait-until |
+| `kde/` | KDE 后端：`outputs.rs` kscreen-doctor 布局，`input.rs` KWin 输入设备，`kwin.rs` KWin 脚本，`mod.rs` 编排 |
+
+新增桌面（X11、GNOME…）只需实现 `Backend` 并在 `backend::detect` / `backend::named` 登记：
+`enter` 在每一步改动之前通过 `Journal::save` 写入足以撤销它的数据；`leave` 只依据这些数据撤销，
+因为崩溃恢复时（守护进程或下次启动）没有桌面视频流。Picture 模式可复用 `cover::show`；
+若物理屏保持开启而 uinput 坐标覆盖整个布局，返回 `Entered::pointer_region`。
+
+To add a desktop (X11, GNOME, ...), implement `Backend` and register it in `backend::detect` and
+`backend::named`. `enter` saves, through `Journal::save`, what undoes each step before making it;
+`leave` must undo from that data alone, because crash recovery (guard or next start) has no
+desktop stream. Picture mode can reuse `cover::show`; when physical outputs stay on and uinput's
+axes span the whole layout, return `Entered::pointer_region`.

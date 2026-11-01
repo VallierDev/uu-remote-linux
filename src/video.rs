@@ -1201,6 +1201,8 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         }
     };
     let mut reader = EncoderTask(tokio::spawn(open(size, live_selection, current)));
+    // The privacy screen swaps the portal stream to a virtual output that can have another size.
+    let mut portal_size = portal.as_ref().map(|p| p.size());
     let mut previous = None;
     let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
     let mut settings_open = true;
@@ -1302,7 +1304,19 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 }
                 return result;
             },
-            _ = health.tick() => { if transport_closed(&pc) { return Ok(()); } },
+            _ = health.tick() => {
+                if transport_closed(&pc) { return Ok(()); }
+                let now = portal.as_ref().map(|p| p.size());
+                if now != portal_size {
+                    log::info!("Portal stream size changed; restarting capture");
+                    portal_size = now;
+                    reader.0.abort();
+                    let _ = (&mut reader.0).await;
+                    while receiver.try_recv().is_ok() {}
+                    idr.store(true, std::sync::atomic::Ordering::Relaxed);
+                    reader.0 = tokio::spawn(open(size, live_selection, current));
+                }
+            },
             changed = settings.changed(), if settings_open => {
                 if changed.is_err() { settings_open = false; }
                 continue;

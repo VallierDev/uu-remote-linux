@@ -596,7 +596,7 @@ static int read_stream_result(struct uu_portal *p, GVariant *results) {
 }
 static struct uu_portal *open_persist(const char *restore, void (*save_token)(const char *, void *),
     void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
-    int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height) {
+    int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height, uint32_t source_types) {
     *error = 0; *width = *height = 0;
     struct uu_portal *p = calloc(1, sizeof(*p));
     if (!p) { *error = 8; return NULL; }
@@ -644,7 +644,8 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     if (!results) goto done;
     g_variant_unref(results);
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(1));
+    /* 1 monitor; 4 virtual (KDE creates a KWin virtual output for the stream). */
+    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(source_types));
     g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(FALSE));
     /* Hidden cursor avoids duplicate pointer; supported since ScreenCast v1. */
     results = request(p, SCREEN, "SelectSources", &options, 1, error);
@@ -707,17 +708,21 @@ struct uu_portal *uu_portal_open_persist_cancellable(const char *restore,
     void (*save_token)(const char *, void *), void *save_data,
     uu_portal_cancelled_fn cancelled, void *cancel_data,
     int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, save_data, cancelled, cancel_data, 0, error, width, height);
+    return open_persist(restore, save_token, save_data, cancelled, cancel_data, 0, error, width, height, 1);
 }
 struct uu_portal *uu_portal_open_persist_capture(const char *restore,
     void (*save_token)(const char *, void *), void *save_data,
     uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf,
     int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height);
+    return open_persist(restore, save_token, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height, 1);
 }
 struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *),
     void *data, int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, data, NULL, NULL, 0, error, width, height);
+    return open_persist(restore, save_token, data, NULL, NULL, 0, error, width, height, 1);
+}
+struct uu_portal *uu_portal_open_virtual(const char *restore, void (*save_token)(const char *, void *),
+    void *data, int *error, uint32_t *width, uint32_t *height) {
+    return open_persist(restore, save_token, data, NULL, NULL, 0, error, width, height, 4);
 }
 struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32_t *width, uint32_t *height) {
     return uu_portal_open_persist(restore, NULL, NULL, error, width, height);

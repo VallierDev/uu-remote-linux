@@ -181,6 +181,7 @@ impl Drop for ScreenCapture {
 
 /// Keep the display visible only while a peer is streaming; never unlock it.
 pub fn keep_display_awake() -> Result<(), String> {
+    if crate::privacy_screen::active() { return Ok(()); }
     if crate::desktop_backend::detect()? == crate::desktop_backend::DesktopBackend::Kms { return Ok(()); }
     if crate::desktop_backend::detect()? == crate::desktop_backend::DesktopBackend::Portal {
         return crate::desktop_power::wake();
