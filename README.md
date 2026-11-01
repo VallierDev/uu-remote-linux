@@ -212,14 +212,8 @@ cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 控制端的 `viewer-ffmpeg` 只支持 **FFmpeg 6.x**（`pkg-config --modversion libavcodec` 为 60.x）；FFmpeg 7 及以上会在依赖 `ffmpeg-sys-next` 里报 `avfft.h file not found`（#63）。
 服务端可选的 `--features inproc-av` 是 X11 下的进程内硬件编码：不链接 FFmpeg 开发库，NVENC 运行时加载 NVIDIA 驱动库（`libcuda.so.1`、`libnvidia-encode.so.1`，需要支持 NVENC API 12.1 的驱动，530 及以上），VAAPI 运行时加载 `libva.so.2`/`libva-drm.so.2`。截屏与编码尺寸一致时 NVENC 直接读取 XShm 缓冲，省去一次主机到显存的拷贝；VAAPI 在同一特性下也进程内运行（DRI3 DMA-BUF 零拷贝，无 DRI3 时 XShm 上传，VPP 转 NV12 后送 VCN，支持 H.264/H.265）。CPU 编码或 `UU_CAPTURE=grab` 仍走外部 FFmpeg 进程；进程内硬件编码启动失败时先回退到对应的 FFmpeg 进程管线，再回退到 CPU。默认构建和预编译包都不需要该特性。
 
-GNOME/KDE Wayland 可用 `cargo build --release --features wayland,portal,inproc-av` 配合 `set-encoder vaapi`：复用已有 Portal 会话，优先协商线性 RGB DMA-BUF，VAAPI 直接导入合成器的 GPU 缓冲，VPP 在 GPU 上转 NV12 并缩放，采集到编码之间没有原始像素的 CPU 拷贝和上传。缓冲持有至 GPU 完成读取后才允许归还；锁状态本身不触发黑屏；合成器仍提供有效帧时继续转发，采集源关闭时才发送占位画面并等待恢复。会话恢复及切屏仍经过原有权限检查。日志 `pipeline=dma-buf zero_cpu_copy=true` 表示实际启用；合成器不提供线性 DMA-BUF、平面布局或同步方式不支持、驱动导入失败时，会明确记录原因并退回进程内 BGRA 上传路径。`UU_PORTAL_DMABUF=0` 可禁用 DMA-BUF 以便对比。该特性同时通过 libpulse/libopus 在进程内采集和编码音频，锁屏等待画面也使用 VAAPI。正常路径无需 FFmpeg 子进程；原生视频或音频失败时会明确记录原因和回退到 FFmpeg 的日志。`UU_VIDEO_PIPELINE=process` 可恢复外部进程管线。此支持限于 Portal + VAAPI，Hyprland 原生后端和 NVENC Wayland 仍走 FFmpeg。
-
-硬件回归需在已解锁、已保存 Portal 授权的桌面上运行，并已选择 VAAPI。以下测试仅在验证解码时启动 FFmpeg，不保存或打印桌面内容。第一项在同一进程重建 Portal 会话 20 次，并注入锁状态验证健康采集源继续出图，再实际关闭/恢复会话验证占位黑帧和恢复；它不会锁住真实桌面，也不替代隔离 VM 中的系统锁屏验收。第二项持续运行 5 分钟，独立解码每一帧，记录编码进程 CPU、内存和文件描述符：
-
-```sh
-RUST_LOG=info cargo test --release --locked --features wayland,portal,inproc-av portal_restart_resources_and_injected_lock_recovery -- --ignored --nocapture
-RUST_LOG=info cargo test --release --locked --features wayland,portal,inproc-av portal_five_minute_endurance_with_full_decode -- --ignored --nocapture
-```
+GNOME/KDE Wayland 的进程内编码用 `cargo build --release --features wayland,portal,inproc-av` 配合 `set-encoder vaapi` 启用，目前仅支持 Portal + VAAPI。
+`UU_PORTAL_DMABUF=0` 禁用 DMA-BUF、改用进程内上传；`UU_VIDEO_PIPELINE=process` 恢复外部 FFmpeg 管线。
 
 ### 3. 登录
 
@@ -283,7 +277,7 @@ sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
 `uaccess` 只把权限给当前坐在这台机器前的登录用户。`UU_INPUT_BACKEND=uinput|native` 可以强制指定后端。
 X11 默认继续用 XTest，因为它能正确处理网络延迟下按住不放的按键。
 
-uinput 成功启用后，单屏 Portal 桌面的键盘、鼠标移动、点击和滚轮统一走内核设备，鼠标移动和点击保持在同一设备队列中，不再等待 Portal 同步调用。`UU_INPUT_BACKEND=uinput` 会强制所有普通键鼠事件走 uinput；绝对坐标按整个桌面归一化。自动模式在多屏或布局未知时保留原生指针定位，避免把单屏坐标拉伸到整个桌面。显示布局改变后需重启主机重新选择路径。完整 uinput 指针模式下，移动端触摸按鼠标拖拽处理；输入法提交的文字会优先通过只读 X11/XWayland XKB 查询，将可映射的 ASCII 前缀（大小写、数字和符号）转换为 uinput 按键，并处理当前布局、锁定修饰状态及 Shift 释放，无需剪贴板；其余文字保留原有文字输入/剪贴板路径。
+uinput 的 ASCII 文本映射依赖 X11/XWayland XKB；不可映射的文字保留原有文字输入/剪贴板路径。
 
 ## 远程协助与主窗口（实验性）
 

@@ -230,14 +230,8 @@ cargo build --release --features wayland,portal   # + GNOME/KDE on Wayland
 The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config --modversion libavcodec` = 60.x); FFmpeg 7+ fails inside `ffmpeg-sys-next` with `avfft.h file not found` (#63).
 The host's optional `--features inproc-av` encodes with hardware inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
 
-On GNOME/KDE Wayland, build with `--features wayland,portal,inproc-av` and select `set-encoder vaapi`. The existing Portal session prefers linear RGB DMA-BUFs, imported directly into VAAPI. GPU VPP converts to NV12 and scales without raw-pixel CPU copies or upload between capture and encoding. Buffers remain leased until GPU reads complete. Lock state alone does not blank a healthy source: compositor-provided frames continue, while a closed source uses placeholder video until recovery. Session recovery and monitor changes retain their permission checks. `pipeline=dma-buf zero_cpu_copy=true` confirms the active path. Missing linear DMA-BUF support, unsupported plane layouts or synchronization, and driver import failures explicitly log a fallback to native BGRA host upload. Set `UU_PORTAL_DMABUF=0` to disable DMA-BUF for comparisons. This feature also captures and encodes audio in process with libpulse/libopus and uses VAAPI for the locked-desktop waiting frame. The normal path has no FFmpeg child processes; native video or audio failures explicitly log the reason and fallback to FFmpeg. `UU_VIDEO_PIPELINE=process` restores the external pipelines. Native video support is limited to Portal + VAAPI; the Hyprland native backend and NVENC on Wayland still use FFmpeg.
-
-Hardware regressions require an unlocked desktop, saved Portal consent and VAAPI selected. FFmpeg is used only for independent decode verification; no desktop contents are saved or printed. The first test recreates Portal sessions 20 times in one process, then injects lock observations to verify healthy sources continue producing frames, and actually closes/restores sessions to verify placeholder black frames and recovery. It does not lock the real desktop or replace system lock-screen acceptance in an isolated VM. The second runs for five minutes, independently decodes every frame and reports encoder-process CPU, memory and file descriptors:
-
-```sh
-RUST_LOG=info cargo test --release --locked --features wayland,portal,inproc-av portal_restart_resources_and_injected_lock_recovery -- --ignored --nocapture
-RUST_LOG=info cargo test --release --locked --features wayland,portal,inproc-av portal_five_minute_endurance_with_full_decode -- --ignored --nocapture
-```
+On GNOME/KDE Wayland, enable in-process encoding with `cargo build --release --features wayland,portal,inproc-av` and `set-encoder vaapi`; support is limited to Portal + VAAPI.
+`UU_PORTAL_DMABUF=0` disables DMA-BUF in favor of in-process host upload; `UU_VIDEO_PIPELINE=process` restores external FFmpeg pipelines.
 
 ### 3. Log in
 
@@ -303,7 +297,7 @@ sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
 `uaccess` grants access only to the user sitting at the machine. `UU_INPUT_BACKEND=uinput|native` forces a backend.
 X11 keeps XTest by default because it handles held keys correctly on high-latency links.
 
-With uinput available, single-output Portal desktops route keyboard events, pointer motion, buttons and wheels through kernel devices. Absolute motion and clicks use the same device queue without synchronous Portal calls. `UU_INPUT_BACKEND=uinput` forces ordinary keyboard/mouse events through uinput; absolute coordinates span the entire desktop. Auto mode retains native pointer positioning for multiple or unknown outputs to avoid stretching one captured monitor across the desktop. Restart the host after display-layout changes to select the route again. Full uinput pointer mode maps mobile touch to mouse dragging. Committed IME text first uses a read-only X11/XWayland XKB query to translate its mappable ASCII prefix (case, digits and punctuation) into uinput keys, accounting for the current layout, locked modifiers and balanced Shift release without using the clipboard. Remaining text keeps its existing text/clipboard path.
+ASCII text mapping through uinput requires X11/XWayland XKB; unmappable text keeps the existing text/clipboard path.
 
 ## Remote assistance and the main window (experimental)
 

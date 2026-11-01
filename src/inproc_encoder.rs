@@ -884,6 +884,10 @@ mod frame_tests {
 
 #[cfg(all(test, target_os = "linux", feature = "portal"))]
 mod portal_hardware_tests {
+    // Run on an unlocked desktop with saved Portal consent and VAAPI selected.
+    // FFmpeg is used only for independent decode verification; desktop contents
+    // are neither saved nor printed. These tests do not lock the real desktop
+    // or replace system lock-screen acceptance in an isolated VM.
     use super::*;
     use crate::capture_setting::VideoCodec;
 
@@ -983,6 +987,9 @@ mod portal_hardware_tests {
         }).await.unwrap();
     }
 
+    // RUST_LOG=info cargo test --release --locked --features wayland,portal,inproc-av portal_five_minute_endurance_with_full_decode -- --ignored --nocapture
+    // Run for five minutes, independently decode every output frame, require equal
+    // encoded/decoded counts and no decode errors, and report CPU, RSS and FDs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "five-minute real Portal/VAAPI run; FFmpeg is used only as an independent decoder"]
     async fn portal_five_minute_endurance_with_full_decode() {
@@ -1049,6 +1056,10 @@ mod portal_hardware_tests {
             started.elapsed().as_secs_f64(), frames, decoded);
     }
 
+    // RUST_LOG=info cargo test --release --locked --features wayland,portal,inproc-av portal_restart_resources_and_injected_lock_recovery -- --ignored --nocapture
+    // Recreate the Portal session 20 times, check resource growth, then inject
+    // locked/unknown/unlocked observations to check healthy-frame passthrough.
+    // Actually close/restore the source to check placeholder black and recovery.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires an unlocked Portal desktop, saved consent, VAAPI and FFmpeg decode verification"]
     async fn portal_restart_resources_and_injected_lock_recovery() {
