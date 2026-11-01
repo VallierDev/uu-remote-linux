@@ -15,7 +15,20 @@ pub fn show(image: Option<&std::path::Path>, rects: &[[f64; 4]]) -> Result<(), S
     for rect in rects { command.arg(rect.iter().map(|v| (v.round() as i64).to_string()).collect::<Vec<_>>().join(",")); }
     // The window must not outlive the host: a crash would leave the picture over the desktop.
     unsafe { command.pre_exec(|| { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM); Ok(()) }); }
-    let child = command.stdin(Stdio::null()).stdout(Stdio::null()).spawn().map_err(|e| format!("cover window: {}", e.kind()))?;
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).spawn().map_err(|e| format!("cover window: {}", e.kind()))?;
+    // A spawned child is not a shown cover: GTK init or monitor matching can still fail (exit 1/2).
+    let stdout = child.stdout.take().ok_or("cover window: no stdout")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut line = String::new();
+        let _ = tx.send(std::io::BufReader::new(stdout).read_line(&mut line).is_ok() && line.trim() == "ready");
+    });
+    if rx.recv_timeout(std::time::Duration::from_secs(5)) != Ok(true) {
+        let _ = child.kill();
+        let status = child.wait().ok().and_then(|s| s.code());
+        return Err(format!("cover window not shown (exit {status:?})"));
+    }
     *COVER.lock().map_err(|_| "cover state poisoned")? = Some(child);
     Ok(())
 }

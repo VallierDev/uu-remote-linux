@@ -9,20 +9,22 @@ pub struct Record { pub backend: String, pub mode: Mode, pub data: serde_json::V
 pub fn path() -> std::path::PathBuf { crate::config::path().with_file_name("privacy-power.json") }
 pub fn pending() -> bool { path().exists() }
 
-/// One process controls the outputs of a config directory (host, probe, guard).
+/// One process controls the outputs of a config directory (host, probe, guard). Only success is
+/// kept: a lock still held by a dying host must be retried (the guard polls this).
 pub fn ownership() -> Result<(), String> {
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
-    static LOCK: std::sync::OnceLock<Result<std::fs::File, String>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| {
-        let path = path().with_extension("lock");
-        std::fs::create_dir_all(path.parent().ok_or("missing config directory")?).map_err(|e| e.kind().to_string())?;
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
-            .open(path).map_err(|e| e.kind().to_string())?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("output control is owned by another process".into());
-        }
-        Ok(file)
-    }).as_ref().map(|_| ()).map_err(Clone::clone)
+    static LOCK: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+    let mut held = LOCK.lock().map_err(|_| "privacy lock state poisoned")?;
+    if held.is_some() { return Ok(()); }
+    let path = path().with_extension("lock");
+    std::fs::create_dir_all(path.parent().ok_or("missing config directory")?).map_err(|e| e.kind().to_string())?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+        .open(path).map_err(|e| e.kind().to_string())?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("output control is owned by another process".into());
+    }
+    *held = Some(file);
+    Ok(())
 }
 
 pub fn load() -> Option<Record> { serde_json::from_slice(&std::fs::read(path()).ok()?).ok() }

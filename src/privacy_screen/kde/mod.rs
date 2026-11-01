@@ -54,6 +54,9 @@ impl Backend for Kde {
     fn name(&self) -> &'static str { NAME }
     fn unavailable(&self, mode: Mode) -> Option<String> {
         if !tool::available("gdbus") { return Some("privacy screen needs gdbus".into()); }
+        // Checked before any output or device changes: on the virtual share KDE drops portal input,
+        // and local devices get blocked, so without uinput neither side could operate.
+        if !crate::input::uinput_ready() { return Some("privacy screen needs uinput input (UU_INPUT_BACKEND=native or /dev/uinput unavailable)".into()); }
         (mode == Mode::Picture && !super::cover::supported()).then(|| "picture mode needs GTK".into())
     }
     fn enter(&self, mode: Mode, journal: &mut Journal) -> Result<Entered, String> {
@@ -73,7 +76,9 @@ impl Backend for Kde {
     }
     fn leave(&self, data: &serde_json::Value) -> Result<(), String> {
         let data: Data = serde_json::from_value(data.clone()).map_err(|_| "invalid KDE recovery data")?;
-        if let Err(e) = input::set(&data.devices, true) { log::warn!("Privacy input devices not all restored: {e}"); }
+        // KWin persists the device flag: a failure is returned (after restoring the outputs) so the
+        // controller keeps the recovery record and the guard for the next attempt.
+        let devices = input::set(&data.devices, true).map_err(|e| format!("enable input devices: {e}"));
         // Physical outputs first: switching back opens a monitor share, which needs them enabled.
         // The wait also matters: a share opened before KWin applies the mode got the virtual
         // output's geometry (seen live: 1920x1080 instead of the panel's 3072x1920).
@@ -85,6 +90,7 @@ impl Backend for Kde {
             // No portal desktop (last connection gone, or crash recovery): nothing to switch back.
             log::info!("Privacy capture source not switched back: {e}");
         }
+        devices?;
         log::info!("Privacy KDE restored: outputs={} input_devices={}", data.outputs.len(), data.devices.len());
         Ok(())
     }

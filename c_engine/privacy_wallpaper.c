@@ -2,6 +2,7 @@
 // a picture and a notice, while the remote session works on a KWin virtual output. Runs in its own
 // process (`uuremote-server privacy-wallpaper`), which the host kills on restore.
 #include <gtk/gtk.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "i18n.h"
 
@@ -66,6 +67,8 @@ int uu_privacy_wallpaper_run(const char *image, const int *rects, int count) {
         shown++;
     }
     if (!shown) return 2;
+    /* Readiness handshake: the host treats picture mode as on only after this line. */
+    fputs("ready\n", stdout); fflush(stdout);
     gtk_main();
     return 0;
 }

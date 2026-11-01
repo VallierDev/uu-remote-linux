@@ -49,7 +49,11 @@ is aimed at the virtual output's region. Needs GTK3.
   若主机无法启动，可在本机终端执行 `kscreen-doctor output.<name>.enable`。
   The recovery record `privacy-power.json` (0600) re-enables the recorded outputs at the next start
   after a crash; manually: `kscreen-doctor output.<name>.enable`.
-- 需要 coreutils `timeout` 和 `gdbus`。/ Requires coreutils `timeout` and `gdbus`.
+- 需要 coreutils `timeout`、`gdbus` 和可用的 uinput（`/dev/uinput` 可写，且未设 `UU_INPUT_BACKEND=native`）；
+  缺少时请求在改动屏幕和设备之前被拒绝。隐私模式的遮挡窗口建好后才算开启，失败即回滚。
+  Requires coreutils `timeout`, `gdbus` and working uinput (`/dev/uinput` writable, not
+  `UU_INPUT_BACKEND=native`); otherwise the request is refused before outputs or devices change.
+  Picture mode counts as on only after the cover window reports ready; a failure rolls back.
 
 ## 协议 / Protocol
 

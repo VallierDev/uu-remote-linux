@@ -116,6 +116,11 @@ fn single_portal_output() -> bool {
         .and_then(|output| active_output_count(&output.stdout)) == Some(1)
 }
 
+/// The desktop injector opened uinput devices. The privacy screen needs them: KDE ignores portal
+/// input on its virtual-output share, so without uinput nobody could operate the desktop.
+static UINPUT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn uinput_ready() -> bool { UINPUT_READY.load(std::sync::atomic::Ordering::Acquire) }
+
 impl InputInjector {
     pub fn new() -> Self {
         let backend = crate::desktop_backend::detect().unwrap_or(crate::desktop_backend::DesktopBackend::X11);
@@ -125,6 +130,7 @@ impl InputInjector {
                 Err(e) => { log::warn!("uinput unavailable ({}); using the desktop input path. See README for the udev rule.", e.kind()); None }
             }
         } else { None };
+        if uinput.is_some() { UINPUT_READY.store(true, std::sync::atomic::Ordering::Release); }
         let uinput_pointer = uinput.is_some() && (std::env::var("UU_INPUT_BACKEND").as_deref() == Ok("uinput")
             || (backend == crate::desktop_backend::DesktopBackend::Portal && single_portal_output()));
         if uinput_pointer { log::info!("Input pointer backend: uinput (motion, buttons and wheel)"); }
@@ -503,9 +509,12 @@ impl InputInjector {
                 if relative { return Self::uinput_result(uinput.move_relative(x,y)); }
                 let (w,h) = *self.screen.lock().unwrap();
                 if w > 1 && h > 1 {
-                    let scale = |v: i32, extent: u32| (i64::from(v).clamp(0, i64::from(extent - 1))
-                        * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
-                    return Self::uinput_result(uinput.move_absolute(scale(x,w),scale(y,h)));
+                    let (ax, ay) = self.privacy_absolute(x, y, (w, h)).unwrap_or_else(|| {
+                        let scale = |v: i32, extent: u32| (i64::from(v).clamp(0, i64::from(extent - 1))
+                            * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
+                        (scale(x, w), scale(y, h))
+                    });
+                    return Self::uinput_result(uinput.move_absolute(ax, ay));
                 }
                 return -1;
             }
@@ -537,11 +546,7 @@ impl InputInjector {
             let (w,h)=placement.and_then(|_|crate::capture::x11_last_size()).unwrap_or(*self.screen.lock().unwrap());
             if w > 1 && h > 1 {
                 let scale = |v: i32, extent: u32| (i64::from(v) * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
-                // Privacy wallpaper mode: the axes span the physical outputs too; aim inside the virtual one.
-                if let Some([rx,ry,rw,rh])=crate::privacy_screen::pointer_region().filter(|_| self.virtual_uinput()) {
-                    let abs = |v: i32, extent: u32, o: f64, span: f64| ((o + f64::from(v) / f64::from(extent - 1) * span) * f64::from(crate::uinput::ABS_MAX)).round() as i32;
-                    return Self::uinput_result(uinput.move_absolute(abs(x,w,rx,rw),abs(y,h,ry,rh)));
-                }
+                if let Some((ax, ay)) = self.privacy_absolute(x, y, (w, h)) { return Self::uinput_result(uinput.move_absolute(ax, ay)); }
                 return Self::uinput_result(uinput.move_absolute(scale(x,w),scale(y,h)));
             }
         }
@@ -550,6 +555,14 @@ impl InputInjector {
         if self.backend==crate::desktop_backend::DesktopBackend::Portal {return self.portal_result("motion", Err("Portal input session is not bound".into()));}
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::move_pointer(x,y,relative) }
         else if relative { unsafe { x11_mouse_relative(x,y) } } else { unsafe { x11_mouse_move(x,y) } }
+    }
+    /// Privacy picture mode keeps the physical outputs on, so uinput's axes span them too: aim the
+    /// stream point inside the virtual output's region of the layout.
+    fn privacy_absolute(&self, x: i32, y: i32, (w, h): (u32, u32)) -> Option<(i32, i32)> {
+        let [rx, ry, rw, rh] = crate::privacy_screen::pointer_region().filter(|_| self.virtual_uinput())?;
+        let abs = |v: i32, extent: u32, o: f64, span: f64| ((o + f64::from(v.clamp(0, extent as i32 - 1)) / f64::from(extent - 1) * span)
+            * f64::from(crate::uinput::ABS_MAX)).round() as i32;
+        Some((abs(x, w, rx, rw), abs(y, h, ry, rh)))
     }
     /// Privacy screen: KDE ignores portal pointer events (motion and buttons) on a virtual-output
     /// share, so the pointer uses uinput, whose axes then span just the virtual output.

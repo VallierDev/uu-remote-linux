@@ -638,6 +638,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("privacy-screen-probe") {
         let screen = ScreenCapture::new()?;
         if screen.portal.is_none() { return Err(std::io::Error::other("privacy screen needs the portal backend").into()); }
+        let _input = input::InputInjector::new(); // the privacy screen requires its uinput devices
         let mode = if std::env::var("UU_PRIVACY_PROBE_WALLPAPER").as_deref() == Ok("1") { privacy_screen::Mode::Picture } else { privacy_screen::Mode::ScreenOff };
         tokio::task::spawn_blocking(move || privacy_screen::probe(mode)).await?.map_err(std::io::Error::other)?;
         drop(screen);
