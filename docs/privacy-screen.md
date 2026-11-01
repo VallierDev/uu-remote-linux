@@ -51,6 +51,22 @@ is aimed at the virtual output's region. Needs GTK3.
   after a crash; manually: `kscreen-doctor output.<name>.enable`.
 - 需要 coreutils `timeout` 和 `gdbus`。/ Requires coreutils `timeout` and `gdbus`.
 
+## 协议 / Protocol
+
+字段号来自官方 Mac 客户端的 SwiftProtobuf name map / Field numbers from the Mac UURemote name maps:
+
+- RPC 7 `PrivateScreenSettingRequest {1 enable, 2 privacy_type, 3 setting_source}` → RpcResponse 3
+  `{1 error_code, 2 req_privacy_type, 3 cur_privacy_type}`；PrivateScreenType 2 隐私/picture, 3 关屏/screen off。
+  主机先应答再切换（客户端约数秒超时，报 9998）；切换失败发 ReportError -7。
+  The host answers before switching (the viewer times out with 9998); a failed switch sends ReportError -7.
+- RPC 25 `update_screen_saver_req` → RpcResponse 21：开启隐私模式前发送，主机回空成功应答，画面仍用本机壁纸。
+  Sent before picture mode; answered empty (success), the host keeps its own wallpaper.
+- FeatureFlag 4 `ff_private_screen` = 2 (ENHANCED_PRIVACY)；SettingMetric 4 `private_screen`、7 `private_screen_type`
+  （最近一次开启的模式，存于 host_settings.json `privacy_type`）；SystemStateChange 5 `PrivateScreenState` 在状态变化时推送。
+
+已知限制：官方 Mac 客户端的防窥菜单在切换后仍回显"不启用"，实际模式正确；客户端未回读上述状态。
+Known limitation: the official Mac viewer's menu still shows "off" after switching although the mode applies.
+
 ## 本机诊断 / Local diagnostic
 
 禁用物理屏 5 秒后恢复，不登录、不启动第二个主机；先停止使用同一配置目录的主机。

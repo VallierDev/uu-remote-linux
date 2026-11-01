@@ -1052,6 +1052,8 @@ impl WebRtcSession {
                                         let payload = actions.metrics_payload(desktop_sound, permission);
                                         let message = crate::initialization::envelope(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &payload);
                                         if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
+                                        let state = crate::privacy_screen::state_message(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts);
+                                        if channel.send(&bytes::Bytes::from(state)).await.is_err() { return; }
                                     }
                                 });
                             }
@@ -1141,19 +1143,26 @@ impl WebRtcSession {
                             let rpc = fields.iter().find_map(|f| match (f.number, &f.value) { (21, WireValue::Bytes(b)) => Some(*b), _ => None });
                             let rpc_fields = rpc.and_then(|r| crate::protocol::decode_wire(r).ok());
                             if let Some(request) = rpc.filter(|_| rpc_fields.as_ref().is_some_and(|r| r.iter().any(|f| f.number == 7))) {
-                                let request = request.to_vec();
-                                let response = tokio::task::spawn_blocking(move || crate::protocol::decode_wire(&request).ok()
-                                    .and_then(|r| crate::privacy_screen::rpc_response(&r))).await.ok().flatten();
-                                if let Some(response) = response {
-                                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                    let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
-                                    let permission = portal_for_message.as_ref().map_or(crate::system_metrics::Permission::Allow, |p| p.snapshot().permission(desktop));
-                                    let metrics = actions.metrics_payload(desktop_sound, permission);
-                                    let _ = reply_chan.send(&bytes::Bytes::from(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &metrics))).await;
+                                let Some((response, accepted)) = rpc_fields.as_deref().and_then(crate::privacy_screen::rpc_accept) else { return };
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                let Some(accepted) = accepted else { return };
+                                let failed = tokio::task::spawn_blocking(move || accepted.apply().is_err()).await.unwrap_or(true);
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let next = || out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if failed {
+                                    let report = crate::initialization::encode_report_error(next(), ts, crate::privacy_screen::REPORT_ERROR, "privacy screen failed");
+                                    let _ = reply_chan.send(&bytes::Bytes::from(report)).await;
                                 }
+                                let permission = portal_for_message.as_ref().map_or(crate::system_metrics::Permission::Allow, |p| p.snapshot().permission(desktop));
+                                let metrics = actions.metrics_payload(desktop_sound, permission);
+                                let _ = reply_chan.send(&bytes::Bytes::from(crate::initialization::envelope(next(), ts, 13, &metrics))).await;
+                                let state = crate::privacy_screen::state_message(next(), ts);
+                                let _ = reply_chan.send(&bytes::Bytes::from(state)).await;
+                                log::info!("Privacy switch done: failed={failed} type={}", crate::privacy_screen::current_type());
                                 return;
                             }
-                            if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
+                            if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::privacy_screen::screensaver_response(r).or_else(|| crate::system_actions::plugin_response(r)).or_else(|| crate::system_actions::session_rpc_response(r))) {
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
                                 return;

@@ -154,12 +154,18 @@ mod native {
             let key = super::permissions::desktop_key();
             let wanted = if virtual_output { None } else { monitor.map(str::to_owned).or_else(crate::wayland::portal_monitor) };
             let virtual_key = format!("{key}-virtual");
+            // One opener at a time: consent tokens are single-use, and two concurrent openers
+            // (privacy virtual-output switch and closure recovery after a quick reconnect) each
+            // consumed one and both failed, leaving no saved consent (seen live, KDE).
+            static OPENING: Mutex<()> = Mutex::new(());
+            let _opening = OPENING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // Each monitor has its own consent; the desktop-wide key is the single-monitor one.
-            let token = directory.as_deref().filter(|_| !fresh).and_then(|dir| {
-                if virtual_output { return super::permissions::take(dir, &virtual_key); }
-                wanted.as_deref().and_then(|name| super::permissions::take(dir, &super::permissions::monitor_key(name)))
-                    .or_else(|| super::permissions::take(dir, key))
-            }).and_then(|value| std::ffi::CString::new(value).ok());
+            let taken = directory.as_deref().filter(|_| !fresh).and_then(|dir| {
+                let take = |k: String| super::permissions::take(dir, &k).map(|v| (k, v));
+                if virtual_output { return take(virtual_key.clone()); }
+                wanted.as_deref().and_then(|name| take(super::permissions::monitor_key(name))).or_else(|| take(key.to_owned()))
+            });
+            let token = taken.as_ref().and_then(|(_, value)| std::ffi::CString::new(value.as_str()).ok());
             // The new token is saved once the granted monitor is known (after open).
             let mut cache: Option<String> = None;
             extern "C" fn save_token(token: *const libc::c_char, data: *mut c_void) {
@@ -171,6 +177,14 @@ mod native {
                 if result.is_err() { log::warn!("Portal permission cache callback failed"); }
             }
             let restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
+            // A failed open must not cost the saved consent: put the token back unless the
+            // portal handed out a new one. A stale token only makes the next open ask again.
+            let failed = |code: i32, cache: &Option<String>| {
+                if let (Some(dir), Some((k, value)), None) = (directory.as_deref(), taken.as_ref(), cache.as_ref()) {
+                    if super::permissions::save(dir, k, value).is_err() { log::warn!("Portal permission cache could not be restored"); }
+                }
+                super::PortalError { code }
+            };
             #[allow(unused_mut)]
             let mut pointer: *mut c_void = std::ptr::null_mut();
             #[cfg(feature = "inproc-av")]
@@ -182,7 +196,7 @@ mod native {
                     restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
                     &mut error, &mut width, &mut height,
                 ) };
-                if pointer.is_null() && error != 0 { return Err(super::PortalError { code: error }); }
+                if pointer.is_null() && error != 0 { return Err(failed(error, &cache)); }
                 if pointer.is_null() { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
             }
             let pointer = if !pointer.is_null() { pointer } else { unsafe {
@@ -198,7 +212,7 @@ mod native {
                     uu_portal_open_persist(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
                 }
             } };
-            let handle = NonNull::new(pointer).ok_or(super::PortalError { code: error })?;
+            let Some(handle) = NonNull::new(pointer) else { return Err(failed(error, &cache)) };
             let (mut x, mut y) = (0, 0);
             let granted = (!virtual_output && unsafe { uu_portal_stream_position(handle.as_ptr(), &mut x, &mut y) } == 0)
                 .then(|| crate::wayland::portal_monitor_at(x, y)).flatten();

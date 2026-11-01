@@ -36,6 +36,8 @@ pub(crate) struct Settings {
     /// video field cannot drop auto_lock / mute when the document is loaded.
     #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_encoder: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_codec: Option<String>,
+    /// Last privacy_type the viewer enabled (2 picture, 3 screen off), reported as SettingMetric 7.
+    #[serde(default)] pub(crate) privacy_type: Option<u8>,
 }
 
 fn lenient_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
@@ -289,7 +291,7 @@ impl PeerActions {
         let current = state().lock().unwrap().settings.clone();
         payload_with_settings(desktop, desktop, desktop, &home, &crate::system_metrics::Settings {
             sound, keep_mute: current.keep_mute, mute_permanent: current.mute_permanent, auto_lock: current.auto_lock,
-            private_screen: crate::privacy_screen::supported().then(crate::privacy_screen::current_type),
+            private_screen: crate::privacy_screen::supported().then(|| (crate::privacy_screen::active(), crate::privacy_screen::preferred_type())),
         })
     }
 }

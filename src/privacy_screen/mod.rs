@@ -28,6 +28,14 @@ pub fn active() -> bool { ACTIVE.load(Ordering::Relaxed) }
 pub fn current_type() -> u8 {
     if !active() { mode::TYPE_OFF } else if PICTURE.load(Ordering::Relaxed) { Mode::Picture.wire_type() } else { Mode::ScreenOff.wire_type() }
 }
+/// The mode last enabled (kept in host_settings.json), 1 (PS_NOT_SET) before any.
+pub fn preferred_type() -> u8 {
+    crate::system_actions::load_settings().privacy_type.filter(|t| matches!(t, 2 | 3)).unwrap_or(mode::TYPE_OFF)
+}
+/// Message 15 SystemStateChange { 5 PrivateScreenState } for the state now in effect.
+pub fn state_message(seq: u64, timestamp: u64) -> Vec<u8> {
+    crate::initialization::envelope(seq, timestamp, 15, &protocol::state_change(current_type()))
+}
 /// See `backend::Entered::pointer_region`.
 pub fn pointer_region() -> Option<[f64; 4]> { *POINTER.lock().ok()? }
 
@@ -68,6 +76,7 @@ fn enter(state: &mut State, mode: Mode) -> Result<(), String> {
     if let Some(active) = state.active.as_mut() { active.record = journal.into_record(); }
     let entered = result?;
     *POINTER.lock().map_err(|_| "pointer state poisoned")? = entered.pointer_region;
+    if let Err(e) = crate::system_actions::merge_save(|s| s.privacy_type = Some(mode.wire_type())) { log::warn!("Privacy mode not saved: {e}"); }
     log::info!("Privacy screen enabled: backend={} mode={mode:?}", backend.name());
     Ok(())
 }
@@ -82,11 +91,36 @@ fn set(enable: bool, mode: Option<Mode>) -> Result<(), String> {
     if result.is_err() { if let Err(e) = leave(&mut state) { log::warn!("Privacy rollback failed: {e}"); } }
     result
 }
-pub fn rpc_response(rpc: &[crate::protocol::WireField]) -> Option<Vec<u8>> {
+/// Why RPC 7 cannot be served at all; checked before answering.
+fn refuse(enable: bool, mode: Option<Mode>) -> Option<String> {
+    if !enable { return None; }
+    let Some(mode) = mode else { return Some("unsupported privacy type".into()) };
+    if STATE.lock().map_or(true, |s| s.sessions == 0) { return Some("no active desktop session".into()); }
+    let Some(backend) = backend::detect() else { return Some("privacy screen is not supported on this desktop".into()) };
+    backend.unavailable(mode)
+}
+/// A switch the RPC accepted; run it with `Accepted::apply` after sending the response.
+pub struct Accepted { enable: bool, mode: Option<Mode> }
+/// RPC 7 answer, sent before the switch: the Mac viewer gives up on the RPC after a few seconds
+/// (error 9998 + n in its RPC failure handler) and a switch takes longer. A later failure is
+/// reported as ReportError -7, which the viewer handles by resetting its privacy menu.
+pub fn rpc_accept(rpc: &[crate::protocol::WireField]) -> Option<(Vec<u8>, Option<Accepted>)> {
     let (header, request) = protocol::parse(rpc)?;
-    let result = set(request.enable, request.mode);
-    if let Err(e) = &result { log::warn!("Privacy request failed: enable={} mode={:?}: {e}", request.enable, request.mode); }
-    Some(protocol::response(&header, &request, result.is_err(), current_type()))
+    if let Some(e) = refuse(request.enable, request.mode) {
+        log::warn!("Privacy request refused: enable={} mode={:?}: {e}", request.enable, request.mode);
+        return Some((protocol::response(&header, &request, true, current_type()), None));
+    }
+    let expected = if request.enable { request.mode.map_or(mode::TYPE_OFF, Mode::wire_type) } else { mode::TYPE_OFF };
+    Some((protocol::response(&header, &request, false, expected), Some(Accepted { enable: request.enable, mode: request.mode })))
+}
+/// ReportError.error_code the Mac viewer treats as a privacy-screen failure (handleForReportError).
+pub const REPORT_ERROR: i32 = -7;
+impl Accepted {
+    pub fn apply(self) -> Result<(), String> {
+        let result = set(self.enable, self.mode);
+        if let Err(e) = &result { log::warn!("Privacy request failed: enable={} mode={:?}: {e}", self.enable, self.mode); }
+        result
+    }
 }
 pub fn session_started() { if let Ok(mut s) = STATE.lock() { s.sessions += 1; } }
 pub fn session_ended() {
@@ -124,15 +158,17 @@ pub fn probe(mode: Mode) -> Result<(), String> {
     if restored.is_err() { log::warn!("Privacy probe restore failed; the next start retries"); }
     result.and(restored)
 }
+pub use protocol::screensaver_response;
 pub fn guard_main() -> i32 { guard::main() }
 pub fn cover_main(args: &[String]) -> i32 { cover::main(args) }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn enabling_without_a_backend_fails_and_reports_off() {
+    fn enabling_without_a_backend_is_refused_and_reports_off() {
         let bytes = [10, 2, 8, 42, 58, 4, 8, 1, 16, 3];
-        let response = super::rpc_response(&crate::protocol::decode_wire(&bytes).unwrap()).unwrap();
+        let (response, accepted) = super::rpc_accept(&crate::protocol::decode_wire(&bytes).unwrap()).unwrap();
         assert_eq!(response, [10, 2, 8, 42, 26, 6, 8, 1, 16, 3, 24, 1]);
+        assert!(accepted.is_none());
     }
 }

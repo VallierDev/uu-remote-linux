@@ -27,14 +27,14 @@ pub fn payload_with_location(capture: Permission, operation: Permission, control
 /// Optional host settings the viewer shows in 声音 / 安全 (SettingMetric 1 keep_mute,
 /// 2 mute_permanent, 3 auto_lock; GeneralMetric 2 system_sound_support).
 #[derive(Debug, Default, Clone, Copy)]
-pub struct Settings { pub sound: bool, pub keep_mute: bool, pub mute_permanent: bool, pub auto_lock: bool, pub private_screen: Option<u8> }
+pub struct Settings { pub sound: bool, pub keep_mute: bool, pub mute_permanent: bool, pub auto_lock: bool, pub private_screen: Option<(bool, u8)> }
 
 pub fn payload_with_settings(capture: Permission, operation: Permission, control: Permission, location: &str, settings: &Settings) -> Vec<u8> {
     let mut setting = Vec::new();
-    // SettingMetric 4 = privacy on, 7 = current privacy_type (1 off, 2 picture, 3 screen off). A fixed
-    // 7 = 2 made the viewer show the picture mode as on when connecting while the host was off.
-    if let Some(kind) = settings.private_screen {
-        setting.extend([4 << 3, u8::from(kind > 1), 7 << 3, kind]);
+    // Mac UURemote name map: SettingMetric 4 private_screen (on), 7 private_screen_type
+    // (PrivateScreenType 2 normal/picture, 3 enhanced/screen off): the chosen mode, also while off.
+    if let Some((on, kind)) = settings.private_screen {
+        setting.extend([4 << 3, u8::from(on), 7 << 3, kind]);
     }
     for (field, on) in [(1u8, settings.keep_mute), (2, settings.mute_permanent), (3, settings.auto_lock)] {
         if on { setting.push(field << 3); setting.push(1); }
