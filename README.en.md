@@ -25,16 +25,10 @@
 
 ## Appearance / 外观
 
-The GTK host, viewer launcher, and file transfer / port mapping / terminal list windows share a flat style.
-Choose **Settings → General → Appearance → System / Light / Dark** in the viewer,
-or open the gear settings button in the host / tool windows. Windows in the current process update immediately.
-System is the default and follows the desktop's GTK theme, including theme changes while running;
-Light and Dark use GTK's bundled Adwaita theme for consistent controls and dialogs.
+Choose **System / Light / Dark** (default: System) in the viewer's **Settings → General → Appearance**, or via the gear settings button in host / tool windows.
 The choice is saved to `$XDG_CONFIG_HOME/uuremote/theme` (default `~/.config/uuremote/theme`).
-Other already running host / viewer processes read it on their next start. This changes only the local GTK UI;
-remote desktop images and the SDL control panel are unaffected.
 
-[Light / dark previews and validation notes](docs/ui-appearance.md).
+<p align="center"><img src="docs/images/appearance-light.png" width="360" alt="Light appearance (synthetic devices)"> <img src="docs/images/appearance-dark.png" width="360" alt="Dark appearance (synthetic devices)"></p>
 
 ## Language / 语言
 

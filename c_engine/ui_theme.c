@@ -7,6 +7,7 @@
 static int initialized, mode;
 static const char *modes[] = {"system", "light", "dark"};
 static const char *CSS =
+    "* { font-family: 'Noto Sans CJK SC', 'Noto Sans SC', sans-serif; }\n"
     "@define-color uu_bg mix(@theme_bg_color, @theme_base_color, 0.5);\n"
     "@define-color uu_surface @theme_base_color;\n"
     "@define-color uu_fg @theme_fg_color;\n"

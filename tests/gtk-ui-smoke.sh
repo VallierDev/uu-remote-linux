@@ -1,5 +1,8 @@
 #!/bin/sh
-# Run under xvfb-run -a -s "-screen 0 1600x1200x24". Optional first argument retains synthetic previews in that directory.
+# Requires a C compiler, GTK3/X11 development headers, Xvfb and xauth.
+# Run: xvfb-run -a -s '-screen 0 1600x1200x24' sh tests/gtk-ui-smoke.sh /tmp/gtk-ui-previews
+# Optional output directory retains synthetic main/settings screenshots; no account or QR is used.
+# Checks 5 window types in Chinese/English with System/Light/Dark and settings persistence.
 set -eu
 cd "$(dirname "$0")/.."
 work=$(mktemp -d)
@@ -11,6 +14,8 @@ export XDG_CONFIG_HOME="$work/config"
 export GSETTINGS_BACKEND=memory
 export G_DEBUG=fatal-warnings
 export GDK_BACKEND=x11
+export GDK_SCALE=1
+export GDK_DPI_SCALE=1
 export NO_AT_BRIDGE=1
 unset GTK_THEME
 printf '[Settings]\ngtk-theme-name=Adwaita\ngtk-application-prefer-dark-theme=false\n' > "$XDG_CONFIG_HOME/gtk-3.0/settings.ini"

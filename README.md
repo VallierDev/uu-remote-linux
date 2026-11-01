@@ -21,14 +21,10 @@
 
 ## 外观 / Appearance
 
-GTK 主机、控制端和文件传输 / 端口映射 / 终端列表窗口使用统一的扁平化样式。
-在控制端的 **设置 → 常规 → 外观**，或主机 / 工具窗口的齿轮设置按钮中选择 **跟随系统 / 浅色 / 深色**，
-当前进程中的窗口立即生效。默认跟随桌面的 GTK 主题（包括运行期间的主题变化）；
-浅色和深色使用 GTK 自带的 Adwaita，保证控件和弹窗的配色一致。
-选择保存在 `$XDG_CONFIG_HOME/uuremote/theme`（默认 `~/.config/uuremote/theme`），
-其他已打开的主机 / 控制端进程在下次启动时读取。此设置只影响本地 GTK 界面，远程桌面图像和 SDL 控制面板不受影响。
+在控制端的 **设置 → 常规 → 外观**，或主机 / 工具窗口的齿轮设置按钮中选择 **跟随系统 / 浅色 / 深色**（默认跟随系统）。
+选择保存在 `$XDG_CONFIG_HOME/uuremote/theme`（默认 `~/.config/uuremote/theme`）。
 
-[浅色 / 深色预览与验证说明](docs/ui-appearance.md)。
+<p align="center"><img src="docs/images/appearance-light.png" width="360" alt="浅色界面（虚构设备）"> <img src="docs/images/appearance-dark.png" width="360" alt="深色界面（虚构设备）"></p>
 
 ## 语言 / Language
 

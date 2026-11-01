@@ -26,7 +26,7 @@ static const char *CSS =
     ".icon { background-color: @uu_accent; color: @uu_accent_fg; border-radius: 6px; font-size: 11px; font-weight: 700; padding: 3px 6px; }\n"
     ".icon.off { background-color: @uu_border; color: @uu_muted; }\n"
     ".header { border-bottom: 1px solid @uu_border; padding: 16px 24px; }\n"
-    ".badge { background-color: @uu_tint; color: @uu_fg; border-radius: 8px; padding: 4px 10px; font-size: 13px; }\n"
+    ".badge { background-color: @uu_tint; color: @uu_success; border-radius: 8px; padding: 4px 10px; font-size: 13px; }\n"
     ".badge.off { background-color: @theme_bg_color; color: @uu_muted; }\n"
     ".hbtn { font-size: 17px; padding: 6px 10px; }\n"
     ".preview { background-image: none; background-color: @uu_tint; border-radius: 12px 12px 0 0; }\n"
