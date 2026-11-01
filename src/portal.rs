@@ -883,10 +883,11 @@ pub fn monitor_key(connector: &str) -> String { permissions::monitor_key(connect
 pub fn register(session: &Arc<PortalSession>) {
     *ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(session));
 }
-/// Privacy screen: see `Session::set_virtual`.
+/// Privacy screen: see `Session::set_virtual`. Restoring without a live session is a no-op;
+/// failures switching a live session must reach the controller so its recovery record survives.
 pub fn set_virtual_active(on: bool) -> Result<(), String> {
-    let session = ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(std::sync::Weak::upgrade)
-        .ok_or("Portal desktop unavailable")?;
+    let session = ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(std::sync::Weak::upgrade);
+    let Some(session) = session else { return if on { Err("Portal desktop unavailable".into()) } else { Ok(()) }; };
     session.set_virtual(on)
 }
 pub fn switch_active(connector: &str) -> Result<(), String> {
@@ -929,6 +930,11 @@ pub fn write_frames(session: Arc<PortalSession>, mut output: impl std::io::Write
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn privacy_restore_without_a_desktop_is_a_noop_but_enable_fails() {
+        assert!(super::set_virtual_active(false).is_ok());
+        assert_eq!(super::set_virtual_active(true).unwrap_err(), "Portal desktop unavailable");
+    }
     #[test]
     fn monitor_lines_parse_and_reject_unsafe_connectors() {
         let m = super::parse_monitors("eDP-1\t2880\t1800\t0\t0\t1\nHDMI-1\t2560\t1440\t1920\t0\t0\n../x\t1\t1\t0\t0\t0\n");

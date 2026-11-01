@@ -76,9 +76,12 @@ fn enter(state: &mut State, mode: Mode) -> Result<(), String> {
     if let Some(active) = state.active.as_mut() { active.record = journal.into_record(); }
     let entered = result?;
     *POINTER.lock().map_err(|_| "pointer state poisoned")? = entered.pointer_region;
-    if let Err(e) = crate::system_actions::merge_save(|s| s.privacy_type = Some(mode.wire_type())) { log::warn!("Privacy mode not saved: {e}"); }
     log::info!("Privacy screen enabled: backend={} mode={mode:?}", backend.name());
     Ok(())
+}
+fn save_preference(mode: Mode) {
+    // Session lifecycle takes the settings lock before STATE; never take it while holding STATE.
+    if let Err(e) = crate::system_actions::merge_save(|s| s.privacy_type = Some(mode.wire_type())) { log::warn!("Privacy mode not saved: {e}"); }
 }
 /// RPC 7: `mode` is None for an unknown privacy_type.
 fn set(enable: bool, mode: Option<Mode>) -> Result<(), String> {
@@ -89,6 +92,8 @@ fn set(enable: bool, mode: Option<Mode>) -> Result<(), String> {
     let result = enter(&mut state, mode);
     // A failed rollback keeps the record and the guard: the next request, exit or start retries.
     if result.is_err() { if let Err(e) = leave(&mut state) { log::warn!("Privacy rollback failed: {e}"); } }
+    drop(state);
+    if result.is_ok() { save_preference(mode); }
     result
 }
 /// Why RPC 7 cannot be served at all; checked before answering.
@@ -152,6 +157,7 @@ pub fn probe(mode: Mode) -> Result<(), String> {
         state.sessions = 1;
         enter(&mut state, mode)
     };
+    if result.is_ok() { save_preference(mode); }
     if result.is_ok() { std::thread::sleep(std::time::Duration::from_secs(5)); }
     let mut state = STATE.lock().map_err(|_| "privacy state poisoned")?;
     let restored = leave(&mut state);

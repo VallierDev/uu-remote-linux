@@ -9,6 +9,12 @@
 typedef struct { int x, y, w, h; } Rect;
 static GdkPixbuf *picture;
 
+static gboolean host_closed(GIOChannel *channel, GIOCondition condition, gpointer data) {
+    (void)channel; (void)condition; (void)data;
+    gtk_main_quit();
+    return G_SOURCE_REMOVE;
+}
+
 static gboolean draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
     (void)data;
     int w = gtk_widget_get_allocated_width(widget), h = gtk_widget_get_allocated_height(widget);
@@ -67,8 +73,13 @@ int uu_privacy_wallpaper_run(const char *image, const int *rects, int count) {
         shown++;
     }
     if (!shown) return 2;
+    /* EOF follows the host process, including crashes, rather than its spawning worker thread. */
+    GIOChannel *host = g_io_channel_unix_new(0);
+    guint watch = g_io_add_watch(host, G_IO_HUP | G_IO_ERR | G_IO_NVAL, host_closed, NULL);
     /* Readiness handshake: the host treats picture mode as on only after this line. */
     fputs("ready\n", stdout); fflush(stdout);
     gtk_main();
+    if (g_main_context_find_source_by_id(NULL, watch)) g_source_remove(watch);
+    g_io_channel_unref(host);
     return 0;
 }

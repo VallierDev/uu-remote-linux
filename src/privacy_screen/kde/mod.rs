@@ -86,10 +86,7 @@ impl Backend for Kde {
             if !outputs::physical().is_ok_and(|now| data.outputs.iter().all(|o| now.contains(o))) { return Err(format!("enable outputs: {e}")); }
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if let Err(e) = crate::portal::set_virtual_active(false) {
-            // No portal desktop (last connection gone, or crash recovery): nothing to switch back.
-            log::info!("Privacy capture source not switched back: {e}");
-        }
+        crate::portal::set_virtual_active(false).map_err(|e| format!("restore capture source: {e}"))?;
         devices?;
         log::info!("Privacy KDE restored: outputs={} input_devices={}", data.outputs.len(), data.devices.len());
         Ok(())

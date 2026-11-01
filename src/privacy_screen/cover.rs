@@ -7,15 +7,13 @@ static COVER: Mutex<Option<Child>> = Mutex::new(None);
 pub fn supported() -> bool { cfg!(uu_gtk) }
 /// `rects` are the monitors to cover in the desktop's logical coordinates (x, y, w, h).
 pub fn show(image: Option<&std::path::Path>, rects: &[[f64; 4]]) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     hide();
     let exe = std::env::current_exe().map_err(|e| e.kind().to_string())?;
     let mut command = Command::new(exe);
     command.arg("privacy-wallpaper").arg(image.map(|p| p.as_os_str().to_owned()).unwrap_or_default());
     for rect in rects { command.arg(rect.iter().map(|v| (v.round() as i64).to_string()).collect::<Vec<_>>().join(",")); }
-    // The window must not outlive the host: a crash would leave the picture over the desktop.
-    unsafe { command.pre_exec(|| { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM); Ok(()) }); }
-    let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).spawn().map_err(|e| format!("cover window: {}", e.kind()))?;
+    // Keep the pipe writer in Child for the host's lifetime, independently of its spawning thread.
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().map_err(|e| format!("cover window: {}", e.kind()))?;
     // A spawned child is not a shown cover: GTK init or monitor matching can still fail (exit 1/2).
     let stdout = child.stdout.take().ok_or("cover window: no stdout")?;
     let (tx, rx) = std::sync::mpsc::channel();
