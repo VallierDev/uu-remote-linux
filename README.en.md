@@ -303,6 +303,8 @@ sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
 `uaccess` grants access only to the user sitting at the machine. `UU_INPUT_BACKEND=uinput|native` forces a backend.
 X11 keeps XTest by default because it handles held keys correctly on high-latency links.
 
+With uinput available, single-output Portal desktops route keyboard events, pointer motion, buttons and wheels through kernel devices. Absolute motion and clicks use the same device queue without synchronous Portal calls. `UU_INPUT_BACKEND=uinput` forces ordinary keyboard/mouse events through uinput; absolute coordinates span the entire desktop. Auto mode retains native pointer positioning for multiple or unknown outputs to avoid stretching one captured monitor across the desktop. Restart the host after display-layout changes to select the route again. Full uinput pointer mode maps mobile touch to mouse dragging. Committed IME text first uses a read-only X11/XWayland XKB query to translate its mappable ASCII prefix (case, digits and punctuation) into uinput keys, accounting for the current layout, locked modifiers and balanced Shift release without using the clipboard. Remaining text keeps its existing text/clipboard path.
+
 ## Remote assistance and the main window (experimental)
 
 As in the official client, this host shows a **device ID** and a **verification code**; whoever you give them to can

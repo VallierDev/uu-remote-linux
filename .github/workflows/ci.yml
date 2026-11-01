@@ -124,10 +124,16 @@ jobs:
           sudo apt-get install -y build-essential pkg-config \
             libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
             libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev \
-            libpulse-dev libopus-dev \
+            libpulse-dev libopus-dev xvfb xauth \
             libwayland-dev libxkbcommon-dev libglib2.0-dev libpipewire-0.3-dev libei-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Read-only uinput text keymap regression
+        run: |
+          cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -Wall -Wextra tests/uinput_keymap.c -o /tmp/uu-uinput-keymap-test -lX11
+          ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+            xvfb-run -a /tmp/uu-uinput-keymap-test
       - run: cargo test --locked --features inproc-av
       - run: cargo test --locked --features inproc-av,wayland,portal
 
