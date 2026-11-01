@@ -15,6 +15,20 @@ impl std::error::Error for PortalError {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FrameVersion(usize, u64);
+
+#[repr(C)]
+#[derive(Default)]
+pub struct DmaFrame {
+    pub fd: i32,
+    pub fourcc: u32,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub offset: u32,
+    pub size: u32,
+    pub modifier: u64,
+}
+pub enum DmaCapture<T> { Frame(T), Pending, Cpu, Blank, Unavailable(i32) }
 #[cfg(unix)]
 #[path = "portal_permissions.rs"]
 mod permissions;
@@ -25,6 +39,7 @@ mod native {
     crate::engine_ffi! { crate::engine_plugin::Engine::Portal;
         fn uu_portal_open_persist(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_open_persist_cancellable(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), save_data: *mut c_void, cancelled: extern "C" fn(*mut c_void) -> i32, cancel_data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
+        fn uu_portal_open_persist_capture(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), save_data: *mut c_void, cancelled: Option<extern "C" fn(*mut c_void) -> i32>, cancel_data: *mut c_void, prefer_dmabuf: i32, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_clipboard_supported(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_ready(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_set(portal: *mut c_void, text: *const u8, length: usize) -> i32;
@@ -35,6 +50,9 @@ mod native {
         fn uu_portal_input_dispatch(portal: *mut c_void);
         fn uu_portal_reset_frame(portal: *mut c_void);
         fn uu_portal_capture_since(portal: *mut c_void, bgra: *mut u8, length: usize, revision: *mut u64) -> i32;
+        fn uu_portal_dmabuf_acquire(portal: *mut c_void, frame: *mut super::DmaFrame, revision: *mut u64) -> i32;
+        fn uu_portal_dmabuf_release(portal: *mut c_void);
+        fn uu_portal_dmabuf_disable(portal: *mut c_void);
         fn uu_portal_move(portal: *mut c_void, x: f64, y: f64, relative: i32) -> i32;
         fn uu_portal_button(portal: *mut c_void, button: i32, pressed: i32) -> i32;
         fn uu_portal_key(portal: *mut c_void, keysym: u32, keycode: i32, pressed: i32) -> i32;
@@ -149,7 +167,21 @@ mod native {
                 if result.is_err() { log::warn!("Portal permission cache callback failed"); }
             }
             let restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
-            let pointer = unsafe {
+            #[allow(unused_mut)]
+            let mut pointer: *mut c_void = std::ptr::null_mut();
+            #[cfg(feature = "inproc-av")]
+            if crate::video::native_engine_eligible(crate::video_select::selection().encoder, crate::video::NativeDisplayKind::Portal)
+                && !std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v| v == "0") {
+                let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
+                let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
+                pointer = unsafe { uu_portal_open_persist_capture(
+                    restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
+                    &mut error, &mut width, &mut height,
+                ) };
+                if pointer.is_null() && error != 0 { return Err(super::PortalError { code: error }); }
+                if pointer.is_null() { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
+            }
+            let pointer = if !pointer.is_null() { pointer } else { unsafe {
                 if let Some(cancelled) = cancelled {
                     uu_portal_open_persist_cancellable(
                         restore, save_token, &mut cache as *mut _ as *mut c_void,
@@ -159,7 +191,7 @@ mod native {
                 } else {
                     uu_portal_open_persist(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
                 }
-            };
+            } };
             let handle = NonNull::new(pointer).ok_or(super::PortalError { code: error })?;
             let (mut x, mut y) = (0, 0);
             let granted = (unsafe { uu_portal_stream_position(handle.as_ptr(), &mut x, &mut y) } == 0)
@@ -172,9 +204,8 @@ mod native {
                 if super::permissions::save(dir, &saved, &token).is_err() { log::warn!("Portal permission cache could not be saved"); }
             }
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
-            // A freshly opened session holds no lock-screen frame: only an observed lock (or a
-            // closed stream) must discard the cached frame. Starting "locked" cleared the first
-            // valid frame, and a static desktop sends no new one, so the viewer stayed black (#2).
+            // Keep a freshly granted compositor frame regardless of lock state. Discarding it
+            // before new damage can leave a static desktop permanently blank (#2).
             Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted) })
         }
         /// Frame pixels of the monitor the stream currently follows.
@@ -210,6 +241,10 @@ mod native {
         }
         pub fn open() -> Result<Self, String> {
             Self::open_inner(None, None, false).map_err(|error| error.to_string())
+        }
+        #[cfg(test)]
+        pub(crate) fn test_lock_watch(&mut self, locked: tokio::sync::watch::Receiver<Option<bool>>) {
+            self.locked = locked;
         }
         /// A consent saved before touch support restores keyboard and pointer only. Ask the host once
         /// more (GNOME shows its share dialog; the consent timeout closes it) and swap the new session
@@ -276,6 +311,7 @@ mod native {
         }
         pub fn pause(&self) {
             if let Ok(handle) = self.handle.lock() {
+                if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } != 0 { return; }
                 unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
                 self.was_locked.store(true, std::sync::atomic::Ordering::Release);
             } else {
@@ -283,7 +319,46 @@ mod native {
             }
         }
         pub fn capture(&self, frame: &mut [u8]) -> Result<(), String> {
-            self.capture_changed(frame, &mut None).map(|_| ())
+            let mut version = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                self.capture_changed(frame, &mut version)?;
+                // A one-shot snapshot must wait for SHM renegotiation after DMA initialization.
+                // Release the handle between attempts so input and recovery remain responsive.
+                if version != Some(super::FrameVersion(0, 0)) || std::time::Instant::now() >= deadline { return Ok(()); }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        pub fn disable_dmabuf(&self) {
+            if let Ok(handle) = self.handle.lock() { unsafe { uu_portal_dmabuf_disable(handle.0.as_ptr()) }; }
+        }
+        pub fn with_dmabuf<T>(&self, version: &mut Option<super::FrameVersion>,
+            encode: impl FnOnce(&super::DmaFrame, bool) -> Result<T, String>,
+        ) -> Result<super::DmaCapture<T>, String> {
+            let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
+            unsafe { uu_portal_input_dispatch(handle.0.as_ptr()) };
+            // Hold the handle guard through GPU completion, so monitor swaps cannot invalidate a lease.
+            if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } == 0 {
+                return Ok(super::DmaCapture::Cpu);
+            }
+            let identity = handle.0.as_ptr() as usize;
+            let mut revision = version.filter(|v| v.0 == identity).map_or(0, |v| v.1);
+            let mut frame = super::DmaFrame::default();
+            match unsafe { uu_portal_dmabuf_acquire(handle.0.as_ptr(), &mut frame, &mut revision) } {
+                code @ (0 | 12) => {
+                    struct Lease(*mut c_void);
+                    impl Drop for Lease {
+                        fn drop(&mut self) { unsafe { uu_portal_dmabuf_release(self.0) }; }
+                    }
+                    let _lease = Lease(handle.0.as_ptr());
+                    let encoded = encode(&frame, code == 0)?;
+                    *version = Some(super::FrameVersion(identity, revision));
+                    Ok(super::DmaCapture::Frame(encoded))
+                },
+                10 => Ok(super::DmaCapture::Pending),
+                15 => Ok(super::DmaCapture::Blank),
+                code => Ok(super::DmaCapture::Unavailable(code)),
+            }
         }
         pub fn capture_changed(&self, frame: &mut [u8], version: &mut Option<super::FrameVersion>) -> Result<bool, String> {
             let (width, height) = self.size();
@@ -293,21 +368,18 @@ mod native {
             // Drain EIS even on a static desktop so pause/disconnect and sync
             // events are processed without waiting for remote input.
             unsafe { uu_portal_input_dispatch(handle.0.as_ptr()) };
-            let state = *self.locked.borrow();
-            if state != Some(false) {
-                // Unknown state (watcher not reported yet): show nothing but keep the cached frame.
-                if state == Some(true) {
+            if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } == 0 {
+                // A healthy source is forwarded regardless of lock state. Only an unavailable
+                // source is blanked; wait for unlock before reopening a compositor-closed session.
+                if *self.locked.borrow() != Some(false) {
                     unsafe { uu_portal_reset_frame(handle.0.as_ptr()) };
                     self.was_locked.store(true, std::sync::atomic::Ordering::Release);
+                    return Ok(blank_changed(frame, version));
                 }
-                return Ok(blank_changed(frame, version));
-            }
-            if self.was_locked.load(std::sync::atomic::Ordering::Acquire) {
-                // First unlocked capture after a real lock: drop frames captured while locked.
-                if self.take_lock_observation()? { unsafe { uu_portal_reset_frame(handle.0.as_ptr()) }; }
-                return Ok(blank_changed(frame, version));
-            }
-            if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } == 0 {
+                if self.was_locked.load(std::sync::atomic::Ordering::Acquire) {
+                    if self.take_lock_observation()? { unsafe { uu_portal_reset_frame(handle.0.as_ptr()) }; }
+                    return Ok(blank_changed(frame, version));
+                }
                 // Serialize recovery without making another capture worker hold
                 // the input mutex while waiting for this worker's Portal calls.
                 let mut recovery = match self.recovery.try_lock() {
@@ -351,6 +423,7 @@ mod native {
                 // Recheck lock state on the next capture before showing the new session.
                 return Ok(blank_changed(frame, version));
             } else {
+                self.was_locked.store(false, std::sync::atomic::Ordering::Release);
                 match self.recovery.try_lock() {
                     Ok(mut recovery) => recovery.retry_at = None,
                     Err(TryLockError::WouldBlock) => (),
@@ -739,6 +812,10 @@ impl PortalSession {
     pub fn pause(&self) {}
     pub fn capture(&self, _: &mut [u8]) -> Result<(), String> { Err(error(15)) }
     pub fn capture_changed(&self, _: &mut [u8], _: &mut Option<FrameVersion>) -> Result<bool, String> { Err(error(15)) }
+    pub fn disable_dmabuf(&self) {}
+    pub fn with_dmabuf<T>(&self, _: &mut Option<FrameVersion>, _: impl FnOnce(&DmaFrame, bool) -> Result<T, String>) -> Result<DmaCapture<T>, String> {
+        Ok(DmaCapture::Unavailable(-1))
+    }
     pub fn move_pointer(&self, _: f64, _: f64, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn button(&self, _: i32, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn touch_supported(&self) -> bool { false }
