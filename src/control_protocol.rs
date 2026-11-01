@@ -180,8 +180,11 @@ pub fn encode_echo_response_with_clipboard(seq: u64, timestamp: u64, request_seq
     // FeatureFlag: 1 ff_capture_setting = CUSTOM_BITRATE (fps/quality/bitrate RPCs),
     // 2 ff_simple_action = AUTO_LOCK (mute + lock after session), 3 ff_system_metrics = SETTING_AUTO_LOCK,
     // 6 ff_file_transfer_ftp = LIST_COMPRESS (zlib dir_data), 8 ff_clipboard = SUPPORT_TEXT_CHANGE.
-    let mut flags = vec![8, crate::capture_setting::FEATURE_VERSION as u8,
-        16, crate::system_actions::FF_SIMPLE_ACTION, 24, crate::system_actions::FF_SYSTEM_METRICS, 48, 2];
+    // On X11: 3 ff_system_metrics = SETTING_PRIVATE_SCREEN (3), 4 ff_private_screen = INIT_VERION (normal privacy).
+    let mut flags = vec![8, crate::capture_setting::FEATURE_VERSION as u8, 16, crate::system_actions::FF_SIMPLE_ACTION];
+    if crate::privacy_screen::supported() { flags.extend_from_slice(&[24, 3, 32, crate::privacy_screen::FF_PRIVATE_SCREEN]); }
+    else { flags.extend_from_slice(&[24, crate::system_actions::FF_SYSTEM_METRICS]); }
+    flags.extend_from_slice(&[48, 2]);
     if clipboard { flags.extend_from_slice(&[64, 3]); }
     action.push(34);
     action.push(flags.len() as u8);

@@ -211,6 +211,11 @@ started a second full host server instead, so check that a subcommand exists in 
 - SystemMetrics (Message 13): GeneralMetric `2 system_sound_support` is an enum, **2 = supported** (1 = not
   supported); SettingMetric 1 keep_mute, 2 mute_permanent, 3 auto_lock, 5 file_transfer_save_location,
   8/9/10 permission states (2 = allow).
+- 防窥 (privacy screen): RpcRequest 7 `PrivateScreenSettingRequest {1 enable, 2 privacy_type, 3 setting_source}` →
+  RpcResponse 3 `{1 error_code, 2 req_privacy_type, 3 cur_privacy_type}`; PrivateScreenType 1 NOT_SET, 2 NORMAL,
+  3 ENHANCED (wallpaper). Declared on X11 only: FeatureFlag `4 ff_private_screen=1`, `3 ff_system_metrics=3`;
+  SettingMetric 4 private_screen, 7 private_screen_type (`src/privacy_screen.rs`, xrandr brightness 0, saved
+  gamma restored on session end / SIGTERM / next start). Not yet accepted with an official viewer.
 - Security menu: 静音运行 on → SimpleAction 14 + 18, off → 16. 远程结束后自动锁屏 → SimpleAction 19 with
   `value` (field 5) **2 = on, 1 = off**. The viewer sends these only when toggled, so the host persists them.
 - Auto unlock: host reports `SystemStateChange{1 SecureDesktopState{1 is_locked, 5 is_support_auto_logon}}`;

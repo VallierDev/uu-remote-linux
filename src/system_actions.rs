@@ -32,6 +32,8 @@ pub(crate) struct Settings {
     #[serde(default)] auto_lock: bool,
     #[serde(default)] keep_mute: bool,
     #[serde(default)] mute_permanent: bool,
+    /// 防窥 type the viewer chose (privacy_screen::PS_NORMAL), 0 = never set.
+    #[serde(default)] pub(crate) privacy_screen_type: u64,
     /// "auto" or absent does not override the environment. A non-string value becomes None so a bad
     /// video field cannot drop auto_lock / mute when the document is loaded.
     #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_encoder: Option<String>,
@@ -273,6 +275,7 @@ impl PeerActions {
         let mut state = state().lock().unwrap();
         state.desktop_sessions = state.desktop_sessions.saturating_sub(1);
         if state.desktop_sessions > 0 { return; }
+        crate::privacy_screen::disable();
         crate::virtual_audio::disable();
         if !state.settings.mute_permanent { restore_mute(&mut state); }
         if state.settings.auto_lock {
@@ -287,6 +290,7 @@ impl PeerActions {
         let current = state().lock().unwrap().settings.clone();
         payload_with_settings(desktop, desktop, desktop, &home, &crate::system_metrics::Settings {
             sound, keep_mute: current.keep_mute, mute_permanent: current.mute_permanent, auto_lock: current.auto_lock,
+            private_screen: crate::privacy_screen::supported().then(|| (crate::privacy_screen::active(), crate::privacy_screen::current_type())),
         })
     }
 }

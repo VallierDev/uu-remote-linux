@@ -1121,6 +1121,22 @@ impl WebRtcSession {
                             use crate::protocol::WireValue;
                             let rpc = fields.iter().find_map(|f| match (f.number, &f.value) { (21, WireValue::Bytes(b)) => Some(*b), _ => None });
                             let rpc_fields = rpc.and_then(|r| crate::protocol::decode_wire(r).ok());
+                            if let Some(request) = rpc.filter(|_| rpc_fields.as_deref().is_some_and(crate::privacy_screen::is_request)) {
+                                let (request, actions, chan, seq_out, rpc_out) = (request.to_vec(), actions.clone(), reply_chan.clone(), out_sequence.clone(), rpc_out.clone());
+                                let settings_portal = portal_for_message.clone();
+                                tokio::spawn(async move {
+                                    let response = tokio::task::spawn_blocking(move || crate::protocol::decode_wire(&request).ok()
+                                        .and_then(|r| crate::privacy_screen::rpc_response(&r))).await.ok().flatten();
+                                    let Some(response) = response else { return };
+                                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                    let _ = rpc_out.send(crate::initialization::envelope(seq_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                    // The 防窥 switch shows SettingMetric 4 like the other 安全 settings.
+                                    let permission = settings_portal.as_ref().map_or(crate::system_metrics::Permission::Allow, |manager| manager.snapshot().permission(desktop));
+                                    let message = crate::initialization::envelope(seq_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &actions.metrics_payload(desktop_sound, permission));
+                                    if let Err(e) = chan.send(&bytes::Bytes::from(message)).await { log::warn!("Settings report failed: {}", e); }
+                                });
+                                return;
+                            }
                             if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
