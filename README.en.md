@@ -210,6 +210,8 @@ sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
 # optional: headers for the inproc-av VAAPI/DRI3 engines (libva itself is loaded at runtime)
 sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
+# In-process audio capture and Opus encoding for inproc-av
+sudo apt install libpulse-dev libopus-dev
 ```
 
 - A Rust toolchain is required (<https://rustup.rs>).
@@ -227,6 +229,9 @@ cargo build --release --features wayland,portal   # + GNOME/KDE on Wayland
 
 The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config --modversion libavcodec` = 60.x); FFmpeg 7+ fails inside `ffmpeg-sys-next` with `avfft.h file not found` (#63).
 The host's optional `--features inproc-av` encodes with hardware inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
+
+On GNOME/KDE Wayland, enable in-process encoding with `cargo build --release --features wayland,portal,inproc-av` and `set-encoder vaapi`; support is limited to Portal + VAAPI.
+`UU_PORTAL_DMABUF=0` disables DMA-BUF in favor of in-process host upload; `UU_VIDEO_PIPELINE=process` restores external FFmpeg pipelines.
 
 ### 3. Log in
 
@@ -291,6 +296,8 @@ sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
 
 `uaccess` grants access only to the user sitting at the machine. `UU_INPUT_BACKEND=uinput|native` forces a backend.
 X11 keeps XTest by default because it handles held keys correctly on high-latency links.
+
+ASCII text mapping through uinput requires X11/XWayland XKB; unmappable text keeps the existing text/clipboard path.
 
 ## Remote assistance and the main window (experimental)
 

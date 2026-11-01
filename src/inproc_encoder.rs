@@ -2,6 +2,7 @@
 //! With UU_VIDEO_ENCODER=vaapi, H.264 / HEVC go through VAAPI instead: a DRI3 DMA-BUF of the root window is
 //! imported as a VA surface and converted/scaled by VPP, so the CPU never touches the pixels (XShm upload
 //! when DRI3 is unavailable).
+//! Portal sessions can instead upload their existing BGRA frames, sharing the same GPU VPP and encoder.
 //! When capture and encoder sizes match, the XShm buffer is registered as CUDA pinned memory and
 //! NVENC reads it by DMA, so there is no host-to-device copy (the X server still writes XShm).
 
@@ -77,6 +78,7 @@ extern "C" {
 
     fn vaapi_create(config: *const VaapiConfigFFI) -> *mut VaapiEngineOpaque;
     fn vaapi_import_dma_buffer(engine: *mut VaapiEngineOpaque, dma_fd: libc::c_int, stride: u32) -> libc::c_int;
+    fn vaapi_import_frame(engine: *mut VaapiEngineOpaque, frame: *const crate::portal::DmaFrame) -> libc::c_int;
     fn vaapi_upload_host_buffer(engine: *mut VaapiEngineOpaque, host_ptr: *const u8, pitch: u32) -> libc::c_int;
     fn vaapi_encode_frame(
         engine: *mut VaapiEngineOpaque,
@@ -130,6 +132,7 @@ impl Drop for SafeDri3Capture {
 }
 
 pub struct Config {
+    pub portal: Option<Arc<crate::portal::PortalSession>>,
     pub display: String,
     pub input: (u32, u32),
     pub output: Option<(u32, u32)>,
@@ -218,6 +221,28 @@ pub fn run(
     }
 }
 
+pub fn black_frame(codec: crate::capture_setting::VideoCodec) -> Result<bytes::Bytes, String> {
+    let device = CString::new(crate::video::vaapi_device()).map_err(|_| "Invalid VAAPI device")?;
+    let config = VaapiConfigFFI {
+        width: 1280, height: 720, cap_width: 1280, cap_height: 720, fps: 1, gop: 1,
+        target_bps: 1_000_000, max_bps: 2_000_000, buffer_bits: 500_000,
+        is_hevc: libc::c_int::from(codec == crate::capture_setting::VideoCodec::H265),
+        device: device.as_ptr(),
+    };
+    let engine = SafeVaapiEngine(unsafe { vaapi_create(&config) });
+    if engine.0.is_null() { return Err("Locked video VAAPI initialization failed".into()); }
+    let pixels = vec![0; 1280 * 720 * 4];
+    if unsafe { vaapi_upload_host_buffer(engine.0, pixels.as_ptr(), 1280 * 4) } != 0 {
+        return Err("Locked video VAAPI upload failed".into());
+    }
+    let mut data = std::ptr::null();
+    let mut length = 0;
+    if unsafe { vaapi_encode_frame(engine.0, 1, &mut data, &mut length) } != 0 || data.is_null() || length == 0 {
+        return Err("Locked video VAAPI encode failed".into());
+    }
+    Ok(bytes::Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(data, length as usize) }))
+}
+
 fn run_vaapi(
     config: Config,
     units: mpsc::Sender<EncodedUnit>,
@@ -257,6 +282,9 @@ fn run_vaapi(
         return Err("Failed to create native VAAPI engine".into());
     }
     let engine = SafeVaapiEngine(raw_engine);
+    if let Some(portal) = config.portal.as_ref() {
+        return run_portal_vaapi(&config, portal, &engine, units, stop, idr, budget);
+    }
 
     // Capture stays at the full input size; VPP scales (or pads) to the encoder size.
     let display = CString::new(config.display.as_str()).map_err(|_| "DISPLAY contains NUL".to_string())?;
@@ -392,6 +420,115 @@ fn run_vaapi(
         keepalive = random_keepalive(&mut seed);
     }
 }
+fn vaapi_packet(engine: &SafeVaapiEngine, idr: &AtomicBool) -> Result<Vec<u8>, String> {
+    let mut data = std::ptr::null();
+    let mut length = 0;
+    let force_idr = libc::c_int::from(idr.swap(false, Ordering::AcqRel));
+    let result = unsafe { vaapi_encode_frame(engine.0, force_idr, &mut data, &mut length) };
+    if result != 0 { return Err(format!("VAAPI encode failed: {result}")); }
+    if data.is_null() || length == 0 { return Ok(Vec::new()); }
+    Ok(unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec())
+}
+
+fn run_portal_vaapi(
+    config: &Config, portal: &crate::portal::PortalSession, engine: &SafeVaapiEngine,
+    units: mpsc::Sender<EncodedUnit>, stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+) -> Result<(), String> {
+    use crate::portal::DmaCapture;
+    let interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps));
+    let mut next_poll = Instant::now();
+    let mut last_send = Instant::now();
+    let mut seed = 1;
+    let mut keepalive = random_keepalive(&mut seed);
+    let mut dma_version = None;
+    let mut cpu_version = None;
+    let mut cpu_frame = Vec::new();
+    let mut uploaded = false;
+    let mut input_dma = false;
+    let mut blank_frame = false;
+    let mut dma_disabled = std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v| v == "0");
+    if dma_disabled { log::info!("Portal VAAPI DMA-BUF disabled by setting; pipeline=host-upload"); }
+    loop {
+        if stop.load(Ordering::Relaxed) || units.is_closed() { return Ok(()); }
+        std::thread::sleep(next_poll.saturating_duration_since(Instant::now()).min(Duration::from_millis(20)));
+        let now = Instant::now();
+        if now < next_poll { continue; }
+        next_poll = (next_poll + interval).max(now);
+        if portal.size() != config.input { return Err("Portal size changed; restart encoder".into()); }
+        let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
+        let due = last_send.elapsed() >= keepalive || idr.load(Ordering::Acquire);
+        let captured = if dma_disabled { Ok(DmaCapture::Cpu) } else {
+            portal.with_dmabuf(&mut dma_version, |frame, changed| {
+                if !changed && input_dma && !due { return Ok(None); }
+                if changed || !input_dma {
+                    let result = unsafe { vaapi_import_frame(engine.0, frame) };
+                    if result != 0 { return Err(format!("VAAPI DMA-BUF import failed: {result}")); }
+                }
+                // vaapi_encode_frame waits for VA completion before the PipeWire lease is released.
+                let packet = vaapi_packet(engine, &idr)?;
+                if !input_dma {
+                    log::info!("Portal VAAPI capture pipeline=dma-buf zero_cpu_copy=true source={}x{} fourcc={} modifier={}",
+                        frame.width, frame.height, frame.fourcc, frame.modifier);
+                }
+                input_dma = true;
+                blank_frame = false;
+                uploaded = true;
+                Ok(Some(packet))
+            })
+        };
+        let captured = match captured {
+            Ok(DmaCapture::Unavailable(code)) => {
+                let reason = match code {
+                    14 => "buffer layout unsupported or DMA-BUF disabled for this session",
+                    16 => "compositor selected shared memory",
+                    17 => "DMA-BUF negotiation or first frame timed out",
+                    18 => "explicit synchronization unsupported",
+                    19 => "nonlinear modifier unsupported",
+                    _ => "DMA-BUF interface unavailable",
+                };
+                log::warn!("Portal DMA-BUF unavailable: {reason} (code={code}); falling back to native VAAPI host upload");
+                dma_disabled = true; portal.disable_dmabuf();
+                DmaCapture::Cpu
+            },
+            Err(error) => {
+                log::warn!("Portal DMA-BUF unavailable: {error}; falling back to native VAAPI host upload");
+                dma_disabled = true; portal.disable_dmabuf();
+                DmaCapture::Cpu
+            },
+            Ok(value) => value,
+        };
+        let data = match captured {
+            DmaCapture::Frame(Some(packet)) => packet,
+            DmaCapture::Frame(None) | DmaCapture::Pending => continue,
+            state @ (DmaCapture::Cpu | DmaCapture::Blank) => {
+                cpu_frame.resize(config.input.0 as usize * config.input.1 as usize * 4, 0);
+                let changed = if matches!(state, DmaCapture::Blank) {
+                    let changed = !blank_frame;
+                    if changed { cpu_frame.fill(0); }
+                    blank_frame = true;
+                    changed
+                } else {
+                    blank_frame = false;
+                    portal.capture_changed(&mut cpu_frame, &mut cpu_version)?
+                };
+                if !changed && !input_dma && uploaded && !due { continue; }
+                if changed || input_dma || !uploaded {
+                    let result = unsafe { vaapi_upload_host_buffer(engine.0, cpu_frame.as_ptr(), config.input.0 * 4) };
+                    if result != 0 { return Err(format!("Portal VAAPI upload failed: {result}")); }
+                    input_dma = false; uploaded = true;
+                }
+                vaapi_packet(engine, &idr)?
+            },
+            DmaCapture::Unavailable(_) => unreachable!(),
+        };
+        if data.is_empty() { continue; }
+        if units.blocking_send(EncodedUnit { data, permit, completed_at: Instant::now() }).is_err() { return Ok(()); }
+        last_send = Instant::now();
+        keepalive = random_keepalive(&mut seed);
+    }
+}
+
 fn vaapi_wait(dri3: &Option<SafeDri3Capture>, capture: &mut Option<DamageCapture>, timeout: Duration) -> Result<bool, String> {
     match (dri3, capture) {
         (Some(c), _) => match unsafe { dri3_capture_wait_damage(c.0, timeout.as_millis().min(1000) as i32) } {
@@ -664,6 +801,24 @@ fn pad_argb32(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, ds
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+    #[test]
+    #[ignore = "requires a VAAPI render node and FFmpeg for independent decode verification"]
+    fn vaapi_locked_frames_decode_as_black_in_both_codecs() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        for codec in [crate::capture_setting::VideoCodec::H264, crate::capture_setting::VideoCodec::H265] {
+            let frame = black_frame(codec).unwrap();
+            let mut decoder = Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+                "-frames:v", "1", "-vf", "scale=1:1", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            decoder.stdin.take().unwrap().write_all(&frame).unwrap();
+            let decoded = decoder.wait_with_output().unwrap();
+            assert!(decoded.status.success(), "decode failed for {codec:?}");
+            assert_eq!(decoded.stdout.len(), 3);
+            assert!(decoded.stdout.iter().all(|&value| value <= 3), "frame is not black for {codec:?}");
+        }
+    }
+
     #[tokio::test]
     async fn closing_encoder_output_wakes_a_blocked_capture() {
         let budget = Arc::new(Semaphore::new(0));
@@ -724,5 +879,240 @@ mod frame_tests {
                 assert_eq!(out[(y * 4 + x) * 4], expected, "({x},{y})");
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "portal"))]
+mod portal_hardware_tests {
+    // Run on an unlocked desktop with saved Portal consent and VAAPI selected.
+    // FFmpeg is used only for independent decode verification; desktop contents
+    // are neither saved nor printed. These tests do not lock the real desktop
+    // or replace system lock-screen acceptance in an isolated VM.
+    use super::*;
+    use crate::capture_setting::VideoCodec;
+
+    struct Runner {
+        stop: Arc<AtomicBool>,
+        idr: Arc<AtomicBool>,
+        rx: mpsc::Receiver<EncodedUnit>,
+        job: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    }
+    impl Drop for Runner {
+        fn drop(&mut self) { self.stop.store(true, Ordering::Release); self.rx.close(); }
+    }
+    impl Runner {
+        fn start(portal: Arc<crate::portal::PortalSession>, codec: VideoCodec) -> Self {
+            let config = Config {
+                input: portal.size(), portal: Some(portal), display: "wayland:portal".into(),
+                output: None, fps: 60, gop: 120, cq: 18, target_bps: 16_000_000,
+                max_bps: 30_000_000, buffer_bits: 500_000, codec,
+                chroma: crate::capture_setting::CHROMA_420, vaapi: true,
+            };
+            let (tx, rx) = mpsc::channel(4);
+            let stop = Arc::new(AtomicBool::new(false));
+            let idr = Arc::new(AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let worker_idr = idr.clone();
+            let job = tokio::task::spawn_blocking(move || run(config, tx, worker_stop, worker_idr, Arc::new(Semaphore::new(4))));
+            Self { stop, idr, rx, job: Some(job) }
+        }
+        async fn frame(&mut self) -> Vec<u8> {
+            tokio::time::timeout(Duration::from_secs(10), self.rx.recv()).await.unwrap()
+                .expect("native capture stopped").data
+        }
+        async fn hevc_idr(&mut self) -> Vec<u8> {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let frame = self.frame().await;
+                    let nals = crate::hevc::payload(usize::MAX, &frame).unwrap();
+                    if nals.iter().any(|nal| (16..=21).contains(&((nal[0] >> 1) & 63))) { return frame; }
+                }
+            }).await.expect("requested HEVC IDR did not arrive")
+        }
+        async fn finish(mut self) {
+            self.stop.store(true, Ordering::Release);
+            self.rx.close();
+            tokio::time::timeout(Duration::from_secs(2), self.job.take().unwrap()).await
+                .expect("native encoder did not stop").unwrap().unwrap();
+        }
+    }
+    fn decoded_is_black(data: &[u8], codec: VideoCodec) -> bool {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let format = if codec == VideoCodec::H265 { "hevc" } else { "h264" };
+        let mut decoder = Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-f", format,
+            "-i", "pipe:0", "-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        // Concurrent writing avoids filling stdin while the decoder is blocked on raw RGB output.
+        let mut input = decoder.stdin.take().unwrap();
+        let encoded = data.to_vec();
+        let writer = std::thread::spawn(move || input.write_all(&encoded));
+        let decoded = decoder.wait_with_output().unwrap();
+        writer.join().unwrap().unwrap();
+        assert!(decoded.status.success() && !decoded.stdout.is_empty(), "native frame decode failed");
+        decoded.stdout.iter().all(|&value| value <= 8)
+    }
+    fn resources() -> (usize, u64) {
+        let fds = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let rss = std::fs::read_to_string("/proc/self/status").unwrap().lines()
+            .find(|line| line.starts_with("VmRSS:")).unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+        (fds, rss)
+    }
+    async fn reopen(portal: Arc<crate::portal::PortalSession>) {
+        tokio::task::spawn_blocking(move || {
+            portal.end();
+            assert!(portal.recover(&AtomicBool::new(false)).unwrap());
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an unlocked Portal desktop and saved consent"]
+    async fn portal_snapshot_after_dma_initialization() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        tokio::task::spawn_blocking(|| {
+            let mut portal = crate::portal::PortalSession::open().unwrap();
+            let (locked, watch) = tokio::sync::watch::channel(Some(false));
+            portal.test_lock_watch(watch);
+            assert!(matches!(portal.with_dmabuf(&mut None, |_, _| Ok(())).unwrap(), crate::portal::DmaCapture::Frame(())));
+            let (width, height) = portal.size();
+            let mut pixels = vec![0; width as usize * height as usize * 4];
+            for state in [Some(true), None, Some(false)] {
+                locked.send(state).unwrap();
+                portal.pause();
+                portal.capture(&mut pixels).unwrap();
+                assert!(pixels.chunks_exact(4).any(|p| p[..3].iter().any(|&v| v > 8)),
+                    "healthy snapshot was blanked for lock state {state:?}");
+                println!("snapshot_lock_state={state:?} valid_frame=true");
+            }
+        }).await.unwrap();
+    }
+
+    // RUST_LOG=info cargo test --release --locked --features wayland,portal,inproc-av portal_five_minute_endurance_with_full_decode -- --ignored --nocapture
+    // Run for five minutes, independently decode every output frame, require equal
+    // encoded/decoded counts and no decode errors, and report CPU, RSS and FDs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "five-minute real Portal/VAAPI run; FFmpeg is used only as an independent decoder"]
+    async fn portal_five_minute_endurance_with_full_decode() {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let _ = env_logger::builder().is_test(true).try_init();
+        let session = tokio::task::spawn_blocking(crate::portal::PortalSession::open).await.unwrap().unwrap();
+        let mut runner = Runner::start(Arc::new(session), VideoCodec::H265);
+        let mut decoder = tokio::process::Command::new("ffmpeg").args([
+            "-hide_banner", "-loglevel", "error", "-nostats", "-threads", "2", "-f", "hevc", "-i", "pipe:0",
+            "-progress", "pipe:1", "-fps_mode", "passthrough", "-f", "null", "/dev/null",
+        ]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let mut input = decoder.stdin.take().unwrap();
+        let mut errors = decoder.stderr.take().unwrap();
+        let error_reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buffer = [0; 2048];
+            loop {
+                let count = errors.read(&mut buffer).await.unwrap();
+                if count == 0 { return total; }
+                total += count;
+            }
+        });
+        let output = decoder.stdout.take().unwrap();
+        let progress_reader = tokio::spawn(async move {
+            let mut lines = BufReader::new(output).lines();
+            let mut frames = 0u64;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if let Some(count) = line.strip_prefix("frame=") { frames = count.trim().parse().unwrap(); }
+            }
+            frames
+        });
+        let ticks = || {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+            let fields: Vec<_> = stat.split_once(") ").unwrap().1.split_whitespace().collect();
+            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+        };
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        let started = Instant::now();
+        let mut last_report = started;
+        let mut last_ticks = ticks();
+        let mut frames = 0u64;
+        while started.elapsed() < Duration::from_secs(300) {
+            let data = runner.frame().await;
+            tokio::time::timeout(Duration::from_secs(5), input.write_all(&data)).await
+                .expect("verification decoder stopped consuming").unwrap();
+            frames += 1;
+            if last_report.elapsed() >= Duration::from_secs(30) {
+                let now_ticks = ticks();
+                let cpu = (now_ticks - last_ticks) as f64 / hz / last_report.elapsed().as_secs_f64() * 100.0;
+                let (fds, rss_kb) = resources();
+                println!("endurance elapsed_s={} encoded_frames={} cpu_percent={cpu:.2} fds={fds} rss_kb={rss_kb}",
+                    started.elapsed().as_secs(), frames);
+                last_ticks = now_ticks; last_report = Instant::now();
+            }
+        }
+        runner.finish().await;
+        drop(input);
+        assert!(tokio::time::timeout(Duration::from_secs(15), decoder.wait()).await.unwrap().unwrap().success());
+        assert_eq!(error_reader.await.unwrap(), 0, "verification decoder reported errors");
+        let decoded = progress_reader.await.unwrap();
+        assert_eq!(decoded, frames, "decoder lost encoded frames");
+        println!("portal_endurance_passed duration_s={:.2} encoded_frames={} decoded_frames={} decode_errors=0",
+            started.elapsed().as_secs_f64(), frames, decoded);
+    }
+
+    // RUST_LOG=info cargo test --release --locked --features wayland,portal,inproc-av portal_restart_resources_and_injected_lock_recovery -- --ignored --nocapture
+    // Recreate the Portal session 20 times, check resource growth, then inject
+    // locked/unknown/unlocked observations to check healthy-frame passthrough.
+    // Actually close/restore the source to check placeholder black and recovery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires an unlocked Portal desktop, saved consent, VAAPI and FFmpeg decode verification"]
+    async fn portal_restart_resources_and_injected_lock_recovery() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut session = tokio::task::spawn_blocking(crate::portal::PortalSession::open).await.unwrap().unwrap();
+        // Inject only the lock observation; actual session closure/recovery and GPU encoding remain real.
+        // This does not lock the user's desktop or bypass the isolated-VM acceptance guard.
+        let (locked, watch) = tokio::sync::watch::channel(Some(false));
+        session.test_lock_watch(watch);
+        let portal = Arc::new(session);
+        let mut snapshots = Vec::new();
+        for cycle in 0..20 {
+            let codec = if cycle % 2 == 0 { VideoCodec::H264 } else { VideoCodec::H265 };
+            let mut runner = Runner::start(portal.clone(), codec);
+            let frame = runner.frame().await;
+            assert!(!decoded_is_black(&frame, codec), "restarted stream stayed black");
+            runner.finish().await;
+            reopen(portal.clone()).await;
+            let (fds, rss_kb) = resources();
+            snapshots.push((fds, rss_kb));
+            println!("restart_cycle={} fds={} rss_kb={}", cycle + 1, fds, rss_kb);
+        }
+        let warm = snapshots[3];
+        let last = *snapshots.last().unwrap();
+        assert!(last.0 <= warm.0 + 2, "file descriptors grew across reconnects");
+        assert!(last.1 <= warm.1 + 32 * 1024, "resident memory grew across reconnects");
+
+        let mut runner = Runner::start(portal.clone(), VideoCodec::H265);
+        assert!(!decoded_is_black(&runner.hevc_idr().await, VideoCodec::H265));
+        for state in [Some(true), None, Some(false)] {
+            locked.send(state).unwrap();
+            portal.pause();
+            runner.idr.store(true, Ordering::Release);
+            assert!(!decoded_is_black(&runner.hevc_idr().await, VideoCodec::H265),
+                "healthy DMA source was blanked for lock state {state:?}");
+            assert!(matches!(portal.with_dmabuf(&mut None, |_, _| Ok(())).unwrap(), crate::portal::DmaCapture::Frame(())));
+            println!("dma_lock_state={state:?} valid_frame=true");
+        }
+        for cycle in 0..3 {
+            locked.send(Some(true)).unwrap();
+            portal.end();
+            runner.idr.store(true, Ordering::Release);
+            assert!(decoded_is_black(&runner.hevc_idr().await, VideoCodec::H265), "closed Portal source did not produce placeholder frame");
+            assert!(matches!(portal.with_dmabuf(&mut None, |_, _| Ok(())).unwrap(), crate::portal::DmaCapture::Cpu));
+            locked.send(Some(false)).unwrap();
+            let session = portal.clone();
+            tokio::task::spawn_blocking(move || { session.recover(&AtomicBool::new(false)).unwrap(); }).await.unwrap();
+            runner.idr.store(true, Ordering::Release);
+            assert!(!decoded_is_black(&runner.hevc_idr().await, VideoCodec::H265), "desktop did not recover after unlock observation");
+            println!("injected_lock_cycle={} source_closed=true placeholder_black=true same_arc_recovered=true", cycle + 1);
+        }
+        runner.finish().await;
+        println!("portal_restart_resources_passed cycles=20 fd_growth={} rss_growth_kb={} injected_lock_cycles=3",
+            last.0 as i64 - warm.0 as i64, last.1 as i64 - warm.1 as i64);
     }
 }

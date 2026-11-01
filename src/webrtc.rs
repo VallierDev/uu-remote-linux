@@ -1373,8 +1373,9 @@ impl WebRtcSession {
                                 if channel_name.contains("CONTROL") {
                                     match crate::control_protocol::decode_control(&msg.data) {
                                         Ok(crate::control_protocol::ControlMessage::Input(event)) => {
+                                            // A ready compositor source remains controllable on its lock screen.
                                             if screen.backend == crate::desktop_backend::DesktopBackend::Portal
-                                                && (screen.init_error.is_some() || !desktop_ready || *lock_for_message.borrow() != Some(false)) { return; }
+                                                && (screen.init_error.is_some() || !desktop_ready) { return; }
                                             if !crate::wayland::input_ready() {return;}
                                             use crate::control_protocol::ControlInput;
                                             // Separate receipt budgets keep motion floods from hiding clicks.

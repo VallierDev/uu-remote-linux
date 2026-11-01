@@ -268,33 +268,57 @@ VaapiEngine* vaapi_create(const VaapiConfig* config) {
 }
 
 int vaapi_import_dma_buffer(VaapiEngine* engine, int dma_fd, uint32_t stride) {
-    if (!engine || dma_fd < 0) return -1;
+    if (!engine) return -1;
+    UuDmaFrame frame = {
+        .fd=dma_fd, .fourcc=0x34325258, .width=engine->cap_width, .height=engine->cap_height,
+        .stride=stride, .size=stride * engine->cap_height, .modifier=0
+    };
+    return vaapi_import_frame(engine, &frame);
+}
 
-    if (engine->in_rgb_surf != VA_INVALID_ID) {
-        RT.vaDestroySurfaces(engine->va_dpy, &engine->in_rgb_surf, 1);
-        engine->in_rgb_surf = VA_INVALID_ID;
-    }
+static void vaapi_clear_input(VaapiEngine *engine) {
     if (engine->vpp_buf != VA_INVALID_ID) {
         RT.vaDestroyBuffer(engine->va_dpy, engine->vpp_buf);
         engine->vpp_buf = VA_INVALID_ID;
     }
+    if (engine->in_rgb_surf != VA_INVALID_ID) {
+        RT.vaDestroySurfaces(engine->va_dpy, &engine->in_rgb_surf, 1);
+        engine->in_rgb_surf = VA_INVALID_ID;
+    }
+    engine->dma_fd = -1;
+}
 
-    engine->dma_fd = dma_fd;
-    engine->stride = stride;
+int vaapi_import_frame(VaapiEngine *engine, const UuDmaFrame *frame) {
+    if (!engine || !frame || frame->fd < 0 || frame->width != engine->cap_width ||
+        frame->height != engine->cap_height || !frame->height || frame->stride < (uint64_t)frame->width * 4 ||
+        (uint64_t)frame->offset + (uint64_t)(frame->height - 1) * frame->stride + (uint64_t)frame->width * 4 > frame->size)
+        return -1;
+    uint32_t va_fourcc;
+    switch (frame->fourcc) {
+        case 0x34325258: va_fourcc=VA_FOURCC_BGRX; break; /* DRM_FORMAT_XRGB8888 */
+        case 0x34325241: va_fourcc=VA_FOURCC_BGRA; break; /* DRM_FORMAT_ARGB8888 */
+        case 0x34324258: va_fourcc=VA_FOURCC_RGBX; break; /* DRM_FORMAT_XBGR8888 */
+        case 0x34324241: va_fourcc=VA_FOURCC_RGBA; break; /* DRM_FORMAT_ABGR8888 */
+        default: return -1;
+    }
+    vaapi_clear_input(engine);
+    engine->dma_fd = frame->fd;
+    engine->stride = frame->stride;
 
     VADRMPRIMESurfaceDescriptor prime_desc;
     memset(&prime_desc, 0, sizeof(prime_desc));
-    prime_desc.fourcc = VA_FOURCC_BGRX;
+    prime_desc.fourcc = va_fourcc;
     prime_desc.width = engine->cap_width;
     prime_desc.height = engine->cap_height;
     prime_desc.num_objects = 1;
-    prime_desc.objects[0].fd = dma_fd;
-    prime_desc.objects[0].size = stride * engine->cap_height;
-    prime_desc.objects[0].drm_format_modifier = 0;
+    prime_desc.objects[0].fd = frame->fd;
+    prime_desc.objects[0].size = frame->size;
+    prime_desc.objects[0].drm_format_modifier = frame->modifier;
     prime_desc.num_layers = 1;
-    prime_desc.layers[0].drm_format = 0x34325258; // DRM_FORMAT_XRGB8888
+    prime_desc.layers[0].drm_format = frame->fourcc;
     prime_desc.layers[0].num_planes = 1;
-    prime_desc.layers[0].pitch[0] = stride;
+    prime_desc.layers[0].pitch[0] = frame->stride;
+    prime_desc.layers[0].offset[0] = frame->offset;
 
     VASurfaceAttrib attribs[2];
     attribs[0].type = VASurfaceAttribMemoryType;
@@ -322,6 +346,8 @@ int vaapi_import_dma_buffer(VaapiEngine* engine, int dma_fd, uint32_t stride) {
 
 int vaapi_upload_host_buffer(VaapiEngine* engine, const uint8_t* host_ptr, uint32_t pitch) {
     if (!engine || !host_ptr) return -1;
+    /* Never write a fallback image into the compositor's imported buffer. */
+    if (engine->dma_fd >= 0) vaapi_clear_input(engine);
 
     if (engine->in_rgb_surf == VA_INVALID_ID) {
         VAStatus st = RT.vaCreateSurfaces(engine->va_dpy, VA_RT_FORMAT_RGB32, engine->cap_width, engine->cap_height, &engine->in_rgb_surf, 1, NULL, 0);

@@ -10,6 +10,29 @@
 //! buttons and wheels, like a QEMU tablet). Mixing relative and absolute axes in one device
 //! confuses libinput.
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TextKey { pub code: u16, pub shift: u16 }
+
+/// Resolve an ASCII prefix against the host's current XKB layout and locked modifiers.
+/// X11/XWayland is queried read-only; the returned events are emitted through uinput.
+pub fn text_plan(text: &str) -> Vec<TextKey> {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn uu_uinput_text_plan(text: *const u8, length: usize, plan: *mut TextKey, capacity: usize) -> usize;
+        }
+        let capacity = text.bytes().take_while(u8::is_ascii).count();
+        if capacity == 0 { return Vec::new(); }
+        let mut plan = vec![TextKey::default(); capacity];
+        let count = unsafe { uu_uinput_text_plan(text.as_ptr(), text.len(), plan.as_mut_ptr(), plan.len()) };
+        plan.truncate(count);
+        plan
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = text; Vec::new() }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::fs::{File, OpenOptions};
@@ -95,6 +118,31 @@ mod imp {
     pub struct Devices { keyboard: Mutex<Device>, pointer: Mutex<Device> }
 
     impl Devices {
+        #[cfg(test)]
+        pub fn recording_for_test() -> (Self, File, File) {
+            let recording = || {
+                let path = std::env::temp_dir().join(format!("uu-uinput-test-{}-{}", std::process::id(), rand::random::<u64>()));
+                let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path).unwrap();
+                std::fs::remove_file(path).unwrap();
+                let reader = file.try_clone().unwrap();
+                (Mutex::new(Device(file)), reader)
+            };
+            let (keyboard, keys) = recording();
+            let (pointer, mouse) = recording();
+            (Self { keyboard, pointer }, keys, mouse)
+        }
+        #[cfg(test)]
+        pub fn recorded_events_for_test(file: &mut File) -> Vec<(u16, u16, i32)> {
+            use std::io::{Read, Seek, SeekFrom};
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).unwrap();
+            assert_eq!(data.len() % std::mem::size_of::<InputEvent>(), 0);
+            data.chunks_exact(std::mem::size_of::<InputEvent>()).map(|chunk| {
+                let event = unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast::<InputEvent>()) };
+                (event.kind, event.code, event.value)
+            }).collect()
+        }
         pub fn open() -> std::io::Result<Self> {
             let keyboard = Device::create("uu-remote-linux keyboard", 1, |d| {
                 d.ioctl(UI_SET_EVBIT, EV_KEY.into())?;

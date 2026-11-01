@@ -2,6 +2,7 @@
 #define UU_PORTAL_ENGINE_H
 #include <stddef.h>
 #include <stdint.h>
+#include "dmabuf_frame.h"
 struct uu_portal;
 typedef int (*uu_portal_cancelled_fn)(void *data);
 /* One object owns one consent/session and one PipeWire stream. */
@@ -10,6 +11,8 @@ struct uu_portal *uu_portal_open(int *error, uint32_t *width, uint32_t *height);
 struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *), void *data, int *error, uint32_t *width, uint32_t *height);
 /* The cancellation callback and data are used only until this call returns. */
 struct uu_portal *uu_portal_open_persist_cancellable(const char *restore, void (*save_token)(const char *, void *), void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int *error, uint32_t *width, uint32_t *height);
+/* Select the capture transport before connecting, including on same-process recovery. */
+struct uu_portal *uu_portal_open_persist_capture(const char *restore, void (*save_token)(const char *, void *), void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height);
 struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32_t *width, uint32_t *height);
 const char *uu_portal_restore_token(struct uu_portal *portal);
 void uu_portal_close(struct uu_portal *portal);
@@ -23,6 +26,12 @@ void uu_portal_logical_size(struct uu_portal *portal, uint32_t *width, uint32_t 
 void uu_portal_reset_frame(struct uu_portal *portal);
 int uu_portal_capture(struct uu_portal *portal, uint8_t *bgra, size_t length);
 int uu_portal_capture_since(struct uu_portal *portal, uint8_t *bgra, size_t length, uint64_t *revision);
+/* acquire holds the PipeWire loop until release, including GPU completion.
+ * 0/12 = leased new/unchanged frame, 10 = pending, 15 = neutral black.
+ * CPU fallback: 14 layout/disabled, 16 shared memory, 17 timeout, 18 explicit sync, 19 modifier. */
+int uu_portal_dmabuf_acquire(struct uu_portal *portal, UuDmaFrame *frame, uint64_t *revision);
+void uu_portal_dmabuf_release(struct uu_portal *portal);
+void uu_portal_dmabuf_disable(struct uu_portal *portal);
 int uu_portal_move(struct uu_portal *portal, double x, double y, int relative);
 int uu_portal_button(struct uu_portal *portal, int button, int pressed);
 int uu_portal_scroll(struct uu_portal *portal, double dx, double dy, int finish);

@@ -5,6 +5,14 @@ use webrtc::{media::Sample, peer_connection::{RTCPeerConnection, peer_connection
 use crate::{capture_setting::VideoCodec, desktop_session::PortalDesktop, video_track::VideoTrack};
 
 async fn black_frame(codec: VideoCodec) -> Result<Bytes, String> {
+    #[cfg(feature = "inproc-av")]
+    if crate::video::native_engine_eligible(crate::video_select::selection().encoder, crate::video::NativeDisplayKind::Portal) {
+        match tokio::task::spawn_blocking(move || crate::inproc_encoder::black_frame(codec)).await {
+            Ok(Ok(frame)) => return Ok(frame),
+            Ok(Err(error)) => log::warn!("Locked video in-process VAAPI unavailable: {error}; falling back to FFmpeg"),
+            Err(_) => log::warn!("Locked video in-process worker failed; falling back to FFmpeg"),
+        }
+    }
     let mut command = crate::video::ffmpeg_command();
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin",
         "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=1", "-frames:v", "1",

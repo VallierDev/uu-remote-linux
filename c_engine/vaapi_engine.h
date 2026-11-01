@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "dmabuf_frame.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,6 +29,7 @@ VaapiEngine* vaapi_create(const VaapiConfig* config);
 
 // Import a DRI3 / GBM DMA-BUF fd as the zero-copy input surface
 int vaapi_import_dma_buffer(VaapiEngine* engine, int dma_fd, uint32_t stride);
+int vaapi_import_frame(VaapiEngine* engine, const UuDmaFrame *frame);
 
 // Host fallback: upload ARGB host memory if DMA-BUF is unavailable
 int vaapi_upload_host_buffer(VaapiEngine* engine, const uint8_t* host_ptr, uint32_t pitch);
