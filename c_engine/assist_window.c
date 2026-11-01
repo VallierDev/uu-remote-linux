@@ -9,26 +9,8 @@
 #include <string.h>
 #include <dlfcn.h>
 #include "i18n.h"
+#include "ui_theme.h"
 static void on_language(GtkComboBox *c, gpointer note);
-
-static const char *CSS =
-    "window { background-color: #f5f6f8; }\n"
-    "* { font-family: 'Noto Sans CJK SC', 'Noto Sans SC', sans-serif; }\n"
-    ".card { background-color: #ffffff; border-radius: 10px; border: 1px solid #e5e7eb; }\n"
-    ".heading { font-size: 20px; font-weight: 700; color: #1d1d1f; }\n"
-    ".key { font-size: 14px; color: #4b5563; }\n"
-    ".big { font-size: 32px; font-weight: 800; color: #111111; }\n"
-    ".note { font-size: 13px; color: #9ca3af; }\n"
-    ".hint { font-size: 13px; color: #6b7280; }\n"
-    ".footer { font-size: 12px; color: #9ca3af; }\n"
-    "button.flat { padding: 4px 8px; }\n"
-    "button.share { background-image: none; background-color: #ffffff; border: 1px solid #d1d5db;"
-    " border-radius: 6px; padding: 6px 14px; font-size: 14px; }\n"
-    "separator { background-color: #e5e7eb; min-height: 1px; }\n"
-    ".user { font-size: 22px; font-weight: 700; color: #111111; }\n"
-    ".status { font-size: 13px; color: #2f6bff; }\n"
-    ".status.ok { color: #16a34a; }\n"
-    ".status.error { color: #dc2626; }\n";
 
 enum { CMD_NONE = 0, CMD_ALLOW = 1, CMD_DENY = 2, CMD_RESET = 3, CMD_STOP = 4, CMD_VERIFY = 5, CMD_REFRESH = 6, CMD_CUSTOM = 7, CMD_LOGOUT = 8, CMD_QUIT = 9 };
 enum { VERIFY_TEMPORARY = 0, VERIFY_CUSTOM = 1, VERIFY_BOTH = 2 };
@@ -387,11 +369,7 @@ static void build_tray(void) {
 }
 
 static void build_window(void) {
-    GtkCssProvider *css = gtk_css_provider_new();
-    gtk_css_provider_load_from_data(css, CSS, -1, NULL);
-    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
-                                              GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_unref(css);
+    uu_theme_init();
 
     gtk_window_set_default_icon_name("uu-remote-linux"); // contrib/desktop icon, when installed
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -522,6 +500,7 @@ static void build_window(void) {
     gtk_box_pack_start(GTK_BOX(lang_row), lang, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(lang_row), lang_note, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(root), lang_row, FALSE, FALSE, 6);
+    gtk_box_pack_end(GTK_BOX(lang_row), uu_theme_settings_button(GTK_WINDOW(window)), FALSE, FALSE, 0);
     if (close_hides) gtk_label_set_text(GTK_LABEL(footer_label), L("开源 Linux 被控端 · 非网易官方客户端 · 关闭窗口后远程协助仍在后台运行", "Open-source Linux host · not an official NetEase client · remote assistance keeps running after the window closes"));
     render_code();
     if (close_hides) build_tray();
@@ -544,8 +523,6 @@ static void on_language(GtkComboBox *c, gpointer note) {
 static void *ui_main(void *arg) {
     (void)arg;
     int ok = gtk_init_check(NULL, NULL);
-    // The CSS hard-codes a light palette; a dark system theme would turn unstyled text white on white (#43).
-    if (ok) g_object_set(gtk_settings_get_default(), "gtk-theme-name", "Adwaita", "gtk-application-prefer-dark-theme", FALSE, NULL);
     if (ok) build_window();
     pthread_mutex_lock(&init_lock);
     init_state = ok ? 1 : -1;

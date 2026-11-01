@@ -23,6 +23,19 @@
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Host main window: remote assistance and account"></p>
 <p align="center"><sub>Linux host main window: remote assistance and account (device ID, code and account redacted). The UI is available in Chinese and English (see [Language](#language--语言)).</sub></p>
 
+## Appearance / 外观
+
+The GTK host, viewer launcher, and file transfer / port mapping / terminal list windows share a flat style.
+Choose **Settings → General → Appearance → System / Light / Dark** in the viewer,
+or open the gear settings button in the host / tool windows. Windows in the current process update immediately.
+System is the default and follows the desktop's GTK theme, including theme changes while running;
+Light and Dark use GTK's bundled Adwaita theme for consistent controls and dialogs.
+The choice is saved to `$XDG_CONFIG_HOME/uuremote/theme` (default `~/.config/uuremote/theme`).
+Other already running host / viewer processes read it on their next start. This changes only the local GTK UI;
+remote desktop images and the SDL control panel are unaffected.
+
+[Light / dark previews and validation notes](docs/ui-appearance.md).
+
 ## Language / 语言
 
 The language is picked once at start, in this order:

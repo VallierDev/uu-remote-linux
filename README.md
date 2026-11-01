@@ -19,6 +19,17 @@
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Linux 主机主窗口：远程协助与账号"></p>
 <p align="center"><sub>Linux 被控端主窗口：远程协助与账号（设备 ID、验证码和账号已打码）</sub></p>
 
+## 外观 / Appearance
+
+GTK 主机、控制端和文件传输 / 端口映射 / 终端列表窗口使用统一的扁平化样式。
+在控制端的 **设置 → 常规 → 外观**，或主机 / 工具窗口的齿轮设置按钮中选择 **跟随系统 / 浅色 / 深色**，
+当前进程中的窗口立即生效。默认跟随桌面的 GTK 主题（包括运行期间的主题变化）；
+浅色和深色使用 GTK 自带的 Adwaita，保证控件和弹窗的配色一致。
+选择保存在 `$XDG_CONFIG_HOME/uuremote/theme`（默认 `~/.config/uuremote/theme`），
+其他已打开的主机 / 控制端进程在下次启动时读取。此设置只影响本地 GTK 界面，远程桌面图像和 SDL 控制面板不受影响。
+
+[浅色 / 深色预览与验证说明](docs/ui-appearance.md)。
+
 ## 语言 / Language
 
 启动时按以下顺序确定界面语言：
