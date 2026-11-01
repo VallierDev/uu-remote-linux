@@ -45,6 +45,7 @@ mod inproc_encoder;
 mod capture_setting;
 mod audio;
 mod virtual_audio;
+mod privacy_screen;
 mod system_actions;
 mod capability;
 mod protocol;
@@ -208,7 +209,7 @@ pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
     }
 }
 
-const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+const SUBCOMMANDS: [&str; 20] = ["privacy-guard", "privacy-wallpaper", "privacy-screen-probe", "doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
     "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
 
 /// Unknown arguments and illegal set-encoder / set-codec values exit 2 (never start a second host).
@@ -630,6 +631,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if login::run(gui).await.is_err() { std::process::exit(1); } // error already shown
         return Ok(());
     }
+    if std::env::args().nth(1).as_deref() == Some("privacy-guard") { std::process::exit(privacy_screen::guard_main()); }
+    if std::env::args().nth(1).as_deref() == Some("privacy-wallpaper") {
+        std::process::exit(privacy_screen::cover_main(&std::env::args().skip(2).collect::<Vec<_>>()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("privacy-screen-probe") {
+        let screen = ScreenCapture::new()?;
+        if screen.portal.is_none() { return Err(std::io::Error::other("privacy screen needs the portal backend").into()); }
+        let _input = input::InputInjector::new(); // the privacy screen requires its uinput devices
+        let mode = if std::env::var("UU_PRIVACY_PROBE_WALLPAPER").as_deref() == Ok("1") { privacy_screen::Mode::Picture } else { privacy_screen::Mode::ScreenOff };
+        tokio::task::spawn_blocking(move || privacy_screen::probe(mode)).await?.map_err(std::io::Error::other)?;
+        drop(screen);
+        return Ok(());
+    }
+    privacy_screen::recover();
     virtual_audio::init();
     let _audio_cleanup=virtual_audio::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
@@ -668,7 +683,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(target_os="linux"))]
         let _ = tokio::signal::ctrl_c().await;
-        if !assist_enabled { shutdown_input.shutdown(); virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
+        if !assist_enabled { privacy_screen::shutdown(); shutdown_input.shutdown(); virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
         let _ = signal_tx.send(true);
     });
     let mut assist = if assist_enabled { Some(assist::Assist::start(&mut shutdown, unified).await?) } else { None };
@@ -699,7 +714,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One exit path for commands, signals, transport failures and UI failures.
     if let Some(session) = assist.as_mut() { session.allowed = false; }
     for (_, old) in webrtc_sessions.lock().await.drain() { close_peer(&old.pc).await; }
-    virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
+    privacy_screen::shutdown(); virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
     // Switching identity (signed in / out) restarts at once and the new identity republishes the same
     // device share: logout already withdrew it, and after a QR login the cloud moved it to the account
     // (a guest cancel then fails). Only a real stop withdraws here.
