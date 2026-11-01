@@ -210,6 +210,8 @@ sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
 # optional: headers for the inproc-av VAAPI/DRI3 engines (libva itself is loaded at runtime)
 sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
+# In-process audio capture and Opus encoding for inproc-av
+sudo apt install libpulse-dev libopus-dev
 ```
 
 - A Rust toolchain is required (<https://rustup.rs>).

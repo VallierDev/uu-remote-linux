@@ -33,6 +33,14 @@ fn main() {
             .file("c_engine/clipboard.c")
             .file("c_engine/pam_check.c");
         if std::env::var_os("CARGO_FEATURE_INPROC_AV").is_some() {
+            println!("cargo:rerun-if-changed=c_engine/audio_engine.c");
+            x11_build.file("c_engine/audio_engine.c");
+            let audio_flags = std::process::Command::new("pkg-config").args(["--cflags", "libpulse", "opus"])
+                .output().expect("inproc-av requires libpulse and opus development libraries");
+            assert!(audio_flags.status.success(), "inproc-av requires libpulse-dev and libopus-dev");
+            for flag in String::from_utf8_lossy(&audio_flags.stdout).split_whitespace() { x11_build.flag(flag); }
+            println!("cargo:rustc-link-lib=pulse");
+            println!("cargo:rustc-link-lib=opus");
             x11_build.file("c_engine/nvenc_engine.c");
             x11_build.file("c_engine/vaapi_engine.c");
             x11_build.file("c_engine/dri3_capture.c");

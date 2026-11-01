@@ -193,6 +193,8 @@ sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
 # 可选：inproc-av 的 VAAPI/DRI3 引擎编译所需（libva 本体运行时加载）
 sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
+# inproc-av 的进程内音频采集与 Opus 编码
+sudo apt install libpulse-dev libopus-dev
 ```
 
 - 需要 Rust 工具链（<https://rustup.rs>）。
