@@ -147,9 +147,37 @@ pub async fn run() -> Result<(), String> {
         Err(_) => line("config mode", "missing (run `uuremote-server login`)"),
     }
     line("service", command_output("systemctl", &["--user", "is-active", "uuremote-native.service"]).await.unwrap_or_else(|| "systemctl unavailable".into()));
-    let running = command_output("pgrep", &["-c", "-x", "uuremote-server"]).await.filter(|n| !n.is_empty()).unwrap_or_else(|| "unknown".into());
-    line("uuremote-server procs", format!("{running} (including this one; more than 2 means duplicates)"));
+    let running = host_processes();
+    line("uuremote-server procs", format!("{} (including this one; more than 2 means duplicates)", running.map_or_else(|| "unknown".into(), |n| n.to_string())));
+    if running.is_some_and(|n| n > 2) {
+        println!("  ! another host instance is running (check `pgrep -af uuremote`); stop the extra one, e.g. an old copy started by hand");
+        println!("    instances sharing one identity, on this or another machine, kick each other out of the room: never copy config.json between machines");
+    }
     Ok(())
+}
+
+/// Hosts re-exec through /proc/self/exe (comm "exe"), so match the executable's file name, not the process name.
+/// Helpers a host spawns (Wayland capture, login window) are its children and are not separate instances.
+fn host_processes() -> Option<usize> {
+    let hosts: Vec<(u32, u32)> = std::fs::read_dir("/proc").ok()?.flatten()
+        .filter_map(|entry| Some((entry.file_name().to_str()?.parse::<u32>().ok()?, entry.path())))
+        .filter(|(_, dir)| std::fs::read_link(dir.join("exe")).is_ok_and(|exe| is_host_executable(&exe)))
+        .filter_map(|(pid, dir)| Some((pid, parent_pid(&std::fs::read_to_string(dir.join("stat")).ok()?)?)))
+        .collect();
+    Some(top_level(&hosts))
+}
+
+/// Field 4 of /proc/<pid>/stat; the command name in field 2 may contain spaces and parentheses.
+fn parent_pid(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn top_level(hosts: &[(u32, u32)]) -> usize {
+    hosts.iter().filter(|(_, parent)| !hosts.iter().any(|(pid, _)| pid == parent)).count()
+}
+
+fn is_host_executable(exe: &std::path::Path) -> bool {
+    exe.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.trim_end_matches(" (deleted)") == "uuremote-server")
 }
 
 #[cfg(test)]
@@ -173,5 +201,25 @@ mod tests {
         // Another backend, or a headless host: not this warning.
         assert!(!super::missing_display(DesktopBackend::Wayland, false, None, None));
         assert!(!super::missing_display(DesktopBackend::X11, true, None, None));
+    }
+
+    #[test]
+    fn host_processes_match_the_executable_even_after_reexec() {
+        use std::path::Path;
+        for exe in ["/usr/bin/uuremote-server", "/home/u/.local/bin/uuremote-server", "/usr/bin/uuremote-server (deleted)"] {
+            assert!(super::is_host_executable(Path::new(exe)));
+        }
+        for exe in ["/usr/bin/uuremote-viewer", "/usr/bin/bash", "/usr/bin/uuremote-server-old"] {
+            assert!(!super::is_host_executable(Path::new(exe)));
+        }
+    }
+
+    #[test]
+    fn host_helpers_are_not_counted_as_instances() {
+        assert_eq!(super::parent_pid("8943 (exe) S 1699 8943 1699 0 -1"), Some(1699));
+        assert_eq!(super::parent_pid("12 (a) b (c) R 7 12"), Some(7));
+        // service 10 with a login window 11, a stale copy 20, doctor 30
+        assert_eq!(super::top_level(&[(10, 1), (11, 10), (20, 5), (30, 9)]), 3);
+        assert_eq!(super::top_level(&[(10, 1), (11, 10), (30, 9)]), 2);
     }
 }

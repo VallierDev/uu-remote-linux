@@ -64,6 +64,9 @@ impl DesktopRole {
             stream: Default::default(), stream_task: Default::default(), screen: Default::default(), tracking: Default::default(), request: Default::default() }
     }
     pub fn is_desktop(&self) -> bool { *self.active.borrow() }
+    /// A promoted peer whose video ended on its own (capture failed while locked or off, #114);
+    /// capture_desktop on it starts the video again.
+    fn stream_ended(&self) -> bool { self.stream_task.lock().unwrap().as_ref().is_some_and(|task| task.is_finished()) }
     fn input(&self) -> Option<Arc<crate::input::DesktopInputSession>> { self.input.lock().unwrap().clone() }
     fn screen_or(&self, screen: &Arc<ScreenCapture>) -> Arc<ScreenCapture> {
         self.screen.lock().unwrap().clone().unwrap_or_else(|| screen.clone())
@@ -108,7 +111,7 @@ pub struct WebRtcSession {
     /// The role this peer was offered with; `role` also covers a later capture_desktop.
     pub desktop: bool,
     pub role: Arc<DesktopRole>,
-    pub controller_mac: bool,
+    pub controller: crate::input::Controller,
     pub context: Arc<Mutex<SessionContext>>,
     actions: Arc<crate::system_actions::PeerActions>,
 }
@@ -1316,10 +1319,14 @@ impl WebRtcSession {
                                                 }
                                             });
                                         } else if action == sa::CAPTURE_DESKTOP && channel_name == "CONTROL_DATA_CHANNEL" {
-                                            if message_role.is_desktop() {
+                                            if message_role.is_desktop() && !message_role.stream_ended() {
                                                 log::info!("SimpleAction 4 (capture_desktop) received on a desktop connection");
                                             } else if let Some(request) = message_role.request.get() {
-                                                log::info!("SimpleAction 4 (capture_desktop) received on a tool connection; starting the desktop");
+                                                if message_role.is_desktop() {
+                                                    log::info!("SimpleAction 4 (capture_desktop) received on a tool connection whose desktop video ended; restarting it");
+                                                } else {
+                                                    log::info!("SimpleAction 4 (capture_desktop) received on a tool connection; starting the desktop");
+                                                }
                                                 request();
                                             } else {
                                                 log::info!("SimpleAction 4 (capture_desktop) not handled: tool connection without a desktop route");
@@ -1447,7 +1454,7 @@ impl WebRtcSession {
             input,
             desktop,
             role,
-            controller_mac: false,
+            controller: crate::input::Controller::Other,
             context,
             actions: session_actions,
         })
@@ -1461,18 +1468,21 @@ impl WebRtcSession {
     /// Makes this tool peer the desktop: it takes the input lease, starts the video it negotiated
     /// (H.264; audio was never negotiated) and repeats the desktop CONTROL initialization.
     /// `screen` replaces a capture that was unavailable when the peer was offered.
+    /// A promoted peer whose video ended keeps its input lease and only restarts the video.
     pub fn promote(&self, screen: Option<Arc<ScreenCapture>>) {
-        if self.role.is_desktop() { return; }
+        let restart = self.role.is_desktop();
+        if restart && !self.role.stream_ended() { return; }
         if let Some(screen) = screen { *self.role.screen.lock().unwrap() = Some(screen); }
-        let session = self.input.desktop_session();
-        if self.pc.connection_state() == RTCPeerConnectionState::Connected { session.connected(); }
-        *self.role.input.lock().unwrap() = Some(session);
-        self.role.active.send_replace(true);
-        let stream = self.role.stream.lock().unwrap().clone();
-        if let Some(stream) = stream {
-            let task = stream.spawn(self.role.screen.lock().unwrap().clone(), self.role.active.subscribe());
-            if let Some(old) = std::mem::replace(&mut *self.role.stream_task.lock().unwrap(), task) { old.abort(); }
+        if !restart {
+            let session = self.input.desktop_session();
+            if self.pc.connection_state() == RTCPeerConnectionState::Connected { session.connected(); }
+            *self.role.input.lock().unwrap() = Some(session);
+            self.role.active.send_replace(true);
         }
+        let stream = self.role.stream.lock().unwrap().clone();
+        let task = stream.and_then(|stream| stream.spawn(self.role.screen.lock().unwrap().clone(), self.role.active.subscribe()));
+        if let Some(old) = std::mem::replace(&mut *self.role.stream_task.lock().unwrap(), task) { old.abort(); }
+        if restart { log::info!("Desktop video restarted on a tool connection after its stream ended"); return; }
         if !cfg!(test) { track_session(self.pc.clone(), self.actions.clone(), &self.role); }
         log::info!("Desktop started on an existing tool connection");
     }

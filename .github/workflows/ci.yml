@@ -25,10 +25,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config \
             libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev \
-            libwayland-dev libwayland-bin libxkbcommon-dev
+            libwayland-dev libwayland-bin libxkbcommon-dev xvfb xauth fonts-noto-cjk
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+      - name: GTK appearance and settings smoke tests
+        run: xvfb-run -a -s '-screen 0 1600x1200x24' sh tests/gtk-ui-smoke.sh "$RUNNER_TEMP/gtk-ui-previews"
+      - name: Synthetic GTK previews
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtk-ui-previews
+          path: ${{ runner.temp }}/gtk-ui-previews
+          if-no-files-found: ignore
       # Same as the release job: the wayland plugin is built on 22.04; libei is unavailable here, so
       # the portal plugin is skipped with a warning (release builds it on 24.04).
       - name: Release feature set
@@ -97,7 +106,7 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1
         run: |
-          for source in tests/portal_engine.c tests/portal_input.c tests/portal_eis.c tests/desktop_power.c; do
+          for source in tests/portal_engine.c tests/portal_input.c tests/portal_eis.c tests/desktop_power.c tests/wayland_transform.c; do
             target="/tmp/$(basename "$source" .c)"
             cc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
               -Wall -Wextra -Wno-unused-parameter "$source" -o "$target" \

@@ -199,6 +199,7 @@ pub fn text_probe()->Result<(),String> {
         typed+=one;
     }
     if typed<0 { return Err(format!("Wayland text typing failed ({typed})")); }
+    std::thread::sleep(std::time::Duration::from_millis(100));
     println!("Typed {typed} of {} characters in {} calls; check that they match.",
         sequence.chars().filter(|character|*character!='|').count(),sequence.split('|').count());
     Ok(())
@@ -209,7 +210,7 @@ pub fn text_probe()->Result<(),String> {
 // root to the selected monitor. No compositor layout or user credentials are modified.
 #[derive(Clone, Debug)]
 pub struct Output { pub name:String, pub width:u32, pub height:u32, pub fps:i32, pub x:i32, pub y:i32 }
-struct Inventory { outputs:Vec<Output>, x11:bool }
+struct Inventory { outputs:Vec<Output>, x11:bool, portal:bool }
 static OUTPUTS: std::sync::OnceLock<Inventory> = std::sync::OnceLock::new();
 #[derive(Default)]
 struct Selection { id:usize, generation:u64, presented:Option<u64>, failed:bool }
@@ -229,21 +230,54 @@ fn inventory() -> &'static Inventory {
         if backend==Some(crate::desktop_backend::DesktopBackend::X11) && !crate::desktop_backend::headless()
             && std::env::var("UU_X11_MULTISCREEN").ok().as_deref()==Some("1") {
             let outputs=x11_outputs();
-            return Inventory {x11:!outputs.is_empty(),outputs};
+            return Inventory {x11:!outputs.is_empty(),outputs,portal:false};
+        }
+        if backend==Some(crate::desktop_backend::DesktopBackend::Portal) && !crate::desktop_backend::headless() {
+            let outputs=portal_outputs();
+            return Inventory {portal:!outputs.is_empty(),outputs,x11:false};
         }
         if !cfg!(all(target_os="linux",feature="wayland"))
             || std::env::var("UU_WAYLAND_MULTISCREEN").ok().as_deref()!=Some("1")
-            || backend!=Some(crate::desktop_backend::DesktopBackend::Wayland) {return Inventory {outputs:Vec::new(),x11:false};}
-        let output=std::process::Command::new("hyprctl").args(["monitors","-j"]).output();
-        let result=output.map_err(|_|"hyprctl unavailable").and_then(|output| {
-            if !output.status.success() {return Err("hyprctl failed");}
-            parse_outputs(&output.stdout,&std::env::var("UU_WAYLAND_OUTPUT").unwrap_or_default())
+            || backend!=Some(crate::desktop_backend::DesktopBackend::Wayland) {return Inventory {outputs:Vec::new(),x11:false,portal:false};}
+        let niri=std::env::var_os("NIRI_SOCKET").is_some();
+        let output=if niri {std::process::Command::new("niri").args(["msg","--json","outputs"]).output()}
+            else {std::process::Command::new("hyprctl").args(["monitors","-j"]).output()};
+        let result=output.map_err(|_|"monitor command unavailable").and_then(|output| {
+            if !output.status.success() {return Err("monitor command failed");}
+            let preferred=std::env::var("UU_WAYLAND_OUTPUT").unwrap_or_default();
+            if niri {parse_niri_outputs(&output.stdout,&preferred)} else {parse_outputs(&output.stdout,&preferred)}
         });
         let outputs=match result {Ok(outputs)=>outputs,Err(reason)=>{log::warn!("Wayland multi-screen disabled: {}",reason);Vec::new()}};
-        Inventory {outputs,x11:false}
+        Inventory {outputs,x11:false,portal:false}
     })
 }
 pub fn outputs() -> &'static [Output] {&inventory().outputs}
+/// GNOME portal grants one monitor per consent (multi-select is refused), so each monitor
+/// gets its own saved consent and a switch opens that monitor's session. Read once.
+fn portal_outputs()->Vec<Output> {
+    let monitors=crate::portal::monitors();
+    if monitors.len()<2 {return Vec::new();}
+    let fps=crate::video::display_fps() as i32;
+    let mut outputs:Vec<Output>=monitors.iter().map(|m|Output {name:m.connector.clone(),width:m.width,height:m.height,fps,x:m.x,y:m.y}).collect();
+    // Screen 0 is the one opened first: the monitor whose consent is already saved, else the primary.
+    let dir=crate::portal::permissions_directory();
+    let granted=|name:&str|dir.as_deref().is_some_and(|d|d.join(crate::portal::monitor_key(name)).exists());
+    let primary=monitors.iter().find(|m|m.primary).map(|m|m.connector.clone()).unwrap_or_default();
+    outputs.sort_by_key(|o|(!granted(&o.name),o.name!=primary,o.x,o.y));
+    outputs.truncate(16);
+    log::info!("Portal multi-screen: {} monitors",outputs.len());
+    outputs
+}
+/// Connector of the selected screen when the portal advertises several monitors.
+pub fn portal_monitor()->Option<String> {
+    if !inventory().portal {return None;}
+    source(selected()).map(|o|o.name.clone())
+}
+/// Monitor at a portal stream's logical position (Mutter logical layout).
+pub fn portal_monitor_at(x:i32,y:i32)->Option<String> {
+    if !inventory().portal {return None;}
+    outputs().iter().find(|o|(o.x,o.y)==(x,y)).map(|o|o.name.clone())
+}
 /// X11 monitors are advertised: the stream captures the selected monitor's region of the root.
 pub fn x11_multiscreen()->bool {inventory().x11}
 /// Read once, like the Hyprland inventory: a changed monitor layout needs a host restart.
@@ -293,6 +327,20 @@ fn parse_x11_monitors(text:&str,preferred:&str,fps:i32)->Result<Vec<Output>,&'st
     outputs.truncate(16);
     if outputs.is_empty() || (!preferred.is_empty() && outputs[0].name!=preferred) {return Err("No capturable preferred output");}
     Ok(outputs)
+}
+fn parse_niri_outputs(json:&[u8],preferred:&str)->Result<Vec<Output>,&'static str> {
+    let inventory=serde_json::from_slice::<serde_json::Map<String,serde_json::Value>>(json).map_err(|_|"Invalid niri inventory")?;
+    let monitors:Vec<_>=inventory.values().filter_map(|m| {
+        let logical=m["logical"].as_object()?;
+        let mode=m["modes"].as_array()?.get(usize::try_from(m["current_mode"].as_u64()?).ok()?)?;
+        let transform=logical.get("transform")?.as_str()?;
+        if !matches!(transform,"Normal"|"90"|"180"|"270") {return None;}
+        let (w,h)=(mode["width"].as_u64()?,mode["height"].as_u64()?);
+        let (w,h)=if matches!(transform,"90"|"270") {(h,w)} else {(w,h)};
+        Some(serde_json::json!({"name":m["name"],"width":w,"height":h,"transform":0,
+            "refreshRate":mode["refresh_rate"].as_f64()?/1000.0}))
+    }).collect();
+    parse_outputs(&serde_json::to_vec(&monitors).map_err(|_|"Invalid niri inventory")?,preferred)
 }
 fn parse_outputs(json:&[u8],preferred:&str)->Result<Vec<Output>,&'static str> {
     let monitors=serde_json::from_slice::<Vec<serde_json::Value>>(json).map_err(|_|"Invalid monitor inventory")?;
@@ -353,6 +401,13 @@ pub fn failed(id:usize,generation:u64) {
 }
 pub fn select(id:usize)->Result<(),String> {
     let output=source(id).ok_or("Unknown screen")?;
+    if inventory().portal {
+        let mut state=SELECTION.lock().unwrap();
+        crate::portal::switch_active(&output.name)?;
+        state.begin(id);
+        log::info!("Portal screen selected: id={} source={}x{}",id,output.width,output.height);
+        return Ok(());
+    }
     if x11_multiscreen() {
         SELECTION.lock().unwrap().begin(id);
         log::info!("X11 screen selected: id={} source={}x{}+{}+{}",id,output.width,output.height,output.x,output.y);
@@ -427,6 +482,28 @@ mod selection_regressions {
         s.sent(0,old);assert!(!s.ready());
         s.sent(1,current);assert!(!s.ready());
         s.sent(0,current);assert!(s.ready());
+    }
+    #[test]
+    #[ignore = "requires an unlocked Wayland session and UU_WAYLAND_MULTISCREEN=1"]
+    fn live_monitor_switch_captures_each_output() {
+        assert!(outputs().len()>1);
+        init().unwrap();
+        for (id,output) in outputs().iter().enumerate() {
+            select(id).unwrap();
+            let mut frame=vec![0;(output.width as usize)*(output.height as usize)*4];
+            capture(&mut frame).unwrap();
+            assert_eq!(selected(),id);
+        }
+        select(0).unwrap();
+    }
+    #[test]
+    fn niri_inventory_uses_active_mode_and_rotated_pixel_size() {
+        let json=br#"{"one":{"name":"DP-1","modes":[{"width":2240,"height":1400,"refresh_rate":60000}],"current_mode":0,"logical":{"transform":"90"}},
+          "off":{"name":"off","modes":[],"current_mode":null,"logical":null}}"#;
+        let outputs=parse_niri_outputs(json,"").unwrap();
+        assert_eq!((outputs.len(),outputs[0].width,outputs[0].height,outputs[0].fps),(1,1400,2240,60));
+        assert!(parse_niri_outputs(json,"off").is_err());
+        assert!(parse_niri_outputs(b"[]","").is_err());
     }
     #[test]
     fn mixed_scale_inventory_preserves_pixel_sizes_and_preferred_output() {

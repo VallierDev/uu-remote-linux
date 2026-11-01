@@ -198,12 +198,33 @@ mod tests {
     }
 }
 
+/// RpcRequest case 15 SendVideoTrackReq with no fields (track 0), sent by the official iPhone
+/// viewer right after CONTROL opens (host logs: response_field=11 value=None). Without it a
+/// second session only joins the stream already encoded for another viewer: no SPS/PPS/IDR (#124).
+pub fn request_video_track()->Vec<u8>{
+    let mut header=Vec::new();int(1,2_000_001,&mut header);
+    let mut rpc=Vec::new();bytes(1,&header,&mut rpc);bytes(15,&[],&mut rpc);
+    envelope(2_000_001,21,&rpc)
+}
 /// CaptureSettingRequest field 7 = ChromaFormat 3, wrapped in RPC 21/case 2.
 pub fn request_chroma444()->Vec<u8>{
     let mut header=Vec::new();int(1,2_000_000,&mut header);
     let mut setting=Vec::new();int(7,3,&mut setting);
     let mut rpc=Vec::new();bytes(1,&header,&mut rpc);bytes(2,&setting,&mut rpc);
     envelope(2_000_000,21,&rpc)
+}
+/// RpcRequest case 2 CaptureSettingRequest with the given (field, value) pairs: 1 fps option
+/// index, 18 fpsCount, 2 quality, 7 chroma, 10 resolution_type, 16/17 pixel size (src/capture_setting.rs).
+pub fn capture_setting(seq:u64,fields:&[(u32,u64)])->Vec<u8>{
+    let mut header=Vec::new();int(1,seq,&mut header);
+    let mut setting=Vec::new();for &(f,v) in fields {int(f,v,&mut setting);}
+    let mut rpc=Vec::new();bytes(1,&header,&mut rpc);bytes(2,&setting,&mut rpc);
+    envelope(seq,21,&rpc)
+}
+/// Message 3 SimpleAction {1 action, 5 value} as the official 安全 menu sends it.
+pub fn simple_action(seq:u64,action:u64,value:Option<u64>)->Vec<u8>{
+    let mut body=Vec::new();int(1,action,&mut body);if let Some(v)=value {int(5,v,&mut body);}
+    envelope(seq,3,&body)
 }
 /// Message 18 is an encoder capability LIST, not the chosen codec; RTP's negotiated PT is authoritative.
 /// Message 25 reports actual encoded chroma, which may fall back to 4:2:0.
@@ -236,6 +257,15 @@ pub fn media_control(data:&[u8])->(Option<u32>,Option<u32>){
             assert_eq!(caps,if force{vec![(1,1),(1,3)]}else{vec![(2,1),(2,3),(1,1),(1,3)]});
             assert!(s.video_preferences(force).connect_options("synthetic-device",false).unwrap()==options);
         }
+    }
+    #[test] fn video_track_request_is_an_empty_rpc_15(){
+        let message=request_video_track();
+        let fields=decode_wire(&message).unwrap();
+        assert!(fields.iter().any(|f|f.number==1));
+        let rpc=fields.iter().find_map(|f|match (f.number,&f.value){(21,WireValue::Bytes(b))=>Some(*b),_=>None}).unwrap();
+        let rpc=decode_wire(rpc).unwrap();
+        assert!(rpc.iter().any(|f|f.number==1));
+        assert!(rpc.iter().any(|f|matches!((f.number,&f.value),(15,WireValue::Bytes(b)) if b.is_empty())));
     }
     #[test] fn chroma_request_and_actual_sync_are_independent_of_encoder_list(){
         let request=request_chroma444();let rpc=super::super::tools::blob(&request,21).unwrap();

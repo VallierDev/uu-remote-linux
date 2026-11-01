@@ -161,7 +161,7 @@ pub fn session_rows(sessions:&[Value])->String{
     let mut rows:Vec<_>=sessions.iter().filter_map(|s|{
         let id=u32::try_from(s["session_id"].as_u64()?).ok().filter(|n|*n!=0)?;
         let shell=s["shell"].as_str().unwrap_or("--").chars().take(256).collect::<String>().replace(['\t','\n','\r','\0']," ");
-        let state=match s["state"].as_str(){Some("running")=>"运行中",Some("detached")=>"已分离",_=>"--"};
+        let state=match s["state"].as_str(){Some("running")=>crate::i18n::s("运行中","Running"),Some("detached")=>crate::i18n::s("已分离","Detached"),_=>"--"};
         Some((id,format!("{id}\t{shell}\t{}\t{state}\n",s["created_at_ms"].as_u64().unwrap_or(0))))
     }).collect();rows.sort_by_key(|r|r.0);rows.into_iter().map(|r|r.1).collect()
 }

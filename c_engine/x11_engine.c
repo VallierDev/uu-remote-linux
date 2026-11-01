@@ -56,6 +56,15 @@ static void track_injected_key(int keycode, int is_press) {
     }
 }
 
+/* XShmAttach fails asynchronously (BadAccess when the X server cannot reach our segment, e.g. a
+ * server in another container); Xlib's default handler would exit the process before the XGetImage fallback. */
+static volatile int g_shm_attach_failed = 0;
+static int shm_attach_error(Display *display, XErrorEvent *event) {
+    (void)display; (void)event;
+    g_shm_attach_failed = 1;
+    return 0;
+}
+
 static void shm_open_image(void) {
     g_use_shm = 0;
     if (!XShmQueryExtension(g_display)) return;
@@ -66,9 +75,15 @@ static void shm_open_image(void) {
     if (g_shminfo.shmid == -1) return;
     g_shminfo.shmaddr = g_shm_image->data = (char *)shmat(g_shminfo.shmid, 0, 0);
     g_shminfo.readOnly = False;
-    if (g_shminfo.shmaddr != (char *)-1 && XShmAttach(g_display, &g_shminfo)) {
+    if (g_shminfo.shmaddr != (char *)-1) {
         XSync(g_display, False);
-        g_use_shm = 1;
+        g_shm_attach_failed = 0;
+        int (*previous)(Display *, XErrorEvent *) = XSetErrorHandler(shm_attach_error);
+        Status attached = XShmAttach(g_display, &g_shminfo);
+        XSync(g_display, False);
+        XSetErrorHandler(previous);
+        if (attached && !g_shm_attach_failed) g_use_shm = 1;
+        else fprintf(stderr, "X11 shared-memory capture unavailable; using XGetImage\n");
     }
     shmctl(g_shminfo.shmid, IPC_RMID, 0); // 标记删除，进程退出时自动回收；失败时也不遗留段
 }

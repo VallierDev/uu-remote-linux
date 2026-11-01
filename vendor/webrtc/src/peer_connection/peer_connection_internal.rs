@@ -121,13 +121,17 @@ impl PeerConnectionInternal {
             ice_gather_policy: configuration.ice_transport_policy,
         })?);
 
-        // Create the ice transport
-        pc.ice_transport = pc.create_ice_transport(api).await;
+        // Create the ice transport. Its state callback must read the real DTLS
+        // transport, which only exists after the ICE transport, so it is wired
+        // in through a weak slot (the placeholder would always report New).
+        let dtls_slot = Arc::new(std::sync::OnceLock::new());
+        pc.ice_transport = pc.create_ice_transport(api, Arc::clone(&dtls_slot)).await;
 
         // Create the DTLS transport
         let certificates = configuration.certificates.drain(..).collect();
         pc.dtls_transport =
             Arc::new(api.new_dtls_transport(Arc::clone(&pc.ice_transport), certificates)?);
+        let _ = dtls_slot.set(Arc::downgrade(&pc.dtls_transport));
 
         // Create the SCTP transport
         pc.sctp_transport = Arc::new(api.new_sctp_transport(Arc::clone(&pc.dtls_transport))?);
@@ -1106,13 +1110,16 @@ impl PeerConnectionInternal {
         }
     }
 
-    pub(super) async fn create_ice_transport(&self, api: &API) -> Arc<RTCIceTransport> {
+    pub(super) async fn create_ice_transport(
+        &self,
+        api: &API,
+        dtls_slot: Arc<std::sync::OnceLock<Weak<RTCDtlsTransport>>>,
+    ) -> Arc<RTCIceTransport> {
         let ice_transport = Arc::new(api.new_ice_transport(Arc::clone(&self.ice_gatherer)));
 
         let ice_connection_state = Arc::clone(&self.ice_connection_state);
         let peer_connection_state = Arc::clone(&self.peer_connection_state);
         let is_closed = Arc::clone(&self.is_closed);
-        let dtls_transport = Arc::clone(&self.dtls_transport);
         let on_ice_connection_state_change_handler =
             Arc::clone(&self.on_ice_connection_state_change_handler);
         let on_peer_connection_state_change_handler =
@@ -1139,7 +1146,11 @@ impl PeerConnectionInternal {
             let on_peer_connection_state_change_handler2 =
                 Arc::clone(&on_peer_connection_state_change_handler);
             let is_closed2 = Arc::clone(&is_closed);
-            let dtls_transport_state = dtls_transport.state();
+            let dtls_transport_state = dtls_slot
+                .get()
+                .and_then(Weak::upgrade)
+                .map(|dtls| dtls.state())
+                .unwrap_or(RTCDtlsTransportState::New);
             let peer_connection_state2 = Arc::clone(&peer_connection_state);
             Box::pin(async move {
                 RTCPeerConnection::do_ice_connection_state_change(

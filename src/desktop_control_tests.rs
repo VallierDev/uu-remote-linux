@@ -244,6 +244,15 @@ async fn capture_desktop_on_a_port_mapping_peer_promotes_it_once() {
         let lease = host.role.input().unwrap();
         host.promote(None);
         assert!(lease.is_current());
+        // Its video ended on its own (capture failed while locked, #114): capture_desktop restarts it
+        // on the same input lease.
+        let ended = tokio::spawn(async {});
+        *host.role.stream_task.lock().unwrap() = Some(ended.abort_handle());
+        ended.await.unwrap();
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(9, 0, 3, &[8, 4])).await;
+        tokio::time::timeout(Duration::from_secs(5), requested.recv()).await.unwrap().unwrap();
+        host.promote(None);
+        assert!(host.role.is_desktop() && !host.role.stream_ended() && lease.is_current());
         // A newer desktop demotes it; the port mapping stays, and capture_desktop promotes it again.
         host.demote();
         assert!(!host.role.is_desktop() && host.role.input().is_none());

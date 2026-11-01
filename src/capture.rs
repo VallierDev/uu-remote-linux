@@ -82,8 +82,10 @@ pub struct ScreenCapture {
 impl ScreenCapture {
     pub fn open_portal(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, crate::portal::PortalError> {
         let session = std::sync::Arc::new(crate::portal::PortalSession::open_cancellable(cancelled)?);
+        crate::portal::register(&session);
+        let (width, height) = session.size();
         Ok(Self { backend: crate::desktop_backend::DesktopBackend::Portal, init_error: None,
-            display: "wayland:portal".into(), width: session.width, height: session.height,
+            display: "wayland:portal".into(), width, height,
             portal: Some(session), kms: None, buffer: Mutex::new(Vec::new()) })
     }
     pub fn new() -> Result<Self, String> {

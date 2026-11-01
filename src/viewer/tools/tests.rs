@@ -156,7 +156,7 @@ fn terminal_metadata_is_allowlisted_and_sorted(){
         serde_json::json!({"session_id":2,"shell":"/bin/bash","state":"running"}),
         serde_json::json!({"session_id":0}),serde_json::json!({"session_id":4294967296u64}),
     ]);
-    assert_eq!(rows,"2\t/bin/bash\t0\t运行中\n9\t/bin/sh X Y \t123\t已分离\n");
+    assert_eq!(rows,format!("2\t/bin/bash\t0\t{}\n9\t/bin/sh X Y \t123\t{}\n",crate::i18n::s("运行中","Running"),crate::i18n::s("已分离","Detached")));
     assert!(!rows.contains("PRIVATE"));assert!(terminal::session_rows(&[]).is_empty());
 }
 #[tokio::test]

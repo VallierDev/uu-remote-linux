@@ -17,7 +17,7 @@ static int portal_eis_dispatch(struct uu_portal *p) {
         case EI_EVENT_SEAT_ADDED:
             ei_seat_bind_capabilities(ei_event_get_seat(event),
                 EI_DEVICE_CAP_POINTER, EI_DEVICE_CAP_POINTER_ABSOLUTE,
-                EI_DEVICE_CAP_BUTTON, EI_DEVICE_CAP_SCROLL, EI_DEVICE_CAP_KEYBOARD, NULL);
+                EI_DEVICE_CAP_BUTTON, EI_DEVICE_CAP_SCROLL, EI_DEVICE_CAP_KEYBOARD, EI_DEVICE_CAP_TOUCH, NULL);
             break;
         case EI_EVENT_DEVICE_RESUMED:
             if (!g_list_find(p->ei_devices, device)) {
@@ -55,15 +55,19 @@ static struct ei_region *portal_eis_region(struct uu_portal *p, struct ei_device
             ei_region_get_width(region) && ei_region_get_height(region)) return region;
     }
 }
-static struct ei_device *portal_eis_absolute(struct uu_portal *p, struct ei_region **region) {
+static struct ei_device *portal_eis_mapped(struct uu_portal *p, enum ei_device_capability capability, struct ei_region **region) {
     for (GList *item = p->ei_devices; item; item = item->next) {
         struct ei_device *device = item->data;
-        if (ei_device_has_capability(device, EI_DEVICE_CAP_POINTER_ABSOLUTE) &&
+        if (ei_device_has_capability(device, capability) &&
             (*region = portal_eis_region(p, device))) return device;
     }
     return NULL;
 }
+static struct ei_device *portal_eis_absolute(struct uu_portal *p, struct ei_region **region) {
+    return portal_eis_mapped(p, EI_DEVICE_CAP_POINTER_ABSOLUTE, region);
+}
 static void portal_eis_close(struct uu_portal *p) {
+    if (p->ei_touch) p->ei_touch = ei_touch_unref(p->ei_touch);
     for (GList *item = p->ei_devices; item; item = item->next) ei_device_unref(item->data);
     g_list_free(p->ei_devices); p->ei_devices = NULL;
     if (p->ei) p->ei = ei_unref(p->ei);
@@ -155,6 +159,38 @@ static int portal_eis_button(struct uu_portal *p, int button, int pressed) {
     struct ei_device *device = portal_eis_device(p, EI_DEVICE_CAP_BUTTON);
     if (!device) return 9;
     ei_device_button_button(device, code, !!pressed);
+    return portal_eis_frame(p, device);
+}
+static int portal_eis_scroll(struct uu_portal *p, double dx, double dy, int finish) {
+    if (portal_eis_available(p)) return 9;
+    struct ei_device *device = portal_eis_device(p, EI_DEVICE_CAP_SCROLL);
+    if (!device) return 9;
+    if (dx != 0 || dy != 0) ei_device_scroll_delta(device, dx, dy);
+    if (finish) ei_device_scroll_stop(device, true, true);
+    return portal_eis_frame(p, device);
+}
+static int portal_eis_touch(struct uu_portal *p, int phase, double x, double y) {
+    if (portal_eis_available(p)) return 9;
+    if (phase == 2) {
+        if (!p->ei_touch) return 0;
+        struct ei_device *device = ei_touch_get_device(p->ei_touch);
+        ei_touch_up(p->ei_touch);
+        p->ei_touch = ei_touch_unref(p->ei_touch);
+        return portal_eis_frame(p, device);
+    }
+    struct ei_region *region = NULL;
+    struct ei_device *device = portal_eis_mapped(p, EI_DEVICE_CAP_TOUCH, &region);
+    if (!device) return 9;
+    double target_x = ei_region_get_x(region) + x * ei_region_get_width(region) / p->width;
+    double target_y = ei_region_get_y(region) + y * ei_region_get_height(region) / p->height;
+    if (phase == 0) {
+        if (p->ei_touch) { ei_touch_up(p->ei_touch); p->ei_touch = ei_touch_unref(p->ei_touch); }
+        if (!(p->ei_touch = ei_device_touch_new(device))) return 9;
+        ei_touch_down(p->ei_touch, target_x, target_y);
+    } else {
+        if (!p->ei_touch) return 11;
+        ei_touch_motion(p->ei_touch, target_x, target_y);
+    }
     return portal_eis_frame(p, device);
 }
 static int portal_eis_key(struct uu_portal *p, int code, int pressed) {

@@ -25,5 +25,12 @@ int uu_portal_capture(struct uu_portal *portal, uint8_t *bgra, size_t length);
 int uu_portal_capture_since(struct uu_portal *portal, uint8_t *bgra, size_t length, uint64_t *revision);
 int uu_portal_move(struct uu_portal *portal, double x, double y, int relative);
 int uu_portal_button(struct uu_portal *portal, int button, int pressed);
+int uu_portal_scroll(struct uu_portal *portal, double dx, double dy, int finish);
+int uu_portal_touch_supported(struct uu_portal *portal);
+int uu_portal_touch_available(struct uu_portal *portal);
+int uu_portal_touch(struct uu_portal *portal, int phase, double x, double y);
 int uu_portal_key(struct uu_portal *portal, uint32_t keysym, int keycode, int pressed);
+int uu_portal_stream_position(struct uu_portal *portal, int32_t *x, int32_t *y);
+int uu_portal_monitors(char *out, size_t length);
+void uu_portal_end(struct uu_portal *portal);
 #endif

@@ -7,13 +7,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 /// A peer that stops reading must not park the heartbeat loop on a full queue.
 /// Kept below the Engine.IO window so the protocol deadline still fires.
 const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+// DNS/TCP/TLS/WebSocket upgrade must finish in bounded time: after a network
+// change the handshake can stall forever and the reconnect loop never retries.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often the watchdog checks the last inbound frame.
 const WATCHDOG_TICK: Duration = Duration::from_secs(1);
 
@@ -49,7 +51,7 @@ pub enum SignalingEvent {
     BeControlled(Value),
     /// be-controlled with its binary app_data (ConnectOptions): capture type and the
     /// ice_id it announces, when present.
-    ConnectRequest { capture_type: u64, ice_id: Option<String>, transport:crate::session_ice::SessionIce, controller_mac: bool },
+    ConnectRequest { capture_type: u64, ice_id: Option<String>, transport:crate::session_ice::SessionIce, controller: crate::input::Controller },
     Soac(SoacMessage),
     Released(Value),
     Left(Value),
@@ -178,6 +180,21 @@ mod refresh_tests {
         assert!(closed.is_ok(),"a blocked consumer must not keep a dead signaling socket open");
     }
     #[tokio::test]
+    async fn stalled_handshake_times_out() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        // Accepts TCP but never answers the upgrade, like a stalled path after a network change.
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_tcp,_)=listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let req=format!("ws://{address}/socket.io/").into_client_request().unwrap();
+        let result=tokio::time::timeout(std::time::Duration::from_secs(5),super::open_socket(req,std::time::Duration::from_secs(1))).await;
+        assert!(matches!(result,Ok(Err(_))),"a stalled handshake must fail within the connect timeout");
+    }
+
+    #[tokio::test]
     async fn stalled_event_delivery_still_reports_disconnected() {
         use futures_util::{SinkExt,StreamExt};
         use tokio_tungstenite::tungstenite::Message;
@@ -210,6 +227,13 @@ mod refresh_tests {
     }
 }
 
+async fn open_socket(
+    req: tokio_tungstenite::tungstenite::handshake::client::Request,
+    limit: Duration,
+) -> Result<crate::ws_transport::Socket, String> {
+    crate::ws_transport::connect(req, limit).await
+}
+
 impl SignalingClient {
     pub async fn connect(
         url: &str,
@@ -231,9 +255,7 @@ impl SignalingClient {
             room_token.parse().map_err(|_| "Invalid token header")?,
         );
 
-        let (ws_stream, _) = connect_async(req)
-            .await
-            .map_err(|e| format!("WS connect failed: {}", e))?;
+        let ws_stream = open_socket(req, CONNECT_TIMEOUT).await?;
 
         log::info!("Connected to Engine.IO / Socket.IO");
         let (mut write, mut read) = ws_stream.split();
@@ -440,6 +462,7 @@ impl SignalingClient {
                                             log::info!("Cloud peer event: generation={} event={} age_s={} pings={} last_ping_gap_s={} ice_id_present={}",generation,event_name,started.elapsed().as_secs(),pings,last_ping.elapsed().as_secs(),data.get("ice_id").is_some());
                                             let ice_id = data.get("ice_id").and_then(|v| v.as_str()).unwrap_or("");
                                             if ice_id.is_empty() {
+                                                log::info!("Cloud room leave shape: {}", crate::protocol::json_shape(data, 3));
                                                 log::warn!("Cloud room leave without peer identifier; renewing signaling (expiry cause unknown)");
                                                 if !send_event(&event_sender, SignalingEvent::Disconnected).await { break; }
                                             } else {
@@ -490,10 +513,9 @@ impl SignalingClient {
                                 if !caps.is_empty() { log::info!("Viewer decoder caps (fps,codec,w,h,chroma fields): {:?}", caps); }
                                 // Viewer platform (website enum: 1 windows, 2 android, 3 ios, 4 macos, 5 tv).
                                 let platform = header.get("controller_platform").or_else(|| header.get("data").and_then(|d| d.get("controller_platform")));
-                                let controller_mac = platform.is_some_and(|v| v.as_i64() == Some(4)
-                                    || v.as_str().is_some_and(|s| s == "4" || s.to_ascii_lowercase().contains("mac") || s.to_ascii_lowercase().contains("darwin")));
-                                log::info!("Controller platform: {} mac={}", platform.map(|v| v.to_string()).unwrap_or_default().chars().take(24).collect::<String>(), controller_mac);
-                                if !send_event(&event_sender, SignalingEvent::ConnectRequest { capture_type, ice_id, transport:crate::session_ice::SessionIce::from_header(&header), controller_mac }).await { break; }
+                                let controller = crate::input::Controller::from_platform(platform);
+                                log::info!("Controller platform: {} controller={:?}", platform.map(|v| v.to_string()).unwrap_or_default().chars().take(24).collect::<String>(), controller);
+                                if !send_event(&event_sender, SignalingEvent::ConnectRequest { capture_type, ice_id, transport:crate::session_ice::SessionIce::from_header(&header), controller }).await { break; }
                             }
                         }
                     }

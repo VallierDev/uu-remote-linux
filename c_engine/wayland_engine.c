@@ -1,5 +1,6 @@
 /* Native Hyprland/wlroots desktop bridge. Protocol XMLs retain upstream licenses. */
 #define _GNU_SOURCE
+#include "wayland_transform.h"
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 #include <pthread.h>
@@ -60,7 +61,7 @@ static struct xkb_state *key_state;
 static unsigned char held_keys[768];
 /* Mobile input-method text (#13/#46). The protocol has no per-key remap request, but
    zwp_virtual_keyboard_v1_keymap may be re-sent at any time, so the pristine keymap text is kept
-   and a spare keycode is pointed at one character's keysym at a time. Never logs the text. */
+   and printable codes on a separate text keyboard carry each batch. Never logs the text. */
 #define UU_TEXT_SPARE 32
 static char *keymap_text;
 static size_t keymap_text_len, keymap_insert;
@@ -187,6 +188,14 @@ static xkb_keycode_t existing_keycode(xkb_keysym_t symbol) {
     }
     return 0;
 }
+static unsigned find_niri_text_codes(xkb_keycode_t *out,unsigned limit) {
+    /* Printable physical keys work in Chromium; reserved evdev codes can be discarded. */
+    static const xkb_keycode_t text_codes[]={24,25,26,27,28,29,30,31,32,33,38,39,40,41,42,43,44,45,46,52,53,54,55,56,57,58};
+    unsigned count=0;
+    for(unsigned i=0;i<sizeof(text_codes)/sizeof(text_codes[0]) && count<limit;i++)
+        if(xkb_keymap_key_get_name(keymap,text_codes[i])) out[count++]=text_codes[i];
+    return count;
+}
 static void press_keycode(xkb_keycode_t code) {
     zwp_virtual_keyboard_v1_key(keyboard,timestamp(),code-8,WL_KEYBOARD_KEY_STATE_PRESSED);
     zwp_virtual_keyboard_v1_key(keyboard,timestamp(),code-8,WL_KEYBOARD_KEY_STATE_RELEASED);
@@ -207,7 +216,8 @@ static void release_held_keys_locked(void) {
    key_state and held_keys: pressed and released here. */
 static int flush_batch(char *buffer,size_t capacity,const char names[][64],const xkb_keycode_t *codes,unsigned count,int *typed) {
     release_held_keys_locked();
-    if(rekey_keyboard()!=0) return -1;
+    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
+    else if(rekey_keyboard()!=0) return -1;
     size_t at=keymap_insert;
     memcpy(buffer,keymap_text,at);
     for(unsigned i=0;i<count;i++) {
@@ -217,8 +227,11 @@ static int flush_batch(char *buffer,size_t capacity,const char names[][64],const
     }
     memcpy(buffer+at,keymap_text+keymap_insert,keymap_text_len-keymap_insert);
     if(upload_keymap(buffer,at+(keymap_text_len-keymap_insert))!=0) return -1;
+    if(getenv("NIRI_SOCKET")) zwp_virtual_keyboard_v1_modifiers(keyboard,0,0,0,0);
     if(sync_display()!=0) return -1;
+    if(getenv("NIRI_SOCKET")) usleep(8000);
     for(unsigned i=0;i<count;i++) { press_keycode(codes[i]); (*typed)++; }
+    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
     return 0;
 }
 /* Type UTF-8 like xdotool type does on X11, but on Wayland: characters the session keymap already
@@ -247,14 +260,14 @@ static int type_utf8_locked(const char *text) {
         else if(cp<0x20 || cp==0x7f || (cp>=0x80 && cp<0xa0)) continue; /* controls carry no text */
         else if(cp<0x100) sym=cp;                                      /* Latin-1 keysyms equal the code point */
         else sym=(xkb_keysym_t)(0x1000000|cp);                         /* Unicode keysym */
-        xkb_keycode_t existing=existing_keycode(sym);
+        xkb_keycode_t existing=getenv("NIRI_SOCKET")?0:existing_keycode(sym);
         if(existing) {
             if(count && flush_batch(buffer,capacity,names,codes,count,&typed)!=0) { failed=1; break; }
             count=0;
             press_keycode(existing); typed++;
             continue;
         }
-        if(count==UU_TEXT_SPARE) {
+        if(count==(getenv("NIRI_SOCKET")?spare_count:UU_TEXT_SPARE)) {
             if(flush_batch(buffer,capacity,names,codes,count,&typed)!=0) { failed=1; break; }
             count=0;
         }
@@ -266,13 +279,23 @@ static int type_utf8_locked(const char *text) {
     if(!failed && count) failed=flush_batch(buffer,capacity,names,codes,count,&typed)!=0;
     free(buffer);
     /* Restore the pristine keymap whatever happened above, so uu_wl_key keeps its own symbol map. */
-    if(upload_keymap(keymap_text,keymap_text_len)!=0) return -1;
+    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
+    else if(upload_keymap(keymap_text,keymap_text_len)!=0) return -1;
     return failed && !typed?-1:typed;
 }
 int uu_wl_type_utf8(const char *text) {
     pthread_mutex_lock(&lock);
     int typed=-1;
-    if(initialized && text && keymap_text && keymap_insert && spare_count) typed=type_utf8_locked(text);
+    if(initialized && text && keymap_text && keymap_insert && spare_count) {
+        if(getenv("NIRI_SOCKET")) {
+            /* Only niri uses printable codes on a separate text device; preserve the Hyprland path. */
+            release_held_keys_locked();
+            struct zwp_virtual_keyboard_v1 *saved=keyboard;
+            keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
+            if(keyboard) {typed=type_utf8_locked(text);sync_display();usleep(8000);if(keyboard) zwp_virtual_keyboard_v1_destroy(keyboard);}
+            keyboard=saved;
+        } else typed=type_utf8_locked(text);
+    }
     if(typed>=0 && wl_display_flush(display)<0) typed=-1;
     pthread_mutex_unlock(&lock); return typed;
 }
@@ -544,9 +567,9 @@ int uu_wl_init(int32_t *w,int32_t *h) {
         for(selected=0;selected<output_count;selected++) if(!strcmp(outputs[selected].name,name)) break;
         if(selected==output_count) goto end;
     }
-    /* Rotated output coordinate mapping needs separate acceptance. */
-    if(outputs[selected].transform!=WL_OUTPUT_TRANSFORM_NORMAL) goto end;
+    if(!uu_output_transform_supported(outputs[selected].transform,getenv("NIRI_SOCKET")!=NULL)) goto end;
     width=outputs[selected].width; height=outputs[selected].height;
+    if(outputs[selected].transform&1) {uint32_t t=width;width=height;height=t;}
     if(!width || !height || width>16384 || height>16384 || (uint64_t)width*height*4>256*1024*1024) goto end;
     if(power_manager) {
         power=zwlr_output_power_manager_v1_get_output_power(power_manager,outputs[selected].handle);
@@ -574,7 +597,7 @@ int uu_wl_init(int32_t *w,int32_t *h) {
         /* Text typing needs unmapped keycodes and a place to declare them. A keymap without either
            only costs that path - uu_wl_type_utf8 refuses and the caller keeps its own fallback. */
         keymap_insert=symbols_close(keymap_text);
-        spare_count=find_spare_codes(spare_codes,sizeof(spare_codes)/sizeof(spare_codes[0]));
+        spare_count=getenv("NIRI_SOCKET")?find_niri_text_codes(spare_codes,UU_TEXT_SPARE):find_spare_codes(spare_codes,UU_TEXT_SPARE);
     }
     initialized=1; *w=width; *h=height; result=0;
 end:
@@ -588,8 +611,9 @@ int uu_wl_select_output(const char *name,uint32_t expected_w,uint32_t expected_h
     if(!initialized || !name || sync_display()!=0) goto end;
     unsigned target;
     for(target=0;target<output_count;target++) if(!strcmp(outputs[target].name,name)) break;
-    if(target==output_count || outputs[target].transform!=WL_OUTPUT_TRANSFORM_NORMAL) goto end;
+    if(target==output_count || !uu_output_transform_supported(outputs[target].transform,getenv("NIRI_SOCKET")!=NULL)) goto end;
     uint32_t w=outputs[target].width,h=outputs[target].height;
+    if(outputs[target].transform&1) {uint32_t t=w;w=h;h=t;}
     if(w!=expected_w || h!=expected_h || !w || !h || w>16384 || h>16384 || (uint64_t)w*h*4>256*1024*1024) goto end;
     struct zwlr_virtual_pointer_v1 *next=NULL;
     if(pointer_manager) {
@@ -640,7 +664,7 @@ retry:;
         for(unsigned i=0;i<2;i++) { frame_clear(&frames[i]); dma_clear(&frames[i]); }
         pending=0; goto retry;
     }
-    if(frame->failed || !frame->pixels || frame->width!=width || frame->height!=height) goto end;
+    if(frame->failed || !frame->pixels || frame->width!=outputs[selected].width || frame->height!=outputs[selected].height) goto end;
     zwlr_screencopy_frame_v1_destroy(frame->handle); frame->handle=NULL;
     const char *pipeline=getenv("UU_WAYLAND_PIPELINE");
     if(!pipeline || strcmp(pipeline,"0")) {
@@ -651,11 +675,22 @@ retry:;
     }
     {
         for(uint32_t y=0;y<height;y++) {
-            uint32_t source=(frame->flags&ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT)?height-y-1:y;
             uint8_t *row=out+(size_t)y*width*4;
-            memcpy(row,(uint8_t*)frame->pixels+(size_t)source*frame->stride,width*4);
-            if(frame->format==WL_SHM_FORMAT_XBGR8888 || frame->format==WL_SHM_FORMAT_ABGR8888) {
-                for(uint32_t x=0;x<width;x++) { uint8_t red=row[x*4]; row[x*4]=row[x*4+2]; row[x*4+2]=red; }
+            if(outputs[selected].transform==WL_OUTPUT_TRANSFORM_NORMAL &&
+               frame->format!=WL_SHM_FORMAT_XBGR8888 && frame->format!=WL_SHM_FORMAT_ABGR8888) {
+                uint32_t sy=(frame->flags&ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT)?height-1-y:y;
+                memcpy(row,(uint8_t*)frame->pixels+(size_t)sy*frame->stride,width*4);
+                continue;
+            }
+            for(uint32_t x=0;x<width;x++) {
+                uint32_t sx=x,sy=y,sw=frame->width,sh=frame->height;
+                uu_source_pixel(outputs[selected].transform,sw,sh,x,y,&sx,&sy);
+                if(frame->flags&ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT) sy=sh-1-sy;
+                const uint8_t *pixel=(uint8_t*)frame->pixels+(size_t)sy*frame->stride+sx*4;
+                memcpy(row+x*4,pixel,4);
+                if(frame->format==WL_SHM_FORMAT_XBGR8888 || frame->format==WL_SHM_FORMAT_ABGR8888) {
+                    row[x*4]=pixel[2];row[x*4+2]=pixel[0];
+                }
             }
         }
         result=0;
@@ -675,7 +710,13 @@ int uu_wl_move(int32_t x,int32_t y,int relative) {
             double scale=outputs[selected].scale;
             zwlr_virtual_pointer_v1_motion(pointer,timestamp(),wl_fixed_from_double(x/scale),wl_fixed_from_double(y/scale));
         }
-        else if(x>=0 && y>=0 && x<(int32_t)width && y<(int32_t)height) zwlr_virtual_pointer_v1_motion_absolute(pointer,timestamp(),x,y,width,height);
+        else if(x>=0 && y>=0 && x<(int32_t)width && y<(int32_t)height) {
+            uint32_t sx,sy,sw=outputs[selected].width,sh=outputs[selected].height;
+            /* niri/Smithay applies the output transform to absolute device coordinates. */
+            if(getenv("NIRI_SOCKET")) uu_source_pixel(outputs[selected].transform,sw,sh,x,y,&sx,&sy);
+            else {sx=x;sy=y;sw=width;sh=height;}
+            zwlr_virtual_pointer_v1_motion_absolute(pointer,timestamp(),sx,sy,sw,sh);
+        }
         else goto end;
         zwlr_virtual_pointer_v1_frame(pointer); result=wl_display_flush(display)<0?-1:0;
     }

@@ -21,7 +21,30 @@
 <p align="center"><sub>Linux viewer: device list (device names redacted)</sub></p>
 
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Host main window: remote assistance and account"></p>
-<p align="center"><sub>Linux host main window: remote assistance and account (device ID, code and account redacted). The UI is in Chinese, like the official app.</sub></p>
+<p align="center"><sub>Linux host main window: remote assistance and account (device ID, code and account redacted). The UI is available in Chinese and English (see [Language](#language--语言)).</sub></p>
+
+## Appearance / 外观
+
+Choose **System / Light / Dark** (default: System) in the viewer's **Settings → General → Appearance**, or via the gear settings button in host / tool windows.
+The choice is saved to `$XDG_CONFIG_HOME/uuremote/theme` (default `~/.config/uuremote/theme`).
+
+<p align="center"><img src="docs/images/appearance-light.png" width="360" alt="Light appearance (synthetic devices)"> <img src="docs/images/appearance-dark.png" width="360" alt="Dark appearance (synthetic devices)"></p>
+
+## Language / 语言
+
+The language is picked once at start, in this order:
+
+1. `UU_LANG=en` or `UU_LANG=zh`;
+2. the choice saved in the viewer's **Settings → General → 语言 / Language**
+   or the host main window's 语言 / Language row; stored as `~/.config/uuremote/language`, applies after a restart);
+3. the locale: `LC_ALL` / `LC_MESSAGES` / `LANG` starting with `zh` → Chinese, anything else → English.
+
+```sh
+UU_LANG=en uuremote-viewer ui
+UU_LANG=zh uuremote-server
+```
+
+Protocol strings and messages that come from the UU servers are shown as the server sends them.
 
 <!-- Screenshot placeholder: the Linux desktop controlled from the official client. Take your own
      screenshot, remove account/device details and NetEase logos, save it as docs/images/remote-desktop.png
@@ -45,7 +68,7 @@
 | Mouse / keyboard | Absolute and relative motion, clicks, wheel, keys; no spurious key repeat on high-latency links; optional uinput virtual devices on Wayland (layout independent, see below) |
 | Mac shortcuts | **Recommended**: turn off 「使用 macOS 快捷键」 (use macOS shortcuts) in the Mac viewer's remote-window menu; then Cmd+C/V/A/F/X/Z work as on a Mac (Cmd+C/V become Ctrl+Shift+C/V in terminals) and Ctrl+C always interrupts. With the option on, the viewer sends Cmd as Ctrl: in a terminal Ctrl+V / Cmd+V paste, Ctrl+C interrupts, copy is Cmd+Shift+C (X11) |
 | Pointer shape | Remote cursor shape is mirrored to the viewer (X11) |
-| Clipboard | Two-way text sync |
+| Clipboard | Two-way text sync; Wayland mobile IME text inputs use clipboard paste fallback (see below) |
 | Quality / frame rate / resolution | Auto, Original 20M, Ultra 8M, HD 2M, custom; 30/60/90/144 fps; on X11 a resolution choice changes the desktop resolution itself like the official Windows host (xrandr, adding the mode when missing; restored for "original" or on disconnect), `UU_DESKTOP_RESIZE=0` scales in the encoder instead; Wayland scales in the encoder |
 | Sound | System audio captured from PulseAudio / PipeWire and sent as Opus |
 | File transfer | Upload, download (including folders), create folder, rename, delete |
@@ -73,7 +96,7 @@ authorized session. Independent file/terminal tool peers do not reset input.
 | Xfce | X11 | ✅ Tested in a VM | default |
 | Cinnamon / MATE | X11 | ✅ Tested in a VM | default |
 | Hyprland | Wayland (native wlroots protocols) | 🧪 Experimental, tested in a VM (some features limited, see below) | `--features wayland` |
-| niri | Wayland (native wlroots protocols) | 🧪 Experimental; protocol support confirmed from niri sources, not yet tested on hardware (#55) | `--features wayland` |
+| niri | Wayland (native wlroots protocols) | 🧪 Experimental; capture, text input and portrait switching hardware-tested; other features pending (#55) | `--features wayland` |
 | GNOME / KDE Plasma | Wayland (xdg-desktop-portal) | 🧪 Experimental; validation scope and limits below | `--features wayland,portal` |
 
 The GNOME Wayland Portal/EIS path has been checked for video and mouse/keyboard input on Ubuntu 26.04, GNOME 50, with one 4K screen at 200% scale; auto unlock after a cold locked connection is verified with the official Mac and iPhone 4.42.0 viewers, while other lock recovery and reconnection still need hardware acceptance testing. Apart from that path and GNOME on X11, desktop testing has primarily used virtual machines. If something goes wrong on
@@ -83,6 +106,10 @@ plugins, permissions and encoders only, no account data, tokens or addresses) an
 
 Wayland limits: captures one screen by default; Hyprland can enable monitor switching as described below. Resolution is fixed. The native Hyprland backend now pipelines two shm screencopy buffers and passes the viewer's requested fps to both capture pacing and the encoder. Actual fps remains limited by the compositor, rendering and readback (the old serial path measured about 16–22 fps at 2560x1600; the pipeline is VM-measured only, not a hardware guarantee). The portal backend does not support dynamic resolution; see below for GNOME wake and lock recovery; the clipboard syncs while the viewer's remote window has focus. On the first connection the desktop asks for "Remote Desktop / Screen Sharing"
 permission; the permission is remembered once granted.
+
+**Touch from mobile viewers (GNOME)**: in touch mode the Android/iOS viewers send a finger as a left-button drag, which on a desktop selects text. On the portal backend the host decides per press: a finger that moves more than a few pixels within 0.45 s scrolls smoothly (`NotifyPointerAxis`; the content follows the finger, also in terminals, and the last event lets clients coast), one held still selects like a mouse drag, and a short press clicks. This needs no touchscreen consent. `UU_TOUCH_INPUT=touch` instead replays drags as one finger on the portal touchscreen, which the host requests where the portal offers it; a consent saved before touch support restores keyboard and pointer only, so the first drag then asks the host once more in the background (the GNOME share dialog, which the phone also sees; it closes after the consent timeout), and an approval for the same monitor switches to touch without reconnecting. The saved consent is never removed beforehand, and the host asks at most once per run. `UU_TOUCH_INPUT=0` keeps mouse drags.
+
+**Mobile IME typing and clipboard on Wayland**: Mobile IME text (`text_input`) on Wayland is typed through spare keycodes on wlroots compositors. On GNOME (Portal) printable ASCII is typed as keysyms when the active input source is a Latin xkb layout (Mutter picks the key and Shift level); other text, KDE and compositors where keycodes are exhausted fall back to "system clipboard write + `Shift+Insert` (or `UU_WAYLAND_PASTE_KEY=ctrl_v`)". VTE terminals paste the PRIMARY selection on `Shift+Insert`, which is why ASCII is typed instead. **Note**: This fallback replaces the host's existing clipboard contents and may echo back to the viewer's clipboard via two-way sync; set `UU_WAYLAND_TEXT=0` to completely disable Wayland mobile text input and clipboard paste fallback.
 
 Scaled GNOME desktops using native Portal input use EIS on the same authorized session when `ConnectToEIS` and a screen `mapping_id` are available. Each axis is mapped using the matched region and actual frame dimensions, with no fixed resolution or scale factor. This avoids scaled-coordinate rejection by `NotifyPointerMotionAbsolute`. Portal builds require libei >= 1.1. Missing EIS support retains the legacy input path and its existing scaling limitations; other initialization failures are reported and trigger session recovery. After a successful EIS connection, all input uses EIS. Capture alone and uinput do not initialize EIS; missing optional logical dimensions do not block capture. Keyboard input uses the existing Windows VK to evdev mapping. Recovery keeps the encoder frame dimensions fixed but accepts logical-size changes after scaling. On GNOME, a display-change notification enables earlier recovery when previously streaming Portal capture remains paused without a valid format for a 200 ms grace after both conditions are present. Healthy renegotiation cancels the early check; repeated notifications do not postpone the same interruption. The five-second fallback remains without a related notification. Static video and valid-format pauses do not trigger recovery. Tested while connected on Ubuntu 26.04, GNOME Wayland, one 3840x2160 display: 200% -> 166.67% -> 200%, with continuously updating video and full-screen pointer control after recovery. Switching briefly freezes and goes black before recovering; five seconds is the fallback threshold, not total recovery time. See [#35](../../pull/35) for timing measurements and validation limits. Lock recovery still needs hardware acceptance testing; multi-monitor support, live resolution changes, and rotation/reflection transforms are outside this fix's scope. Capture settings remain at protocol version 4: advertised resolutions use pixel coordinates and DPR 1; Portal logical dimensions are used only for local input mapping.
 
@@ -114,11 +141,13 @@ X11 sessions send all monitors as one combined picture by default. With `UU_X11_
 
 Switching reuses one video track and pauses input until the new source sends a frame. Capture/encoder failure or a first-frame timeout requests restoration of the previous source. The inventory uses `hyprctl` and supports unrotated outputs; restart the host after monitor hotplug or layout changes. Phone-side switching and clicks were tested on Omarchy / Hyprland with 2560×1440 at 125% and 1920×1080 at 133.33%.
 
+On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/180/270-degree capture and pointer transforms are enabled only with `NIRI_SOCKET`; reflected transforms are excluded. Three-output switching, 90-degree portrait capture/click alignment, and mobile Chinese input into Codex were hardware-tested on CachyOS + niri. Other compositors retain their existing text path and reject rotated outputs. Restart after layout changes. The temporary printable-key text keyboard is niri-only; the Hyprland fast path and pristine-keymap restoration are unchanged.
+
 ## Not implemented / not supported
 
 | Feature | Status |
 |---|---|
-| Switching between multiple monitors | Experimental on native Hyprland Wayland and on X11 (`UU_X11_MULTISCREEN=1`); see above |
+| Switching between multiple monitors | Experimental on native niri / Hyprland Wayland and on X11 (`UU_X11_MULTISCREEN=1`); see above |
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
@@ -211,6 +240,10 @@ Run inside your graphical session:
 
 Scan the code with the **NetEase UU Remote mobile app** and confirm. Credentials are stored only on this
 machine, in `~/.config/uuremote/config.json` (mode 0600).
+
+A failed status query or the 60-second request timeout does not prove that the QR expired or that the phone confirmed login. The official-client refresh policy is unchanged: after a query error, click Refresh QR (Enter in a terminal; refresh after 60 seconds with neither a window nor a terminal). QR request diagnostics contain only the request phase, error category, elapsed time, HTTP/API status and last known scan state—not tickets, URLs or response content. A `connect` category alone does not identify a DNS, TLS or proxy cause.
+
+The same file holds this machine's device identity (`device_id`, `client_id`, `system_id`), which reinstalls and new QR logins keep. **Do not copy `config.json` between machines or clone a second host from a snapshot/disk that includes the home directory**: two host instances with one identity, on the same or different machines, kick each other out of the room. The log then shows `Cloud room leave without peer identifier` every few seconds with reconnects, and viewers disconnect right after connecting. On a cloned or copied machine, stop the service, remove those three keys plus `token`, `csrf` and `user_id`, and run `uuremote-server login` to register a new device. A leftover instance on the same machine (for example an old `~/.local/bin/uuremote-server` started by hand) has the same effect; `uuremote-server doctor` warns when more than one host instance is running.
 
 ### 4. Run as a user service
 
@@ -358,7 +391,12 @@ Common environment variables:
 | `UU_LOGIN_WINDOW=0` | Do not open the login window automatically when credentials are missing |
 | `UU_PORT_MAPPING=0` | Disable port mapping (the official host's controlled-side switch) |
 | `UU_WOL_HELPER=1` | Experimental: act as a remote-boot helper like the official Windows host — report this host's LAN info after sign-in and send a magic packet to the LAN when the cloud asks to wake a PC (not verified end to end) |
-| `UU_USE_PROXY=1` | Honor HTTP/SOCKS proxy environment variables; by default proxies are ignored and NetEase servers are reached directly |
+| `UU_USE_PROXY=1` | Share environment HTTP/HTTPS proxy policy between REST and host/viewer WebSocket signaling; proxies are ignored by default |
+
+
+`UU_USE_PROXY=1` uses only proxy settings already available to the current process. `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (and lowercase forms) and `NO_PROXY` follow reqwest's standard selection, with uppercase taking precedence. Signaling rejects invalid/unsupported values in the selected variables (HTTP/HTTPS only, not SOCKS), proxy URLs with paths/queries/fragments, and CGI environments that would ignore proxies; this validation is intentionally stricter than silently ignoring bad values. No matching proxy or a `NO_PROXY` match still means direct access; a selected proxy failing does not trigger direct fallback. Certificate verification remains enabled and redirects are not followed, so room authentication is not forwarded to a redirect target.
+
+With it the host also reaches the cloud TURN relays over TCP/TLS (CONNECT through the unauthenticated `http://` proxy in `HTTPS_PROXY`/`ALL_PROXY`, or directly without one), for hosts whose UDP cannot reach the TURN servers but whose TCP/proxy can. TURN certificates are chain-verified; a name mismatch is tolerated only when the cloud-supplied TURN address is an IP (media itself is end-to-end DTLS-SRTP). Without the setting only UDP relays are used, as before. **This creates no new network access**: login, signaling and media each still need an allowed network path. Connector errors expose only fixed categories/HTTP status; do not enable dependency TRACE logs that may record URLs or authentication information.
 
 Host settings such as "lock after remote session" and "mute host" are stored in
 `~/.config/uuremote/host_settings.json`. The same file stores `video_encoder`
@@ -560,7 +598,8 @@ terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsd
 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`.
 
 SDL clipboard access reuses the desktop window to avoid temporary-window Dock churn on GNOME Wayland (#37).
-Synchronization runs only while that window is focused and keeps the 30 KiB text limit. Selections without a supported
+On niri, data-control-capable `wl-clipboard` is used instead, so synchronization does not require window focus.
+Other SDL backends synchronize only while that window is focused. The 30 KiB text limit applies. Selections without a supported
 text format are skipped; empty-text detection depends on the SDL2 backend. Builds without SDL retain the command backend.
 SDL2 reads selections synchronously, so a slow selection owner can temporarily block the window; the bridge timeout cannot interrupt it.
 GNOME-to-official-Mac bidirectional clipboard synchronization is still unverified; this change does not resolve host compatibility.
@@ -591,6 +630,8 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
 - Desktop offers H.264 / H.265; the host chooses the codec. `UU_VIEWER_CODEC=h264` limits both SDP and decoder capabilities to H.264.
   The default request stays 4:2:0; `UU_VIEWER_CHROMA=444` requests true color (4:4:4) after CONTROL opens. The host may fall back to
   4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
+- Frames are decoded at the host's native resolution and scaled to the window with linear filtering; a host resolution
+  change restarts the decoder. `UU_VIEWER_SIZE=WxH` forces a fixed letterboxed canvas instead.
 
 Mac targets use native macOS keycodes; Windows / Linux targets retain Windows VK. Keys follow physical positions, without
 automatically translating Ctrl to Command; on a Mac target the PC Super / Windows key acts as Command. Only verified target
@@ -616,3 +657,11 @@ assistance and ISO / JIS keyboards have not been tested live.
 
 "—" = not tested yet. Only use reboot/shutdown on machines you can restart. **Not tested live**: H.265 / 4:4:4 with official hosts, multiple monitors. Logs carry field
 numbers, sizes and states only, never keystrokes, clipboard or file contents, codes or credentials.
+
+### Native gamepad and rumble (experimental)
+
+The SDL viewer forwards one mapped controller and ordinary two-motor rumble through the existing desktop CONTROL channel to a Windows host.
+Default OFF: set `UU_VIEWER_NATIVE_GAMEPAD=1` to enable input; `UU_VIEWER_NATIVE_RUMBLE=0` disables feedback independently.
+Guide forwarding, multiple controllers and adaptive triggers are unsupported; suspend, forced exit and network recovery are not comprehensively verified.
+One reporting user tested input, phone-hotspot WAN, reconnect and rumble on one Windows/Steam Deck pair.
+See [protocol evidence, design and limits](docs/deckpad-native-gamepad.md).

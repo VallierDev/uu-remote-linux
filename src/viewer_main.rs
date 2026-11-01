@@ -2,7 +2,9 @@
 #![allow(dead_code)]
 #[path = "auth.rs"] mod auth;
 #[path = "config.rs"] mod config;
+#[path = "i18n.rs"] mod i18n;
 #[path = "protocol.rs"] mod protocol;
+mod ws_transport;
 mod viewer;
 #[cfg(test)] #[path="hevc.rs"] mod hevc;
 use viewer::clipboard;
@@ -13,7 +15,7 @@ use viewer::clipboard;
 #[cfg(test)] #[path="initialization.rs"] mod initialization;
 use viewer::{api::Api,rtc::ReadyPolicy,session::{Options,Session},wire::Shape};
 use std::time::Duration;
-const HELP:&str="Experimental native viewer.\n  uuremote-viewer ui   (GTK window: sign-in, devices, sessions) Desktop UI requires viewer-sdl (decodes with the ffmpeg CLI, or FFmpeg 6.x libraries with viewer-ffmpeg).\n  uuremote-viewer power DEVICE reboot|shutdown\n  uuremote-viewer type DEVICE [options]   (secret from UU_INPUT_ENV or stdin; reuses running viewer)\n    options: --delay-ms MS --omit-last N --snapshot PATH --dry-run --new-session\n  uuremote-viewer unbind DEVICE [--shared]   (从账号删除设备 / remove a device from the account)\n  uuremote-viewer terminal DEVICE [SESSION]\n  uuremote-viewer files DEVICE ls PATH | get REMOTE LOCAL | put LOCAL REMOTE\n  uuremote-viewer portmap DEVICE LOCAL_PORT HOST PORT\n  uuremote-viewer files-ui|portmap-ui|terminal-ui DEVICE NAME   (GTK tool windows)\n  uuremote-viewer login [--no-gui]\n  uuremote-viewer devices METHOD ARRAY_POINTER ID_POINTER NAME_POINTER\n  uuremote-viewer assist CONNECT_ID   (验证码从 stdin 读取一行)\n  uuremote-viewer connect DEVICE true|false SHAPE_JSON echo|manual raw|legacy [--view-only]\nVideo: UU_VIEWER_CODEC=h264 forces H.264; UU_VIEWER_CHROMA=444 requests true color (default 4:2:0).\nAudio: UU_VIEWER_AUDIO=0 disables playback. UU_VIEWER_VIEW_ONLY=1 disables desktop input.\nDevice-list method/JSON pointers and compatibility shape require verified operator configuration.\nQR login reuses the sibling uuremote-server login command. Never run login in a captured log.\nEcho readiness is transport observation only; no sendVideoTrack RPC is emitted.";
+const HELP:&str="Experimental native viewer.\n  uuremote-viewer ui   (GTK window: sign-in, devices, sessions) Desktop UI requires viewer-sdl (decodes with the ffmpeg CLI, or FFmpeg 6.x libraries with viewer-ffmpeg).\n  uuremote-viewer power DEVICE reboot|shutdown\n  uuremote-viewer type DEVICE [options]   (secret from UU_INPUT_ENV or stdin; reuses running viewer)\n    options: --delay-ms MS --omit-last N --snapshot PATH --dry-run --new-session\n  uuremote-viewer unbind DEVICE [--shared]   (从账号删除设备 / remove a device from the account)\n  uuremote-viewer terminal DEVICE [SESSION]\n  uuremote-viewer files DEVICE ls PATH | get REMOTE LOCAL | put LOCAL REMOTE\n  uuremote-viewer portmap DEVICE LOCAL_PORT HOST PORT\n  uuremote-viewer files-ui|portmap-ui|terminal-ui DEVICE NAME   (GTK tool windows)\n  uuremote-viewer login [--no-gui]\n  uuremote-viewer devices METHOD ARRAY_POINTER ID_POINTER NAME_POINTER\n  uuremote-viewer assist CONNECT_ID   (验证码从 stdin 读取一行)\n  uuremote-viewer connect DEVICE true|false SHAPE_JSON echo|manual raw|legacy [--view-only]\nVideo: UU_VIEWER_CODEC=h264 forces H.264; UU_VIEWER_CHROMA=444 requests true color (default 4:2:0).\nAudio: UU_VIEWER_AUDIO=0 disables playback. UU_VIEWER_VIEW_ONLY=1 disables desktop input.\nDevice-list method/JSON pointers and compatibility shape require verified operator configuration.\nQR login reuses the sibling uuremote-server login command. Never run login in a captured log.\nEcho readiness is transport observation only; desktop sessions send one sendVideoTrack RPC (like the official iPhone viewer).";
 const DEFAULT_SHAPE:&str=r#"{"capture_type":1,"platform":3,"client_version":"4.42.0","width":1920,"height":1080,"fps":60,"chroma":1,
  "decoders":[{"fps":60,"codec":1,"width":3840,"height":2160,"chroma":1}],"display_modes":[[1920,1080,60]],
  "displays":[{"id":1,"fps":60,"type":0,"hdr":0}],
@@ -56,8 +58,8 @@ async fn run(args:&[String])->Result<(),String> {
             Ok(())
         }
         Some("unbind") if (args.len()==2 || (args.len()==3 && args[2]=="--shared")) && !args[1].is_empty() => {
-            api()?.unbind(&args[1],args.len()==3).await.map_err(|e|format!("删除设备失败：{e}"))?;
-            println!("已从账号删除设备");Ok(())
+            api()?.unbind(&args[1],args.len()==3).await.map_err(|e|crate::tr!("删除设备失败：{e}","Removing the device failed: {e}"))?;
+            println!("{}",crate::i18n::s("已从账号删除设备","Device removed from the account"));Ok(())
         }
         Some("power")=>power_command(args).await,
         Some("type")=>type_command(args).await,
@@ -68,7 +70,7 @@ async fn run(args:&[String])->Result<(),String> {
         Some("terminal"|"files"|"portmap"|"files-ui"|"portmap-ui"|"terminal-ui")=>tool_command(args).await,
         Some("assist") if args.len()==2=> {
             let code=viewer::assist::read_code(std::io::stdin().lock())?;
-            desktop_command(&["connect".into(),args[1].clone(),"false".into(),"-".into(),"echo".into(),"legacy".into()],Some(code)).await.map_err(|e|format!("协助连接失败：{e}"))
+            desktop_command(&["connect".into(),args[1].clone(),"false".into(),"-".into(),"echo".into(),"legacy".into()],Some(code)).await.map_err(|e|crate::tr!("协助连接失败：{e}","Assistance connection failed: {e}"))
         }
         Some("connect") if args.len()==6 || args.len()==7=> desktop_command(args,None).await,
         _=>Err(HELP.into()),
@@ -95,11 +97,16 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     let creds=credentials()?;
     let api=Api::new(auth::UUAuthClient::new(creds.clone()),auth::BASE_URL);
     let account_connection=code.is_none();
-    let room=match code {
+    #[cfg(feature="viewer-sdl")]
+    macro_rules! wait {($stage:expr,$fut:expr)=>{viewer::sdl::loading(desktop.as_mut().map(|d|&mut d.0),$stage,$fut).await?}}
+    #[cfg(not(feature="viewer-sdl"))]
+    macro_rules! wait {($stage:expr,$fut:expr)=>{{let _=$stage;$fut.await}}}
+    let contacting=i18n::s("正在连接远端设备…","Contacting the remote device…");
+    let room=wait!(contacting,async{match code {
         Some(code)=>api.join_share(&args[1],&code).await,
         None=>api.join(&args[1],force,true).await,
-    }.map_err(|e|e.to_string())?;
-    let target_mac=if shape.capture_type==1 {api.target_is_mac(&room,account_connection.then_some(args[1].as_str())).await} else {Err(viewer::api::Error::UnknownKeyboardPlatform)};
+    }}).map_err(|e|e.to_string())?;
+    let target_mac=if shape.capture_type==1 {wait!(contacting,api.target_is_mac(&room,account_connection.then_some(args[1].as_str())))} else {Err(viewer::api::Error::UnknownKeyboardPlatform)};
     #[cfg(feature="viewer-sdl")]
     if let Some((window,_))=desktop.as_mut().filter(|_|!view_only){
         window.set_mac(*target_mac.as_ref().map_err(|e|e.to_string())?);
@@ -110,7 +117,7 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     let mut clipboard=clipboard::Bridge::new(shape.capture_type==1);
     clipboard.set_target_mac(target_mac.ok());
     let options=Options{timeout:Duration::from_secs(12),legacy_prefix:legacy,ready_policy:policy,clipboard};
-    let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
+    let mut session=wait!(i18n::s("正在建立安全连接…","Establishing a secure connection…"),Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()))?;
     #[cfg(feature="viewer-sdl")]
     let result=if let Some((window,decoder))=desktop.as_mut(){viewer::sdl::run(&mut session,window,decoder.as_mut(),view_only,&args[1]).await}else{session.run().await};
     #[cfg(not(feature="viewer-sdl"))]
@@ -168,7 +175,7 @@ async fn type_command(args:&[String])->Result<(),String>{
             if !response.ok {
                 return Err(response.error.unwrap_or_else(||"Secure input failed on running viewer".into()));
             }
-            println!("安全输入已发送（{} 个按键事件，{} 字符）。", response.events, response.chars);
+            println!("{}",crate::tr!("安全输入已发送（{} 个按键事件，{} 字符）。","Secure input sent ({} key events, {} characters).", response.events, response.chars));
             if let Some(path)=response.snapshot {
                 println!("snapshot={path}");
                 log::info!("Secure input snapshot: {path}");
@@ -195,7 +202,7 @@ async fn type_command(args:&[String])->Result<(),String>{
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
     let result=viewer::secure_input::run_session(&mut session,actions.as_slice(),delay).await;
     session.close().await;
-    if result.is_ok(){println!("安全输入已发送（{event_count} 个按键事件）；新会话路径无截图。");}
+    if result.is_ok(){println!("{}",crate::tr!("安全输入已发送（{event_count} 个按键事件）；新会话路径无截图。","Secure input sent ({event_count} key events); no snapshot on the new-session path."));}
     result
 }
 
@@ -294,6 +301,6 @@ async fn power_command(args:&[String])->Result<(),String>{
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;
     let result=viewer::power::run(&mut session,action).await;
     session.close().await;
-    if result.is_ok(){println!("电源指令已发送；未确认远端执行结果。");}
+    if result.is_ok(){println!("{}",crate::i18n::s("电源指令已发送；未确认远端执行结果。","Power command sent; the result on the remote device is not confirmed."));}
     result
 }

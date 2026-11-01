@@ -1,6 +1,7 @@
 //! UU Remote Pure Native Linux Server (Rust Edition)
 //! Zero-Wine, Zero-Python, Single-Binary, 5 Native Tools Integrated
 
+mod ws_transport;
 mod engine_plugin;
 mod doctor;
 mod wol;
@@ -15,6 +16,7 @@ mod wayland;
 mod auth;
 mod assist;
 mod config;
+mod i18n;
 mod login;
 mod login_ui;
 mod session_lock;
@@ -69,6 +71,8 @@ use webrtc::WebRtcSession;
 /// Set before a normal return when the host must come back in the other mode (signed in / out).
 static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+struct AbortOnDrop(tokio::task::AbortHandle);
+impl Drop for AbortOnDrop { fn drop(&mut self) { self.0.abort(); } }
 fn superseded_peer_ids(sessions: &HashMap<String, WebRtcSession>, ice: &str, desktop: bool) -> Vec<String> {
     sessions.iter().filter(|(id, peer)| id.as_str() == ice || (desktop && peer.desktop))
         .map(|(id, _)| id.clone()).collect()
@@ -629,6 +633,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     virtual_audio::init();
     let _audio_cleanup=virtual_audio::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
+    session_ice::configure_relay_transport();
     // Before host.pid, and before assist: a missing or failed assist session must still handle SIGUSR2.
     let _ = install_host_signals(None);
     video::warm_auto_probe();
@@ -711,6 +716,21 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
     assist: &mut Option<assist::Assist>, commands: &mut mpsc::Receiver<assist::Command>, webrtc_sessions: Arc<Mutex<HashMap<String, WebRtcSession>>>) -> Result<(), Box<dyn std::error::Error>> {
     let portal_desktop = (capture.backend == desktop_backend::DesktopBackend::Portal && !desktop_backend::headless())
         .then(|| Arc::new(desktop_session::PortalDesktop::new(capture.clone())));
+    // Stop sharing the screen once no desktop controller is left. Viewers send stop_capture
+    // before leaving and phones reconnect within seconds, so require two idle checks in a row.
+    let idle_watch = portal_desktop.clone().map(|portal| {
+        let sessions = webrtc_sessions.clone();
+        tokio::spawn(async move {
+            let mut idle = 0u8;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if sessions.lock().await.values().any(|s| s.role.is_desktop()) { idle = 0; continue; }
+                idle = idle.saturating_add(1);
+                if idle >= 2 { portal.end_idle(); }
+            }
+        })
+    });
+    let _idle_watch = idle_watch.map(|task| AbortOnDrop(task.abort_handle()));
     let mut auth = if let Some(session) = assist.as_ref() { session.client.clone() } else {
         let creds = match config::file().and_then(Credentials::load) {
             Ok(creds) => creds,
@@ -743,8 +763,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
     // One peer per viewer connection (desktop, file transfer, terminal...), keyed by ice_id.
     let mut next_capture_type: Option<(u64,crate::session_ice::SessionIce)> = None;
     let mut capture_types: HashMap<String, (u64,crate::session_ice::SessionIce)> = HashMap::new();
-    let mut mac_by_ice: HashMap<String, bool> = HashMap::new();
-    let mut next_mac = false;
+    let mut controller_by_ice: HashMap<String, crate::input::Controller> = HashMap::new();
+    let mut next_controller = crate::input::Controller::Other;
     // Tool peers ask here to become the desktop (capture_desktop on an existing connection, #99).
     let (desktop_requests, mut desktop_requested) = mpsc::unbounded_channel::<String>();
 
@@ -868,6 +888,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                     let mut desktop_ended = false;
                     for id in ended { if let Some(s) = sessions.remove(&id) { desktop_ended |= s.role.is_desktop(); close_peer(&s.pc).await; } }
                     if desktop_ended && !sessions.values().any(|s| s.role.is_desktop()) { if let Some(s) = assist.as_mut() { s.session_ended()?; } }
+                    // The controller left: stop sharing now; reconnecting reopens silently with the saved consent.
+                    if !sessions.values().any(|s| s.role.is_desktop()) { if let Some(portal) = &portal_desktop { portal.end_idle(); } }
                     if let Some(s) = assist.as_mut() { s.tick()?; }
                 }
                 SignalingEvent::Connected => {
@@ -929,9 +951,9 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                             .and_then(|s| s.as_str())
                     );
                 }
-                SignalingEvent::ConnectRequest { capture_type, ice_id, transport, controller_mac } => {
-                    if mac_by_ice.len()>=32 { mac_by_ice.clear(); }
-                    match ice_id.clone() { Some(id) => { mac_by_ice.insert(id, controller_mac); } None => next_mac = controller_mac }
+                SignalingEvent::ConnectRequest { capture_type, ice_id, transport, controller } => {
+                    if controller_by_ice.len()>=32 { controller_by_ice.clear(); }
+                    match ice_id.clone() { Some(id) => { controller_by_ice.insert(id, controller); } None => next_controller = controller }
                     // Pending cloud credentials live only within this room; cap
                     // requests that never receive an offer rather than retain them.
                     if capture_types.len()>=32 { capture_types.clear(); }
@@ -962,8 +984,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         let (capture_type,transport) = capture_types.remove(&ice).or_else(|| next_capture_type.take()).unwrap_or((1,crate::session_ice::SessionIce::default()));
                         // CaptureType: 0 unknown, 1 desktop, 2 window; 5 file transfer, 8 terminal, 9 port mapping.
                         let desktop = capture_type <= 2;
-                        let controller_mac = mac_by_ice.remove(&ice).unwrap_or(next_mac);
-                        if desktop { input.set_mac_controller(controller_mac); }
+                        let controller = controller_by_ice.remove(&ice).unwrap_or(next_controller);
+                        if desktop { input.set_controller(controller); }
                         log::info!("Offer for connection: capture_type={} desktop={} active_peers={}", capture_type, desktop, sessions.len());
                         // An expired NVENC failure is re-probed in the background. This offer keeps the cached encoder.
                         if desktop { video::warm_auto_probe(); video::check_ffmpeg_usable(); }
@@ -995,7 +1017,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         match WebRtcSession::new(session_capture, input.clone(), signaling_client.clone(), desktop, transport,
                             if desktop { portal_desktop.clone() } else { None }).await {
                             Ok(mut sess) => {
-                                sess.controller_mac = controller_mac;
+                                sess.controller = controller;
                                 if !desktop {
                                     let (requests, peer) = (desktop_requests.clone(), ice.clone());
                                     sess.on_desktop_request(move || { let _ = requests.send(peer.clone()); });
@@ -1062,7 +1084,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         log::info!("Desktop request on a tool connection not supported with the Portal backend; open the desktop before port mapping");
                         continue;
                     }
-                    let controller_mac = peer.controller_mac;
+                    let controller = peer.controller;
                     let current = peer.desktop_capture();
                     // Same recovery as a desktop offer: the display may have come up or been resized after this peer.
                     let resized = current.init_error.is_none() && current.backend == desktop_backend::DesktopBackend::X11
@@ -1076,7 +1098,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         }
                     } else { None };
                     video::warm_auto_probe(); video::check_ffmpeg_usable();
-                    input.set_mac_controller(controller_mac);
+                    input.set_controller(controller);
                     input.bind_portal(screen.as_ref().map_or_else(|| sessions[&ice].capture.portal.clone(), |screen| screen.portal.clone()));
                     // One desktop at a time, as for a new desktop offer. Peers offered as desktops
                     // close; a promoted tool peer only stops its desktop and keeps its tools.

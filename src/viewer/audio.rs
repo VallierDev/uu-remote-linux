@@ -93,20 +93,21 @@ mod playback {
             if let Some(mut child)=self.child.take() {let _=child.start_kill();tokio::spawn(async move {let _=child.wait().await;});}
         }
     }
-    pub struct Playback { queue:sdl2::audio::AudioQueue<i16>, decoder:Decoder }
+    pub struct Playback { queue:sdl2::audio::AudioQueue<i16>, decoder:Decoder, pub volume:u8 }
     impl Playback {
         pub fn new(sdl:&sdl2::Sdl,audio:Audio)->Option<Self> {
             if !audio.enabled {return None}
             let result=(|| {
                 let subsystem=sdl.audio()?;
                 let queue=subsystem.open_queue::<i16,_>(None,&sdl2::audio::AudioSpecDesired{freq:Some(48000),channels:Some(2),samples:Some(960)})?;
-                let decoder=Decoder::new(audio)?;queue.resume();Ok::<_,String>(Self{queue,decoder})
+                let decoder=Decoder::new(audio)?;queue.resume();Ok::<_,String>(Self{queue,decoder,volume:100})
             })();
             match result {Ok(p)=>Some(p),Err(_)=>{log::warn!("Viewer audio playback unavailable");None}}
         }
         pub fn pump(&mut self)->Result<(),String> {
             if !self.decoder.alive() {return Err("Audio decoder stopped".into())}
-            while let Some(samples)=self.decoder.pcm.pop() {
+            while let Some(mut samples)=self.decoder.pcm.pop() {
+                if self.volume<100 {let v=i32::from(self.volume);for s in samples.iter_mut(){*s=(i32::from(*s)*v/100) as i16;}}
                 if self.queue.size()+samples.len() as u32*2>SDL_BYTES {self.queue.clear();}
                 self.queue.queue_audio(&samples).map_err(|_|"Audio queue failed")?;
             }Ok(())

@@ -36,10 +36,15 @@ pub struct Observed {
     pub media_packets:AtomicU64,
     pub encoder_codecs:AtomicU32,
     pub chroma:AtomicU32,
+    /// Received RTP payload bytes and video packets vs. sequence span, for the network-status panel.
+    pub media_bytes:AtomicU64,
+    pub video_received:AtomicU64,
+    pub video_expected:AtomicU64,
 }
 pub struct Peer {
     clipboard:super::clipboard::Bridge,
     pub tools:super::tools::Inbox,
+    pub rumble:super::native_rumble::Feedback,
     pub pc:Arc<RTCPeerConnection>,
     pub channels:Vec<Arc<RTCDataChannel>>,
     pub observed:Arc<Observed>,
@@ -74,6 +79,7 @@ impl Peer {
         let api=APIBuilder::new().with_media_engine(engine).with_setting_engine(settings).with_interceptor_registry(registry).build();
         let pc=Arc::new(api.new_peer_connection(config).await.map_err(|e|format!("Peer creation failed: {}",crate::auth::transport_error(&e)))?);
         let tools:super::tools::Inbox=Arc::new(std::sync::Mutex::new(None));
+        let rumble=super::native_rumble::Feedback::default();
         let inbox=tools.clone();
         pc.on_peer_connection_state_change(Box::new(move |state|{
             use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -115,11 +121,22 @@ impl Peer {
                 let mut receiver=super::media::Receiver::new(super::media::Codec::from_mime(&track.codec().capability.mime_type).unwrap_or_default());
                 let mut tick=tokio::time::interval(std::time::Duration::from_millis(40));
                 let mut last_pli=std::time::Instant::now()-std::time::Duration::from_secs(1);
+                let mut span:Option<(u16,u64)>=None;
                 loop {
                     let output=tokio::select! {
                         packet=track.read_rtp()=>match packet {
                             Ok((p,_))=>{
                                 counters.media_packets.fetch_add(1,Ordering::Relaxed);
+                                counters.media_bytes.fetch_add(p.payload.len() as u64+12,Ordering::Relaxed);
+                                if video {
+                                    // Extended sequence span: forward steps add, reordered/old packets do not.
+                                    let seq=p.header.sequence_number;
+                                    let (last,expected)=span.unwrap_or((seq.wrapping_sub(1),0));
+                                    let step=seq.wrapping_sub(last);
+                                    span=Some(if step!=0 && step<32768 {(seq,expected+u64::from(step))} else {(last,expected)});
+                                    counters.video_expected.store(span.map_or(0,|s|s.1),Ordering::Relaxed);
+                                    counters.video_received.fetch_add(1,Ordering::Relaxed);
+                                }
                                 if !video {if opus {audio.push(p.header.sequence_number,&p.payload);}continue}
                                 // TrackRemote updates codec from the negotiated payload type on each read.
                                 let Some(codec)=super::media::Codec::from_mime(&track.codec().capability.mime_type) else{continue};
@@ -172,23 +189,27 @@ impl Peer {
                 if index==0 {
                     let weak=Arc::downgrade(&channel);let state=observed.clone();
                     let chroma444=shape.capture_type==1 && std::env::var("UU_VIEWER_CHROMA").is_ok_and(|v|v=="444");
+                    let desktop_track=shape.capture_type==1;
                     channel.on_open(Box::new(move ||Box::pin(async move {
                         state.control_open.store(true,Ordering::Release);
                         if let Some(channel)=weak.upgrade(){
                             let _=channel.send(&bytes::Bytes::from(wire::echo_request_with_clipboard(1,clipboard_enabled))).await;
+                            if desktop_track {let _=channel.send(&bytes::Bytes::from(wire::request_video_track())).await;}
                             if chroma444 {let _=channel.send(&bytes::Bytes::from(wire::request_chroma444())).await;}
                         }
                     })));
                 }
-                let closed=tools.clone();let state=observed.clone();
-                channel.on_close(Box::new(move ||{let closed=closed.clone();let state=state.clone();Box::pin(async move {
-                    if index==0 {state.control_open.store(false,Ordering::Release);}
+                let closed=tools.clone();let state=observed.clone();let rumble_closed=rumble.clone();
+                channel.on_close(Box::new(move ||{let closed=closed.clone();let state=state.clone();let rumble_closed=rumble_closed.clone();Box::pin(async move {
+                    if index==0 {state.control_open.store(false,Ordering::Release);rumble_closed.set_active(false);}
                     if [0,3,4].contains(&index){closed.lock().unwrap().take();}
                 })}));
                 let state=observed.clone();let inbox=tools.clone();let clipboard_tx=clipboard.sender();
+                let feedback=rumble.clone();
                 let control_for_echo=if index==0 {Arc::downgrade(&channel)} else {std::sync::Weak::new()};
-                channel.on_message(Box::new(move |message| {let state=state.clone();let inbox=inbox.clone();let control_for_echo=control_for_echo.clone();let clipboard_tx=clipboard_tx.clone();Box::pin(async move {
+                channel.on_message(Box::new(move |message| {let state=state.clone();let inbox=inbox.clone();let control_for_echo=control_for_echo.clone();let clipboard_tx=clipboard_tx.clone();let feedback=feedback.clone();Box::pin(async move {
                     if index==0 {
+                        feedback.receive(&message.data);
                         let (codecs,chroma)=wire::media_control(&message.data);
                         if let Some(codecs)=codecs {state.encoder_codecs.store(codecs,Ordering::Release);}
                         if let Some(chroma)=chroma {
@@ -236,7 +257,7 @@ impl Peer {
             Ok::<_,String>((channels,tools,clipboard))
         }.await;
         match result {
-            Ok((channels,tools,clipboard))=>Ok(Self{clipboard,tools,pc,channels,observed,desktop,audio,answered:false,early:Vec::new(),app_id:app_id.into(),ice_id:ice_id.into(),remote_client:remote_client.into()}),
+            Ok((channels,tools,clipboard))=>Ok(Self{clipboard,tools,rumble,pc,channels,observed,desktop,audio,answered:false,early:Vec::new(),app_id:app_id.into(),ice_id:ice_id.into(),remote_client:remote_client.into()}),
             Err(e)=>{let _=pc.close().await;Err(e)},
         }
     }
@@ -293,7 +314,26 @@ impl Peer {
         if channel.ready_state()!=webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {return Err("CONTROL is not open".into())}
         channel.send(&bytes::Bytes::from(value.to_string())).await.map_err(|_|"CONTROL input send failed")?;Ok(())
     }
-    pub async fn close(&self) {self.clipboard.stop();self.tools.lock().unwrap().take();let _=self.pc.close().await;}
+    /// Binary CONTROL message (protobuf envelope), e.g. capture settings and SimpleActions.
+    pub async fn send_control(&self,data:Vec<u8>)->Result<(),String> {
+        let channel=&self.channels[0];
+        if channel.ready_state()!=webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {return Err("CONTROL is not open".into())}
+        channel.send(&bytes::Bytes::from(data)).await.map_err(|_|"CONTROL send failed")?;Ok(())
+    }
+    /// Selected ICE pair: (round-trip ms, "UDP · direct" / "TCP · relay" ...). Addresses are not kept.
+    pub async fn route(&self)->(Option<u32>,String) {
+        use webrtc::stats::StatsReportType as T;
+        let report=self.pc.get_stats().await;
+        let pair=report.reports.values().filter_map(|r|match r{T::CandidatePair(p) if p.nominated=>Some(p),_=>None}).max_by_key(|p|p.bytes_received);
+        let Some(pair)=pair else {return (None,String::new())};
+        let local=report.reports.get(&pair.local_candidate_id).and_then(|r|match r{T::LocalCandidate(c)=>Some(c),_=>None});
+        let remote=report.reports.get(&pair.remote_candidate_id).and_then(|r|match r{T::RemoteCandidate(c)=>Some(c),_=>None});
+        let relay=[local,remote].iter().flatten().any(|c|c.candidate_type==webrtc::ice::candidate::CandidateType::Relay);
+        let tcp=local.is_some_and(|c|c.network_type.to_string().to_ascii_lowercase().contains("tcp") || c.relay_protocol.eq_ignore_ascii_case("tcp"));
+        let rtt=(pair.current_round_trip_time>0.).then(||(pair.current_round_trip_time*1000.).round() as u32);
+        (rtt,format!("{} · {}",if tcp{"TCP"}else{"UDP"},if relay{"relay"}else{"direct"}))
+    }
+    pub async fn close(&self) {self.rumble.set_active(false);self.clipboard.stop();self.tools.lock().unwrap().take();let _=self.pc.close().await;}
 }
 fn answer_sdp(body:&Value)->Result<String,String> {
     if let Some(s)=body.get("sdp").and_then(Value::as_str) {if s.len()<=1024*1024{return Ok(s.into())}}

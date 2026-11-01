@@ -13,6 +13,7 @@ extern "C" {
     fn uu_viewer_ui_closed() -> c_int;
     fn uu_viewer_ui_confirm_replace() -> c_int;
     fn uu_viewer_ui_toast(text: *const c_char);
+    fn uu_viewer_ui_set_host(active: c_int);
 }
 fn toast(text: &str) { let t = c(text); unsafe { uu_viewer_ui_toast(t.as_ptr()) } }
 
@@ -31,7 +32,7 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
                 }
                 status = child.wait() => break status,
                 line = async { match lines.as_mut() { Some(l) => l.next_line().await, None => std::future::pending().await } } => match line {
-                    Ok(Some(l)) => { if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); } }
+                    Ok(Some(l)) => { if l.starts_with("DECKPAD_"){eprintln!("{l}");} else if !l.starts_with('[') && !l.trim().is_empty() { last = l.chars().take(160).collect(); } }
                     _ => lines = None,
                 },
             }
@@ -46,12 +47,12 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
         }).await;
         if !status.is_ok_and(|s| s.success()) {
             let reason = match last.as_str() {
-                "" => "连接已断开".to_owned(),
-                "CONTROL echo timed out" => "连接超时：被控端没有响应（官方主机互通尚未完成）".to_owned(),
-                "Remote session released" => "被控端结束了本次连接".to_owned(),
+                "" => crate::i18n::s("连接已断开","Disconnected").to_owned(),
+                "CONTROL echo timed out" => crate::i18n::s("连接超时：被控端没有响应（官方主机互通尚未完成）","Timed out: the remote device did not answer (official host interop is not finished)").to_owned(),
+                "Remote session released" => crate::i18n::s("被控端结束了本次连接","The remote device ended the connection").to_owned(),
                 other => other.to_owned(),
             };
-            toast(&format!("连接失败：{reason}"));
+            toast(&crate::tr!("连接失败：{reason}","Connection failed: {reason}"));
         } else if let Some(message) = success { toast(message); }
     })
 }
@@ -81,7 +82,8 @@ pub fn device_rows(devices: &[Value], current: Option<&str>) -> String {
         let name = d.get("alias").and_then(Value::as_str).unwrap_or(id);
         let platform = d.get("platform").and_then(Value::as_i64).unwrap_or(0);
         let online = d.get("status").and_then(Value::as_str) == Some("CONNECTED");
-        Some(format!("{}\t{}\t{}\t{}\t{}\n", clean(id), clean(name), platform, online as u8, (current == Some(id)) as u8))
+        let thumb = super::thumbs::existing(id).map(|p| clean(&p.to_string_lossy())).unwrap_or_default();
+        Some(format!("{}\t{}\t{}\t{}\t{}\t{}\n", clean(id), clean(name), platform, online as u8, (current == Some(id)) as u8, thumb))
     }).collect()
 }
 
@@ -94,6 +96,10 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
     let mut next_refresh = Instant::now();
     let mut sessions:std::collections::HashMap<String,Running>=Default::default();
     let mut names: std::collections::HashMap<String, String> = Default::default();
+    // Account token seen last; a new sign-in restarts a host the user turned on.
+    let mut host_token: Option<String> = None;
+    let mut just_logged_in = false;
+    unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
     let refresh = |creds: &crate::auth::Credentials| {
         let api = super::api::Api::new(crate::auth::UUAuthClient::new(creds.clone()), crate::auth::BASE_URL);
         async move { api.device_list().await }
@@ -103,27 +109,40 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
         sessions.retain(|_,s| !s.task.is_finished());
         if let Some(child) = login.as_mut() {
             if let Ok(meta) = std::fs::metadata(&qr) {
-                if meta.modified().ok() != qr_seen { qr_seen = meta.modified().ok(); set_login(false, &qr.to_string_lossy(), "请用手机扫码并确认", ""); }
+                if meta.modified().ok() != qr_seen { qr_seen = meta.modified().ok(); set_login(false, &qr.to_string_lossy(), crate::i18n::s("请用手机扫码并确认","Scan with your phone and confirm"), ""); }
             }
-            if let Ok(Some(_)) = child.try_wait() { login = None; let _ = std::fs::remove_file(&qr); next_refresh = Instant::now(); }
+            if let Ok(Some(_)) = child.try_wait() { login = None; let _ = std::fs::remove_file(&qr); next_refresh = Instant::now(); just_logged_in = true; }
         } else if Instant::now() >= next_refresh {
             next_refresh = Instant::now() + Duration::from_secs(30);
             match credentials() {
                 Ok(creds) => {
-                    set_login(true, "", "", "已登录");
+                    set_login(true, "", "", crate::i18n::s("已登录","Signed in"));
+                    // Hosting is opt-in (Settings switch): signing in never starts the host, but a
+                    // host the user turned on goes online with the new account.
+                    if host_token.as_deref() != Some(creds.token.as_str()) {
+                        let changed = host_token.is_some() || std::mem::take(&mut just_logged_in);
+                        if changed && super::host::managed() && super::host::active() {
+                            match super::host::restart() {
+                                Ok(()) => toast(crate::i18n::s("本机已上线，可在你的其他设备上远程控制","This computer is online; control it from your other devices")),
+                                Err(e) => log::warn!("Host service not restarted: {e}"),
+                            }
+                            unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
+                        }
+                        host_token = Some(creds.token.clone());
+                    }
                     match refresh(&creds).await {
                         Ok(data) => {
                             let list = data.get("my_binded_devices").and_then(Value::as_array).cloned().unwrap_or_default();
                             let current = data.pointer("/current_device/device_id").and_then(Value::as_str);
                             names = list.iter().filter_map(|d| Some((d.get("device_id")?.as_str()?.to_owned(),
-                                d.get("alias").and_then(Value::as_str).unwrap_or("远端设备").to_owned()))).collect();
+                                d.get("alias").and_then(Value::as_str).unwrap_or_else(|| crate::i18n::s("远端设备","Remote device")).to_owned()))).collect();
                             let rows = c(&device_rows(&list, current)); unsafe { uu_viewer_ui_set_devices(rows.as_ptr()) }
                         }
-                        Err(super::api::Error::AuthenticationExpired) => set_login(false, "", "登录已过期，请重新登录", ""),
+                        Err(super::api::Error::AuthenticationExpired) => set_login(false, "", crate::i18n::s("登录已过期，请重新登录","Sign-in expired, please sign in again"), ""),
                         Err(_) => {}
                     }
                 }
-                Err(_) => set_login(false, "", "尚未登录", ""),
+                Err(_) => set_login(false, "", crate::i18n::s("尚未登录","Not signed in"), ""),
             }
         }
         while let Some(cmd) = take() {
@@ -131,6 +150,18 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
             match parts.as_slice() {
                 ["quit"] => break,
                 ["refresh"] => next_refresh = Instant::now(),
+                ["relaunch"] => {
+                    // Language is read once at start: restart the launcher in place. Open
+                    // sessions are separate processes and keep running.
+                    use std::os::unix::process::CommandExt;
+                    let _ = std::process::Command::new(&exe).args(std::env::args_os().skip(1)).exec();
+                    toast(crate::i18n::s("请重新启动控制端以切换语言","Restart the viewer to switch the language"));
+                }
+                ["host", state] => {
+                    let result = if *state == "on" { super::host::enable(&exe) } else { super::host::disable() };
+                    if let Err(e) = result { toast(&crate::tr!("本机被控设置失败：{e}","Could not change hosting: {e}")); }
+                    unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
+                }
                 ["logout"] => {
                     // Sign out locally: drop the account token, keep the device identity.
                     let path = crate::config::path();
@@ -140,7 +171,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                     }
                     for (_,s) in sessions.drain() { s.stop().await; }
                     unsafe { uu_viewer_ui_set_devices(c("").as_ptr()) }
-                    set_login(false, "", "已退出登录", "");
+                    set_login(false, "", crate::i18n::s("已退出登录","Signed out"), "");
                     next_refresh = Instant::now() + Duration::from_secs(3600);
                 }
                 ["login"] if login.is_none() => {
@@ -149,7 +180,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                         .env("UU_LOGIN_QR_PNG", &qr).stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                         .kill_on_drop(true).spawn().ok();
-                    if login.is_none() { set_login(false, "", "找不到配套的 uuremote-server", ""); }
+                    if login.is_none() { set_login(false, "", crate::i18n::s("找不到配套的 uuremote-server","The matching uuremote-server was not found"), ""); }
                 }
                 ["connect", id, kind] if matches!(*kind, "desktop" | "watch") => {
                     if !replace(&mut sessions,id).await{continue}
@@ -161,38 +192,38 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                     match command.env("UU_VIEWER_COMMANDS","1").stdin(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn() {
                         Ok(mut child) => { let input=child.stdin.take();let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,None);sessions.insert((*id).into(),Running{cancel,task,input}); }
-                        Err(_) => toast("连接失败：无法启动会话进程"),
+                        Err(_) => toast(crate::i18n::s("连接失败：无法启动会话进程","Connection failed: cannot start the session process")),
                     }
                 }
                 ["assist", id, code] => {
                     match super::assist::command(&exe, id).spawn() {
                         Ok(mut child) => match super::assist::send_code(&mut child, code).await {
                             Ok(()) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,None);sessions.insert(format!("assist:{id}"),Running{cancel,task,input:None}); }
-                            Err(reason) => toast(&format!("连接失败：{reason}")),
+                            Err(reason) => toast(&crate::tr!("连接失败：{reason}","Connection failed: {reason}")),
                         },
-                        Err(_) => toast("连接失败：无法启动协助会话进程"),
+                        Err(_) => toast(crate::i18n::s("连接失败：无法启动协助会话进程","Connection failed: cannot start the assistance session")),
                     }
                 }
                 ["connect", id, kind @ ("file" | "portmap" | "terminal")] => {
                     if *kind=="file" {if let Some(s)=sessions.get_mut(*id){if let Some(input)=s.input.as_mut(){
                         use tokio::io::AsyncWriteExt;
-                        if input.write_all(b"files\n").await.is_err(){toast("桌面会话命令发送失败，请重试")}continue
+                        if input.write_all(b"files\n").await.is_err(){toast(crate::i18n::s("桌面会话命令发送失败，请重试","Could not send the command to the desktop session, try again"))}continue
                     }}}
                     if !replace(&mut sessions,id).await{continue}
-                    let name = names.get(*id).cloned().unwrap_or_else(|| "远端设备".into());
+                    let name = names.get(*id).cloned().unwrap_or_else(|| crate::i18n::s("远端设备","Remote device").into());
                     let tool = if *kind == "file" { "files-ui" } else if *kind == "terminal" { "terminal-ui" } else { "portmap-ui" };
                     match tokio::process::Command::new(&exe).args([tool, id, &name])
                         .stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn() {
                         Ok(child) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,None);sessions.insert((*id).into(),Running{cancel,task,input:None}); }
-                        Err(_) => toast("连接失败：无法启动工具进程"),
+                        Err(_) => toast(crate::i18n::s("连接失败：无法启动工具进程","Connection failed: cannot start the tool process")),
                     }
                 }
                 ["connect", id, kind @ ("reboot" | "shutdown")] => {
                     if !replace(&mut sessions,id).await{continue}
                     match tokio::process::Command::new(&exe).args(["power", id, kind])
                         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn() {
-                        Ok(child) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,Some("电源指令已发送，未确认远端执行结果"));sessions.insert((*id).into(),Running{cancel,task,input:None}); }
-                        Err(_) => toast("电源指令失败：无法启动会话进程"),
+                        Ok(child) => { let (cancel,rx)=tokio::sync::oneshot::channel();let task=watch_session(child,rx,Some(crate::i18n::s("电源指令已发送，未确认远端执行结果","Power command sent; the result on the remote device is not confirmed")));sessions.insert((*id).into(),Running{cancel,task,input:None}); }
+                        Err(_) => toast(crate::i18n::s("电源指令失败：无法启动会话进程","Power command failed: cannot start the session process")),
                     }
                 }
                 ["connect", id, "unbind"] => {
@@ -201,7 +232,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                         Ok(creds)=>super::api::Api::new(crate::auth::UUAuthClient::new(creds),crate::auth::BASE_URL).unbind(id,false).await.map_err(|e|e.to_string()),
                         Err(e)=>Err(e),
                     };
-                    match result {Ok(())=>toast("设备已从账号删除"),Err(e)=>toast(&format!("删除设备失败：{e}"))}
+                    match result {Ok(())=>toast(crate::i18n::s("设备已从账号删除","Device removed from the account")),Err(e)=>toast(&crate::tr!("删除设备失败：{e}","Removing the device failed: {e}"))}
                     next_refresh=Instant::now();
                 }
                 ["connect", _, kind] => log::info!("Viewer UI: {kind} is not supported yet"),
@@ -221,6 +252,6 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
             serde_json::json!({"device_id":"d2","platform":1,"status":"DISCONNECTED"}),
             serde_json::json!({"alias":"no id"}),
         ], Some("d2"));
-        assert_eq!(rows, "d1\ta b\t4\t1\t0\nd2\td2\t1\t0\t1\n");
+        assert_eq!(rows, "d1\ta b\t4\t1\t0\t\nd2\td2\t1\t0\t1\t\n");
     }
 }

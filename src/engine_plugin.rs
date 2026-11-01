@@ -87,6 +87,7 @@ pub use native::symbol;
 pub trait Missing { fn missing() -> Self; }
 impl Missing for () { fn missing() -> Self {} }
 impl Missing for i32 { fn missing() -> Self { -1 } }
+impl Missing for usize { fn missing() -> Self { 0 } }
 impl<T> Missing for *mut T { fn missing() -> Self { std::ptr::null_mut() } }
 
 /// Declares engine C functions: an `extern "C"` block when linked statically, or dlsym-resolved

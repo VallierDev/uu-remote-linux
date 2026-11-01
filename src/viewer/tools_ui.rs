@@ -54,7 +54,7 @@ fn task(id:i32,name:&str,status:&str,done:u64,total:u64,from:&str,to:&str,state:
     let(n,s,f,t)=(c(name),c(status),c(from),c(to));
     unsafe{uu_files_ui_task(id,n.as_ptr(),s.as_ptr(),done,total,f.as_ptr(),t.as_ptr(),state)}
 }
-fn reason(error:&str)->String{if error.contains("canceled"){"已取消".into()}else{format!("失败：{error}")}}
+fn reason(error:&str)->String{if error.contains("canceled"){crate::i18n::s("已取消","Canceled").into()}else{crate::tr!("失败：{error}","Failed: {error}")}}
 
 pub async fn files(io:Transport,rx:mpsc::Receiver<Packet>,name:&str)->Result<(),String>{
     start("files",name)?;
@@ -67,7 +67,7 @@ pub async fn files(io:Transport,rx:mpsc::Receiver<Packet>,name:&str)->Result<(),
             let mut guard=shown.lock().unwrap();let Some(a)=guard.as_mut() else{continue};
             if a.last.elapsed()<Duration::from_millis(200) && p.transferred<p.total{continue}a.last=Instant::now();
             let percent=if p.total>0{p.transferred*100/p.total}else{0};
-            task(a.id,&a.name,&format!("传输中 {percent}%"),p.transferred,p.total,&a.from,&a.to,0);
+            task(a.id,&a.name,&crate::tr!("传输中 {percent}%","Transferring {percent}%"),p.transferred,p.total,&a.from,&a.to,0);
         }
     });
     let _reporter=super::tools::Cancel(reporter.abort_handle());
@@ -79,24 +79,24 @@ pub async fn files(io:Transport,rx:mpsc::Receiver<Packet>,name:&str)->Result<(),
         while let Some(job)=queue.recv().await{if worker_closing.load(Ordering::Acquire){break}match job{
             Job::List(path)=>match worker_f.list_dir(&path).await{
                 Ok(entries)=>{remote=path.clone();let(p,r)=(c(&path),c(&entry_rows(&entries)));unsafe{uu_files_ui_set_remote(p.as_ptr(),r.as_ptr())}}
-                Err(e)=>toast(&format!("无法读取远端目录：{e}")),
+                Err(e)=>toast(&crate::tr!("无法读取远端目录：{e}","Cannot read remote folder: {e}")),
             },
             Job::Mkdir(path,parent)=>match worker_f.mkdir(&path).await{
                 Ok(())=>if parent==remote{if let Ok(entries)=worker_f.list_dir(&remote).await{let(p,r)=(c(&remote),c(&entry_rows(&entries)));unsafe{uu_files_ui_set_remote(p.as_ptr(),r.as_ptr())}}},
-                Err(e)=>toast(&format!("无法创建远端文件夹：{e}")),
+                Err(e)=>toast(&crate::tr!("无法创建远端文件夹：{e}","Cannot create remote folder: {e}")),
             },
             Job::Transfer{id,upload,from,dir,generation}=>{
                 let name=base_name(&from).to_owned();
                 let to=if upload{remote_join(&dir,&name)}else{free_local(std::path::Path::new(&dir),&name).to_string_lossy().into_owned()};
-                if generation!=worker_gen.load(Ordering::Acquire){task(id,&name,"已取消",0,0,&from,&to,2);continue}
+                if generation!=worker_gen.load(Ordering::Acquire){task(id,&name,crate::i18n::s("已取消","Canceled"),0,0,&from,&to,2);continue}
                 *worker_active.lock().unwrap()=Some(Active{id,name:name.clone(),from:from.clone(),to:to.clone(),last:Instant::now()});
-                task(id,&name,"传输中",0,0,&from,&to,0);
+                task(id,&name,crate::i18n::s("传输中","Transferring"),0,0,&from,&to,0);
                 let result=if upload{worker_f.upload(&from,&to).await}else{worker_f.download(&from,&to).await};
                 *worker_active.lock().unwrap()=None;
                 match result{
                     Ok(())=>{
                         let size=std::fs::metadata(if upload{&from}else{&to}).map(|m|if m.is_file(){m.len()}else{0}).unwrap_or(0);
-                        task(id,&name,"已完成",size,size,&from,&to,1);
+                        task(id,&name,crate::i18n::s("已完成","Done"),size,size,&from,&to,1);
                         if upload{if dir==remote{if let Ok(entries)=worker_f.list_dir(&remote).await{let(p,r)=(c(&remote),c(&entry_rows(&entries)));unsafe{uu_files_ui_set_remote(p.as_ptr(),r.as_ptr())}}}}
                         else{unsafe{uu_files_ui_refresh_local()}}
                     }
@@ -118,7 +118,7 @@ pub async fn files(io:Transport,rx:mpsc::Receiver<Packet>,name:&str)->Result<(),
                 ["mkdir",path]=>{let parent=path.rfind(['/','\\']).map(|i|path[..i.max(1)].to_owned()).unwrap_or_default();let _=jobs.send(Job::Mkdir((*path).into(),parent));}
                 [kind@("put"|"get"),from,dir]=>{
                     let(id,upload)=(NEXT_TASK.fetch_add(1,Ordering::Relaxed),*kind=="put");
-                    let name=base_name(from);task(id,name,"等待中",0,0,from,dir,0);
+                    let name=base_name(from);task(id,name,crate::i18n::s("等待中","Waiting"),0,0,from,dir,0);
                     let _=jobs.send(Job::Transfer{id,upload,from:(*from).into(),dir:(*dir).into(),generation:generation.load(Ordering::Acquire)});
                 }
                 ["cancel"]=>{generation.fetch_add(1,Ordering::AcqRel);f.cancel();}
@@ -147,12 +147,12 @@ pub async fn portmap(io:Transport,rx:mpsc::Receiver<Packet>,name:&str)->Result<(
                 ["add",rule,local,host,port]=>match(local.parse::<u16>(),port.parse::<u16>()){
                     (Ok(local),Ok(port))=>match p.add_rule(*rule,local,*host,port).await{
                         Ok(id)=>{targets.insert(id,format!("{host}:{port}"));}
-                        Err(e)=>toast(&format!("添加失败：{}",if e.contains("bind"){"本地端口已被占用".to_owned()}else{e})),
+                        Err(e)=>toast(&crate::tr!("添加失败：{}","Add failed: {}",if e.contains("bind"){crate::i18n::s("本地端口已被占用","Local port is already in use").to_owned()}else{e})),
                     },
-                    _=>toast("端口无效"),
+                    _=>toast(crate::i18n::s("端口无效","Invalid port")),
                 },
                 ["remove",id]=>if let Ok(id)=id.parse::<u64>(){
-                    if let Err(e)=p.remove_rule(id).await{toast(&format!("删除失败：{e}"))}targets.remove(&id);
+                    if let Err(e)=p.remove_rule(id).await{toast(&crate::tr!("删除失败：{e}","Remove failed: {e}"))}targets.remove(&id);
                 },
                 _=>{}
             }
@@ -160,9 +160,9 @@ pub async fn portmap(io:Transport,rx:mpsc::Receiver<Packet>,name:&str)->Result<(
         let mut status=p.status();status.sort_by_key(|s|s.id);
         let rows:String=status.iter().map(|s|format!("{}\t{}\t127.0.0.1:{}\t{}\t{}\n",s.id,s.name.replace(['\t','\n']," "),s.local_port,
             targets.get(&s.id).map(String::as_str).unwrap_or("-"),
-            if s.failures>0{format!("已启用 · {} 个连接 · {} 次失败",s.streams,s.failures)}else{format!("已启用 · {} 个连接",s.streams)})).collect();
+            if s.failures>0{crate::tr!("已启用 · {} 个连接 · {} 次失败","On · {} connections · {} failures",s.streams,s.failures)}else{crate::tr!("已启用 · {} 个连接","On · {} connections",s.streams)})).collect();
         if rows!=last{let r=c(&rows);unsafe{uu_portmap_ui_set_rules(r.as_ptr())};last=rows;}
-        tokio::select!{_=&mut closed_transport=>{toast("连接已断开");tokio::time::sleep(Duration::from_secs(3)).await;break Err("Forwarding transport closed".into())},_=tokio::time::sleep(Duration::from_millis(200))=>{}}
+        tokio::select!{_=&mut closed_transport=>{toast(crate::i18n::s("连接已断开","Disconnected"));tokio::time::sleep(Duration::from_secs(3)).await;break Err("Forwarding transport closed".into())},_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     };
     let ids:Vec<u64>=p.status().iter().map(|s|s.id).collect();for id in ids{let _=p.remove_rule(id).await;}
     result
@@ -190,14 +190,14 @@ pub async fn terminal(io:Transport,rx:mpsc::Receiver<Packet>,_device:&str,name:&
                     unsafe{uu_terminal_ui_set(rows.as_ptr(),1)}
                 },
                 id=queue.recv()=>match id{
-                    Some(id)=>{if t.kill(id).await.is_err(){toast("结束会话失败，会话可能已退出")}
+                    Some(id)=>{if t.kill(id).await.is_err(){toast(crate::i18n::s("结束会话失败，会话可能已退出","Could not end the session; it may have exited"))}
                         let rows=c(&session_rows(&t.list_sessions().await?));unsafe{uu_terminal_ui_set(rows.as_ptr(),1)}},
                     None=>return Ok::<(),String>(()),
                 },
                 _=tokio::time::sleep(Duration::from_millis(100)),if relay.0.is_finished()=>return Err("Terminal channel closed".into()),
             }}
         }.await;
-        if operation.is_err(){unsafe{uu_terminal_ui_set(c("").as_ptr(),0)};toast("终端连接已断开，请关闭窗口后重试")}
+        if operation.is_err(){unsafe{uu_terminal_ui_set(c("").as_ptr(),0)};toast(crate::i18n::s("终端连接已断开，请关闭窗口后重试","Terminal disconnected. Close the window and try again"))}
     });
     let _worker=super::tools::Cancel(worker.abort_handle());
     let mut children:Vec<std::process::Child>=Vec::new();
@@ -205,7 +205,7 @@ pub async fn terminal(io:Transport,rx:mpsc::Receiver<Packet>,_device:&str,name:&
         if worker.is_finished(){ipc.0.abort();}
         children.retain_mut(|child|matches!(child.try_wait(),Ok(None)));
         while let Some(cmd)=take(){
-            if worker.is_finished(){toast("连接已断开");continue}
+            if worker.is_finished(){toast(crate::i18n::s("连接已断开","Disconnected"));continue}
             let parts:Vec<_>=cmd.split('\t').collect();
             let session=match parts.as_slice(){
                 ["create"]=>None,
@@ -214,8 +214,8 @@ pub async fn terminal(io:Transport,rx:mpsc::Receiver<Packet>,_device:&str,name:&
                 _=>continue,
             };
             match local_terminal_command(&exe,&path,session){
-                Some(mut command)=>match command.spawn(){Ok(child)=>children.push(child),Err(_)=>toast("无法启动本机终端程序")},
-                None=>toast("没有找到本机终端程序（可设置 TERMINAL 环境变量）"),
+                Some(mut command)=>match command.spawn(){Ok(child)=>children.push(child),Err(_)=>toast(crate::i18n::s("无法启动本机终端程序","Cannot start a local terminal"))},
+                None=>toast(crate::i18n::s("没有找到本机终端程序（可设置 TERMINAL 环境变量）","No local terminal found (set the TERMINAL environment variable)")),
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;

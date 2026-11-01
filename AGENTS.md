@@ -29,7 +29,10 @@ This file is written for large language model agents (Claude Code, Codex, Cursor
    the config file / environment. The only built-in default is the public client signing key in `src/auth.rs`.
 6. **Don't break other tools.** The desktop, file-transfer, terminal and port-mapping tools each open their own
    peer connection; a new offer must never close other peers.
-7. Keep changes small and tested; match the surrounding code style (dense, comment only the non-obvious).
+7. **UI text is bilingual.** Every user-facing string has Chinese and English: `L("中文", "English")` in C
+   (`c_engine/i18n.h`), `crate::i18n::s(..)` / `crate::tr!(..)` in Rust (`src/i18n.rs`; `UU_LANG`, saved choice, locale).
+   Logs stay English.
+8. Keep changes small and tested; match the surrounding code style (dense, comment only the non-obvious).
 
 ## 3. Build and test
 
@@ -124,6 +127,7 @@ viewer does not reconnect them automatically.
 | `UU_X11_MULTISCREEN=1`, `UU_X11_OUTPUT` | X11: advertise each RandR monitor (`xrandr --listmonitors`, read once at start; primary or `UU_X11_OUTPUT` is id 0) through the same screen-switch path as `UU_WAYLAND_MULTISCREEN` (`wayland::outputs`/`select`). x11grab reads `display+x,y` at the monitor size, XTest/uinput absolute input adds the monitor offset, the in-process engine and `desktop_mode` resize are skipped (分辨率 scales). Needs two or more monitors |
 | `UU_DESKTOP_RESIZE=0` | X11: the viewer's 分辨率 choice scales the encoded stream instead of changing the display mode. Default: `src/desktop_mode.rs` switches the primary output via xrandr (adds a CVT-RB mode when missing, re-applies once if mutter resets it), restores the original mode for resolution_type 3 and 2 s after the last desktop stream ends |
 | `UU_NVENC_RGB=0` / `=1` | NVENC 4:2:0 without scaling takes packed BGRA/BGR0 directly (no CPU swscale). Default: on, except when a connected DRM connector belongs to an nvidia-bound card (desktop composited on the encoding GPU; #16 measured 82.6 vs 98 fps at 4K). `0` forces CPU conversion, `1` forces the direct path |
+| `UU_TOUCH_INPUT` | Android/iOS controllers (connect header `controller_platform` 2/3) send a finger as a left-button drag at absolute positions. Default on the portal backend (gesture): per press, moving past 12 px within 450 ms scrolls (`NotifyPointerAxis` / EIS scroll, content follows the finger, `finish` on release), holding still selects with button 1 down, a short press clicks; needs no touchscreen consent. `touch`: replay as one finger on the portal touchscreen (`NotifyTouch*` / EIS touch; requested where `AvailableDeviceTypes` offers it; consents saved before touch support restore keyboard+pointer only, so the first mobile drag asks once per run in the background via `PortalSession::upgrade_touch`, swapped in only with the touchscreen granted for the same monitor; the saved consent is never removed first). `0`: plain mouse drags |
 | `UU_INPUT_BACKEND` | `auto` (uinput on Wayland/portal when `/dev/uinput` is accessible, udev `uaccess` rule in README) / `uinput` / `native`. X11 keeps XTest (held-key autorepeat handling) |
 | Mac viewer Cmd | With 「使用 macOS 快捷键」 off the Mac viewer sends Cmd=VK_LWIN 0x5B, Option=0xA4, Ctrl=0xA2; connect header `controller_platform`=4 is macOS. For Mac controllers Cmd is held back: Cmd+C/V/A/F/X/Z → Ctrl+key (terminal: Cmd+C/V → Ctrl+Shift+C/V), other combos/alone → Super |
 | `UU_TERMINAL_SHORTCUTS=0` | disable Ctrl+V → Ctrl+Shift+V in focused X11 terminals (Mac Cmd and Ctrl both arrive as VK_LCONTROL) |
@@ -135,7 +139,7 @@ viewer does not reconnect them automatically.
 | `UU_LOGIN_WINDOW=0` | don't auto-open the login window |
 | `UU_ENGINE_DIR` | directory holding `libuu-wayland.so` / `libuu-portal.so` (`--features engine-plugins`, used by release packages: engines are dlopen'ed only on Wayland sessions; also searched next to the binary, `../lib/uu-remote-linux`, `~/.local/lib/uu-remote-linux`, `/usr/lib/uu-remote-linux`) |
 | `UU_WOL_HELPER=1` | experimental: report LAN info (`api-ipv4…/api/v1/device/wake_on_lan/info` {mac, ip, subnet_mask}) after sign-in and answer `wake_on_lan` pushes (`target_device` {mac, ip, subnet_mask}) with a magic packet, like the official Windows host (field names from its log strings; not verified end to end). `wake_on_lan` push key names are always logged |
-| `UU_USE_PROXY=1` | honor HTTP/SOCKS proxy env vars; cloud API clients bypass env proxies by default |
+| `UU_USE_PROXY=1` | honor HTTP/HTTPS proxy env vars for REST and WebSocket signaling, and also gather TURN relays over TCP/TLS through that proxy (`vendor/webrtc-ice/PATCHES.md`; chain-verified, name mismatch tolerated for IP TURN URLs); clients bypass env proxies by default |
 | `UU_REMOTE_ASSIST=0`, `UU_ASSIST_ALLOW=1`, `UU_ASSIST_UI=tty`, `UU_ASSIST_DEBUG=1` | disable assistance / allow at start / terminal UI for `assist` / include the server's short error message in assist errors |
 
 Token has no expiry field; API code 1120 (HTTP 422) means invalid/expired → re-login. `config.json` is parsed once
@@ -170,6 +174,8 @@ for a new QR login.
 | `src/assist.rs`, `c_engine/assist_window.c` | remote assistance (guest + account) and the unified GTK main window (assist + account/QR card) |
 | `src/viewer_main.rs`, `src/viewer/` | experimental viewer (`--features native-viewer,viewer-sdl`): cloud join, WebRTC offer side, SDL desktop window (ffmpeg CLI decode), files/terminal/portmap/power/assist tools, device removal (`POST /api/v1/device/{id}/unbind`, verified live; shared devices use `/api/v1/device/share/{id}/unbind`, strings only), GTK launcher |
 | `c_engine/viewer_window.c`, `c_engine/viewer_tools.c` | viewer GTK launcher and tool windows (files, port mapping, terminal list) |
+| `src/viewer/hud.rs` | in-window chrome drawn on the SDL canvas: loading screen, control center (Ctrl+Alt+M; capture settings RPC 2 and SimpleActions 14/16/18/19 as the official viewer sends them), network-status panel (Ctrl+Alt+G); fontconfig font via ab_glyph |
+| `src/viewer/thumbs.rs`, `src/viewer/host.rs` | launcher device previews (last picture, local 0600 cache); viewer sign-in keeps the local host user service running so the machine joins the account's device list |
 
 Diagnostic subcommands: `doctor` (paste-safe report: session, selected backend, engine plugins, uinput, encoder and codec with source, sign-in/service state; booleans and names only), `set-encoder auto|cpu|vaapi|nvenc` and `set-codec auto|h264|h265` (both notify a running host with SIGUSR2; live encoder switch, negotiated codec unchanged, codec preference on the next desktop stream; illegal values exit 2), `login [--no-gui]`, `unlock-check` (password on stdin, prints only accepted/rejected),
 `desktop-probe [new.png]`, `desktop-video-probe` (`UU_PROBE_FPS`, `UU_PROBE_FRAMES`, `UU_PROBE_QUALITY` 1-5 = viewer bitrate preset, 5 auto; `UU_PROBE_CHROMA=444` 真彩; `UU_PROBE_INPUT` fixed video/image sequence, `UU_PROBE_LOOP=1` repeats), `wayland-input-probe`, `clipboard-acceptance`,

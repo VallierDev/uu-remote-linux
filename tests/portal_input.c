@@ -18,6 +18,7 @@ enum response_mode { UNKNOWN_METHOD, NOT_SUPPORTED, TEMPORARY_FAILURE, NO_FDS, B
 static enum response_mode mode;
 static unsigned connects, legacy_calls;
 static double last_x, last_y;
+static int last_finish;
 
 static GVariant *test_call(GDBusConnection *bus, const gchar *dest, const gchar *path,
     const gchar *interface, const gchar *method, GVariant *parameters,
@@ -26,7 +27,24 @@ static GVariant *test_call(GDBusConnection *bus, const gchar *dest, const gchar 
     assert(!strcmp(interface, REMOTE));
     assert(!strcmp(method, "NotifyKeyboardKeysym") || !strcmp(method, "NotifyPointerButton") ||
         !strcmp(method, "NotifyPointerAxisDiscrete") || !strcmp(method, "NotifyPointerMotion") ||
-        !strcmp(method, "NotifyPointerMotionAbsolute"));
+        !strcmp(method, "NotifyPointerMotionAbsolute") || !strcmp(method, "NotifyTouchDown") ||
+        !strcmp(method, "NotifyTouchMotion") || !strcmp(method, "NotifyTouchUp") || !strcmp(method, "NotifyPointerAxis"));
+    if (!strcmp(method, "NotifyPointerAxis")) {
+        assert(g_variant_is_of_type(parameters, G_VARIANT_TYPE("(oa{sv}dd)")));
+        GVariant *options = g_variant_get_child_value(parameters, 1);
+        GVariant *x = g_variant_get_child_value(parameters, 2), *y = g_variant_get_child_value(parameters, 3);
+        last_x = g_variant_get_double(x); last_y = g_variant_get_double(y);
+        gboolean finish = FALSE; last_finish = g_variant_lookup(options, "finish", "b", &finish) && finish;
+        g_variant_unref(options); g_variant_unref(x); g_variant_unref(y);
+    }
+    if (!strcmp(method, "NotifyTouchDown") || !strcmp(method, "NotifyTouchMotion")) {
+        assert(g_variant_is_of_type(parameters, G_VARIANT_TYPE("(oa{sv}uudd)")));
+        GVariant *x = g_variant_get_child_value(parameters, 4);
+        GVariant *y = g_variant_get_child_value(parameters, 5);
+        last_x = g_variant_get_double(x); last_y = g_variant_get_double(y);
+        g_variant_unref(x); g_variant_unref(y);
+    }
+    if (!strcmp(method, "NotifyTouchUp")) assert(g_variant_is_of_type(parameters, G_VARIANT_TYPE("(oa{sv}u)")));
     if (!strcmp(method, "NotifyPointerMotion") || !strcmp(method, "NotifyPointerMotionAbsolute")) {
         unsigned offset = !strcmp(method, "NotifyPointerMotion") ? 2 : 3;
         GVariant *x = g_variant_get_child_value(parameters, offset);
@@ -93,6 +111,28 @@ static void legacy_input(struct uu_portal *p) {
     assert(legacy_calls == 7 && uu_portal_alive(p) && !p->ei);
 }
 
+/* Smooth scroll maps like relative motion; only the last event of a gesture carries "finish". */
+static void legacy_scroll(struct uu_portal *p) {
+    unsigned before = legacy_calls;
+    assert(uu_portal_scroll(p, 20, -40, 0) == 0);
+    assert(last_x == 20. * p->logical_width / p->width && last_y == -40. * p->logical_height / p->height && !last_finish);
+    assert(uu_portal_scroll(p, 0, 0, 1) == 0 && last_finish && last_x == 0 && last_y == 0);
+    assert(uu_portal_scroll(p, NAN, 0, 0) == 11 && legacy_calls == before + 2);
+}
+/* Touch needs the granted touchscreen type and uses the same stream mapping as absolute motion. */
+static void legacy_touch(struct uu_portal *p) {
+    p->devices = 3;
+    assert(uu_portal_touch(p, 0, 10, 10) == 11 && legacy_calls == 7);
+    p->devices = 7;
+    assert(uu_portal_touch(p, 0, 1920, 1080) == 0);
+    assert(last_x == (p->absolute_stream_pixels ? 1920 : 960));
+    assert(last_y == (p->absolute_stream_pixels ? 1080 : 540));
+    assert(uu_portal_touch(p, 1, 3840, 0) == 11);
+    assert(uu_portal_touch(p, 1, 0, 0) == 0 && last_x == 0 && last_y == 0);
+    assert(uu_portal_touch(p, 2, 0, 0) == 0);
+    assert(legacy_calls == 10 && !p->ei);
+}
+
 int main(void) {
     struct uu_portal *p = session(1, 1, 0);
     legacy_input(p);
@@ -107,10 +147,14 @@ int main(void) {
     }
     p = session(0, 1, 1); /* Unscaled GNOME keeps Notify*. */
     legacy_input(p);
+    legacy_touch(p);
+    legacy_scroll(p);
     assert(!connects);
     uu_portal_close(p);
     p = session(1, 0, 1); /* KDE keeps its compositor-logical mapping. */
     legacy_input(p);
+    legacy_touch(p);
+    legacy_scroll(p);
     assert(!connects);
     uu_portal_close(p);
 
