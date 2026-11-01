@@ -19,6 +19,13 @@
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Linux 主机主窗口：远程协助与账号"></p>
 <p align="center"><sub>Linux 被控端主窗口：远程协助与账号（设备 ID、验证码和账号已打码）</sub></p>
 
+## 外观 / Appearance
+
+在控制端的 **设置 → 常规 → 外观**，或主机 / 工具窗口的齿轮设置按钮中选择 **跟随系统 / 浅色 / 深色**（默认跟随系统）。
+选择保存在 `$XDG_CONFIG_HOME/uuremote/theme`（默认 `~/.config/uuremote/theme`）。
+
+<p align="center"><img src="docs/images/appearance-light.png" width="360" alt="浅色界面（虚构设备）"> <img src="docs/images/appearance-dark.png" width="360" alt="深色界面（虚构设备）"></p>
+
 ## 语言 / Language
 
 启动时按以下顺序确定界面语言：

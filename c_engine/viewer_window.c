@@ -11,45 +11,32 @@
 #include <time.h>
 #include <sys/stat.h>
 #include "i18n.h"
+#include "ui_theme.h"
 
 static const char *CSS =
-    "window { background-color: #ffffff; }\n"
-    "* { font-family: 'Noto Sans CJK SC', 'Noto Sans SC', sans-serif; }\n"
-    ".sidebar { background-color: #e9e9ec; }\n"
-    ".section { font-size: 16px; font-weight: 600; color: #1d1d1f; }\n"
+    ".sidebar { background-color: @theme_bg_color; border-right: 1px solid @uu_border; }\n"
     ".sidebar list, .sidebar row { background-color: transparent; }\n"
-    ".sidebar row { border-radius: 8px; margin: 1px 10px; padding: 8px 10px; }\n"
-    ".sidebar row:selected { background-color: #d4d4d9; color: #1d1d1f; }\n"
-    ".devname { font-size: 15px; color: #1d1d1f; }\n"
-    ".offline { color: #9ca3af; }\n"
-    ".dot { color: #22c55e; font-size: 10px; }\n"
+    ".sidebar row { border-radius: 8px; margin: 3px 12px; padding: 10px 12px; }\n"
+    ".sidebar row:hover { background-color: @uu_tint; }\n"
+    ".sidebar row:selected { background-color: @uu_tint; color: @uu_fg; }\n"
+    ".devname { font-size: 15px; color: @uu_fg; }\n"
+    ".offline { color: @uu_muted; }\n"
+    ".dot { font-size: 10px; }\n"
     ".dot.off { color: transparent; }\n"
-    ".icon { background-color: #2f7bff; color: #ffffff; border-radius: 6px; font-size: 11px; font-weight: 700; padding: 2px 5px; }\n"
-    ".icon.off { background-color: #c4c7cf; }\n"
-    ".tag { background-color: #e8f0ff; color: #2f6bff; border-radius: 4px; font-size: 12px; padding: 1px 6px; }\n"
-    ".title { font-size: 20px; font-weight: 700; color: #1d1d1f; }\n"
-    ".header { border-bottom: 1px solid #e5e7eb; padding: 12px 22px; background-color: #f7f7f8; }\n"
-    ".badge { background-color: #1d1d1f; color: #ffffff; border-radius: 12px; padding: 3px 12px; font-size: 13px; }\n"
-    ".badge.off { background-color: #9ca3af; }\n"
-    ".hbtn { background-image: none; background-color: transparent; border: none; font-size: 17px; color: #4b5563; padding: 4px 10px; }\n"
-    ".preview { background-image: linear-gradient(135deg, #a8c0ff 0%, #e2c2f2 50%, #f6c8a8 100%); border-radius: 12px 12px 0 0; }\n"
-    ".enter { background-image: none; background-color: rgba(0,0,0,0.18); color: #ffffff; border: none; font-size: 19px; padding: 8px 20px; border-radius: 8px; }\n"
-    ".toolbar { border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 12px 12px; padding: 4px; }\n"
-    ".tool { background-image: none; background-color: transparent; border: none; font-size: 15px; color: #374151; padding: 10px; }\n"
-    ".dashed { border: 1px dashed #d1d5db; border-radius: 12px; padding: 36px; }\n"
-    ".round { background-image: none; background-color: #f3f4f6; border: none; border-radius: 40px; font-size: 26px; min-width: 64px; min-height: 64px; }\n"
-    ".card { background-color: #fafafa; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; }\n"
-    ".cardbtn { background-image: none; background-color: #fafafa; border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px 16px; }\n"
-    ".banner { background-color: #f7f8fa; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; }\n"
-    ".group { font-size: 16px; font-weight: 600; color: #1d1d1f; }\n"
-    ".h2 { font-size: 19px; font-weight: 700; color: #1d1d1f; }\n"
-    ".big { font-size: 30px; font-weight: 800; color: #111111; }\n"
-    ".hint { font-size: 14px; color: #6b7280; }\n"
-    ".primary { background-image: none; background-color: #3b82f6; color: #ffffff; border: none; border-radius: 8px; font-size: 16px; padding: 8px 26px; }\n"
-    ".secondary { background-image: none; background-color: #ffffff; border: 1px solid #d1d5db; border-radius: 8px; padding: 6px 16px; }\n"
-    ".qrbox { background-color: #ffffff; border-radius: 12px; border: 1px solid #e5e7eb; padding: 14px; }\n"
-    ".status { font-size: 13px; color: #2f6bff; }\n"
-    ".toast { background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px 18px; font-size: 15px; }\n";
+    ".icon { background-color: @uu_accent; color: @uu_accent_fg; border-radius: 6px; font-size: 11px; font-weight: 700; padding: 3px 6px; }\n"
+    ".icon.off { background-color: @uu_border; color: @uu_muted; }\n"
+    ".header { border-bottom: 1px solid @uu_border; padding: 16px 24px; }\n"
+    ".badge { background-color: @uu_tint; color: @uu_success; border-radius: 8px; padding: 4px 10px; font-size: 13px; }\n"
+    ".badge.off { background-color: @theme_bg_color; color: @uu_muted; }\n"
+    ".hbtn { font-size: 17px; padding: 6px 10px; }\n"
+    ".preview { background-image: none; background-color: @uu_tint; border-radius: 12px 12px 0 0; }\n"
+    ".enter { font-size: 18px; }\n"
+    ".toolbar { background-color: @uu_surface; border: 1px solid @uu_border; border-top: none; border-radius: 0 0 12px 12px; padding: 6px; }\n"
+    ".tool { font-size: 15px; padding: 10px; }\n"
+    ".dashed { border: 1px dashed @uu_border; border-radius: 12px; padding: 36px; }\n"
+    ".round { background-color: @uu_tint; border: none; border-radius: 16px; font-size: 26px; min-width: 64px; min-height: 64px; }\n"
+    ".card, .banner { padding: 18px 20px; }\n"
+    ".cardbtn { padding: 14px 18px; }\n";
 
 typedef struct { char id[64]; char name[128]; int platform, online, current; char thumb[512]; } Device;
 static Device devices[64];
@@ -217,7 +204,7 @@ static void show_device(int index) {
     pthread_mutex_unlock(&d_lock);
     load_thumb(thumb);
     set_header(name, 1);
-    gtk_label_set_markup(GTK_LABEL(badge), online ? L("<span foreground='#22c55e'>●</span> 在线", "<span foreground='#22c55e'>●</span> Online") : L("离线", "Offline"));
+    gtk_label_set_text(GTK_LABEL(badge), online ? L("● 在线", "● Online") : L("离线", "Offline"));
     GtkStyleContext *ctx = gtk_widget_get_style_context(badge);
     if (online) gtk_style_context_remove_class(ctx, "off"); else gtk_style_context_add_class(ctx, "off");
     gtk_stack_set_visible_child_name(GTK_STACK(stack), "device");
@@ -574,6 +561,10 @@ static void open_settings(void) {
     GtkWidget *g0[] = { acct };
     gtk_box_pack_start(GTK_BOX(general), settings_card(g0, 1), FALSE, FALSE, 0);
     refresh_account();
+    const char *languages[] = {"中文", "English"}; GtkWidget *language = combo(languages, 2);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(language), uu_i18n_english()); g_signal_connect(language, "changed", G_CALLBACK(on_language), NULL);
+    GtkWidget *g4[] = { setting_row("语言 / Language", NULL, language), uu_theme_selector() };
+    gtk_box_pack_start(GTK_BOX(general), settings_card(g4, 2), FALSE, FALSE, 0);
     const char *wake[] = {L("永不", "Never"), L("接通电源时", "When plugged in"), L("始终", "Always")}, *close_opts[] = {L("最小化", "Minimize"), L("退出程序", "Quit")};
     GtkWidget *g1[] = { setting_row(L("开机自启动", "Start at login"), NULL, gtk_switch_new()),
         setting_row(L("保持唤醒状态", "Stay awake"), L("防止电脑进入睡眠状态，导致无法远程访问。", "Keep the computer from sleeping so it stays reachable."), combo(wake, 3)),
@@ -587,11 +578,10 @@ static void open_settings(void) {
     GtkWidget *real = button(L("在手机 App 中查看", "View in the mobile app"), "secondary"); gtk_widget_set_sensitive(real, FALSE);
     GtkWidget *g3[] = { setting_row(L("实名认证", "Identity verification"), NULL, real) };
     gtk_box_pack_start(GTK_BOX(general), settings_card(g3, 1), FALSE, FALSE, 0);
-    const char *languages[] = {"中文", "English"}; GtkWidget *language = combo(languages, 2);
-    gtk_combo_box_set_active(GTK_COMBO_BOX(language), uu_i18n_english()); g_signal_connect(language, "changed", G_CALLBACK(on_language), NULL);
-    GtkWidget *g4[] = { setting_row("语言 / Language", NULL, language) };
-    gtk_box_pack_start(GTK_BOX(general), settings_card(g4, 1), FALSE, FALSE, 0);
-    gtk_stack_add_titled(GTK_STACK(tabs), general, "general", L("⚙ 常规", "⚙ General"));
+    GtkWidget *gscroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(gscroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(gscroll), general);
+    gtk_stack_add_titled(GTK_STACK(tabs), gscroll, "general", L("⚙ 常规", "⚙ General"));
     // 安全
     GtkWidget *security = settings_page();
     const char *verify[] = {L("仅使用临时验证码", "Temporary code only"), L("仅使用自定义验证码", "Custom code only"), L("临时与自定义验证码", "Temporary and custom codes")};
@@ -666,12 +656,9 @@ static void *run(void *arg) {
     (void)arg;
     int ok = gtk_init_check(NULL, NULL);
     if (ok) { gtk_window_set_default_icon_name("uu-remote-linux"); } // same taskbar icon as the host (#13)
-    // The CSS hard-codes a light palette; a dark system theme would turn unstyled text white on white (#43).
-    if (ok) g_object_set(gtk_settings_get_default(), "gtk-theme-name", "Adwaita", "gtk-application-prefer-dark-theme", FALSE, NULL);
     if (ok) {
-        GtkCssProvider *css = gtk_css_provider_new();
-        gtk_css_provider_load_from_data(css, CSS, -1, NULL);
-        gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(css), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        uu_theme_init();
+        uu_theme_load_css(CSS);
         window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
         gtk_window_set_title(GTK_WINDOW(window), L("UU 远程 Linux 控制端（非官方）", "UU Remote Linux viewer (unofficial)"));
         gtk_window_set_default_size(GTK_WINDOW(window), 1180, 780);

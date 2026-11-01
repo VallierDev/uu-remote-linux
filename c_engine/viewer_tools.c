@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "i18n.h"
+#include "ui_theme.h"
 
 #define QSIZE 64
 static char queue[QSIZE][4096];
@@ -46,26 +47,17 @@ static gboolean toast_idle(gpointer d) { show_toast(d); g_free(d); return G_SOUR
 void uu_tools_ui_toast(const char *text) { g_idle_add(toast_idle, g_strdup(text)); }
 static gboolean on_delete(GtkWidget *w, GdkEvent *e, gpointer d) { (void)e; (void)d; gtk_widget_hide(w); atomic_store(&closed, 1); return TRUE; }
 
-static const char *css =
-    "window { background: #f5f6f8; }\n"
-    ".title { font-size: 22px; font-weight: bold; color: #111827; }\n"
-    ".tag { background: #e5e7eb; color: #4b5563; border-radius: 6px; padding: 2px 8px; }\n"
-    ".tag.remote { background: #d1fae5; color: #047857; }\n"
-    ".card { background: white; border: 1px solid #e5e7eb; border-radius: 10px; padding: 8px; }\n"
-    ".section { font-size: 17px; font-weight: bold; }\n"
-    ".toast { background: rgba(17,24,39,0.88); color: white; border-radius: 8px; padding: 10px 18px; }\n"
-    ".primary { background-image: none; background-color: #10b981; color: white; border: none; }\n"
-    ".empty { color: #6b7280; font-size: 15px; }\n"
-    ".online { color: #10b981; }\n";
-
 static GtkWidget *frame(const char *title, GtkWidget **content) {
-    GtkCssProvider *p = gtk_css_provider_new(); gtk_css_provider_load_from_data(p, css, -1, NULL);
-    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(), GTK_STYLE_PROVIDER(p), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    uu_theme_init();
+    uu_theme_load_css(".card { padding: 12px; } treeview.view { padding: 6px; }");
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), title);
     g_signal_connect(window, "delete-event", G_CALLBACK(on_delete), NULL);
     GtkWidget *overlay = gtk_overlay_new(); *content = vbox(14);
     gtk_container_set_border_width(GTK_CONTAINER(*content), 22);
+    GtkWidget *appearance = uu_theme_settings_button(GTK_WINDOW(window));
+    gtk_widget_set_halign(appearance, GTK_ALIGN_END);
+    gtk_box_pack_start(GTK_BOX(*content), appearance, FALSE, FALSE, 0);
     gtk_container_add(GTK_CONTAINER(overlay), *content);
     toast = label("", "toast"); gtk_widget_set_halign(toast, GTK_ALIGN_CENTER); gtk_widget_set_valign(toast, GTK_ALIGN_END);
     gtk_widget_set_margin_bottom(toast, 30); gtk_widget_set_no_show_all(toast, TRUE);
@@ -476,8 +468,6 @@ static void *ui_thread(void *d) {
     (void)d;
     if (!gtk_init_check(NULL, NULL)) { pthread_mutex_lock(&init_lock); init_state = -1; pthread_cond_signal(&init_cond); pthread_mutex_unlock(&init_lock); return NULL; }
     gtk_window_set_default_icon_name("uu-remote-linux"); // same taskbar icon as the host (#13)
-    // Light palette in CSS; keep a dark system theme from making unstyled text white on white (#43).
-    g_object_set(gtk_settings_get_default(), "gtk-theme-name", "Adwaita", "gtk-application-prefer-dark-theme", FALSE, NULL);
     show_window(NULL); gtk_main(); return NULL;
 }
 /* Hidden windows retain their widgets so queued idle callbacks stay valid. */

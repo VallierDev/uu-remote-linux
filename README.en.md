@@ -23,6 +23,13 @@
 <p align="center"><img src="docs/images/main-window.png" width="620" alt="Host main window: remote assistance and account"></p>
 <p align="center"><sub>Linux host main window: remote assistance and account (device ID, code and account redacted). The UI is available in Chinese and English (see [Language](#language--语言)).</sub></p>
 
+## Appearance / 外观
+
+Choose **System / Light / Dark** (default: System) in the viewer's **Settings → General → Appearance**, or via the gear settings button in host / tool windows.
+The choice is saved to `$XDG_CONFIG_HOME/uuremote/theme` (default `~/.config/uuremote/theme`).
+
+<p align="center"><img src="docs/images/appearance-light.png" width="360" alt="Light appearance (synthetic devices)"> <img src="docs/images/appearance-dark.png" width="360" alt="Dark appearance (synthetic devices)"></p>
+
 ## Language / 语言
 
 The language is picked once at start, in this order:
