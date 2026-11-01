@@ -674,7 +674,15 @@ impl InputInjector {
         typed
     }
     fn type_uinput_text(&self, text: &str) -> usize {
+        self.type_uinput_text_when(text, || {
+            uinput_layout_types_ascii(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(), gnome_layout_types_ascii)
+        })
+    }
+    fn type_uinput_text_when(&self, text: &str, layout_allowed: impl FnOnce() -> bool) -> usize {
         if self.uinput.is_none() || !self.held.lock().unwrap().keys.is_empty() { return 0; }
+        // XKB can still report US while IBus consumes physical keys for composition.
+        // Leave committed text intact for the existing native/clipboard fallback.
+        if !layout_allowed() { return 0; }
         self.emit_uinput_text(&crate::uinput::text_plan(text))
     }
 
@@ -791,6 +799,23 @@ mod motion_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod kernel_pointer_tests {
     use super::*;
+    #[test]
+    fn committed_text_with_gnome_ime_emits_no_uinput_keys() {
+        for source in ["[('ibus', 'libpinyin'), ('xkb', 'us')]", "@a(ss) []"] {
+            let (devices, mut keyboard, _) = crate::uinput::Devices::recording_for_test();
+            let mut input = InputInjector::without_desktop(); input.uinput = Some(devices);
+            let checked = std::cell::Cell::new(false);
+            let text = "fixture";
+            let typed = input.type_uinput_text_when(text, || {
+                checked.set(true);
+                uinput_layout_types_ascii("GNOME", || first_source_types_ascii(source))
+            });
+            assert!(checked.get());
+            assert_eq!(typed, 0);
+            assert!(crate::uinput::Devices::recorded_events_for_test(&mut keyboard).is_empty());
+        }
+    }
+
     #[test]
     fn text_plan_emits_balanced_modifiers_without_portal_or_clipboard() {
         let (devices, mut keyboard, _) = crate::uinput::Devices::recording_for_test();
@@ -1036,6 +1061,9 @@ fn first_source_types_ascii(sources: &str) -> bool {
     const NON_LATIN: &[&str]=&["af","am","ara","bd","bg","bt","by","eg","et","ge","gr","il","in","iq","ir","kg","kh","kz","la","lk","mk","mm","mn","mv","np","ru","sy","th","tj","ua"];
     kind=="xkb" && !NON_LATIN.contains(&base) && !variant.contains("cyrillic") && (base!="rs" || variant.contains("latin"))
 }
+fn uinput_layout_types_ascii(desktop: &str, gnome_layout: impl FnOnce() -> bool) -> bool {
+    !desktop.split(':').any(|name| name.eq_ignore_ascii_case("gnome")) || gnome_layout()
+}
 /// GNOME's active input source is the first of `mru-sources` (else of `sources`). Cached for 2 s.
 fn gnome_layout_types_ascii() -> bool {
     #[cfg(test)]
@@ -1057,6 +1085,17 @@ fn gnome_layout_types_ascii() -> bool {
 #[cfg(test)]
 mod text_keysym_tests {
     use super::*;
+    #[test]
+    fn uinput_preserves_gnome_input_source_guard_without_gating_other_desktops() {
+        for desktop in ["GNOME", "ubuntu:GNOME", "gnome:GNOME-Classic"] {
+            assert!(!uinput_layout_types_ascii(desktop, || first_source_types_ascii("[('ibus', 'libpinyin'), ('xkb', 'us')]")));
+            assert!(!uinput_layout_types_ascii(desktop, || false));
+            assert!(uinput_layout_types_ascii(desktop, || first_source_types_ascii("[('xkb', 'us'), ('ibus', 'libpinyin')]")));
+        }
+        for desktop in ["KDE", "Hyprland", ""] {
+            assert!(uinput_layout_types_ascii(desktop, || panic!("GNOME input-source state must not gate another desktop")));
+        }
+    }
     #[test]
     fn ascii_text_becomes_keysyms_and_other_text_does_not() {
         assert_eq!(ascii_keysyms("Hi!\n\t~"), Some(vec![0x48,0x69,0x21,0xff0d,0xff09,0x7e]));
