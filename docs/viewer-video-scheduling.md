@@ -39,11 +39,6 @@ cargo test --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
 cargo build --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
 ```
 
-The current PR commit's CI is the authoritative integration result. Hardware
-feedback on an earlier combined build came from the reporting user, not the
-maintainer; it is supplementary and does not validate this isolated change.
-Real-device acceptance of this isolated patch has not been performed.
-
 ## Limits and scope
 
 The 4 ms budget cannot interrupt an already-blocked decoder call and does not
@@ -52,5 +47,5 @@ overflow the queue. This adds no hardware decoding and guarantees neither stable
 144 FPS nor 144 distinct displayed pictures on a 90 Hz screen.
 
 Startup timeout, stream-profile synchronization, gamepad/rumble and installation
-changes are outside this patch. It is independent of #142's gamepad work.
+changes are outside this patch.
 Implementation and regression tests were prepared with Codex assistance.
