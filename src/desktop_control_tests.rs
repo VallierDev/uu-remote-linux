@@ -80,6 +80,53 @@ fn mapping(kind: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn ready_portal_control_input_is_forwarded_while_locked() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let input = Arc::new(InputInjector::without_desktop());
+        let mut screen = ScreenCapture::unavailable("synthetic ready desktop".into());
+        screen.backend = crate::desktop_backend::DesktopBackend::Portal;
+        screen.init_error = None;
+        let (lock, locked) = tokio::sync::watch::channel(Some(true));
+        let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(Arc::new(screen), locked));
+        let (host, mut viewer) = connect(input.clone(), true, Some(portal.clone()), &["CONTROL_DATA_CHANNEL"]).await;
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        for (index, state) in [Some(true), None].into_iter().enumerate() {
+            lock.send(state).unwrap();
+            let before = input.portal_input_counts_for_test();
+            for message in [
+                br#"{"action":"kbd_press","key":65}"#.as_slice(),
+                br#"{"action":"kbd_release","key":65}"#.as_slice(),
+                br#"{"action":"mouse_press","button":1}"#.as_slice(),
+                br#"{"action":"mouse_release","button":1}"#.as_slice(),
+            ] {
+                send(&viewer, "CONTROL_DATA_CHANNEL", message.to_vec()).await;
+            }
+            let sequence = 310 + index as u64;
+            send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(sequence, 0, 3, &[8, 0])).await;
+            loop {
+                let response = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
+                let args: serde_json::Value = serde_json::from_slice(body(body(&response, 3).unwrap(), 2).unwrap()).unwrap();
+                if args["seq"] == sequence { break; }
+            }
+            let after = input.portal_input_counts_for_test();
+            assert_eq!(after[2] - before[2], 2, "keyboard dropped for lock state {state:?}");
+            assert_eq!(after[1] - before[1], 2, "mouse buttons dropped for lock state {state:?}");
+        }
+        let before = input.portal_input_counts_for_test();
+        let mut unavailable = ScreenCapture::unavailable("synthetic closed source".into());
+        unavailable.backend = crate::desktop_backend::DesktopBackend::Portal;
+        portal.publish_test_screen(Arc::new(unavailable));
+        send(&viewer, "CONTROL_DATA_CHANNEL", br#"{"action":"kbd_click","key":65}"#.to_vec()).await;
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(320, 0, 3, &[8, 0])).await;
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
+        assert_eq!(input.portal_input_counts_for_test(), before, "unavailable source accepted input");
+        host.pc.close().await.unwrap();
+        viewer.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("locked CONTROL input regression exceeded deadline");
+}
+
+#[tokio::test]
 async fn closing_unnegotiated_peers_releases_callback_state() {
     for desktop in [false, true] {
         let input = Arc::new(InputInjector::without_desktop());

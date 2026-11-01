@@ -1,7 +1,10 @@
 fn main() {
+    println!("cargo:rerun-if-changed=c_engine/dmabuf_frame.h");
     println!("cargo:rerun-if-changed=c_engine/wayland_transform.h");
     println!("cargo:rerun-if-changed=c_engine/portal_clipboard.inc");
     println!("cargo:rerun-if-changed=c_engine/x11_engine.c");
+    println!("cargo:rerun-if-changed=c_engine/uinput_keymap.c");
+    println!("cargo:rerun-if-changed=c_engine/uinput_keymap.h");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.c");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.h");
     println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/dynlink_cuda.h");
@@ -30,9 +33,16 @@ fn main() {
         }
         let mut x11_build = cc::Build::new();
         x11_build.file("c_engine/x11_engine.c")
+            .file("c_engine/uinput_keymap.c")
             .file("c_engine/clipboard.c")
             .file("c_engine/pam_check.c");
         if std::env::var_os("CARGO_FEATURE_INPROC_AV").is_some() {
+            println!("cargo:rerun-if-changed=c_engine/audio_engine.c");
+            x11_build.file("c_engine/audio_engine.c");
+            let audio_flags = std::process::Command::new("pkg-config").args(["--cflags", "libpulse", "opus"])
+                .output().expect("inproc-av requires libpulse and opus development libraries");
+            assert!(audio_flags.status.success(), "inproc-av requires libpulse-dev and libopus-dev");
+            for flag in String::from_utf8_lossy(&audio_flags.stdout).split_whitespace() { x11_build.flag(flag); }
             x11_build.file("c_engine/nvenc_engine.c");
             x11_build.file("c_engine/vaapi_engine.c");
             x11_build.file("c_engine/dri3_capture.c");
@@ -48,6 +58,8 @@ fn main() {
         if std::env::var_os("CARGO_FEATURE_INPROC_AV").is_some() {
             // Emit them after the static C archive: GNU ld --as-needed would otherwise
             // discard the shared libraries before libx11_engine.a references their symbols.
+            println!("cargo:rustc-link-lib=pulse");
+            println!("cargo:rustc-link-lib=opus");
             println!("cargo:rustc-link-lib=gbm");
             println!("cargo:rustc-link-lib=X11-xcb");
             println!("cargo:rustc-link-lib=xcb");

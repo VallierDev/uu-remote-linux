@@ -92,8 +92,7 @@ pub fn watch_locked() -> watch::Receiver<Option<bool>> {
                 if locked.is_none() { session = None; } // session ended or changed: look it up again
                 sender.send_if_modified(|current| if *current != locked {
                     log::info!("Desktop lock state: {}", match locked { Some(true) => "locked", Some(false) => "unlocked", None => "unknown" });
-                    // The viewer only sees black frames while locked and gives no hint (#61).
-                    if locked == Some(true) { log::info!("Desktop is locked: viewers see a black screen until it is unlocked (viewer 自动解锁被控端, or `loginctl unlock-session` on the host)"); }
+                    if locked == Some(true) { log::info!("Desktop is locked; capture continues while the compositor supplies frames"); }
                     *current = locked; true
                 } else { false });
                 std::thread::sleep(Duration::from_secs(1));
