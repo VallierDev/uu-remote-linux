@@ -47,9 +47,9 @@ async fn source() -> Option<PathBuf> {
         let schema = if desktop.contains("cinnamon") { "org.cinnamon.desktop.background" } else { "org.gnome.desktop.background" };
         if schema == "org.gnome.desktop.background" && command("gsettings", &["get", "org.gnome.desktop.interface", "color-scheme"])
             .await.is_some_and(|v| v.contains("prefer-dark")) {
-            if let Some(path) = command("gsettings", &["get", schema, "picture-uri-dark"]).await.and_then(|v| local_path(&v)) { return Some(path); }
+            if let Some(path) = command("gsettings", &["get", schema, "picture-uri-dark"]).await.and_then(|v| gsettings_path(&v)) { return Some(path); }
         }
-        return command("gsettings", &["get", schema, "picture-uri"]).await.and_then(|v| local_path(&v));
+        return command("gsettings", &["get", schema, "picture-uri"]).await.and_then(|v| gsettings_path(&v));
     }
     if desktop.contains("kde") {
         let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
@@ -57,7 +57,7 @@ async fn source() -> Option<PathBuf> {
         let text = tokio::fs::read_to_string(config.join("plasma-org.kde.plasma.desktop-appletsrc")).await.unwrap_or_default();
         if let Some(path) = kde_image(&text) { return package_image(path).await; }
         // Plasma omits Image for the look-and-feel's default wallpaper.
-        if text.contains("[Wallpaper][") { return None; }
+        if !kde_default_allowed(&text) { return None; }
         let theme = command("kreadconfig6", &["--file", "kdeglobals", "--group", "KDE", "--key", "LookAndFeelPackage"])
             .await.unwrap_or_default();
         let theme = if theme.trim().is_empty() { "org.kde.breeze.desktop" } else { theme.trim() };
@@ -103,8 +103,50 @@ fn kde_image(text: &str) -> Option<PathBuf> {
     None
 }
 
+fn kde_default_allowed(text: &str) -> bool {
+    let mut containment = false;
+    let mut plugins = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            containment = line.strip_prefix("[Containments][").and_then(|s| s.strip_suffix(']'))
+                .is_some_and(|id| !id.contains(['[', ']']));
+        }
+        if containment {
+            if let Some(plugin) = line.strip_prefix("wallpaperplugin=") { plugins.push(plugin.trim()); }
+        }
+    }
+    if !plugins.is_empty() { return plugins.contains(&"org.kde.image"); }
+    !text.contains("[Wallpaper][") || text.contains("[Wallpaper][org.kde.image]")
+}
+
+fn gsettings_path(value: &str) -> Option<PathBuf> {
+    // gsettings prints a GVariant string, with either quote style and C/Unicode escapes.
+    // https://docs.gtk.org/glib/gvariant-text-format.html#strings
+    let mut chars = value.trim().chars();
+    let quote = chars.next()?;
+    if quote != '\'' && quote != '"' { return None; }
+    let mut decoded = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == quote { return chars.as_str().is_empty().then(|| local_path(&decoded)).flatten(); }
+        if ch != '\\' { decoded.push(ch); continue; }
+        let escaped = chars.next()?;
+        decoded.push(match escaped {
+            'a' => '\x07', 'b' => '\x08', 'f' => '\x0c', 'n' => '\n',
+            'r' => '\r', 't' => '\t', 'v' => '\x0b', '\\' => '\\', '\'' => '\'', '"' => '"',
+            'u' | 'U' => {
+                let mut code = 0u32;
+                for _ in 0..if escaped == 'u' { 4 } else { 8 } { code = u32::checked_add(code.checked_mul(16)?, chars.next()?.to_digit(16)?)?; }
+                char::from_u32(code).filter(|c| *c != '\0')?
+            }
+            '\n' => continue,
+            _ => escaped,
+        });
+    }
+    None
+}
+
 fn local_path(value: &str) -> Option<PathBuf> {
-    let value = value.trim().trim_matches('\'');
+    let value = value.trim();
     let path = if value.starts_with("file:") {
         let url = reqwest::Url::parse(value).ok()?;
         if url.query().is_some() || url.fragment().is_some() { return None; }
@@ -272,9 +314,25 @@ mod tests {
         }
     }
     #[test] fn wallpaper_sources_are_local_and_scoped() {
-        assert_eq!(local_path("'file:///usr/share/a%20b.png'"), Some(PathBuf::from("/usr/share/a b.png")));
+        assert_eq!(gsettings_path("'file:///usr/share/a%20b.png'"), Some(PathBuf::from("/usr/share/a b.png")));
         for value in ["", "relative.png", "https://example.com/a.png", "file://remote/a.png", "file:///tmp/a.png?token=secret"] { assert!(local_path(value).is_none()); }
         assert_eq!(kde_image("[Other]\nImage=/wrong.png\n[Containments][2][Wallpaper][org.kde.image][General]\nImage=file:///right.png"), Some(PathBuf::from("/right.png")));
+    }
+    #[test] fn gsettings_decodes_quotes_backslashes_and_unicode() {
+        assert_eq!(gsettings_path("\"file:///tmp/it's.png\""), Some(PathBuf::from("/tmp/it's.png")));
+        assert_eq!(gsettings_path(r#"'file:///tmp/it\'s.png'"#), Some(PathBuf::from("/tmp/it's.png")));
+        assert_eq!(gsettings_path(r#"'/tmp/a\\b\t\u00e9\U0001f600.png'"#), Some(PathBuf::from("/tmp/a\\b\té😀.png")));
+        for value in ["'unterminated", "'/tmp/a' trailing", r#"'/tmp/\uD800'"#, r#"'/tmp/\Uffffffff'"#] { assert!(gsettings_path(value).is_none()); }
+        assert_eq!(gsettings_path(r#"'/tmp/\x41'"#), Some(PathBuf::from("/tmp/x41")));
+        assert_eq!(local_path("/tmp/it's.png"), Some(PathBuf::from("/tmp/it's.png")));
+    }
+    #[test] fn kde_default_survives_saved_image_settings_but_not_other_plugins() {
+        let image = "[Containments][1]\nwallpaperplugin=org.kde.image\n[Containments][1][Wallpaper][org.kde.image][General]\nFillMode=1\n";
+        assert!(kde_image(image).is_none()); assert!(kde_default_allowed(image));
+        assert!(kde_default_allowed("[Containments][1][Wallpaper][org.kde.image][General]\nFillMode=1"));
+        assert!(kde_default_allowed(""));
+        assert!(!kde_default_allowed(&image.replace("wallpaperplugin=org.kde.image", "wallpaperplugin=org.kde.slideshow")));
+        assert!(!kde_default_allowed("[Containments][1][Wallpaper][org.kde.slideshow][General]\nSlidePaths=/tmp"));
     }
     #[test] fn only_supported_image_files_are_uploaded() {
         assert_eq!(image_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
