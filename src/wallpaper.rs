@@ -38,6 +38,13 @@ async fn command(program: &str, args: &[&str]) -> Option<String> {
     output.status.success().then(|| String::from_utf8(output.stdout).ok()).flatten()
 }
 
+async fn kde_config(programs: &[&str], args: &[&str]) -> Option<String> {
+    for program in programs {
+        if let Some(value) = command(program, args).await { return Some(value); }
+    }
+    None
+}
+
 async fn source() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("UU_WALLPAPER") {
         let path = PathBuf::from(path); return path.is_absolute().then_some(path);
@@ -58,12 +65,13 @@ async fn source() -> Option<PathBuf> {
         if let Some(path) = kde_image(&text) { return package_image(path).await; }
         // Plasma omits Image for the look-and-feel's default wallpaper.
         if !kde_default_allowed(&text) { return None; }
-        let theme = command("kreadconfig6", &["--file", "kdeglobals", "--group", "KDE", "--key", "LookAndFeelPackage"])
+        let readers = ["kreadconfig6", "kreadconfig5"];
+        let theme = kde_config(&readers, &["--file", "kdeglobals", "--group", "KDE", "--key", "LookAndFeelPackage"])
             .await.unwrap_or_default();
         let theme = if theme.trim().is_empty() { "org.kde.breeze.desktop" } else { theme.trim() };
         if theme.contains('/') || theme.contains("..") { return None; }
         let defaults = format!("/usr/share/plasma/look-and-feel/{theme}/contents/defaults");
-        let image = command("kreadconfig6", &["--file", &defaults, "--group", "Wallpaper", "--key", "Image"]).await?;
+        let image = kde_config(&readers, &["--file", &defaults, "--group", "Wallpaper", "--key", "Image"]).await?;
         let image = image.trim();
         if image.is_empty() || image.contains('/') || image.contains("..") { return None; }
         return package_image(PathBuf::from("/usr/share/wallpapers").join(image)).await;
@@ -236,6 +244,22 @@ fn https_url(value: &str) -> Result<reqwest::Url, ()> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    #[tokio::test]
+    async fn kde_config_uses_plasma5_when_plasma6_reader_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("uu-kreadconfig-test-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let five = root.join("kreadconfig5"); let six = root.join("kreadconfig6");
+        std::fs::write(&five, "#!/bin/sh\ncase \"$*\" in *LookAndFeelPackage*) echo org.kde.breeze.desktop;; *Image*) echo Next;; esac\n").unwrap();
+        std::fs::set_permissions(&five, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let readers = [six.to_str().unwrap(), five.to_str().unwrap()];
+        assert_eq!(kde_config(&readers, &["--key", "LookAndFeelPackage"]).await.as_deref(), Some("org.kde.breeze.desktop\n"));
+        assert_eq!(kde_config(&readers, &["--key", "Image"]).await.as_deref(), Some("Next\n"));
+        std::fs::write(&six, "#!/bin/sh\necho Plasma6\n").unwrap();
+        std::fs::set_permissions(&six, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(kde_config(&readers, &["--key", "Image"]).await.as_deref(), Some("Plasma6\n"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[tokio::test]
     async fn kde_packages_select_landscape_and_image_reads_are_bounded() {
         let root = std::env::temp_dir().join(format!("uu-wallpaper-test-{}-{}", std::process::id(), rand::random::<u64>()));
