@@ -640,6 +640,8 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
 - Frames are decoded at the host's native resolution and scaled to the window with linear filtering; a host resolution
   change restarts the decoder. `UU_VIEWER_SIZE=WxH` forces a fixed letterboxed canvas instead.
 
+The SDL remote desktop window disables local IME text composition and forwards physical keys; use the remote host’s input method and its language toggle (for example, Shift) to enter Chinese.
+
 Mac targets use native macOS keycodes; Windows / Linux targets retain Windows VK. Keys follow physical positions, without
 automatically translating Ctrl to Command; on a Mac target the PC Super / Windows key acts as Command. Only verified target
 platform values 1 (Windows / this project's Linux host) and 4 (Mac) are accepted; unknown values fail explicitly. Account
