@@ -563,6 +563,8 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
 - 按被控端原始分辨率解码，窗口缩放使用线性过滤；被控端分辨率变化时自动重启解码器。`UU_VIEWER_SIZE=WxH` 可改为固定的留黑边画布。
 
+SDL 远程画面窗口关闭本地输入法的文本组合，按物理键转发；输入中文时请使用被控端的输入法及其中英切换键（例如 Shift）。
+
 Mac 目标使用 macOS 原生键码，Windows / Linux 目标保留 Windows VK。键盘按物理键位置转发，不自动把 Ctrl 改成 Command；
 控制 Mac 时，PC 键盘的 Super / Win 键对应 Command。仅接受已验证的目标平台值 1（Windows / 本项目 Linux 主机）和 4（Mac），
 未知值会报错，不猜测键码。账号连接缺少平台字段时查询目标设备；远程协助必须由连接响应提供平台。只看模式不需要此识别。

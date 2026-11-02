@@ -19,6 +19,9 @@ impl Window {
         let name=super::device_label(std::env::var("UU_VIEWER_DEVICE_NAME").ok().as_deref()).to_owned();
         let window=video.window(&format!("{name} · {}",crate::i18n::s("UU 远程 Linux 控制端","UU Remote Linux viewer")),1280,720).position_centered().resizable().build().map_err(|_|"Window creation failed")?;
         let mut canvas=window.into_canvas().build().map_err(|_|"Renderer creation failed")?;
+        // This window forwards scancodes, not SDL_TEXTINPUT. SDL enables text input by
+        // default; its X11 IME path can consume keys before KeyDown/KeyUp (#149).
+        video.text_input().stop();
         // Wayland maps a toplevel only after its first buffer; without this the window stays
         // invisible until the first decoded frame, which a stalled stream never delivers.
         canvas.set_draw_color(LOADING_BG);canvas.clear();canvas.present();
@@ -708,6 +711,33 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[cfg_attr(target_os="macos",ignore)]
+    #[test] fn remote_window_disables_local_text_input_and_forwards_shift(){
+        if std::env::var_os("UU_VIEWER_IME_TEST_CHILD").is_none(){
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","viewer::sdl::tests::remote_window_disables_local_text_input_and_forwards_shift","--test-threads=1"])
+                .env("SDL_VIDEODRIVER","dummy").env("UU_VIEWER_IME_TEST_CHILD","1").output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return
+        }
+        let mut window=Window::new().unwrap();
+        assert!(!window.canvas.window().subsystem().text_input().is_active());
+        let id=window.canvas.window().id();
+        let key=|down,scan|if down {
+            Event::KeyDown{timestamp:0,window_id:id,keycode:None,scancode:Some(scan),keymod:sdl2::keyboard::Mod::NOMOD,repeat:false}
+        }else{
+            Event::KeyUp{timestamp:0,window_id:id,keycode:None,scancode:Some(scan),keymod:sdl2::keyboard::Mod::NOMOD,repeat:false}
+        };
+        let push=|event|window._sdl.event().unwrap().push_event(event).unwrap();
+        use sdl2::keyboard::Scancode as S;
+        for event in [key(true,S::LShift),key(false,S::LShift),key(true,S::A),key(false,S::A),
+            key(true,S::RShift),Event::Window{timestamp:0,window_id:id,win_event:WindowEvent::FocusLost},
+            Event::Window{timestamp:0,window_id:id,win_event:WindowEvent::FocusGained}] {push(event);}
+        let (_,messages)=window.poll(&mut Input::new(false));
+        let keys:Vec<_>=messages.iter().filter_map(|m|Some((m.get("action")?.as_str()?,m.get("key")?.as_i64()?))).collect();
+        assert_eq!(keys,vec![("kbd_press",0xa0),("kbd_release",0xa0),("kbd_press",0x41),("kbd_release",0x41),
+            ("kbd_press",0xa1),("kbd_release",0xa1)]);
+        assert!(!window.canvas.window().subsystem().text_input().is_active());
+    }
     // macOS: SDL video must start on the main thread, which the test harness does not use; CI runs it on Linux.
     #[cfg_attr(target_os="macos",ignore)]
     #[tokio::test] async fn clipboard_requests_use_existing_window(){
