@@ -109,31 +109,41 @@ fn kde_image(text: &str) -> Option<PathBuf> {
         if line.starts_with('[') {
             image_section = line.strip_prefix("[Containments][").and_then(|s| s.split_once(']'))
                 .is_some_and(|(id, section)| section == "[Wallpaper][org.kde.image][General]"
-                    && plugins.get(id).map_or(true, |plugin| *plugin == "org.kde.image"));
+                    && plugins.get(id).map_or(true, |plugin| *plugin == KdeWallpaper::Image));
         }
         if image_section { if let Some(value) = line.strip_prefix("Image=") { if let Some(path) = local_path(value) { return Some(path); } } }
     }
     None
 }
 
-fn kde_plugins(text: &str) -> std::collections::HashMap<&str, &str> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KdeWallpaper { Image, Unsupported }
+
+fn kde_plugins(text: &str) -> std::collections::HashMap<&str, KdeWallpaper> {
     let mut containment = None;
     let mut plugins = std::collections::HashMap::new();
+    let mut panels = Vec::new();
     for line in text.lines().map(str::trim) {
         if line.starts_with('[') {
             containment = line.strip_prefix("[Containments][").and_then(|s| s.split_once(']'))
                 .filter(|(_, section)| section.is_empty()).map(|(id, _)| id);
         }
         if let Some(id) = containment {
-            if let Some(plugin) = line.strip_prefix("wallpaperplugin=") { plugins.insert(id, plugin.trim()); }
+            plugins.entry(id).or_insert(KdeWallpaper::Image);
+            if line.strip_prefix("plugin=").is_some_and(|plugin| plugin.trim() == "org.kde.panel") { panels.push(id); }
+            if let Some(plugin) = line.strip_prefix("wallpaperplugin=") {
+                plugins.insert(id, if plugin.trim() == "org.kde.image" { KdeWallpaper::Image } else { KdeWallpaper::Unsupported });
+            }
         }
     }
+    // Panels can keep an image wallpaper setting, but do not supply a desktop background.
+    for id in panels { plugins.insert(id, KdeWallpaper::Unsupported); }
     plugins
 }
 
 fn kde_default_allowed(text: &str) -> bool {
     let plugins = kde_plugins(text);
-    if !plugins.is_empty() { return plugins.values().any(|plugin| *plugin == "org.kde.image"); }
+    if !plugins.is_empty() { return plugins.values().any(|plugin| *plugin == KdeWallpaper::Image); }
     !text.contains("[Wallpaper][") || text.contains("[Wallpaper][org.kde.image]")
 }
 
@@ -375,6 +385,16 @@ mod tests {
         let mixed = format!("{stale}[Containments][2]\nwallpaperplugin=org.kde.image\n[Containments][2][Wallpaper][org.kde.image][General]\nImage=/tmp/current.png\n");
         assert_eq!(kde_image(&mixed), Some(PathBuf::from("/tmp/current.png")));
         assert_eq!(kde_image(&stale.replace("org.kde.slideshow", "org.kde.image")), Some(PathBuf::from("/tmp/previous.png")));
+    }
+    #[test] fn kde_panels_do_not_enable_default_wallpaper_or_supply_saved_images() {
+        let panel = "[Containments][2]\nwallpaperplugin=org.kde.image\nplugin=org.kde.panel\n[Containments][2][Wallpaper][org.kde.image][General]\nImage=/tmp/panel.png\n";
+        let slideshow = "[Containments][1]\nplugin=org.kde.plasma.folder\nwallpaperplugin=org.kde.slideshow\n";
+        assert!(!kde_default_allowed(slideshow));
+        assert!(!kde_default_allowed(&format!("{slideshow}{panel}")));
+        assert!(kde_image(&format!("{slideshow}{panel}")).is_none());
+        assert!(!kde_default_allowed(panel));
+        let desktop = "[Containments][1]\nplugin=org.kde.plasma.folder\n";
+        assert!(kde_default_allowed(&format!("{desktop}{panel}")));
     }
     #[test] fn only_supported_image_files_are_uploaded() {
         assert_eq!(image_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
