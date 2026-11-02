@@ -25,6 +25,12 @@
 
 ## Appearance / 外观
 
+Signed-in graphical hosts report the system wallpaper for disconnected device cards in official clients
+(no desktop-window screenshot). GNOME/Cinnamon, KDE and Xfce are supported; checks run every 60 seconds
+and unchanged content is not uploaded again. Other desktops can set `UU_WALLPAPER=/absolute/path/image.png`
+(PNG/JPEG/WebP). Set `UU_WALLPAPER_UPLOAD=0` to disable; guest and headless hosts skip reporting.
+See [protocol evidence and limitations](docs/wallpaper-protocol.md).
+
 Choose **System / Light / Dark** (default: System) in the viewer's **Settings → General → Appearance**, or via the gear settings button in host / tool windows.
 The choice is saved to `$XDG_CONFIG_HOME/uuremote/theme` (default `~/.config/uuremote/theme`).
 
@@ -458,6 +464,7 @@ flowchart LR
 
 ## Security and privacy
 
+- By default, signed-in graphical hosts upload the current wallpaper image to UU's file service for device-card backgrounds. Set `UU_WALLPAPER_UPLOAD=0` to disable this upload.
 - Logs never contain keystrokes, terminal text, clipboard contents, file contents, passwords or tokens.
 - For auto unlock the password is stored in the **viewer** (the official client). The host only checks it
   once with PAM; it is never written to disk or logs.
