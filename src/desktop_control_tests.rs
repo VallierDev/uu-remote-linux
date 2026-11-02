@@ -80,6 +80,50 @@ fn mapping(kind: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn privacy_replies_wait_for_each_peers_text_channel() {
+    tokio::time::timeout(Duration::from_secs(25), async {
+        let mut peers = Vec::new();
+        for request_id in [41, 51] {
+            let (host, mut viewer) = connect(Arc::new(InputInjector::without_desktop()), false, None,
+                &["CONTROL_DATA_CHANNEL"]).await;
+            receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+            for (id, case, payload) in [(request_id, 25, &[][..]), (request_id + 1, 7, &[8, 1, 16, 3][..])] {
+                let mut rpc = bytes(1, &[8, id]);
+                rpc.extend(bytes(case, payload));
+                send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(1, 0, 21, &rpc)).await;
+            }
+            // A synthetic host rejects privacy without touching a physical desktop.
+            // Echo is a dispatch barrier: both replies are queued before TEXT exists.
+            send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(2, 0, 3, &[8, 0])).await;
+            receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
+            peers.push((request_id, host, viewer));
+        }
+        for (request_id, host, mut viewer) in peers {
+            let text = viewer.pc.create_data_channel("TEXT_DATA_CHANNEL", None).await.unwrap();
+            let (tx, messages) = mpsc::unbounded_channel();
+            text.on_message(Box::new(move |message| {
+                let _ = tx.send(("TEXT_DATA_CHANNEL".into(), message.data.to_vec()));
+                Box::pin(async {})
+            }));
+            viewer.messages = messages;
+            receive(&mut viewer.messages, "TEXT_DATA_CHANNEL", 13).await;
+            for (id, case) in [(request_id, 21), (request_id + 1, 3)] {
+                let message = receive(&mut viewer.messages, "TEXT_DATA_CHANNEL", 22).await;
+                let rpc = body(&message, 22).unwrap();
+                assert_eq!(body(rpc, 1), Some([8, id].as_slice()));
+                let response = body(rpc, case).expect("wrong RPC response case");
+                if case == 3 {
+                    assert!(decode_wire(response).unwrap().iter().any(|f| f.number == 1 && f.value == WireValue::Varint(1)));
+                }
+            }
+            host.pc.close().await.unwrap();
+            viewer.pc.close().await.unwrap();
+            viewer.router.lock().await.stop().await.unwrap();
+        }
+    }).await.expect("privacy TEXT routing regression exceeded deadline");
+}
+
+#[tokio::test]
 async fn ready_portal_control_input_is_forwarded_while_locked() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let input = Arc::new(InputInjector::without_desktop());

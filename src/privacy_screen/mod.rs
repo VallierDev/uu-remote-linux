@@ -28,10 +28,6 @@ pub fn active() -> bool { ACTIVE.load(Ordering::Relaxed) }
 pub fn current_type() -> u8 {
     if !active() { mode::TYPE_OFF } else if PICTURE.load(Ordering::Relaxed) { Mode::Picture.wire_type() } else { Mode::ScreenOff.wire_type() }
 }
-/// The mode last enabled (kept in host_settings.json), 1 (PS_NOT_SET) before any.
-pub fn preferred_type() -> u8 {
-    crate::system_actions::load_settings().privacy_type.filter(|t| matches!(t, 2 | 3)).unwrap_or(mode::TYPE_OFF)
-}
 /// Message 15 SystemStateChange { 5 PrivateScreenState } for the state now in effect.
 pub fn state_message(seq: u64, timestamp: u64) -> Vec<u8> {
     crate::initialization::envelope(seq, timestamp, 15, &protocol::state_change(current_type()))
@@ -118,7 +114,8 @@ pub fn rpc_accept(rpc: &[crate::protocol::WireField]) -> Option<(Vec<u8>, Option
     let expected = if request.enable { request.mode.map_or(mode::TYPE_OFF, Mode::wire_type) } else { mode::TYPE_OFF };
     Some((protocol::response(&header, &request, false, expected), Some(Accepted { enable: request.enable, mode: request.mode })))
 }
-/// ReportError.error_code the Mac viewer treats as a privacy-screen failure (handleForReportError).
+/// Mac 4.43.0 handleForReportError: -7 resets privacy to off; -9 reports an RDP session change,
+/// not privacy success. Success is carried by RpcResponse 3 and SystemMetrics.setting 7.
 pub const REPORT_ERROR: i32 = -7;
 impl Accepted {
     pub fn apply(self) -> Result<(), String> {

@@ -489,6 +489,11 @@ impl WebRtcSession {
         let file_channel: Arc<std::sync::Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(std::sync::Mutex::new(None));
         let (file_tx, mut file_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let peer_files = crate::file_trans::FileSession::new(file_tx, control_sequence.clone());
+        // Mac 4.43: streamerDidReceiveTextData (0x1001f56b4, arm64) reaches
+        // the metrics/RPC dispatcher at 0x1003a8560; CONTROL does not.
+        // Keep CONTROL metrics for other viewers; privacy replies use TEXT.
+        let (text_tx, text_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let text_rx = Arc::new(tokio::sync::Mutex::new(Some(text_rx)));
         // 端口映射 frames (Message 27) also travel on FILE_DATA_CHANNEL; one session per peer.
         let port_mapping = crate::port_mapping::Session::new(file_channel.clone(), control_sequence.clone());
         {
@@ -537,6 +542,8 @@ impl WebRtcSession {
             let echo_seen = echo_seen.clone();
             let channel_lock_state = channel_lock_state.clone();
             let peer_files = peer_files.clone();
+            let text_out = text_tx.clone();
+            let text_rx = text_rx.clone();
             let peer_port_mapping = port_mapping.clone();
             let peer_video_settings = video_settings.clone();
             let peer_video_track = control_video_track.clone();
@@ -565,12 +572,16 @@ impl WebRtcSession {
                 }
                 // Ordered outbound queue for protocol replies produced outside this callback.
                 // webrtc-rs announces the channel before handle_open (ready_state Connecting);
-                // send() returns ErrClosedPipe until Open. Draining CONTROL here would drop
-                // Message 25 and every later reply. Start CONTROL from the on_open below
+                // send() returns ErrClosedPipe until Open. Draining CONTROL/TEXT here would
+                // drop initial state and replies. Start them from the on_open below
                 // (one handler; a second on_open replaces it). Receiver taken once.
-                let mut control_drain: Option<Box<dyn (FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) + Send + Sync>> = None;
-                let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                let outbound_rx = Arc::new(tokio::sync::Mutex::new(Some(outbound_rx)));
+                let mut open_drain: Option<Box<dyn (FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) + Send + Sync>> = None;
+                let (outbound, outbound_rx) = if label == "TEXT_DATA_CHANNEL" {
+                    (text_out.clone(), text_rx)
+                } else {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                    (tx, Arc::new(tokio::sync::Mutex::new(Some(rx))))
+                };
                 if label == "CONTROL_DATA_CHANNEL" {
                     if let Some(mut chroma_sync_rx) = chroma_sync_rx.lock().unwrap().take() {
                         let sync_out = outbound.clone();
@@ -603,8 +614,8 @@ impl WebRtcSession {
                             });
                         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
                     };
-                    if label != "CONTROL_DATA_CHANNEL" { tokio::spawn(start_drain()); }
-                    else { control_drain = Some(Box::new(start_drain)); }
+                    if !matches!(label.as_str(), "CONTROL_DATA_CHANNEL" | "TEXT_DATA_CHANNEL") { tokio::spawn(start_drain()); }
+                    else { open_drain = Some(Box::new(start_drain)); }
                 }
                 let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
                 if matches!(label.as_str(),"CONTROL_DATA_CHANNEL"|"TEXT_DATA_CHANNEL") {
@@ -795,8 +806,9 @@ impl WebRtcSession {
                     let open_role = channel_role.clone();
                     let open_screen = screen.clone();
                     let open_selection = peer_selection;
+                    let open_text_out = text_out.clone();
                     d.on_open(Box::new(move || {
-                        if let Some(start_drain) = control_drain { tokio::spawn(start_drain()); }
+                        if let Some(start_drain) = open_drain { tokio::spawn(start_drain()); }
                         let init_actions = open_actions.clone();
                         let init_video = open_video.clone();
                         let init_track = open_track.clone();
@@ -810,6 +822,7 @@ impl WebRtcSession {
                         let owner = open_owner.clone();
                         let role = open_role.clone();
                         let pc = desktop_pc.upgrade();
+                        let text_out = open_text_out.clone();
                         Box::pin(async move {
                           // Permission dialogs and first-frame waits must not occupy the
                           // channel-open callback or delay CONTROL message dispatch.
@@ -962,6 +975,7 @@ impl WebRtcSession {
                                     let message = crate::initialization::envelope(
                                         sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
                                         &init_actions.metrics_payload(desktop_sound, snapshot.permission(true)));
+                                    let _ = text_out.send(message.clone());
                                     if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
                                     let mut updates = portal.subscribe();
                                     match crate::desktop_session::wait_ready(&mut updates, &channel).await {
@@ -972,6 +986,7 @@ impl WebRtcSession {
                                                 let message = crate::initialization::envelope(
                                                     sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
                                                     &init_actions.metrics_payload(desktop_sound, crate::system_metrics::Permission::Reject));
+                                                let _ = text_out.send(message.clone());
                                                 let _ = channel.send(&bytes::Bytes::from(message)).await;
                                             }
                                             return;
@@ -1019,6 +1034,7 @@ impl WebRtcSession {
                                         Ok(message) => message,
                                         Err(e) => { log::error!("CONTROL initialization encode failed: {}", e); return; }
                                     };
+                                    if field == 13 { let _ = text_out.send(message.clone()); }
                                     if let Err(e) = channel.send(&bytes::Bytes::from(message)).await {
                                         log::error!("CONTROL initialization field {} failed: {}", field, e);
                                         return;
@@ -1038,6 +1054,7 @@ impl WebRtcSession {
                                 tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), crate::session_lock::watch_locked()));
                                 let (channel, sequence, actions) = (channel.clone(), sequence.clone(), init_actions.clone());
                                 let portal = portal_desktop.clone();
+                                let text_out = text_out.clone();
                                 tokio::spawn(async move {
                                     let mut previous = crate::privacy_screen::current_type();
                                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1051,6 +1068,7 @@ impl WebRtcSession {
                                         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                         let payload = actions.metrics_payload(desktop_sound, permission);
                                         let message = crate::initialization::envelope(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &payload);
+                                        let _ = text_out.send(message.clone());
                                         if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
                                         let state = crate::privacy_screen::state_message(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts);
                                         if channel.send(&bytes::Bytes::from(state)).await.is_err() { return; }
@@ -1107,6 +1125,7 @@ impl WebRtcSession {
                     let message_role=channel_role.clone();
                     let terminal_worker = terminal_conn.clone();
                     let rpc_out = outbound.clone();
+                    let text_out = text_out.clone();
                     let reply_chan = d_reply.clone();
                     let out_sequence = reply_sequence.clone();
                     let clipboard_sink = clipboard_input.clone();
@@ -1145,7 +1164,7 @@ impl WebRtcSession {
                             if let Some(request) = rpc.filter(|_| rpc_fields.as_ref().is_some_and(|r| r.iter().any(|f| f.number == 7))) {
                                 let Some((response, accepted)) = rpc_fields.as_deref().and_then(crate::privacy_screen::rpc_accept) else { return };
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
                                 let Some(accepted) = accepted else { return };
                                 let failed = tokio::task::spawn_blocking(move || accepted.apply().is_err()).await.unwrap_or(true);
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -1156,13 +1175,19 @@ impl WebRtcSession {
                                 }
                                 let permission = portal_for_message.as_ref().map_or(crate::system_metrics::Permission::Allow, |p| p.snapshot().permission(desktop));
                                 let metrics = actions.metrics_payload(desktop_sound, permission);
+                                let _ = text_out.send(crate::initialization::envelope(next(), ts, 13, &metrics));
                                 let _ = reply_chan.send(&bytes::Bytes::from(crate::initialization::envelope(next(), ts, 13, &metrics))).await;
                                 let state = crate::privacy_screen::state_message(next(), ts);
                                 let _ = reply_chan.send(&bytes::Bytes::from(state)).await;
                                 log::info!("Privacy switch done: failed={failed} type={}", crate::privacy_screen::current_type());
                                 return;
                             }
-                            if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::privacy_screen::screensaver_response(r).or_else(|| crate::system_actions::plugin_response(r)).or_else(|| crate::system_actions::session_rpc_response(r))) {
+                            if let Some(response) = rpc_fields.as_deref().and_then(crate::privacy_screen::screensaver_response) {
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                return;
+                            }
+                            if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
                                 return;
@@ -1343,6 +1368,7 @@ impl WebRtcSession {
                                                 crate::control_protocol::simple_action_name(action).unwrap_or("?"), value, sa::args_shape(&args));
                                             let (actions, input, chan, seq_out) = (actions.clone(), input_worker.clone(), reply_chan.clone(), out_sequence.clone());
                                             let settings_portal = portal_for_message.clone();
+                                            let text_out = text_out.clone();
                                             tokio::spawn(async move {
                                                 let worker = actions.clone();
                                                 let report = tokio::task::spawn_blocking(move || worker.handle(action, value, &args, || {
@@ -1356,6 +1382,7 @@ impl WebRtcSession {
                                                         crate::system_metrics::Permission::Allow,
                                                         |manager| manager.snapshot().permission(desktop));
                                                     let message = crate::initialization::envelope(seq_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &actions.metrics_payload(desktop_sound, permission));
+                                                    let _ = text_out.send(message.clone());
                                                     if let Err(e) = chan.send(&bytes::Bytes::from(message)).await { log::warn!("Settings report failed: {}", e); }
                                                 }
                                             });
