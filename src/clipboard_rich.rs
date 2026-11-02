@@ -17,6 +17,9 @@ impl TextFormat {
     }
     fn id(self)->u64{match self{Self::Windows=>UNICODE_TEXT,Self::Mac=>0}}
     fn name(self)->&'static str{match self{Self::Windows=>"CF_UNICODETEXT",Self::Mac=>MAC_TEXT}}
+    /// Name in a format-list offer. Official Windows peers name predefined formats `predefined_<id>`; a plain
+    /// `CF_UNICODETEXT` makes the Windows viewer register a custom format instead of id 13 (issue #151).
+    fn offer_name(self)->&'static str{match self{Self::Windows=>WINDOWS_OFFER_NAME,Self::Mac=>MAC_TEXT}}
     fn encode(self,text:&str)->Vec<u8>{match self{Self::Windows=>encode_windows(text),Self::Mac=>text.as_bytes().to_vec()}}
     fn decode(self,data:&[u8])->Result<String,&'static str>{
         match self{
@@ -31,6 +34,7 @@ impl TextFormat {
         }
     }
 }
+const WINDOWS_OFFER_NAME:&str="predefined_13";
 const BLOCK_BYTES:usize=0x20000;
 const MAX_BYTES:usize=MAX_TEXT*2+2;
 pub struct ResultMessages {pub messages:Vec<(u32,Vec<u8>)>,pub text:Option<String>}
@@ -96,7 +100,7 @@ impl State{
         if text.contains('\0')||encode_windows(&text).len()>MAX_BYTES{return Err("clipboard encoded text exceeds limit");}
         self.local=Some(text);
         let mut list=Vec::new();
-        for kind in formats {let mut format=Vec::new();int(1,kind.id(),&mut format);string(2,kind.name(),&mut format);nested(1,&format,&mut list);}
+        for kind in formats {let mut format=Vec::new();int(1,kind.id(),&mut format);string(2,kind.offer_name(),&mut format);nested(1,&format,&mut list);}
         Ok(request(id,1,&list))
     }
     pub fn request(&mut self,rpc:&[u8],next:&mut impl FnMut()->u64)->Result<ResultMessages,&'static str>{
@@ -210,7 +214,11 @@ mod tests{
         let data=bytes(bytes(bytes(&out.messages[1].1,9).unwrap().unwrap(),3).unwrap().unwrap(),3).unwrap().unwrap();
         assert_eq!(data,b"hi");
         // Host-side offers are unchanged: CF_UNICODETEXT only.
-        assert_eq!(format_ids(&State::default().offer(1,"hi".into()).unwrap()),vec![13]);
+        let host_offer=State::default().offer(1,"hi".into()).unwrap();
+        assert_eq!(format_ids(&host_offer),vec![13]);
+        let list=bytes(bytes(&host_offer,9).unwrap().unwrap(),1).unwrap().unwrap();
+        let format=bytes(list,1).unwrap().unwrap();
+        assert_eq!(text_field(format,2),Ok(WINDOWS_OFFER_NAME));
     }
     #[test]
     fn desktop_clipboard_negotiates_and_buffers_unicode_until_confirmation(){
