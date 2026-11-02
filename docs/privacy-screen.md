@@ -63,13 +63,54 @@ is aimed at the virtual output's region. Needs GTK3.
   `{1 error_code, 2 req_privacy_type, 3 cur_privacy_type}`；PrivateScreenType 2 隐私/picture, 3 关屏/screen off。
   主机先应答再切换（客户端约数秒超时，报 9998）；切换失败发 ReportError -7。
   The host answers before switching (the viewer times out with 9998); a failed switch sends ReportError -7.
+  成功不发送 ReportError；Mac 4.43.0 的 -9 是系统会话变化提示，不是防窥成功通知。
+  Success does not send ReportError; -9 in Mac 4.43.0 reports a system session change, not privacy success.
 - RPC 25 `update_screen_saver_req` → RpcResponse 21：开启隐私模式前发送，主机回空成功应答，画面仍用本机壁纸。
   Sent before picture mode; answered empty (success), the host keeps its own wallpaper.
 - FeatureFlag 4 `ff_private_screen` = 2 (ENHANCED_PRIVACY)；SettingMetric 4 `private_screen`、7 `private_screen_type`
-  （最近一次开启的模式，存于 host_settings.json `privacy_type`）；SystemStateChange 5 `PrivateScreenState` 在状态变化时推送。
+  上报当前实际模式（1 关闭、2 屏保、3 关屏），不使用 host_settings.json 中的历史选项；SystemStateChange 5
+  `PrivateScreenState` 在状态变化时推送。
+  SettingMetric 4/7 report the effective mode (1 off, 2 picture, 3 screen off), not the saved preference;
+  SystemStateChange 5 is sent after a switch.
 
-已知限制：官方 Mac 客户端的防窥菜单在切换后仍回显"不启用"，实际模式正确；客户端未回读上述状态。
-Known limitation: the official Mac viewer's menu still shows "off" after switching although the mode applies.
+Mac 4.43.0 从 CONTROL 发送请求，但只在 TEXT 接收分支处理上述 RPC 应答与 SystemMetrics。
+防窥与屏保应答走 TEXT；SystemMetrics 同步发送到 TEXT，并保留 CONTROL 上报以兼容其他客户端。
+每个 peer 独立排队，TEXT 打开后才发送；待发 SystemMetrics 只保留最新一条，其他应答最多 64 条，
+按入队顺序发送。满队列时丢弃新增应答并记录一次警告，不阻塞 CONTROL 请求处理。
+SystemMetrics 优先读取非零的 field 7，仅在其为 0 时回退
+到 field 4。SystemMetrics field 1 `metrics` 必须列出本次报告的类型（general=1、setting=2），
+否则客户端直接忽略消息内容。已用原签名 Mac 4.43.0 客户端验证三种模式的安全浮层回显，
+关屏后断开恢复物理屏与输入设备，再次连接回显“不启用”。
+Mac 4.43.0 sends requests on CONTROL, but handles these RPC responses and SystemMetrics only on TEXT.
+Privacy/screensaver replies use TEXT; SystemMetrics are also sent on TEXT, retaining CONTROL for other
+viewers. Each peer queues messages until its TEXT channel opens, retaining only the latest pending
+SystemMetrics and up to 64 other replies in FIFO order. Excess replies are dropped with one warning
+per peer, without blocking CONTROL request handling. Nonzero field 7 takes precedence over
+field 4. SystemMetrics field 1 `metrics` must list the reported sections (general=1, setting=2), or the
+viewer ignores the payload. The original signed Mac 4.43.0 viewer was verified for all three labels,
+physical-screen/input restoration on disconnect, and an off label after reconnecting.
+
+官方主机侧依据：原签名 Mac `UURemoteServer` 4.43.0（626），arm64 UUID
+`7E10CB24-F516-3728-8375-BA5EC124A2C5`。`SystemMetricsHandler.handleSystemMetrics`（`0x10000a96c`）
+按请求填充各节，general 分支在 `0x10000abe8` 追加 `1`，setting helper（`0x10000a230`）
+在 `0x10000a64c` 追加 `2`；`GvPb_SystemMetrics.traverse`（`0x100423840`）将列表按 packed enum
+写入 field 1。发送链 `0x10000b11c → 0x10018e948 → ControlledSendTextData:data:` 使用 TEXT。
+这是静态主机代码依据：请求 general 和 setting 时得到 `[1,2]`，不是抓包，也不表示每条响应都固定
+包含两节或证明官方 CONTROL 报文。本实现总是报告两节，因此列出 `[1,2]`。
+Official host evidence: the original signed Mac `UURemoteServer` 4.43.0 (626), arm64 UUID
+`7E10CB24-F516-3728-8375-BA5EC124A2C5`. `SystemMetricsHandler.handleSystemMetrics` (`0x10000a96c`)
+fills the requested sections, appending GENERAL=1 at `0x10000abe8` and SETTING=2 at `0x10000a64c`
+in helper `0x10000a230`. `GvPb_SystemMetrics.traverse` (`0x100423840`) encodes that list as packed
+field 1. The send chain `0x10000b11c → 0x10018e948 → ControlledSendTextData:data:` uses TEXT.
+This is static host-code evidence: requesting both sections produces `[1,2]`; it is not a packet
+capture or proof that every response includes both sections or that the official host sends it on
+CONTROL. Our payload always reports both sections, so it lists `[1,2]`.
+
+Android 4.43.0 已确认打开 TEXT；主机日志和手机端人工验收确认，关屏、隐私屏保、取消三种操作的
+实际模式与菜单选中状态均正确。Windows/iOS 未在本轮验收。
+Android 4.43.0 opens TEXT; host logs and manual phone-side acceptance confirmed that screen-off,
+picture and off operations update both the effective mode and the selected menu item.
+Windows/iOS were not tested in this round.
 
 ## 本机诊断 / Local diagnostic
 
