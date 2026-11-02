@@ -95,27 +95,37 @@ async fn package_image(path: PathBuf) -> Option<PathBuf> {
 }
 
 fn kde_image(text: &str) -> Option<PathBuf> {
+    let plugins = kde_plugins(text);
     let mut image_section = false;
     for line in text.lines().map(str::trim) {
-        if line.starts_with('[') { image_section = line.starts_with("[Containments][") && line.ends_with("[Wallpaper][org.kde.image][General]"); }
+        if line.starts_with('[') {
+            image_section = line.strip_prefix("[Containments][").and_then(|s| s.split_once(']'))
+                .is_some_and(|(id, section)| section == "[Wallpaper][org.kde.image][General]"
+                    && plugins.get(id).map_or(true, |plugin| *plugin == "org.kde.image"));
+        }
         if image_section { if let Some(value) = line.strip_prefix("Image=") { if let Some(path) = local_path(value) { return Some(path); } } }
     }
     None
 }
 
-fn kde_default_allowed(text: &str) -> bool {
-    let mut containment = false;
-    let mut plugins = Vec::new();
+fn kde_plugins(text: &str) -> std::collections::HashMap<&str, &str> {
+    let mut containment = None;
+    let mut plugins = std::collections::HashMap::new();
     for line in text.lines().map(str::trim) {
         if line.starts_with('[') {
-            containment = line.strip_prefix("[Containments][").and_then(|s| s.strip_suffix(']'))
-                .is_some_and(|id| !id.contains(['[', ']']));
+            containment = line.strip_prefix("[Containments][").and_then(|s| s.split_once(']'))
+                .filter(|(_, section)| section.is_empty()).map(|(id, _)| id);
         }
-        if containment {
-            if let Some(plugin) = line.strip_prefix("wallpaperplugin=") { plugins.push(plugin.trim()); }
+        if let Some(id) = containment {
+            if let Some(plugin) = line.strip_prefix("wallpaperplugin=") { plugins.insert(id, plugin.trim()); }
         }
     }
-    if !plugins.is_empty() { return plugins.contains(&"org.kde.image"); }
+    plugins
+}
+
+fn kde_default_allowed(text: &str) -> bool {
+    let plugins = kde_plugins(text);
+    if !plugins.is_empty() { return plugins.values().any(|plugin| *plugin == "org.kde.image"); }
     !text.contains("[Wallpaper][") || text.contains("[Wallpaper][org.kde.image]")
 }
 
@@ -333,6 +343,14 @@ mod tests {
         assert!(kde_default_allowed(""));
         assert!(!kde_default_allowed(&image.replace("wallpaperplugin=org.kde.image", "wallpaperplugin=org.kde.slideshow")));
         assert!(!kde_default_allowed("[Containments][1][Wallpaper][org.kde.slideshow][General]\nSlidePaths=/tmp"));
+    }
+    #[test] fn kde_stored_images_belong_to_the_same_active_image_containment() {
+        let stale = "[Containments][1]\nwallpaperplugin=org.kde.slideshow\n[Containments][1][Wallpaper][org.kde.image][General]\nImage=/tmp/previous.png\n";
+        assert!(kde_image(stale).is_none());
+        assert!(!kde_default_allowed(stale));
+        let mixed = format!("{stale}[Containments][2]\nwallpaperplugin=org.kde.image\n[Containments][2][Wallpaper][org.kde.image][General]\nImage=/tmp/current.png\n");
+        assert_eq!(kde_image(&mixed), Some(PathBuf::from("/tmp/current.png")));
+        assert_eq!(kde_image(&stale.replace("org.kde.slideshow", "org.kde.image")), Some(PathBuf::from("/tmp/previous.png")));
     }
     #[test] fn only_supported_image_files_are_uploaded() {
         assert_eq!(image_type(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
