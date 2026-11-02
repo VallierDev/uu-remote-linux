@@ -106,9 +106,19 @@ async fn privacy_replies_wait_for_each_peers_text_channel() {
                 Box::pin(async {})
             }));
             viewer.messages = messages;
-            receive(&mut viewer.messages, "TEXT_DATA_CHANNEL", 13).await;
-            for (id, case) in [(request_id, 21), (request_id + 1, 3)] {
-                let message = receive(&mut viewer.messages, "TEXT_DATA_CHANNEL", 22).await;
+            let mut replies = Vec::new();
+            let mut metrics_seen = false;
+            while replies.len() < 2 || !metrics_seen {
+                let (channel, message) = tokio::time::timeout(Duration::from_secs(5), viewer.messages.recv()).await
+                    .expect("late TEXT delivery timed out").expect("peer stopped responding");
+                assert_eq!(channel, "TEXT_DATA_CHANNEL");
+                if let Some(metrics) = body(&message, 13) {
+                    assert_eq!(body(metrics, 1), Some([1, 2].as_slice()));
+                    metrics_seen = true;
+                }
+                if body(&message, 22).is_some() { replies.push(message); }
+            }
+            for ((id, case), message) in [(request_id, 21), (request_id + 1, 3)].into_iter().zip(replies) {
                 let rpc = body(&message, 22).unwrap();
                 assert_eq!(body(rpc, 1), Some([8, id].as_slice()));
                 let response = body(rpc, case).expect("wrong RPC response case");

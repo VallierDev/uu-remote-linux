@@ -52,8 +52,11 @@ pub fn payload_with_settings(capture: Permission, operation: Permission, control
     }
     // SystemMetrics.general: system_sound_support = SS_SUPPORT (2) when desktop audio is streamed
     // (GvPb_SystemSoundSupport: 0 unknown, 1 nonsupport, 2 support).
-    // SystemMetrics.metrics (field 1): Metric.general=1, setting=2. Mac 4.43.0
-    // callBackSystemMetrics returns immediately for an empty list (0x1003b4584).
+    // Official Mac host 4.43.0 (626), arm64: SystemMetricsHandler (0x10000a96c)
+    // appends GENERAL=1 (0x10000abe8) and SETTING=2 (helper 0x10000a230, write
+    // 0x10000a64c) as it fills those sections; traverse (0x100423840) packs field 1.
+    // We always report both sections. The Mac viewer ignores an empty list
+    // (callBackSystemMetrics, 0x1003b4584). Host evidence: docs/privacy-screen.md.
     let mut out = vec![10, 2, 1, 2];
     out.extend(if settings.sound { &[26, 2, 16, 2][..] } else { &[26, 0][..] });
     // No support_touch, sound capability, win_os_ver, private-screen, virtual

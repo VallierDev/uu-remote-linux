@@ -75,16 +75,42 @@ is aimed at the virtual output's region. Needs GTK3.
 
 Mac 4.43.0 从 CONTROL 发送请求，但只在 TEXT 接收分支处理上述 RPC 应答与 SystemMetrics。
 防窥与屏保应答走 TEXT；SystemMetrics 同步发送到 TEXT，并保留 CONTROL 上报以兼容其他客户端。
-每个 peer 独立排队，TEXT 打开后才发送。SystemMetrics 优先读取非零的 field 7，仅在其为 0 时回退
+每个 peer 独立排队，TEXT 打开后才发送；待发 SystemMetrics 只保留最新一条，其他应答最多 64 条，
+按入队顺序发送。满队列时丢弃新增应答并记录一次警告，不阻塞 CONTROL 请求处理。
+SystemMetrics 优先读取非零的 field 7，仅在其为 0 时回退
 到 field 4。SystemMetrics field 1 `metrics` 必须列出本次报告的类型（general=1、setting=2），
 否则客户端直接忽略消息内容。已用原签名 Mac 4.43.0 客户端验证三种模式的安全浮层回显，
 关屏后断开恢复物理屏与输入设备，再次连接回显“不启用”。
 Mac 4.43.0 sends requests on CONTROL, but handles these RPC responses and SystemMetrics only on TEXT.
 Privacy/screensaver replies use TEXT; SystemMetrics are also sent on TEXT, retaining CONTROL for other
-viewers. Each peer queues messages until its TEXT channel opens. Nonzero field 7 takes precedence over
+viewers. Each peer queues messages until its TEXT channel opens, retaining only the latest pending
+SystemMetrics and up to 64 other replies in FIFO order. Excess replies are dropped with one warning
+per peer, without blocking CONTROL request handling. Nonzero field 7 takes precedence over
 field 4. SystemMetrics field 1 `metrics` must list the reported sections (general=1, setting=2), or the
 viewer ignores the payload. The original signed Mac 4.43.0 viewer was verified for all three labels,
 physical-screen/input restoration on disconnect, and an off label after reconnecting.
+
+官方主机侧依据：原签名 Mac `UURemoteServer` 4.43.0（626），arm64 UUID
+`7E10CB24-F516-3728-8375-BA5EC124A2C5`。`SystemMetricsHandler.handleSystemMetrics`（`0x10000a96c`）
+按请求填充各节，general 分支在 `0x10000abe8` 追加 `1`，setting helper（`0x10000a230`）
+在 `0x10000a64c` 追加 `2`；`GvPb_SystemMetrics.traverse`（`0x100423840`）将列表按 packed enum
+写入 field 1。发送链 `0x10000b11c → 0x10018e948 → ControlledSendTextData:data:` 使用 TEXT。
+这是静态主机代码依据：请求 general 和 setting 时得到 `[1,2]`，不是抓包，也不表示每条响应都固定
+包含两节或证明官方 CONTROL 报文。本实现总是报告两节，因此列出 `[1,2]`。
+Official host evidence: the original signed Mac `UURemoteServer` 4.43.0 (626), arm64 UUID
+`7E10CB24-F516-3728-8375-BA5EC124A2C5`. `SystemMetricsHandler.handleSystemMetrics` (`0x10000a96c`)
+fills the requested sections, appending GENERAL=1 at `0x10000abe8` and SETTING=2 at `0x10000a64c`
+in helper `0x10000a230`. `GvPb_SystemMetrics.traverse` (`0x100423840`) encodes that list as packed
+field 1. The send chain `0x10000b11c → 0x10018e948 → ControlledSendTextData:data:` uses TEXT.
+This is static host-code evidence: requesting both sections produces `[1,2]`; it is not a packet
+capture or proof that every response includes both sections or that the official host sends it on
+CONTROL. Our payload always reports both sections, so it lists `[1,2]`.
+
+Android 4.43.0 已确认打开 TEXT；主机日志和手机端人工验收确认，关屏、隐私屏保、取消三种操作的
+实际模式与菜单选中状态均正确。Windows/iOS 未在本轮验收。
+Android 4.43.0 opens TEXT; host logs and manual phone-side acceptance confirmed that screen-off,
+picture and off operations update both the effective mode and the selected menu item.
+Windows/iOS were not tested in this round.
 
 ## 本机诊断 / Local diagnostic
 

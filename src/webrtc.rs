@@ -4,6 +4,9 @@ use crate::capture::ScreenCapture;
 use crate::input::InputInjector;
 use crate::signaling::SoacMessage;
 
+#[path = "text_outbox.rs"]
+mod text_outbox;
+
 use base64::Engine;
 use flate2::read::GzDecoder;
 use std::io::Read;
@@ -492,8 +495,8 @@ impl WebRtcSession {
         // Mac 4.43: streamerDidReceiveTextData (0x1001f56b4, arm64) reaches
         // the metrics/RPC dispatcher at 0x1003a8560; CONTROL does not.
         // Keep CONTROL metrics for other viewers; privacy replies use TEXT.
-        let (text_tx, text_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let text_rx = Arc::new(tokio::sync::Mutex::new(Some(text_rx)));
+        let (text_tx, text_rx) = text_outbox::channel();
+        let text_rx = Arc::new(tokio::sync::Mutex::new(Some(OutboundReceiver::Text(text_rx))));
         // 端口映射 frames (Message 27) also travel on FILE_DATA_CHANNEL; one session per peer.
         let port_mapping = crate::port_mapping::Session::new(file_channel.clone(), control_sequence.clone());
         {
@@ -577,10 +580,10 @@ impl WebRtcSession {
                 // (one handler; a second on_open replaces it). Receiver taken once.
                 let mut open_drain: Option<Box<dyn (FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) + Send + Sync>> = None;
                 let (outbound, outbound_rx) = if label == "TEXT_DATA_CHANNEL" {
-                    (text_out.clone(), text_rx)
+                    (Outbound::Text(text_out.clone()), text_rx)
                 } else {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                    (tx, Arc::new(tokio::sync::Mutex::new(Some(rx))))
+                    (Outbound::Other(tx), Arc::new(tokio::sync::Mutex::new(Some(OutboundReceiver::Other(rx)))))
                 };
                 if label == "CONTROL_DATA_CHANNEL" {
                     if let Some(mut chroma_sync_rx) = chroma_sync_rx.lock().unwrap().take() {
@@ -787,9 +790,10 @@ impl WebRtcSession {
                     Some(peer_files.clone())
                 } else { None };
                 // CT_TERMINAL: TERM frames and terminal RPCs (check_env/rename) on BINARY.
-                let terminal_conn = if label == "BINARY_DATA_CHANNEL" {
-                    Some(Arc::new(crate::terminal::TerminalConn::new(outbound.clone())))
-                } else { None };
+                let terminal_conn = match (&outbound, label.as_str()) {
+                    (Outbound::Other(tx), "BINARY_DATA_CHANNEL") => Some(Arc::new(crate::terminal::TerminalConn::new(tx.clone()))),
+                    _ => None,
+                };
                 if label == "CONTROL_DATA_CHANNEL" || label == "TEXT_DATA_CHANNEL" {
                     let channel = d.clone();
                     let initial_sequence = out_sequence.clone();
@@ -975,7 +979,7 @@ impl WebRtcSession {
                                     let message = crate::initialization::envelope(
                                         sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
                                         &init_actions.metrics_payload(desktop_sound, snapshot.permission(true)));
-                                    let _ = text_out.send(message.clone());
+                                    text_out.metrics(message.clone());
                                     if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
                                     let mut updates = portal.subscribe();
                                     match crate::desktop_session::wait_ready(&mut updates, &channel).await {
@@ -986,7 +990,7 @@ impl WebRtcSession {
                                                 let message = crate::initialization::envelope(
                                                     sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
                                                     &init_actions.metrics_payload(desktop_sound, crate::system_metrics::Permission::Reject));
-                                                let _ = text_out.send(message.clone());
+                                                text_out.metrics(message.clone());
                                                 let _ = channel.send(&bytes::Bytes::from(message)).await;
                                             }
                                             return;
@@ -1034,7 +1038,7 @@ impl WebRtcSession {
                                         Ok(message) => message,
                                         Err(e) => { log::error!("CONTROL initialization encode failed: {}", e); return; }
                                     };
-                                    if field == 13 { let _ = text_out.send(message.clone()); }
+                                    if field == 13 { text_out.metrics(message.clone()); }
                                     if let Err(e) = channel.send(&bytes::Bytes::from(message)).await {
                                         log::error!("CONTROL initialization field {} failed: {}", field, e);
                                         return;
@@ -1068,7 +1072,7 @@ impl WebRtcSession {
                                         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                         let payload = actions.metrics_payload(desktop_sound, permission);
                                         let message = crate::initialization::envelope(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &payload);
-                                        let _ = text_out.send(message.clone());
+                                        text_out.metrics(message.clone());
                                         if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
                                         let state = crate::privacy_screen::state_message(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts);
                                         if channel.send(&bytes::Bytes::from(state)).await.is_err() { return; }
@@ -1175,7 +1179,7 @@ impl WebRtcSession {
                                 }
                                 let permission = portal_for_message.as_ref().map_or(crate::system_metrics::Permission::Allow, |p| p.snapshot().permission(desktop));
                                 let metrics = actions.metrics_payload(desktop_sound, permission);
-                                let _ = text_out.send(crate::initialization::envelope(next(), ts, 13, &metrics));
+                                text_out.metrics(crate::initialization::envelope(next(), ts, 13, &metrics));
                                 let _ = reply_chan.send(&bytes::Bytes::from(crate::initialization::envelope(next(), ts, 13, &metrics))).await;
                                 let state = crate::privacy_screen::state_message(next(), ts);
                                 let _ = reply_chan.send(&bytes::Bytes::from(state)).await;
@@ -1382,7 +1386,7 @@ impl WebRtcSession {
                                                         crate::system_metrics::Permission::Allow,
                                                         |manager| manager.snapshot().permission(desktop));
                                                     let message = crate::initialization::envelope(seq_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &actions.metrics_payload(desktop_sound, permission));
-                                                    let _ = text_out.send(message.clone());
+                                                    text_out.metrics(message.clone());
                                                     if let Err(e) = chan.send(&bytes::Bytes::from(message)).await { log::warn!("Settings report failed: {}", e); }
                                                 }
                                             });
@@ -1737,8 +1741,28 @@ fn negotiated_bundle_media(sdp: &str) -> Option<(String, u16)> {
     None
 }
 
+#[derive(Clone)]
+enum Outbound {
+    Text(text_outbox::Sender),
+    Other(tokio::sync::mpsc::UnboundedSender<Vec<u8>>),
+}
+impl Outbound {
+    fn send(&self, message: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        match self { Self::Text(tx) => tx.send(message), Self::Other(tx) => tx.send(message) }
+    }
+}
+enum OutboundReceiver {
+    Text(text_outbox::Receiver),
+    Other(tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>),
+}
+impl OutboundReceiver {
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        match self { Self::Text(rx) => rx.recv().await, Self::Other(rx) => rx.recv().await }
+    }
+}
+
 /// First drain owns the outbound receiver; a later open must not start another.
-async fn take_outbound_once<T>(slot: &tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<T>>>) -> Option<tokio::sync::mpsc::UnboundedReceiver<T>> {
+async fn take_outbound_once<T>(slot: &tokio::sync::Mutex<Option<T>>) -> Option<T> {
     slot.lock().await.take()
 }
 
