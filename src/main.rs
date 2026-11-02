@@ -5,6 +5,7 @@ mod ws_transport;
 mod engine_plugin;
 mod doctor;
 mod wol;
+mod wallpaper;
 mod desktop_backend;
 mod desktop_mode;
 mod desktop_session;
@@ -775,6 +776,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
         client
     };
 
+    let mut wallpaper_task = AbortOnDrop(wallpaper::start(auth.clone()));
     // One peer per viewer connection (desktop, file transfer, terminal...), keyed by ice_id.
     let mut next_capture_type: Option<(u64,crate::session_ice::SessionIce)> = None;
     let mut capture_types: HashMap<String, (u64,crate::session_ice::SessionIce)> = HashMap::new();
@@ -812,6 +814,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                 log::error!("UU login is invalid or expired; a new QR login is required");
                 let stale = config::read_fresh().ok().flatten().and_then(|f| f.get("token").and_then(|t| t.as_str()).map(str::to_owned));
                 auth = Arc::new(UUAuthClient::new(login::wait_for_credentials(stale).await));
+                wallpaper_task.0.abort();
+                wallpaper_task = AbortOnDrop(wallpaper::start(auth.clone()));
                 continue;
             }
             Err(e) => {

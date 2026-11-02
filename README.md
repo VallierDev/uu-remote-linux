@@ -21,6 +21,8 @@
 
 ## 外观 / Appearance
 
+已登录的图形主机会上报系统壁纸，供官方客户端的设备卡片在未连接时显示背景图（不是桌面窗口截图）。支持 GNOME/Cinnamon、KDE、Xfce；每 60 秒检查一次，内容不变则不重复上传。其他桌面可用 `UU_WALLPAPER=/绝对路径/图片.png` 指定 PNG/JPEG/WebP；`UU_WALLPAPER_UPLOAD=0` 关闭。访客和无桌面模式跳过上报。协议依据与限制见 [设备壁纸上报](docs/wallpaper-protocol.md)。
+
 在控制端的 **设置 → 常规 → 外观**，或主机 / 工具窗口的齿轮设置按钮中选择 **跟随系统 / 浅色 / 深色**（默认跟随系统）。
 选择保存在 `$XDG_CONFIG_HOME/uuremote/theme`（默认 `~/.config/uuremote/theme`）。
 

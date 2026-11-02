@@ -2,6 +2,12 @@
 
 [简体中文](README.md) | **English**
 
+Signed-in graphical hosts report the system wallpaper for disconnected device cards in official clients
+(no desktop-window screenshot). GNOME/Cinnamon, KDE and Xfce are supported; checks run every 60 seconds
+and unchanged content is not uploaded again. Other desktops can set `UU_WALLPAPER=/absolute/path/image.png`
+(PNG/JPEG/WebP). Set `UU_WALLPAPER_UPLOAD=0` to disable; guest and headless hosts skip reporting.
+See [protocol evidence and limitations](docs/wallpaper-protocol.md).
+
 > **A note first**
 >
 > NetEase UU Remote (网易 UU 远程) is a great remote-desktop tool, but there is no Linux version on its
