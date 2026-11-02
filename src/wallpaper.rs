@@ -92,7 +92,7 @@ async fn package_image(path: PathBuf) -> Option<PathBuf> {
     let mut entries = tokio::fs::read_dir(path.join("contents/images")).await.ok()?;
     let mut candidates = Vec::new();
     while let Some(entry) = entries.next_entry().await.ok()? {
-        if !entry.file_type().await.ok()?.is_file() { continue; }
+        if !tokio::fs::metadata(entry.path()).await.is_ok_and(|meta| meta.is_file()) { continue; }
         let path = entry.path();
         let Some((w,h)) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.split_once('x'))
             .and_then(|(w,h)| Some((w.parse::<u32>().ok()?,h.parse::<u32>().ok()?))) else { continue; };
@@ -287,6 +287,22 @@ mod tests {
         std::fs::OpenOptions::new().write(true).open(&image).unwrap().set_len((LIMIT + 1) as u64).unwrap();
         assert!(read_image(&image).await.is_err());
         assert!(read_image(&root).await.is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn kde_packages_follow_image_symlinks_and_skip_invalid_targets() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("uu-wallpaper-links-test-{}-{}", std::process::id(), rand::random::<u64>()));
+        let images = root.join("contents/images");
+        std::fs::create_dir_all(&images).unwrap();
+        let target = root.join("shared.png");
+        std::fs::write(&target, b"\x89PNG\r\n\x1a\n").unwrap();
+        let image = images.join("1920x1080.png");
+        symlink("../../shared.png", &image).unwrap();
+        symlink("../../missing.png", images.join("640x480.png")).unwrap();
+        symlink(&root, images.join("800x600.png")).unwrap();
+        assert_eq!(package_image(root.clone()).await, Some(image.clone()));
+        assert!(read_image(&image).await.is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
