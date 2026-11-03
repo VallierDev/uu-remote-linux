@@ -81,6 +81,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
       - run: cargo build --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
+      - name: Independent-session configuration and SDL input adapter
+        run: |
+          python3 -m unittest discover -s contrib/independent-viewer -p 'test_*.py' -v
+          shellcheck contrib/independent-viewer/install.sh
+          cc -Wall -Wextra -Werror -shared -fPIC contrib/independent-viewer/sdl-input-compat.c -ldl -o /tmp/uu-input-test.so
+          SDL_VIDEODRIVER=dummy UU_VIEWER_BACKSPACE_REPEAT=1 UU_VIEWER_PC_SHORTCUTS=1 UU_VIEWER_SHIFT_SYNC=1 \
+            LD_PRELOAD=/tmp/uu-input-test.so python3 contrib/independent-viewer/check-key-repeat.py
 
   test-wayland:
     runs-on: ubuntu-24.04

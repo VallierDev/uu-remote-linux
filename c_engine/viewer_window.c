@@ -16,7 +16,7 @@
 static const char *CSS =
     ".sidebar { background-color: @theme_bg_color; border-right: 1px solid @uu_border; }\n"
     ".sidebar list, .sidebar row { background-color: transparent; }\n"
-    ".sidebar row { border-radius: 8px; margin: 3px 12px; padding: 10px 12px; }\n"
+    ".sidebar row { border-radius: 10px; margin: 4px 12px; padding: 12px; }\n"
     ".sidebar row:hover { background-color: @uu_tint; }\n"
     ".sidebar row:selected { background-color: @uu_tint; color: @uu_fg; }\n"
     ".devname { font-size: 15px; color: @uu_fg; }\n"
@@ -29,10 +29,15 @@ static const char *CSS =
     ".badge { background-color: @uu_tint; color: @uu_success; border-radius: 8px; padding: 4px 10px; font-size: 13px; }\n"
     ".badge.off { background-color: @theme_bg_color; color: @uu_muted; }\n"
     ".hbtn { font-size: 17px; padding: 6px 10px; }\n"
-    ".preview { background-image: none; background-color: @uu_tint; border-radius: 12px 12px 0 0; }\n"
+    ".preview { background-image: linear-gradient(135deg, @uu_tint, mix(@uu_tint, @uu_surface, 0.65)); border-radius: 16px 16px 0 0; }\n"
     ".enter { font-size: 18px; }\n"
-    ".toolbar { background-color: @uu_surface; border: 1px solid @uu_border; border-top: none; border-radius: 0 0 12px 12px; padding: 6px; }\n"
-    ".tool { font-size: 15px; padding: 10px; }\n"
+    ".toolbar { background-color: @uu_surface; border: 1px solid @uu_border; border-top: none; border-radius: 0 0 16px 16px; padding: 8px; }\n"
+    ".tool { font-size: 14px; padding: 10px 12px; }\n"
+    ".session-card { background-color: @uu_surface; border: 1px solid @uu_border; border-radius: 16px; padding: 20px; box-shadow: 0 3px 12px alpha(@uu_fg, 0.035); }\n"
+    ".session-icon { background-color: @uu_tint; color: @uu_accent; border-radius: 12px; padding: 14px; }\n"
+    ".session-title { font-size: 17px; font-weight: 700; }\n"
+    ".session-caption { font-size: 13px; color: @uu_muted; }\n"
+    ".session-card button { min-height: 24px; }\n"
     ".dashed { border: 1px dashed @uu_border; border-radius: 12px; padding: 36px; }\n"
     ".round { background-color: @uu_tint; border: none; border-radius: 16px; font-size: 26px; min-width: 64px; min-height: 64px; }\n"
     ".card, .banner { padding: 18px 20px; }\n"
@@ -53,7 +58,7 @@ static pthread_cond_t init_cond = PTHREAD_COND_INITIALIZER;
 
 static GtkWidget *assist_list;
 static GtkWidget *window, *stack, *title_label, *badge, *more_button, *device_list, *my_section, *all_box,
-    *qr_image, *status_label, *toast, *banner, *fav_stack, *settings_window;
+    *qr_image, *status_label, *toast, *banner, *fav_stack, *settings_window, *image_clipboard_button;
 static int logged_in, selected = -1, banner_closed;
 static char qr_path[512], status_text[256], user_text[128];
 
@@ -73,6 +78,14 @@ static GtkWidget *label(const char *text, const char *cls) {
     return l;
 }
 static GtkWidget *button(const char *text, const char *cls) { GtkWidget *b = gtk_button_new_with_label(text); if (cls) add_class(b, cls); return b; }
+static GtkWidget *icon(const char *name, int size) {
+    GtkWidget *image = gtk_image_new_from_icon_name(name, GTK_ICON_SIZE_BUTTON);
+    gtk_image_set_pixel_size(GTK_IMAGE(image), size); return image;
+}
+static GtkWidget *icon_button(const char *text, const char *name, const char *cls) {
+    GtkWidget *b = button(text, cls); gtk_button_set_image(GTK_BUTTON(b), icon(name, 17));
+    gtk_button_set_always_show_image(GTK_BUTTON(b), TRUE); return b;
+}
 static GtkWidget *hbox(int spacing) { return gtk_box_new(GTK_ORIENTATION_HORIZONTAL, spacing); }
 static GtkWidget *vbox(int spacing) { return gtk_box_new(GTK_ORIENTATION_VERTICAL, spacing); }
 static GtkWidget *platform_icon(int platform, int online) {
@@ -85,7 +98,10 @@ static void show_toast(const char *text) { gtk_label_set_text(GTK_LABEL(toast), 
 static void unsupported(GtkButton *b, gpointer what) { (void)b; char t[128]; snprintf(t, sizeof t, L("%s：暂未支持", "%s: not supported yet"), (const char *)what); show_toast(t); }
 
 static void connect_kind(const char *kind) {
-    if (selected < 0) return;
+    if (selected < 0) {
+        if (!strncmp(kind, "independent", 11)) show_toast(L("请先选择要配置的远端设备", "Select the remote device first"));
+        return;
+    }
     char cmd[200];
     pthread_mutex_lock(&d_lock);
     snprintf(cmd, sizeof cmd, "connect\t%s\t%s", devices[selected].id, kind);
@@ -124,10 +140,12 @@ static void open_more(void) {
     GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog)), *box = vbox(10);
     gtk_container_set_border_width(GTK_CONTAINER(box), 22);
     gtk_box_pack_start(GTK_BOX(box), label(L("更多工具", "More tools"), "h2"), FALSE, FALSE, 6);
-    const char *names[] = {L("🗂   文件传输", "🗂   File transfer"), L("▶   观看模式", "▶   Watch mode"), L("⌨   终端", "⌨   Terminal"), L("⇄   端口映射", "⇄   Port mapping"), L("⏻   远程开机", "⏻   Wake on LAN"), L("↻   重启", "↻   Restart"), L("⏻   关机", "⏻   Shut down"), L("🗑   删除设备", "🗑   Remove device")};
+    const char *names[] = {L("文件传输", "File transfer"), L("观看模式", "Watch mode"), L("终端", "Terminal"), L("端口映射", "Port mapping"), L("远程开机", "Wake on LAN"), L("重启", "Restart"), L("关机", "Shut down"), L("删除设备", "Remove device")};
+    const char *icons[] = {"folder-symbolic", "media-playback-start-symbolic", "utilities-terminal-symbolic", "network-wired-symbolic", "computer-symbolic", "view-refresh-symbolic", "system-shutdown-symbolic", "user-trash-symbolic"};
     const char *kinds[] = {"file", "watch", "terminal", "portmap", "wol", "reboot", "shutdown", "unbind"};
     for (int i = 0; i < 8; i++) {
         GtkWidget *b = gtk_button_new(), *line = hbox(10); add_class(b, "cardbtn");
+        gtk_box_pack_start(GTK_BOX(line), icon(icons[i], 20), FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(line), label(names[i], "devname"), TRUE, TRUE, 0);
         gtk_box_pack_end(GTK_BOX(line), label("›", "hint"), FALSE, FALSE, 0);
         gtk_container_add(GTK_CONTAINER(b), line);
@@ -199,11 +217,12 @@ static void show_device(int index) {
     if (index < 0 || index >= device_count) { pthread_mutex_unlock(&d_lock); return; }
     selected = index;
     char name[128]; snprintf(name, sizeof name, "%s", devices[index].name);
-    int online = devices[index].online;
+    int online = devices[index].online, mac = devices[index].platform == 4;
     char thumb[512]; snprintf(thumb, sizeof thumb, "%s", devices[index].thumb);
     pthread_mutex_unlock(&d_lock);
     load_thumb(thumb);
     set_header(name, 1);
+    gtk_widget_set_sensitive(image_clipboard_button, mac && online);
     gtk_label_set_text(GTK_LABEL(badge), online ? L("● 在线", "● Online") : L("离线", "Offline"));
     GtkStyleContext *ctx = gtk_widget_get_style_context(badge);
     if (online) gtk_style_context_remove_class(ctx, "off"); else gtk_style_context_add_class(ctx, "off");
@@ -224,7 +243,8 @@ static void on_card(GtkButton *b, gpointer index) { (void)b; show_device(GPOINTE
 
 static GtkWidget *nav_row(const char *icon, const char *text, const char *kind) {
     GtkWidget *row = gtk_list_box_row_new(), *line = hbox(10);
-    gtk_box_pack_start(GTK_BOX(line), label(icon, "devname"), FALSE, FALSE, 0);
+    GtkWidget *image = gtk_image_new_from_icon_name(icon, GTK_ICON_SIZE_BUTTON);
+    gtk_box_pack_start(GTK_BOX(line), image, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(line), label(text, "devname"), TRUE, TRUE, 0);
     gtk_container_add(GTK_CONTAINER(row), line);
     g_object_set_data_full(G_OBJECT(row), "kind", g_strdup(kind), g_free);
@@ -298,7 +318,7 @@ static gboolean apply_devices(gpointer d) {
         gtk_box_pack_start(GTK_BOX(all_box), card, FALSE, FALSE, 4);
     }
     pthread_mutex_unlock(&d_lock);
-    gtk_list_box_insert(GTK_LIST_BOX(device_list), nav_row("◼", L("全部设备", "All devices"), "all"), -1);
+    gtk_list_box_insert(GTK_LIST_BOX(device_list), nav_row("view-grid-symbolic", L("全部设备", "All devices"), "all"), -1);
     gtk_widget_show_all(device_list); gtk_widget_show_all(all_box);
     return G_SOURCE_REMOVE;
 }
@@ -367,21 +387,45 @@ static GtkWidget *build_device(void) {
     gtk_overlay_add_overlay(GTK_OVERLAY(preview), enter);
     gtk_box_pack_start(GTK_BOX(page), preview, FALSE, FALSE, 0);
     GtkWidget *tools = hbox(0); add_class(tools, "toolbar");
-    const char *names[] = {L("🗂  文件传输", "🗂  File transfer"), L("▶  观看模式", "▶  Watch mode"), L("⌨  终端", "⌨  Terminal"), L("⇄  端口映射", "⇄  Port mapping"), "▦"}, *kinds[] = {"file", "watch", "terminal", "portmap", "more"};
+    const char *names[] = {L("文件传输", "File transfer"), L("观看模式", "Watch mode"), L("终端", "Terminal"), L("端口映射", "Port mapping"), L("更多", "More")}, *kinds[] = {"file", "watch", "terminal", "portmap", "more"};
+    const char *tool_icons[] = {"folder-symbolic", "media-playback-start-symbolic", "utilities-terminal-symbolic", "network-wired-symbolic", "view-more-symbolic"};
     for (int i = 0; i < 5; i++) {
-        GtkWidget *b = button(names[i], "tool");
+        GtkWidget *b = icon_button(names[i], tool_icons[i], "tool");
         g_signal_connect(b, "clicked", G_CALLBACK(on_tool), (gpointer)kinds[i]);
         gtk_box_pack_start(GTK_BOX(tools), b, i < 4, TRUE, 0);
         if (i < 4) gtk_box_pack_start(GTK_BOX(tools), gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 0);
     }
     gtk_box_pack_start(GTK_BOX(page), tools, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(page), label(L("快速启动", "Quick launch"), "h2"), FALSE, FALSE, 22);
-    GtkWidget *quick = vbox(10); add_class(quick, "dashed");
-    GtkWidget *add = button("+", "round"); gtk_widget_set_halign(add, GTK_ALIGN_CENTER);
-    g_signal_connect(add, "clicked", G_CALLBACK(unsupported), L("快速启动", "Quick launch"));
-    GtkWidget *al = label(L("添加", "Add"), "hint"); gtk_widget_set_halign(al, GTK_ALIGN_CENTER);
-    gtk_box_pack_start(GTK_BOX(quick), add, FALSE, FALSE, 0); gtk_box_pack_start(GTK_BOX(quick), al, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(page), quick, FALSE, FALSE, 0);
+    GtkWidget *independent = hbox(16); add_class(independent, "session-card");
+    gtk_widget_set_margin_top(independent, 20);
+    GtkWidget *session_icon = icon("video-display-symbolic", 24); add_class(session_icon, "session-icon");
+    gtk_widget_set_valign(session_icon, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(independent), session_icon, FALSE, FALSE, 0);
+    GtkWidget *session_text = vbox(6);
+    gtk_box_pack_start(GTK_BOX(session_text), label(L("独立会话", "Independent session"), "session-title"), FALSE, FALSE, 0);
+    GtkWidget *caption = label(L("独立图标与窗口，关闭主窗口后仍保持连接。", "A separate icon and window; keep connected after closing the launcher."), "session-caption");
+    gtk_label_set_max_width_chars(GTK_LABEL(caption), 36);
+    gtk_box_pack_start(GTK_BOX(session_text), caption, FALSE, FALSE, 0);
+    gtk_widget_set_valign(session_text, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(independent), session_text, TRUE, TRUE, 0);
+    GtkWidget *actions = hbox(10); gtk_widget_set_valign(actions, GTK_ALIGN_CENTER);
+    GtkWidget *open_independent = icon_button(L("独立远控", "Independent remote"), "media-playback-start-symbolic", "primary");
+    GtkWidget *configure_independent = icon_button(L("会话设置", "Session settings"), "preferences-system-symbolic", "secondary");
+    g_signal_connect(open_independent, "clicked", G_CALLBACK(on_tool), "independent");
+    g_signal_connect(configure_independent, "clicked", G_CALLBACK(on_tool), "independent-settings");
+    gtk_box_pack_start(GTK_BOX(actions), configure_independent, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(actions), open_independent, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(independent), actions, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(page), independent, FALSE, FALSE, 0);
+    GtkWidget *tip = hbox(8); gtk_widget_set_margin_top(tip, 18);
+    image_clipboard_button = icon_button(L("传送截图", "Send screenshot"), "edit-paste-symbolic", "secondary");
+    g_signal_connect(image_clipboard_button, "clicked", G_CALLBACK(on_tool), "independent-image");
+    gtk_widget_set_sensitive(image_clipboard_button, FALSE);
+    gtk_box_pack_start(GTK_BOX(tip), image_clipboard_button, FALSE, FALSE, 0);
+    GtkWidget *image_hint = label(L("先传送，再到 Mac 按 Ctrl+V 粘贴；传送时会短暂重连。", "Send first, then press Ctrl+V on the Mac to paste. Transfer briefly reconnects."), "session-caption");
+    gtk_label_set_max_width_chars(GTK_LABEL(image_hint), 48);
+    gtk_box_pack_start(GTK_BOX(tip), image_hint, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(page), tip, FALSE, FALSE, 0);
     return page;
 }
 static void close_banner(GtkButton *b, gpointer d) { (void)b; (void)d; banner_closed = 1; gtk_widget_hide(banner); }
@@ -570,6 +614,11 @@ static void open_settings(void) {
         setting_row(L("保持唤醒状态", "Stay awake"), L("防止电脑进入睡眠状态，导致无法远程访问。", "Keep the computer from sleeping so it stays reachable."), combo(wake, 3)),
         setting_row(L("关闭窗口时", "When closing the window"), NULL, combo(close_opts, 2)) };
     gtk_box_pack_start(GTK_BOX(general), settings_card(g1, 3), FALSE, FALSE, 0);
+    GtkWidget *independent_settings = button(L("配置当前设备", "Configure selected device"), "secondary");
+    g_signal_connect(independent_settings, "clicked", G_CALLBACK(on_tool), "independent-settings");
+    GtkWidget *independent_rows[] = { setting_row(L("独立会话兼容设置", "Independent session compatibility"),
+        L("按设备选择字体、画面兼容模式、Mac 快捷键与图片传送。", "Choose per-device font, video compatibility, Mac shortcuts and image transfer."), independent_settings) };
+    gtk_box_pack_start(GTK_BOX(general), settings_card(independent_rows, 1), FALSE, FALSE, 0);
     GtkWidget *path = hbox(8); GtkWidget *change = button(L("修改路径", "Change path"), "secondary"), *open = button(L("打开文件夹", "Open folder"), "secondary");
     g_signal_connect(change, "clicked", G_CALLBACK(unsupported), L("修改路径", "Change path")); g_signal_connect(open, "clicked", G_CALLBACK(unsupported), L("打开文件夹", "Open folder"));
     gtk_box_pack_end(GTK_BOX(path), open, FALSE, FALSE, 0); gtk_box_pack_end(GTK_BOX(path), change, FALSE, FALSE, 0);
@@ -581,7 +630,7 @@ static void open_settings(void) {
     GtkWidget *gscroll = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(gscroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     gtk_container_add(GTK_CONTAINER(gscroll), general);
-    gtk_stack_add_titled(GTK_STACK(tabs), gscroll, "general", L("⚙ 常规", "⚙ General"));
+    gtk_stack_add_titled(GTK_STACK(tabs), gscroll, "general", L("常规", "General"));
     // 安全
     GtkWidget *security = settings_page();
     const char *verify[] = {L("仅使用临时验证码", "Temporary code only"), L("仅使用自定义验证码", "Custom code only"), L("临时与自定义验证码", "Temporary and custom codes")};
@@ -593,7 +642,7 @@ static void open_settings(void) {
     gtk_box_pack_start(GTK_BOX(security), settings_card(s1, 2), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(security), settings_card(s2, 1), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(security), settings_card(s3, 1), FALSE, FALSE, 0);
-    gtk_stack_add_titled(GTK_STACK(tabs), security, "security", L("🔒 安全", "🔒 Security"));
+    gtk_stack_add_titled(GTK_STACK(tabs), security, "security", L("安全", "Security"));
     // 键盘
     GtkWidget *keys = settings_page();
     gtk_box_pack_start(GTK_BOX(keys), label(L("仅控制端响应的快捷键", "Viewer-only shortcuts"), "h2"), FALSE, FALSE, 0);
@@ -608,13 +657,13 @@ static void open_settings(void) {
     for (int i = 0; i < 8; i++) k2[i] = setting_row(fns[i], NULL, edit_button(fns[i]));
     gtk_box_pack_start(GTK_BOX(keys), settings_card(k2, 8), FALSE, FALSE, 0);
     GtkWidget *kscroll = gtk_scrolled_window_new(NULL, NULL); gtk_container_add(GTK_CONTAINER(kscroll), keys);
-    gtk_stack_add_titled(GTK_STACK(tabs), kscroll, "keys", L("⌨ 键盘", "⌨ Keyboard"));
+    gtk_stack_add_titled(GTK_STACK(tabs), kscroll, "keys", L("键盘", "Keyboard"));
     // 网络
     GtkWidget *network = settings_page();
     const char *proxy[] = {L("使用系统环境代理", "Use system proxy"), L("不使用代理", "No proxy")};
     GtkWidget *n1[] = { setting_row(L("代理设置", "Proxy"), NULL, combo(proxy, 2)) };
     gtk_box_pack_start(GTK_BOX(network), settings_card(n1, 1), FALSE, FALSE, 0);
-    gtk_stack_add_titled(GTK_STACK(tabs), network, "network", L("🌐 网络", "🌐 Network"));
+    gtk_stack_add_titled(GTK_STACK(tabs), network, "network", L("网络", "Network"));
     gtk_box_pack_start(GTK_BOX(root), tabs, TRUE, TRUE, 0);
     gtk_container_add(GTK_CONTAINER(settings_window), root);
     gtk_widget_show_all(settings_window);
@@ -669,18 +718,21 @@ static void *run(void *arg) {
         GtkWidget *side = vbox(0); add_class(side, "sidebar"); gtk_widget_set_size_request(side, 270, -1);
         my_section = vbox(0);
         GtkWidget *mh = hbox(8); gtk_widget_set_margin_start(mh, 18); gtk_widget_set_margin_top(mh, 22); gtk_widget_set_margin_bottom(mh, 6);
-        gtk_box_pack_start(GTK_BOX(mh), label(L("⧉  我的设备", "⧉  My devices"), "section"), TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(mh), icon("computer-symbolic", 17), FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(mh), label(L("我的设备", "My devices"), "section"), TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(my_section), mh, FALSE, FALSE, 0);
         device_list = gtk_list_box_new(); g_signal_connect(device_list, "row-activated", G_CALLBACK(on_row), NULL);
         gtk_box_pack_start(GTK_BOX(my_section), device_list, FALSE, FALSE, 0);
         GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL); gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
         GtkWidget *side_inner = vbox(0); gtk_box_pack_start(GTK_BOX(side_inner), my_section, FALSE, FALSE, 0);
         GtkWidget *welcome_nav = gtk_list_box_new(); g_signal_connect(welcome_nav, "row-activated", G_CALLBACK(on_row), NULL);
-        GtkWidget *ah = label(L("⧉  远程协助", "⧉  Remote assistance"), "section"); gtk_widget_set_margin_start(ah, 18); gtk_widget_set_margin_top(ah, 16); gtk_widget_set_margin_bottom(ah, 6);
+        GtkWidget *ah = hbox(8); gtk_widget_set_margin_start(ah, 18); gtk_widget_set_margin_top(ah, 16); gtk_widget_set_margin_bottom(ah, 6);
+        gtk_box_pack_start(GTK_BOX(ah), icon("network-workgroup-symbolic", 17), FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(ah), label(L("远程协助", "Remote assistance"), "section"), FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(side_inner), ah, FALSE, FALSE, 0);
         GtkWidget *assist = assist_list = gtk_list_box_new(); g_signal_connect(assist, "row-activated", G_CALLBACK(on_row), NULL);
-        gtk_list_box_insert(GTK_LIST_BOX(assist), nav_row("◧", L("开始协助", "Start assistance"), "assist"), -1);
-        gtk_list_box_insert(GTK_LIST_BOX(assist), nav_row("★", L("收藏设备", "Favorites"), "favorite"), -1);
+        gtk_list_box_insert(GTK_LIST_BOX(assist), nav_row("network-workgroup-symbolic", L("开始协助", "Start assistance"), "assist"), -1);
+        gtk_list_box_insert(GTK_LIST_BOX(assist), nav_row("starred-symbolic", L("收藏设备", "Favorites"), "favorite"), -1);
         gtk_box_pack_start(GTK_BOX(side_inner), assist, FALSE, FALSE, 0);
         gtk_list_box_unselect_all(GTK_LIST_BOX(assist));
         (void)welcome_nav;
@@ -691,12 +743,13 @@ static void *run(void *arg) {
         GtkWidget *main = vbox(0), *header = hbox(10); add_class(header, "header");
         badge = gtk_label_new(""); add_class(badge, "badge");
         title_label = label(L("全部设备", "All devices"), "title");
-        more_button = button("⋮", "hbtn"); g_signal_connect(more_button, "clicked", G_CALLBACK(on_more), NULL);
+        more_button = icon_button("", "view-more-symbolic", "hbtn"); gtk_widget_set_tooltip_text(more_button, L("设备信息", "Device information")); g_signal_connect(more_button, "clicked", G_CALLBACK(on_more), NULL);
         gtk_box_pack_start(GTK_BOX(header), badge, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(header), title_label, FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(header), more_button, FALSE, FALSE, 0);
-        const char *icons[] = {"☰", "◉", "🔔"}, *kinds[] = {"menu", "account", "notice"};
-        for (int i = 0; i < 3; i++) { GtkWidget *b = button(icons[i], "hbtn"); g_signal_connect(b, "clicked", G_CALLBACK(popup), (gpointer)kinds[i]); gtk_box_pack_end(GTK_BOX(header), b, FALSE, FALSE, 0); }
+        const char *icons[] = {"open-menu-symbolic", "avatar-default-symbolic", "preferences-system-notifications-symbolic"}, *kinds[] = {"menu", "account", "notice"};
+        const char *tips[] = {L("菜单", "Menu"), L("账号", "Account"), L("通知", "Notifications")};
+        for (int i = 0; i < 3; i++) { GtkWidget *b = icon_button("", icons[i], "hbtn"); gtk_widget_set_tooltip_text(b, tips[i]); g_signal_connect(b, "clicked", G_CALLBACK(popup), (gpointer)kinds[i]); gtk_box_pack_end(GTK_BOX(header), b, FALSE, FALSE, 0); }
         gtk_box_pack_start(GTK_BOX(main), header, FALSE, FALSE, 0);
         GtkWidget *overlay = gtk_overlay_new();
         stack = gtk_stack_new();

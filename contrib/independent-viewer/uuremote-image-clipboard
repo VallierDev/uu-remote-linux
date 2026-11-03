@@ -1,0 +1,216 @@
+#!/usr/bin/python3
+"""Transfer an image to one UU Mac session; never send a chat message."""
+import errno
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pty
+import re
+import select
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import uuid
+from pathlib import Path
+
+MAX_IMAGE = 32 * 1024 * 1024
+
+
+def independent():
+    path = Path(__file__).with_name('uuremote-independent')
+    if not path.is_file():
+        path = Path(__file__).with_name('uuremote-independent.py')
+    loader = importlib.machinery.SourceFileLoader('uu_independent', str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def terminal_command(device, command, marker, executable=None):
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 160, 0, 0))
+
+    def setup():
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    process = subprocess.Popen(
+        [executable or os.environ.get('UU_VIEWER_EXECUTABLE') or shutil.which('uuremote-viewer'), 'terminal', device],
+        stdin=slave, stdout=slave, stderr=slave, preexec_fn=setup,
+    )
+    os.close(slave)
+    started = time.monotonic()
+    sent = False
+    output = bytearray()
+    try:
+        while time.monotonic() - started < 45:
+            # This stock CLI opens its own terminal channel before reading the PTY.
+            if not sent and time.monotonic() - started >= 4:
+                os.write(master, command.encode('utf-8') + b'\n')
+                sent = True
+            ready, _, _ = select.select([master], [], [], .2)
+            if ready:
+                try:
+                    chunk = os.read(master, 16384)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break
+                    raise
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if len(output) > 256 * 1024:
+                    raise RuntimeError('Terminal output limit')
+            if process.poll() is not None:
+                break
+        if process.poll() is None:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        clean = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', output)
+        # The script constructs the marker from two pieces; echoed commands cannot match.
+        return marker.encode() in clean and process.poll() == 0
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        os.close(master)
+
+
+def read_image(path):
+    with path.open('wb') as output:
+        process = subprocess.Popen(
+            ['wl-paste', '--no-newline', '--type', 'image/png'],
+            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL,
+        )
+        try:
+            if process.wait(timeout=10):
+                raise RuntimeError('No PNG image in clipboard')
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    if not 8 < path.stat().st_size <= MAX_IMAGE:
+        raise RuntimeError('Image size is unsupported')
+    with path.open('rb') as stream:
+        if stream.read(8) != b'\x89PNG\r\n\x1a\n':
+            raise RuntimeError('Not a PNG image')
+
+
+def send_image(entry, local):
+    suffix = uuid.uuid4().hex
+    remote_dir = '/private/tmp/uu-clipboard-' + suffix
+    remote = remote_dir + '/image.png'
+    executable = independent().viewer_path(entry)
+    prepare = ('umask 077; /bin/mkdir -m 700 -- ' + shlex.quote(remote_dir)
+               + " && printf 'UU_IMAGE_DIR_READY_%s\\n' " + shlex.quote(suffix)
+               + '; uu_clip_exit=$?; exit $uu_clip_exit')
+    if not terminal_command(entry['device_id'], prepare, 'UU_IMAGE_DIR_READY_' + suffix, executable):
+        raise RuntimeError('Could not prepare a private Mac transfer directory')
+    cleanup = '/bin/rm -f -- ' + shlex.quote(remote) + '; /bin/rmdir -- ' + shlex.quote(remote_dir)
+    result = subprocess.run(
+        [executable, 'files', entry['device_id'], 'put', str(local), remote],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=90,
+    )
+    if result.returncode:
+        terminal_command(entry['device_id'], cleanup + '; exit', 'unused-marker', executable)
+        raise RuntimeError('UU image file transfer failed')
+    marker = 'UU_IMAGE_READY_' + suffix
+    script = (
+        'ObjC.import("AppKit");'
+        'var data=$.NSData.dataWithContentsOfFile(' + json.dumps(remote) + ');'
+        'if(!data.length)throw Error("image read failed");'
+        'var image=$.NSImage.alloc.initWithData(data);'
+        'if(!image.isValid)throw Error("invalid image");'
+        'var pb=$.NSPasteboard.generalPasteboard;'
+        'pb.clearContents;'
+        'if(!pb.writeObjects($.NSArray.arrayWithObject(image)))throw Error("image write failed");'
+        'if(!pb.setDataForType(data,"public.png"))throw Error("PNG write failed");'
+        'if(!pb.availableTypeFromArray(["public.png","public.tiff"]))throw Error("image unavailable");'
+        'console.log("UU_IMAGE_READY_"+' + json.dumps(suffix) + ');'
+    )
+    command = (
+        'unset HISTFILE; /usr/bin/osascript -l JavaScript -e ' + shlex.quote(script)
+        + '; uu_clip_exit=$?; /bin/rm -f -- ' + shlex.quote(remote)
+        + ' || uu_clip_exit=1; /bin/rmdir -- ' + shlex.quote(remote_dir)
+        + ' || uu_clip_exit=1; exit $uu_clip_exit'
+    )
+    if not terminal_command(entry['device_id'], command, marker, executable):
+        raise RuntimeError('Mac clipboard image write could not be confirmed')
+
+
+def notify(summary, message, critical=False):
+    subprocess.run(
+        ['notify-send', '--app-name=UU 独立远控', '--icon=computer',
+         '--urgency=' + ('critical' if critical else 'normal'), summary, message],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+    )
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise ValueError('Expected one device entry')
+    os.umask(0o077)
+    helper = independent()
+    entry, app_id, unit = helper.read_entry(sys.argv[1])
+    if entry.get('image_clipboard') is not True or entry.get('platform') != 4:
+        raise ValueError('Image clipboard is not enabled for this entry')
+    runtime = Path(os.environ.get('XDG_RUNTIME_DIR', '/tmp'))
+    lock_path = runtime / ('uu-image-clipboard-' + sys.argv[1] + '.lock')
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        with tempfile.TemporaryDirectory(prefix='uu-image-clipboard-', dir=runtime) as directory:
+            path = Path(directory) / 'clipboard.png'
+            read_image(path)
+            notify('正在传送剪贴板图片 / Sending clipboard image',
+                   '远控会短暂重连，完成后可粘贴图片 / The remote window will briefly reconnect')
+            was_active = helper.active(unit)
+            completed = False
+            try:
+                # Stock Mac/tool signaling shares leave notifications with the desktop.
+                # Pause explicitly and restore it once both stock tool CLIs finish.
+                if was_active:
+                    subprocess.run(['systemctl', '--user', 'stop', unit],
+                                   capture_output=True, check=True, timeout=15)
+                send_image(entry, path)
+                completed = True
+            finally:
+                if was_active or completed:
+                    helper.launch(sys.argv[1])
+        if helper.active(unit):
+            helper.focus(app_id, unit)
+        notify('图片已放入 Mac 剪贴板 / Image copied to Mac clipboard',
+               '在聊天框中右键选择“粘贴”；不会自动发送 / Right-click the chat box and paste; nothing is sent automatically')
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError):
+        message = '图片传送失败，请确认剪贴板内有图片且 Mac 可连接 / Could not send the image; check the clipboard and Mac connection'
+        try:
+            notify('Mac 图片剪贴板 / Mac image clipboard', message, True)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        print(message, file=sys.stderr)
+        sys.exit(1)

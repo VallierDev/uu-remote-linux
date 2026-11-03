@@ -524,6 +524,13 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 
 ## 实验性原生控制端（uuremote-viewer）
 
+**可选独立会话组件**：设备页提供「独立远控 / 会话设置 / 传送截图」，每设备独立窗口可在关闭主窗口后继续运行。
+支持独立 Dock 入口、接管开关、中文字体与画布设置，以及 Mac 的 Shift 恢复、长按连发、可选 Ctrl → Command 快捷键。
+先安装 `contrib/independent-viewer/install.sh`；按键适配目前仅对 Debian 包 0.2.45 启用。
+截图需显式点击「传送截图」再在 Mac 粘贴；它使用文件/终端工具，会短暂重连，不是原生图片剪贴板同步。
+安装方式、测试和限制见 [独立会话组件](contrib/independent-viewer/README.md)。
+
+
 [SDL 控制端视频调度说明](docs/viewer-video-scheduling.md)。
 
 `uuremote-viewer` 是 Linux 上的**控制端**：用你的 UU 账号连接并控制其他设备（官方 Windows / Mac 被控端，或本项目的 Linux 主机），

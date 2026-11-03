@@ -81,6 +81,41 @@ static gboolean snapshot(GtkWidget *w, const char *path) {
 static const char *output;
 static int expected_mode, stage;
 #if defined(UI_VIEWER)
+static GtkWidget *named_button(GtkWidget *widget, const char *name) {
+    if (GTK_IS_BUTTON(widget) && !g_strcmp0(gtk_button_get_label(GTK_BUTTON(widget)), name)) return widget;
+    if (!GTK_IS_CONTAINER(widget)) return NULL;
+    GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+    GtkWidget *found = NULL;
+    for (GList *child = children; child && !found; child = child->next) found = named_button(child->data, name);
+    g_list_free(children);
+    return found;
+}
+static gboolean show_fixture_device(gpointer unused) {
+    (void)unused; show_device(0); return G_SOURCE_REMOVE;
+}
+static void verify_independent_commands(void) {
+    char command[200];
+    while (uu_viewer_ui_take_command(command, sizeof command)) {}
+    show_device(0);
+    GtkWidget *open = named_button(window, L("独立远控", "Independent remote"));
+    GtkWidget *settings = named_button(window, L("会话设置", "Session settings"));
+    g_assert_nonnull(open); g_assert_nonnull(settings);
+    gtk_button_clicked(GTK_BUTTON(open));
+    g_assert_true(uu_viewer_ui_take_command(command, sizeof command));
+    g_assert_cmpstr(command, ==, "connect\tdemo-workstation\tindependent");
+    gtk_button_clicked(GTK_BUTTON(settings));
+    g_assert_true(uu_viewer_ui_take_command(command, sizeof command));
+    g_assert_cmpstr(command, ==, "connect\tdemo-workstation\tindependent-settings");
+    GtkWidget *image = named_button(window, L("传送截图", "Send screenshot"));
+    g_assert_nonnull(image); g_assert_false(gtk_widget_get_sensitive(image));
+    devices[1].online = 1; show_device(1);
+    g_assert_true(gtk_widget_get_sensitive(image));
+    gtk_button_clicked(GTK_BUTTON(image));
+    g_assert_true(uu_viewer_ui_take_command(command, sizeof command));
+    g_assert_cmpstr(command, ==, "connect\tdemo-laptop\tindependent-image");
+    devices[1].online = 0; show_device(1);
+    g_assert_false(gtk_widget_get_sensitive(image)); show_device(0);
+}
 static void verify_badge(void) {
     for (int i = 0; i < 2; i++) {
         show_device(i); // Fixture 0 is online, fixture 1 is offline.
@@ -136,6 +171,7 @@ static gboolean verify(gpointer unused) {
     g_assert_cmpint(dark, ==, expected_mode == 2);
 #if defined(UI_VIEWER)
     verify_badge();
+    verify_independent_commands();
 #endif
     char *path = g_build_filename(g_get_user_config_dir(), "uuremote", "theme", NULL), *saved = NULL;
     g_assert_true(g_file_get_contents(path, &saved, NULL, NULL));
@@ -164,6 +200,7 @@ int main(int argc, char **argv) {
     logged_in = 1;
     g_idle_add(apply_devices, NULL);
     g_idle_add(apply_login, NULL);
+    g_idle_add(show_fixture_device, NULL);
     run(NULL);
 #else
     g_strlcpy(remote_name, "Workstation", sizeof remote_name);

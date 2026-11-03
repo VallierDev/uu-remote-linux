@@ -600,6 +600,17 @@ No official "no desktop" error code was found for headless desktop offers, so th
 
 ## Experimental native viewer (uuremote-viewer)
 
+**Optional independent-session companion**: the device page adds Independent remote,
+Session settings and Send screenshot. Each device gets its own desktop entry and
+session that survives closing the launcher, with takeover, CJK font/canvas settings,
+Mac Shift recovery, held-key repeats and optional Ctrl → Command editing shortcuts.
+Install `contrib/independent-viewer/install.sh`; the input adapter currently supports
+Debian package 0.2.45 only. Send screenshot explicitly transfers a PNG through the
+file/terminal tools before pasting on the Mac, briefly reconnecting the desktop;
+it is not native image clipboard synchronization. See the [companion guide](contrib/independent-viewer/README.md)
+for installation, validation and limitations.
+
+
 See [SDL viewer video scheduling](docs/viewer-video-scheduling.md).
 
 `uuremote-viewer` is a Linux **viewer/controller**: it connects to and controls other devices on your UU account (official Windows / Mac
