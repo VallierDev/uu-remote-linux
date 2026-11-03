@@ -21,12 +21,15 @@ It never sends Enter or submits a chat.
 - X11/XWayland: native Xlib selection read through an unmapped requestor on a separate connection;
   supports ICCCM INCR, with a five-second deadline and a total byte limit. No polling subprocess/window.
 - SDL2 native Wayland: `wl-paste --type image/png --no-newline` is used only on explicit paste;
-  install `wl-clipboard`. This path needs compositor-specific acceptance. In particular, a
+  install `wl-clipboard` for images. If the optional executable is absent or not executable,
+  the viewer preserves ordinary SDL text paste. This path needs compositor-specific acceptance. In particular, a
   compositor/helper-induced focus loss cancels the paste. It does not reintroduce periodic
   `wl-paste` polling from issue #37. SDL3 MIME access would be a future backend improvement.
 
 目前实机确认的是官方 Mac 接收与 X11/XWayland 控制端路径。SDL2 原生 Wayland
 按需读取仍需各桌面验证，辅助进程引起失焦时会取消本次粘贴。
+缺少可选的 `wl-paste` 程序时，原有文字粘贴仍可使用。复制新内容会结束上一张图片的
+文字去重状态；传输期间继续打字时，仅过滤最初粘贴快捷键的 V，后续输入保留。
 
 ## 协议证据 / Protocol evidence
 
@@ -77,4 +80,5 @@ xvfb-run -a /tmp/viewer-clipboard-test
 
 The Xvfb test owns an isolated selection and checks normal, 700 KB INCR, oversize and
 unsupported conversions. Rust checks cover PNG bounds, block ordering/ACK correlation,
-text compatibility, delayed paste cancellation and balanced Mac modifier release.
+text compatibility, absent Wayland helpers, text copied again after a PNG, subsequent V
+keystrokes, same-batch target/selection changes, and balanced Mac modifier release.

@@ -1,4 +1,5 @@
 use super::{desktop::{Frame,FrameSink},input::{Input,Viewport},session::Session};
+use std::sync::{Arc,atomic::{AtomicU64,Ordering}};
 use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum,rect::Rect};
 #[derive(Debug)] enum Command { Files, Type }
 struct PendingPaste {task:tokio::task::JoinHandle<()>,reply:tokio::sync::oneshot::Receiver<Result<bool,()>>,events:Vec<Event>}
@@ -9,7 +10,24 @@ fn paste_chord(event:&Event)->bool {
         if keymod.intersects(Mod::LCTRLMOD|Mod::RCTRLMOD|Mod::LGUIMOD|Mod::RGUIMOD)
         && !keymod.intersects(Mod::LSHIFTMOD|Mod::RSHIFTMOD|Mod::LALTMOD|Mod::RALTMOD))
 }
-fn paste_key(event:&Event)->bool {matches!(event,Event::KeyDown{scancode:Some(sdl2::keyboard::Scancode::V),..}|Event::KeyUp{scancode:Some(sdl2::keyboard::Scancode::V),..})}
+// Suppress only the original held V, including repeats/release arriving after
+// transfer completion. A fresh V press belongs to subsequent typing.
+fn suppress_paste_key(held:&mut bool,event:&Event)->bool {
+    if !*held{return false}
+    match event {
+        Event::KeyUp{scancode:Some(sdl2::keyboard::Scancode::V),..}=>{*held=false;true},
+        Event::KeyDown{scancode:Some(sdl2::keyboard::Scancode::V),repeat,..}=>{if *repeat{true}else{*held=false;false}},
+        _=>false,
+    }
+}
+fn cancels_paste(event:&Event)->bool {
+    use sdl2::keyboard::{Mod,Scancode};
+    matches!(event,Event::Quit{..}|Event::ClipboardUpdate{..}|Event::MouseButtonDown{..}|
+        Event::Window{win_event:WindowEvent::FocusLost|WindowEvent::Close,..}|
+        Event::KeyDown{scancode:Some(Scancode::Escape),..})
+        || matches!(event,Event::KeyDown{scancode:Some(Scancode::M|Scancode::F|Scancode::Return),keymod,..}
+            if keymod.intersects(Mod::LCTRLMOD|Mod::RCTRLMOD)&&keymod.intersects(Mod::LALTMOD|Mod::RALTMOD))
+}
 fn image_paste_keys(input:&mut Input)->Vec<serde_json::Value>{
     // Release the physical PC modifiers before an atomic, balanced Mac Cmd+V.
     // The next real SDL key restores any modifiers the user is still holding.
@@ -17,7 +35,7 @@ fn image_paste_keys(input:&mut Input)->Vec<serde_json::Value>{
     for (scan,down) in [(227,true),(25,true),(25,false),(227,false)]{if let Some(m)=input.key(scan,down){out.push(m);}}
     out
 }
-pub struct Window { image_reader:super::image_paste::Reader,image_tx:Option<super::image_paste::Sender>,paste:Option<PendingPaste>,notice:Option<(String,std::time::Instant)>,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
+pub struct Window { clipboard_selection:Arc<AtomicU64>,paste_key_held:bool,image_reader:super::image_paste::Reader,image_tx:Option<super::image_paste::Sender>,paste:Option<PendingPaste>,notice:Option<(String,std::time::Instant)>,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest>,
     pub last_frame:Option<Frame>, chrome:Chrome }
 /// In-window chrome state (src/viewer/hud.rs): menu, network panel, loading screen.
@@ -50,9 +68,9 @@ impl Window {
         let image_reader=super::image_paste::Reader::for_driver(video.current_video_driver());
         log::info!("Viewer clipboard display backend: {}",video.current_video_driver());
         let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
-        Ok(Self{image_reader,image_tx:None,paste:None,notice:None,canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
+        Ok(Self{clipboard_selection:Arc::default(),paste_key_held:false,image_reader,image_tx:None,paste:None,notice:None,canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
     }
-    pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone())}
+    pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone(),self.clipboard_selection.clone())}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
     fn viewport(&self)->Viewport {
         let window=self.canvas.window().size();
@@ -81,15 +99,14 @@ impl Window {
         }
     }
     pub fn poll(&mut self,input:&mut Input)->(bool,Vec<serde_json::Value>){
+        let events=poll_events(&mut self.events);self.poll_batch(input,events)
+    }
+    fn poll_batch(&mut self,input:&mut Input,events:Vec<Event>)->(bool,Vec<serde_json::Value>){
         let viewport=self.viewport();
         let mut redraw=false;
-        let events=poll_events(&mut self.events);
         let mut forward=Vec::with_capacity(events.len());let mut prefix=Vec::new();
         // Never replay delayed paste into a new focus, a menu, or a changed selection.
-        let cancel=!self.focused||!input.enabled()||self.chrome.menu.open||events.iter().any(|event|matches!(event,
-            Event::Quit{..}|Event::ClipboardUpdate{..}|Event::MouseButtonDown{..}|
-            Event::Window{win_event:WindowEvent::FocusLost|WindowEvent::Close,..}|
-            Event::KeyDown{scancode:Some(sdl2::keyboard::Scancode::Escape),..}));
+        let cancel=!self.focused||!input.enabled()||self.chrome.menu.open||events.iter().any(cancels_paste);
         if cancel && self.paste.take().is_some(){prefix.extend(input.release_all());self.notice=None;redraw=true;}
         let finished=self.paste.as_mut().and_then(|p|match p.reply.try_recv(){
             Ok(result)=>Some(result),Err(tokio::sync::oneshot::error::TryRecvError::Closed)=>Some(Err(())),Err(_)=>None,
@@ -97,7 +114,7 @@ impl Window {
         if let Some(result)=finished {
             let mut pending=self.paste.take().unwrap();
             match result {
-                Ok(true)=>{self.clipboard_dirty=false;prefix.extend(image_paste_keys(input));forward.extend(std::mem::take(&mut pending.events).into_iter().filter(|e|!paste_key(e)));self.notice=None;redraw=true;},
+                Ok(true)=>{self.clipboard_dirty=false;prefix.extend(image_paste_keys(input));self.paste_key_held=true;forward.extend(std::mem::take(&mut pending.events).into_iter().skip(1).filter(|e|!suppress_paste_key(&mut self.paste_key_held,e)));self.notice=None;redraw=true;},
                 Ok(false)=>{forward.append(&mut pending.events);self.notice=None;redraw=true;},
                 Err(())=>{prefix.extend(input.release_all());self.notice=Some((crate::i18n::s("图片粘贴失败，请重新复制截图后重试", "Image paste failed; copy the screenshot and try again").into(),std::time::Instant::now()+std::time::Duration::from_secs(5)));redraw=true;},
             }
@@ -105,6 +122,11 @@ impl Window {
         if self.notice.as_ref().is_some_and(|(_,until)|*until<std::time::Instant::now()){self.notice=None;redraw=true;}
         let mut event_focused=self.focused;
         for event in events {
+            // The pre-pass protects an already finished transfer; this also
+            // cancels one started by an earlier event in this same SDL batch.
+            if cancels_paste(&event) && self.paste.take().is_some(){prefix.extend(input.release_all());self.notice=None;redraw=true;}
+            if matches!(event,Event::ClipboardUpdate{..}){self.clipboard_selection.fetch_add(1,Ordering::AcqRel);}
+            if suppress_paste_key(&mut self.paste_key_held,&event){continue}
             match event {Event::Window{win_event:WindowEvent::FocusGained,..}=>event_focused=true,Event::Window{win_event:WindowEvent::FocusLost,..}=>event_focused=false,_=>{}}
             if matches!(event,Event::ClipboardUpdate{..}|Event::Window{win_event:WindowEvent::FocusGained,..}){self.clipboard_dirty=true;}
             redraw|=needs_redraw(&event);
@@ -112,8 +134,8 @@ impl Window {
             if consumed {continue}
             if self.paste.is_none() && self.mac && event_focused && input.enabled() && paste_chord(&event) {
                 if let Some(tx)=self.image_tx.clone(){
-                    let reader=self.image_reader;let(reply,rx)=tokio::sync::oneshot::channel();
-                    let task=tokio::spawn(async move{let result=super::image_paste::prepare(reader,tx).await;let _=reply.send(result);});
+                    let reader=self.image_reader;let selection=self.clipboard_selection.load(Ordering::Acquire);let(reply,rx)=tokio::sync::oneshot::channel();
+                    let task=tokio::spawn(async move{let result=super::image_paste::prepare(reader,tx,selection).await;let _=reply.send(result);});
                     self.paste=Some(PendingPaste{task,reply:rx,events:vec![event]});
                     self.notice=Some((crate::i18n::s("正在准备粘贴…", "Preparing paste…").into(),std::time::Instant::now()+std::time::Duration::from_secs(25)));redraw=true;continue
                 }
@@ -962,6 +984,46 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         let pairs:Vec<_>=events.iter().map(|v|(v["action"].as_str().unwrap(),v["key"].as_i64().unwrap())).collect();
         assert_eq!(pairs,vec![("kbd_release",59),("kbd_press",55),("kbd_press",9),("kbd_release",9),("kbd_release",55)]);
         assert!(input.release_all().is_empty());
+    }
+    #[cfg_attr(target_os="macos",ignore)]
+    #[tokio::test] async fn image_paste_keeps_later_typing_and_cancels_new_transfers_in_batch(){
+        if std::env::var_os("UU_IMAGE_EVENTS_TEST_CHILD").is_none(){
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","viewer::sdl::tests::image_paste_keeps_later_typing_and_cancels_new_transfers_in_batch","--test-threads=1"])
+                .env("SDL_VIDEODRIVER","dummy").env("UU_IMAGE_EVENTS_TEST_CHILD","1").output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return
+        }
+        use sdl2::keyboard::{Scancode as S,Mod as M};
+        let mut window=Window::new().unwrap();window.mac=true;
+        let mut input=Input::default();input.set_mac(true);window.poll(&mut input);
+        let id=window.canvas.window().id();
+        let key=|scan,down,mods,repeat|if down{Event::KeyDown{timestamp:0,window_id:id,keycode:None,scancode:Some(scan),keymod:mods,repeat}}
+            else{Event::KeyUp{timestamp:0,window_id:id,keycode:None,scancode:Some(scan),keymod:mods,repeat}};
+        let paste=key(S::V,true,M::LGUIMOD,false);
+        let mut events=vec![paste.clone(),key(S::V,true,M::LGUIMOD,true),key(S::V,false,M::LGUIMOD,false),key(S::LGui,false,M::NOMOD,false)];
+        for scan in [S::V,S::A,S::L,S::U,S::E]{events.push(key(scan,true,M::NOMOD,false));events.push(key(scan,false,M::NOMOD,false));}
+        let(reply,rx)=tokio::sync::oneshot::channel();
+        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events});reply.send(Ok(true)).unwrap();
+        let messages=window.poll(&mut input).1;
+        let presses:Vec<_>=messages.iter().filter(|v|v["action"]=="kbd_press").map(|v|v["key"].as_i64().unwrap()).collect();
+        assert_eq!(presses,vec![55,9,9,0,37,32,14]); // Cmd+V, then the complete word "value".
+        assert!(input.release_all().is_empty());
+        // Completion can precede the original V release; suppress only its remaining hold.
+        let(reply,rx)=tokio::sync::oneshot::channel();
+        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:vec![paste.clone()]});reply.send(Ok(true)).unwrap();
+        window.poll(&mut input);assert!(window.paste_key_held);
+        for event in [key(S::V,true,M::LGUIMOD,true),key(S::V,false,M::NOMOD,false)]{window._sdl.event().unwrap().push_event(event).unwrap();}
+        assert!(window.poll(&mut input).1.is_empty());assert!(!window.paste_key_held);
+        // A paste followed by a target/selection/menu change in the same batch is cancelled.
+        let(tx,_requests)=tokio::sync::mpsc::channel(1);window.image_tx=Some(tx);window.image_reader=super::super::image_paste::Reader::Unavailable;
+        for cancel in [Event::MouseButtonDown{timestamp:0,window_id:id,which:0,mouse_btn:MouseButton::Left,clicks:1,x:300,y:300},
+            Event::Window{timestamp:0,window_id:id,win_event:WindowEvent::FocusLost},Event::ClipboardUpdate{timestamp:0},
+            key(S::Escape,true,M::NOMOD,false),key(S::M,true,M::LCTRLMOD|M::LALTMOD,false)] {
+            window.focused=true;window.chrome.menu.open=false;input.release_all();
+            let messages=window.poll_batch(&mut input,vec![paste.clone(),cancel]).1;
+            assert!(window.paste.is_none());assert!(messages.iter().all(|v|!(v["action"]=="kbd_press"&&v["key"]==9)));
+        }
+        assert_eq!(window.clipboard_selection.load(Ordering::Acquire),1);
     }
     #[test] fn clipboard_text_rejects_invalid_or_large_data_and_keeps_empty_text(){
         assert_eq!(clipboard_text(b""),Some(String::new()));
