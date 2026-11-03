@@ -524,6 +524,8 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 
 ## 实验性原生控制端（uuremote-viewer）
 
+可选的[独立会话组件](contrib/independent-viewer/README.md)可按设备创建独立窗口和桌面入口，关闭主窗口后继续连接。安装后以 `UU_VIEWER_INDEPENDENT=1 uuremote-viewer ui` 启用“更多工具”中的入口；默认布局和“快速启动”保持原样。
+
 [SDL 控制端视频调度说明](docs/viewer-video-scheduling.md)。
 
 `uuremote-viewer` 是 Linux 上的**控制端**：用你的 UU 账号连接并控制其他设备（官方 Windows / Mac 被控端，或本项目的 Linux 主机），

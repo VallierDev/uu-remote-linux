@@ -600,6 +600,8 @@ No official "no desktop" error code was found for headless desktop offers, so th
 
 ## Experimental native viewer (uuremote-viewer)
 
+The optional [independent-session companion](contrib/independent-viewer/README.md) gives each device a separate window and desktop entry that survives closing the launcher. After installation, opt in with `UU_VIEWER_INDEPENDENT=1 uuremote-viewer ui` to expose its More tools actions; the default layout and Quick launch section stay intact.
+
 See [SDL viewer video scheduling](docs/viewer-video-scheduling.md).
 
 `uuremote-viewer` is a Linux **viewer/controller**: it connects to and controls other devices on your UU account (official Windows / Mac
