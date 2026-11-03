@@ -535,6 +535,8 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 `ffmpeg` 命令；SDL 桌面窗口直接同步文本剪贴板（Wayland/X11），无需额外剪贴板工具；终端功能需要本机终端程序（可用 `TERMINAL` 指定）。
 从源码构建：`sudo apt install libsdl2-dev`，然后 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`。
 
+组合键使用 SDL 按键事件携带的左右修饰键状态；窗口失焦时释放远端按键，重新聚焦后的下一次普通按键会恢复仍按住的 Shift/Ctrl/Alt/Win（Mac 为 Command）。此行为内置，无需适配库或开关。
+
 SDL 剪贴板复用桌面窗口，避免 GNOME Wayland 上临时窗口引起的 Dock 跳动（#37）。niri 改用支持 data-control 的
 `wl-clipboard`，不需要桌面窗口保持焦点；其他 SDL 后端仅在桌面窗口获得焦点时同步。
 保留 30 KiB 文本上限；跳过不含支持的文本格式的本地选择，空文本的识别取决于 SDL2 后端。不带 SDL 的构建保留命令后端。

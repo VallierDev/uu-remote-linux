@@ -613,6 +613,8 @@ separate from the host `uuremote-server`; the default host build and behaviour a
 terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsdl2-dev`, then
 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`.
 
+Key combinations use the left/right modifier state attached to each SDL key event. Focus loss releases remote keys; after focus returns, the next non-modifier key restores any still-held Shift/Ctrl/Alt/Win (Command on Mac). This is built in, with no adapter or setting required.
+
 SDL clipboard access reuses the desktop window to avoid temporary-window Dock churn on GNOME Wayland (#37).
 On niri, data-control-capable `wl-clipboard` is used instead, so synchronization does not require window focus.
 Other SDL backends synchronize only while that window is focused. The 30 KiB text limit applies. Selections without a supported
