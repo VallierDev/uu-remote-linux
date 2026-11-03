@@ -1184,7 +1184,7 @@ mod wayland_hardware_tests {
     async fn wayland_dma_idle_idr_and_restarts() {
         assert_eq!(std::env::var("UU_WAYLAND_DMABUF").as_deref(), Ok("1"));
         let input = crate::wayland::init().expect("native Wayland desktop");
-        let config = Config {
+        let config = || Config {
             portal: None, display: "wayland:native".into(), input, output: None,
             fps: 30, gop: 15, cq: 26, target_bps: 1_500_000, max_bps: 2_000_000,
             buffer_bits: 250_000, codec: crate::capture_setting::VideoCodec::H264,
@@ -1197,7 +1197,7 @@ mod wayland_hardware_tests {
             let stop = Arc::new(AtomicBool::new(false));
             let idr = Arc::new(AtomicBool::new(false));
             let job = tokio::task::spawn_blocking({
-                let (config, stop, idr) = (config.clone(), stop.clone(), idr.clone());
+                let (config, stop, idr) = (config(), stop.clone(), idr.clone());
                 move || run(config, tx, stop, idr, Arc::new(Semaphore::new(4)))
             });
             let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
