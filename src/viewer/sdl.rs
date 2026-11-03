@@ -151,7 +151,14 @@ impl Window {
                 }
             }
             if let Some(pending)=self.paste.as_mut(){if matches!(event,Event::KeyDown{..}|Event::KeyUp{..}){
-                if pending.events.len()<256 {pending.events.push(event);}else{self.paste=None;prefix.extend(input.release_all());}
+                if pending.events.len()<256 {pending.events.push(event);}else{
+                    // Keep the queue bounded without discarding what was typed while
+                    // the transfer stalled. Cancel only the paste, including its held V.
+                    let mut pending=self.paste.take().unwrap();prefix.extend(input.release_all());
+                    forward.extend(pending.following_events(&mut self.paste_key_held));
+                    if !suppress_paste_key(&mut self.paste_key_held,&event){forward.push(event);}
+                    self.notice=Some((crate::i18n::s("已取消图片粘贴，后续输入已保留", "Image paste cancelled; subsequent typing preserved").into(),std::time::Instant::now()+std::time::Duration::from_secs(5)));redraw=true;
+                }
                 continue
             }}
             forward.push(event);
@@ -936,6 +943,39 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             assert_eq!(presses,vec![9,0,37,32,14]); // Only subsequent "value", never the failed paste.
             assert!(window.paste.is_none());assert!(window.notice.is_some());assert!(input.release_all().is_empty());
         }
+    }
+    #[cfg_attr(target_os="macos",ignore)]
+    #[tokio::test] async fn image_paste_queue_limit_preserves_typing(){
+        if isolated_image_test("viewer::sdl::tests::image_paste_queue_limit_preserves_typing"){return}
+        use sdl2::keyboard::{Scancode as S,Mod as M};
+        let mut window=Window::new().unwrap();window.mac=true;window.chrome.font=None;
+        let id=window.canvas.window().id();let(tx,_requests)=tokio::sync::mpsc::channel(1);
+        window.image_tx=Some(tx);window.image_reader=super::super::image_paste::Reader::Unavailable;
+        for count in [126,127,128,200,1000]{
+            window.paste_key_held=false;let mut input=Input::default();input.set_mac(true);
+            let mut messages=window.poll_batch(&mut input,vec![image_test_key(id,S::LCtrl,true,M::LCTRLMOD),image_test_key(id,S::V,true,M::LCTRLMOD)]).1;
+            let(reply,rx)=tokio::sync::oneshot::channel();let pending=window.paste.as_mut().unwrap();
+            pending.task.abort();pending.task=tokio::spawn(std::future::pending());pending.reply=rx;
+            let mut events=vec![image_test_key(id,S::V,false,M::LCTRLMOD),image_test_key(id,S::LCtrl,false,M::NOMOD)];
+            for _ in 0..count{events.push(image_test_key(id,S::A,true,M::NOMOD));events.push(image_test_key(id,S::A,false,M::NOMOD));}
+            messages.extend(window.poll_batch(&mut input,events).1);
+            let overflow=3+2*count>256;
+            if overflow{assert!(reply.is_closed());assert!(window.paste.is_none());assert!(window.notice.is_some());}
+            else{assert!(window.paste.is_some());reply.send(Ok(true)).unwrap();messages.extend(window.poll_batch(&mut input,vec![]).1);}
+            assert_eq!(messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"]==0).count(),count);
+            assert_eq!(messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"]==9).count(),usize::from(!overflow));
+            assert!(input.release_all().is_empty());
+        }
+        // Overflow while the original V is held must not replay its repeats.
+        let mut input=Input::default();input.set_mac(true);window.paste_key_held=false;
+        let mut messages=window.poll_batch(&mut input,vec![image_test_key(id,S::LCtrl,true,M::LCTRLMOD),image_test_key(id,S::V,true,M::LCTRLMOD)]).1;
+        let(reply,rx)=tokio::sync::oneshot::channel();let pending=window.paste.as_mut().unwrap();
+        pending.task.abort();pending.task=tokio::spawn(std::future::pending());pending.reply=rx;
+        let mut repeat=image_test_key(id,S::V,true,M::LCTRLMOD);if let Event::KeyDown{repeat:flag,..}=&mut repeat{*flag=true;}
+        let mut events=vec![repeat;260];events.extend([image_test_key(id,S::V,false,M::LCTRLMOD),image_test_key(id,S::LCtrl,false,M::NOMOD),image_test_key(id,S::A,true,M::NOMOD),image_test_key(id,S::A,false,M::NOMOD)]);
+        messages.extend(window.poll_batch(&mut input,events).1);assert!(reply.is_closed());assert!(window.paste.is_none());
+        assert!(messages.iter().all(|m|!(m["action"]=="kbd_press"&&m["key"]==9)));
+        assert_eq!(messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"]==0).count(),1);assert!(input.release_all().is_empty());
     }
     #[cfg_attr(target_os="macos",ignore)]
     #[test] fn remote_window_disables_local_text_input_and_forwards_shift(){

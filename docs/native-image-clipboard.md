@@ -17,6 +17,8 @@ It never sends Enter or submits a chat.
 - No PNG: retain the normal text/key path. Read/transfer failure: suppress paste and show an
   in-window message, so the previous remote image is not pasted accidentally. Subsequent
   buffered typing is replayed if focus and selection are unchanged.
+- While a transfer is pending, at most 256 key events are buffered. Reaching the limit
+  cancels the image paste and preserves subsequent typing, with an in-window notice.
 - Focus loss, menu activation, a new clipboard selection or closing the window cancels the
   pending paste and releases held keys. View-only sessions and `UU_VIEWER_CLIPBOARD=0` do not read images.
 - X11/XWayland: native Xlib selection read through an unmapped requestor on a separate connection;
@@ -32,6 +34,7 @@ It never sends Enter or submits a chat.
 缺少可选的 `wl-paste` 程序时，原有文字粘贴仍可使用。复制新内容会结束上一张图片的
 文字去重状态；传输期间继续打字时，仅过滤最初粘贴快捷键的 V，后续输入保留。
 传输失败时也保留后续输入；取消粘贴时，先按顺序处理先前按键，再释放修饰键。
+等待期间输入较多、达到暂存上限时，会取消图片粘贴并保留后续打字，不会静默丢字。
 
 ## 协议证据 / Protocol evidence
 
