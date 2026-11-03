@@ -50,6 +50,13 @@ async fn source() -> Option<PathBuf> {
         let path = PathBuf::from(path); return path.is_absolute().then_some(path);
     }
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+    if desktop.split(':').any(|name| name == "hyprland") {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let xdg = |name, fallback| std::env::var_os(name).map(PathBuf::from)
+            .filter(|p| p.is_absolute()).or_else(|| home.as_ref().map(|p| p.join(fallback)));
+        return omarchy_background(xdg("XDG_STATE_HOME", ".local/state").as_deref(),
+            xdg("XDG_CONFIG_HOME", ".config").as_deref()).await;
+    }
     if desktop.contains("gnome") || desktop.contains("unity") || desktop.contains("cinnamon") {
         let schema = if desktop.contains("cinnamon") { "org.cinnamon.desktop.background" } else { "org.gnome.desktop.background" };
         if schema == "org.gnome.desktop.background" && command("gsettings", &["get", "org.gnome.desktop.interface", "color-scheme"])
@@ -83,6 +90,16 @@ async fn source() -> Option<PathBuf> {
                 if key.ends_with("/last-image") { if let Some(path) = local_path(value) { return Some(path); } }
             }
         }
+    }
+    None
+}
+
+// Omarchy maintains this link when changing wallpaper/theme. Prefer its current
+// XDG state location, while supporting older installations using XDG config.
+async fn omarchy_background(state: Option<&std::path::Path>, config: Option<&std::path::Path>) -> Option<PathBuf> {
+    for root in [state, config].into_iter().flatten() {
+        let path = root.join("omarchy/current/background");
+        if tokio::fs::metadata(&path).await.is_ok_and(|meta| meta.is_file()) { return Some(path); }
     }
     None
 }
@@ -268,6 +285,35 @@ mod tests {
         std::fs::write(&six, "#!/bin/sh\necho Plasma6\n").unwrap();
         std::fs::set_permissions(&six, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(kde_config(&readers, &["--key", "Image"]).await.as_deref(), Some("Plasma6\n"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn omarchy_follows_current_wallpaper_links_and_supports_legacy_location() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("uu-omarchy-{}-{}", std::process::id(), rand::random::<u64>()));
+        let state = root.join("custom-state");
+        let config = root.join("custom-config");
+        for dir in [&state, &config] { std::fs::create_dir_all(dir.join("omarchy/current")).unwrap(); }
+        let current = state.join("omarchy/current/background");
+        let legacy = config.join("omarchy/current/background");
+        let first = root.join("first.png");
+        let second = root.join("second.jpg");
+        std::fs::write(&first, b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(&second, b"\xff\xd8\xff").unwrap();
+        symlink(&second, &legacy).unwrap();
+        let detect = || omarchy_background(Some(&state), Some(&config));
+        assert_eq!(detect().await, Some(legacy.clone()));
+        symlink(&first, &current).unwrap();
+        assert_eq!(detect().await, Some(current.clone()));
+        assert_eq!(read_image(&detect().await.unwrap()).await.unwrap(), std::fs::read(&first).unwrap());
+        std::fs::remove_file(&current).unwrap(); symlink(&second, &current).unwrap();
+        assert_eq!(read_image(&detect().await.unwrap()).await.unwrap(), std::fs::read(&second).unwrap());
+        std::fs::remove_file(&current).unwrap(); symlink(root.join("missing"), &current).unwrap();
+        assert_eq!(detect().await, Some(legacy.clone()));
+        std::fs::remove_file(&current).unwrap(); symlink(&root, &current).unwrap();
+        assert_eq!(detect().await, Some(legacy.clone()));
+        std::fs::remove_file(&legacy).unwrap();
+        assert_eq!(detect().await, None);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]

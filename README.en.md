@@ -26,7 +26,7 @@
 ## Appearance / 外观
 
 Signed-in graphical hosts report the system wallpaper for disconnected device cards in official clients
-(no desktop-window screenshot). GNOME/Cinnamon, KDE and Xfce are supported; checks run every 60 seconds
+(no desktop-window screenshot). GNOME/Cinnamon, KDE, Xfce and Omarchy on Hyprland are supported (following the current wallpaper); checks run every 60 seconds
 and unchanged content is not uploaded again. Other desktops can set `UU_WALLPAPER=/absolute/path/image.png`
 (PNG/JPEG/WebP). Set `UU_WALLPAPER_UPLOAD=0` to disable; guest and headless hosts skip reporting.
 See [protocol evidence and limitations](docs/wallpaper-protocol.md).
