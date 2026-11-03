@@ -21,6 +21,10 @@ static STATE: Mutex<State> = Mutex::new(State { sessions: 0, active: None });
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PICTURE: AtomicBool = AtomicBool::new(false);
 static POINTER: Mutex<Option<[f64; 4]>> = Mutex::new(None);
+/// Set by any viewer RPC 7 during the current desktop sessions and cleared when the last one
+/// ends. An auto-enable never overrides it, including an RPC that arrives after the connection
+/// opens but before `session_started` bumps the counter.
+static VIEWER_OVERRIDE: AtomicBool = AtomicBool::new(false);
 
 pub fn supported() -> bool { backend::detect().is_some() }
 pub fn active() -> bool { ACTIVE.load(Ordering::Relaxed) }
@@ -80,7 +84,9 @@ fn save_preference(mode: Mode) {
     if let Err(e) = crate::system_actions::merge_save(|s| s.privacy_type = Some(mode.wire_type())) { log::warn!("Privacy mode not saved: {e}"); }
 }
 /// RPC 7: `mode` is None for an unknown privacy_type.
-fn set(enable: bool, mode: Option<Mode>) -> Result<(), String> {
+fn set(enable: bool, mode: Option<Mode>) -> Result<(), String> { set_inner(enable, mode, true) }
+/// `save` records the viewer's preference; the auto-enable path must not overwrite it.
+fn set_inner(enable: bool, mode: Option<Mode>, save: bool) -> Result<(), String> {
     let mut state = STATE.lock().map_err(|_| "privacy state poisoned")?;
     if !enable { return leave(&mut state); }
     let mode = mode.ok_or("unsupported privacy type")?;
@@ -89,7 +95,7 @@ fn set(enable: bool, mode: Option<Mode>) -> Result<(), String> {
     // A failed rollback keeps the record and the guard: the next request, exit or start retries.
     if result.is_err() { if let Err(e) = leave(&mut state) { log::warn!("Privacy rollback failed: {e}"); } }
     drop(state);
-    if result.is_ok() { save_preference(mode); }
+    if result.is_ok() && save { save_preference(mode); }
     result
 }
 /// Why RPC 7 cannot be served at all; checked before answering.
@@ -119,21 +125,83 @@ pub fn rpc_accept(rpc: &[crate::protocol::WireField]) -> Option<(Vec<u8>, Option
 pub const REPORT_ERROR: i32 = -7;
 impl Accepted {
     pub fn apply(self) -> Result<(), String> {
+        VIEWER_OVERRIDE.store(true, Ordering::Relaxed);
         let result = set(self.enable, self.mode);
         if let Err(e) = &result { log::warn!("Privacy request failed: enable={} mode={:?}: {e}", self.enable, self.mode); }
         result
     }
 }
-pub fn session_started() { if let Ok(mut s) = STATE.lock() { s.sessions += 1; } }
+/// `UU_PRIVACY_AUTO` accepts `picture`/`2` and `screen-off`/`3`; anything else leaves the viewer
+/// in charge (and so does the viewer's own RPC 7, which cancels a pending auto-enable).
+fn parse_auto(value: &str) -> Option<Mode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "2" | "picture" => Some(Mode::Picture),
+        "3" | "screen-off" | "screen_off" => Some(Mode::ScreenOff),
+        _ => None,
+    }
+}
+fn auto_mode() -> Option<Mode> { std::env::var("UU_PRIVACY_AUTO").ok().as_deref().and_then(parse_auto) }
+/// Enter the auto mode with the viewer-override check inside the STATE lock, so a request that
+/// lands between the caller's check and this lock still wins. Ok(false): the viewer overrode it.
+fn auto_set(mode: Mode) -> Result<bool, String> {
+    let mut state = STATE.lock().map_err(|_| "privacy state poisoned")?;
+    if VIEWER_OVERRIDE.load(Ordering::Relaxed) { return Ok(false); }
+    if state.sessions == 0 { return Err("no active desktop session".into()); }
+    let result = enter(&mut state, mode);
+    if result.is_err() { if let Err(e) = leave(&mut state) { log::warn!("Privacy rollback failed: {e}"); } }
+    result.map(|_| true)
+}
+/// The capture session and the viewer's CONTROL state need a moment after the peer connects;
+/// retry while the portal session is still missing, and let the viewer's RPC 7 win if it arrives.
+fn auto_enable(mode: Mode) {
+    for attempt in 1..=5 {
+        if VIEWER_OVERRIDE.load(Ordering::Relaxed) {
+            log::info!("Privacy auto: skipped, the viewer already chose a mode");
+            return;
+        }
+        // Not a failure yet: the desktop capture opens its portal session a moment after the peer
+        // connects, and entering without it would roll back and log a restore for nothing.
+        if !crate::portal::available() {
+            log::info!("Privacy auto: waiting for the desktop capture (attempt {attempt})");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
+        match auto_set(mode) {
+            Ok(true) => { log::info!("Privacy auto: enabled mode={mode:?} on attempt {attempt}"); return; }
+            Ok(false) => { log::info!("Privacy auto: skipped, the viewer already chose a mode"); return; }
+            Err(e) if e.contains("no active desktop session") => return,
+            Err(e) if e.contains("Portal desktop unavailable") => {
+                log::info!("Privacy auto: desktop capture not ready (attempt {attempt})");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(e) => { log::warn!("Privacy auto failed: {e}"); return; }
+        }
+    }
+    log::warn!("Privacy auto: giving up; the viewer can still enable the privacy screen");
+}
+pub fn session_started() {
+    let auto = auto_mode();
+    let first = STATE.lock().ok().is_some_and(|mut s| { s.sessions += 1; s.sessions == 1 });
+    let Some(mode) = auto else { return };
+    if !first { return; }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        auto_enable(mode);
+    });
+}
 pub fn session_ended() {
     if let Ok(mut s) = STATE.lock() {
         s.sessions = s.sessions.saturating_sub(1);
-        if s.sessions == 0 { if let Err(e) = leave(&mut s) { log::warn!("Privacy restore failed: {e}"); } }
+        if s.sessions == 0 {
+            VIEWER_OVERRIDE.store(false, Ordering::Relaxed);
+            if let Err(e) = leave(&mut s) { log::warn!("Privacy restore failed: {e}"); }
+        }
     }
 }
 pub fn shutdown() {
     if let Ok(mut s) = STATE.lock() {
         s.sessions = 0;
+        VIEWER_OVERRIDE.store(false, Ordering::Relaxed);
         if let Err(e) = leave(&mut s) { log::warn!("Privacy restore failed: {e}"); }
     }
 }
@@ -167,6 +235,17 @@ pub fn cover_main(args: &[String]) -> i32 { cover::main(args) }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_auto_privacy_modes() {
+        use super::{parse_auto, Mode};
+        assert_eq!(parse_auto("picture"), Some(Mode::Picture));
+        assert_eq!(parse_auto("2"), Some(Mode::Picture));
+        assert_eq!(parse_auto(" screen-off "), Some(Mode::ScreenOff));
+        assert_eq!(parse_auto("3"), Some(Mode::ScreenOff));
+        assert_eq!(parse_auto("0"), None);
+        assert_eq!(parse_auto("off"), None);
+        assert_eq!(parse_auto(""), None);
+    }
     #[test]
     fn enabling_without_a_backend_is_refused_and_reports_off() {
         let bytes = [10, 2, 8, 42, 58, 4, 8, 1, 16, 3];

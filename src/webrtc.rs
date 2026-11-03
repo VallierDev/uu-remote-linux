@@ -1002,6 +1002,7 @@ impl WebRtcSession {
                             // Default file-transfer folder: the desktop user's home directory.
                             let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
                             let (mut desktop, mut promoted, mut lock_reported) = (desktop, false, desktop);
+                            let mut privacy_reported = false;
                             let mut screen = screen;
                             loop {
                             loop {
@@ -1056,11 +1057,20 @@ impl WebRtcSession {
                             if !lock_reported {
                                 lock_reported = true;
                                 tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), crate::session_lock::watch_locked()));
+                            }
+                            // The viewer's menu only learns about a mode it did not ask for (an
+                            // auto-enable) from this push, so desktop peers need it too, not only a
+                            // tool peer promoted to desktop.
+                            if !privacy_reported && crate::privacy_screen::supported() {
+                                privacy_reported = true;
                                 let (channel, sequence, actions) = (channel.clone(), sequence.clone(), init_actions.clone());
                                 let portal = portal_desktop.clone();
                                 let text_out = text_out.clone();
                                 tokio::spawn(async move {
-                                    let mut previous = crate::privacy_screen::current_type();
+                                    // 0 is not a wire type: the first tick must push the effective state.
+                                    // An auto-enable can land before this task starts, and the viewer
+                                    // never sent an RPC to learn the mode from a response.
+                                    let mut previous = 0u8;
                                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
                                     loop {
                                         tick.tick().await;
@@ -1068,6 +1078,7 @@ impl WebRtcSession {
                                         let current = crate::privacy_screen::current_type();
                                         if current == previous { continue; }
                                         previous = current;
+                                        log::info!("Privacy state change pushed: type={current}");
                                         let permission = portal.as_ref().map_or(crate::system_metrics::Permission::Allow, |p| p.snapshot().permission(true));
                                         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                         let payload = actions.metrics_payload(desktop_sound, permission);
@@ -1075,6 +1086,9 @@ impl WebRtcSession {
                                         text_out.metrics(message.clone());
                                         if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
                                         let state = crate::privacy_screen::state_message(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts);
+                                        // Android 4.43.0 handles privacy replies on TEXT; CONTROL stays for
+                                        // viewers that only read the desktop channel.
+                                        let _ = text_out.send(state.clone());
                                         if channel.send(&bytes::Bytes::from(state)).await.is_err() { return; }
                                     }
                                 });
