@@ -118,6 +118,9 @@ struct Index {
           }
         } else {
           Text(this.sharing ? text('共享中：同账号可从设备列表连接，其他账号可通过远程协助连接', "Sharing: use the device list for this account, or assistance for another account") : text('账号已登录', "Signed in")).fontColor('#CDD8E8')
+          Text(text('输入法提示：如需在控制端看到候选栏，请在系统共享弹窗中取消勾选“隐藏敏感信息”。这会让更多屏幕内容进入共享画面。',
+            'Input method: to see candidates on the controller, clear “Hide sensitive information” in the system sharing dialog. This allows more screen content to be shared.'))
+            .fontSize(14).fontColor('#BCEDE5').textAlign(TextAlign.Start)
           if (!this.sharing && !this.preparing) {
             Button(text('开始共享屏幕', "Start screen sharing")).backgroundColor('#36BFA7').fontColor('#061B21').onClick(() => this.beginSharing())
           } else {
