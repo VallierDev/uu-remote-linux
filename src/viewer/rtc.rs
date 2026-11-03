@@ -227,7 +227,7 @@ impl Peer {
                     }
                     if [0,1].contains(&index) && message.data.len()<=super::clipboard::MAX_TEXT*2+1024 {
                         if let Some(tx)=clipboard_tx {
-                            if crate::protocol::decode_wire(&message.data).is_ok_and(|f|f.iter().any(|f|[17,21,22].contains(&f.number))){let _=tx.try_send(message.data.to_vec());}
+                            if crate::protocol::decode_wire(&message.data).is_ok_and(|f|f.iter().any(|f|[17,21,22].contains(&f.number))){if index==super::clipboard::CHANNEL {let _=tx.send(message.data.to_vec()).await;}else{let _=tx.try_send(message.data.to_vec());}}
                         }
                     }
                     // Tools need FILE/BINARY traffic and CONTROL RPC replies (Message 22) only. Official
@@ -309,6 +309,7 @@ impl Peer {
     pub fn ready(&self,policy:ReadyPolicy,explicit:bool)->bool {
         self.observed.echo_received.load(Ordering::Acquire) && match policy {ReadyPolicy::EchoOnly=>true,ReadyPolicy::Explicit=>explicit}
     }
+    pub fn image_sender(&self)->Option<super::image_paste::Sender>{self.clipboard.image_sender()}
     pub async fn send_input(&self,value:&Value)->Result<(),String> {
         let channel=&self.channels[0];
         if channel.ready_state()!=webrtc::data_channel::data_channel_state::RTCDataChannelState::Open {return Err("CONTROL is not open".into())}

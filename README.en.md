@@ -1,5 +1,8 @@
 # uu-remote-linux · Unofficial Linux host and viewer for NetEase UU Remote
 
+
+Mac viewer sessions support **Ctrl+V / Command+V PNG screenshot paste** over the native clipboard channel, after all data is confirmed. No separate switch or remote file/terminal tools are needed. See [native image paste](docs/native-image-clipboard.md) for scope and platform limitations.
+
 [简体中文](README.md) | **English**
 
 > **A note first**

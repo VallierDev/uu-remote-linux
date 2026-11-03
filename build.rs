@@ -52,6 +52,10 @@ fn main() {
             }
             x11_build.include("vendor/ffnvcodec");
         }
+        if std::env::var_os("CARGO_FEATURE_VIEWER_SDL").is_some() {
+            println!("cargo:rerun-if-changed=c_engine/viewer_clipboard.c");
+            x11_build.file("c_engine/viewer_clipboard.c");
+        }
         x11_build.compile("x11_engine");
         // libva/libva-drm are dlopen'ed at runtime (like NVENC's libcuda); these are
         // link-time-only deps of the DRI3/VAAPI engines and must stay out of default builds.

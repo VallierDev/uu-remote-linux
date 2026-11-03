@@ -1,5 +1,8 @@
 # uu-remote-linux · UU 远程 Linux 被控端 + 控制端（非官方）
 
+
+Mac 远控窗口支持直接 **Ctrl+V / Command+V 粘贴 PNG 截图**：原生剪贴板通道确认完整后才粘贴，无须额外开关或远端文件/终端工具。范围与平台限制见[原生图片粘贴](docs/native-image-clipboard.md)。
+
 **简体中文** | [English](README.en.md)
 
 > **写在前面**

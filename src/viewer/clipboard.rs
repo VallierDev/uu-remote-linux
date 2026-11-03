@@ -153,9 +153,12 @@ impl SyncState {
     }
 }
 async fn send(channel:&RTCDataChannel,message:Vec<u8>)->Result<(),()>{
-    tokio::time::timeout(Duration::from_secs(2),channel.send(&bytes::Bytes::from(message))).await.map_err(|_|())?.map_err(|_|())?;Ok(())
+    tokio::time::timeout(Duration::from_secs(2),async {
+        while channel.buffered_amount().await>512*1024 {tokio::time::sleep(Duration::from_millis(10)).await;}
+        channel.send(&bytes::Bytes::from(message)).await.map_err(|_|())?;Ok(())
+    }).await.map_err(|_|())?
 }
-pub struct Bridge {backend:Option<Backend>,pub enabled:bool,tx:Option<mpsc::Sender<Vec<u8>>>,task:Option<tokio::task::JoinHandle<()>>,target_mac:Option<bool>}
+pub struct Bridge {image_tx:Option<super::image_paste::Sender>,backend:Option<Backend>,pub enabled:bool,tx:Option<mpsc::Sender<Vec<u8>>>,task:Option<tokio::task::JoinHandle<()>>,target_mac:Option<bool>}
 #[cfg(feature="viewer-sdl")]
 fn sdl_backend(wayland:bool,niri:bool,tx:mpsc::Sender<ClipboardRequest>,find:impl Fn(&str)->Option<PathBuf>)->Option<Backend>{
     if wayland && niri {
@@ -169,27 +172,54 @@ fn sdl_backend(wayland:bool,niri:bool,tx:mpsc::Sender<ClipboardRequest>,find:imp
 impl Bridge {
     pub fn new(desktop:bool)->Self{
         let backend=if desktop{Backend::detect()}else{None};let enabled=backend.is_some();
-        Self{backend,enabled,tx:None,task:None,target_mac:None}
+        Self{image_tx:None,backend,enabled,tx:None,task:None,target_mac:None}
     }
     #[cfg(feature="viewer-sdl")]
     pub fn sdl(tx:mpsc::Sender<ClipboardRequest>)->Self{
         let wayland=std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v|!v.is_empty());
         let backend=(std::env::var("UU_VIEWER_CLIPBOARD").as_deref()!=Ok("0"))
             .then(||sdl_backend(wayland,std::env::var_os("NIRI_SOCKET").is_some(),tx,executable)).flatten();
-        Self{enabled:backend.is_some(),backend,tx:None,task:None,target_mac:None}
+        Self{image_tx:None,enabled:backend.is_some(),backend,tx:None,task:None,target_mac:None}
     }
     pub fn set_target_mac(&mut self,mac:Option<bool>){self.target_mac=mac;}
     pub fn start(&mut self,channel:&Arc<RTCDataChannel>,control:&Arc<RTCDataChannel>,observed:Arc<Observed>){
         let Some(backend)=self.backend.take() else{return};let target_mac=self.target_mac;
-        let (tx,mut rx)=mpsc::channel::<Vec<u8>>(16);self.tx=Some(tx);
+        let (tx,mut rx)=mpsc::channel::<Vec<u8>>(64);self.tx=Some(tx);
+        let(image_tx,mut image_rx)=mpsc::channel::<super::image_paste::Request>(1);
+        if target_mac==Some(true){self.image_tx=Some(image_tx);}
         let channel=Arc::downgrade(channel);let control=Arc::downgrade(control);
         self.task=Some(tokio::spawn(async move{
+            let(write_tx,mut write_rx)=mpsc::channel(2);
+            let writer_channel=channel.clone();
+            tokio::spawn(async move{while let Some(message)=write_rx.recv().await {
+                let Some(c)=writer_channel.upgrade() else{break};if send(&c,message).await.is_err(){break}
+            }});
+            let mut outgoing=std::collections::VecDeque::<Vec<u8>>::new();
+            let mut pending:Option<(tokio::sync::oneshot::Sender<Result<(),()>>,std::time::Instant)>=None;
             let mut state=SyncState{target_mac,..SyncState::default()};let mut tick=tokio::time::interval(POLL);
             let mut retries=0;let mut last_probe=std::time::Instant::now();
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let Some(channel)=channel.upgrade() else{break};
                 tokio::select!{
+                    permit=write_tx.reserve(),if !outgoing.is_empty()=>{
+                        let Ok(permit)=permit else{break};permit.send(outgoing.pop_front().unwrap());
+                    },
+                    request=image_rx.recv(),if target_mac==Some(true)=>{
+                        let Some(request)=request else{break};
+                        if request.reply.is_closed(){continue}
+                        if let Some((reply,_))=pending.take(){let _=reply.send(Err(()));}
+                        if !observed.clipboard_supported.load(Ordering::Acquire) {let _=request.reply.send(Err(()));continue}
+                        // Consume the focused selection's text view before installing PNG.
+                        // Mixed text/image selections must not replace it at the next poll.
+                        if let Ok(Some(text))=backend.read().await {state.last=Some(text);}
+                        if request.reply.is_closed(){continue}
+                        let id=state.next();
+                        match state.rich.offer_png(id,request.data){
+                            Ok(body)=>{outgoing.push_back(wire::envelope(state.next(),21,&body));pending=Some((request.reply,std::time::Instant::now()));},
+                            Err(_)=>{let _=request.reply.send(Err(()));},
+                        }
+                    },
                     data=rx.recv()=>{
                         let Some(data)=data else{break};
                         if !observed.clipboard_supported.load(Ordering::Acquire){continue}
@@ -199,13 +229,19 @@ impl Bridge {
                                     // Update only after the write succeeds; the next poll cannot echo it.
                                     if state.apply(&backend,value).await.is_err(){warn();break}
                                 }
-                                let mut failed=false;for reply in replies{if send(&channel,reply).await.is_err(){failed=true;break}}
-                                if failed{break}
+                                // A separate bounded writer lets block confirmations keep flowing
+                                // while a large image is sent; never drop ACKs behind the sender.
+                                if outgoing.iter().map(Vec::len).sum::<usize>()+replies.iter().map(Vec::len).sum::<usize>()>rich::MAX_IMAGE+2*1024*1024 {break}
+                                outgoing.extend(replies);
+                                if let Some(ok)=state.rich.image_status(){if let Some((reply,_))=pending.take(){let _=reply.send(if ok{Ok(())}else{Err(())});}}
                             },
                             Err(_)=>log::warn!("Viewer clipboard message rejected"),
                         }
                     },
                     _=tick.tick()=>{
+                        if pending.as_ref().is_some_and(|(reply,start)|reply.is_closed()||start.elapsed()>Duration::from_secs(18)) {
+                            if let Some((reply,_))=pending.take(){let _=reply.send(Err(()));}
+                        }
                         if observed.echo_received.load(Ordering::Acquire) && !observed.control_open.load(Ordering::Acquire){break}
                         if !observed.echo_received.load(Ordering::Acquire){continue}
                         if !observed.clipboard_supported.load(Ordering::Acquire){
@@ -218,6 +254,7 @@ impl Bridge {
                             continue
                         }
                         if channel.ready_state()!=webrtc::data_channel::data_channel_state::RTCDataChannelState::Open{continue}
+                        if pending.is_some() || !outgoing.is_empty(){continue}
                         match backend.read().await {
                             Ok(Some(value))=>{let length=value.len();match state.local(value){
                                 Ok(Some(messages))=>{let mut failed=false;for m in messages{if send(&channel,m).await.is_err(){failed=true;break}}if failed{break}log::info!("Viewer local clipboard offered: bytes={length}");},
@@ -230,6 +267,7 @@ impl Bridge {
             }
         }));
     }
+    pub fn image_sender(&self)->Option<super::image_paste::Sender>{self.image_tx.clone()}
     pub fn sender(&self)->Option<mpsc::Sender<Vec<u8>>>{self.tx.clone()}
     pub fn stop(&self){if let Some(task)=&self.task{task.abort();}}
 }
