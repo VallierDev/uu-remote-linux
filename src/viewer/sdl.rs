@@ -345,7 +345,13 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
                             if !repeat{*files=true;messages.extend(input.release_all());}None
                         },
                 _ if !*focused || !input.enabled()=>None,
-                Event::KeyDown{scancode:Some(s),repeat:false,..}=>input.key(s as i32,true),
+                Event::KeyDown{scancode:Some(s),keymod,repeat:false,..}=>{
+                    // FocusLost releases remote keys, while a modifier may remain physically held.
+                    // SDL_Keysym.mod is the event-time snapshot: restore it before the next key,
+                    // without querying the final state of a whole polled batch or typing text.
+                    if !(224..=231).contains(&(s as i32)){messages.extend(sync_modifiers(input,keymod));}
+                    input.key(s as i32,true)
+                },
                 Event::KeyUp{scancode:Some(s),..}=>input.key(s as i32,false),
                 Event::MouseMotion{x,y,..}=>viewport.motion(x as f64,y as f64),
                 Event::MouseButtonDown{mouse_btn,..}=>button(mouse_btn).and_then(|b|input.button(b,true)),
@@ -364,6 +370,18 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
                 messages.push(m);
             }
         } (quit,messages)
+}
+
+fn sync_modifiers(input:&mut Input,keymod:sdl2::keyboard::Mod)->Vec<serde_json::Value>{
+    use sdl2::keyboard::Mod as M;
+    let modifiers=[(224,M::LCTRLMOD),(225,M::LSHIFTMOD),(226,M::LALTMOD),(227,M::LGUIMOD),
+        (228,M::RCTRLMOD),(229,M::RSHIFTMOD),(230,M::RALTMOD),(231,M::RGUIMOD)];
+    let mut out=Vec::new();
+    // Release stale modifiers before pressing new ones. Input deduplicates transitions.
+    // Caps/Num/Scroll Lock and MODE are not physical held modifiers.
+    for down in [false,true]{for (scan,flag) in modifiers{
+        if keymod.contains(flag)==down{out.extend(input.key(scan,down));}
+    }}out
 }
 
 fn needs_redraw(event:&Event)->bool{
@@ -705,6 +723,72 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             }
             job.done = true;
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)] mod modifier_tests {
+    use super::*;
+    use sdl2::keyboard::{Scancode as S,Mod as M};
+    fn key(scan:S,down:bool,mods:M)->Event{
+        if down{Event::KeyDown{timestamp:0,window_id:1,keycode:None,scancode:Some(scan),keymod:mods,repeat:false}}
+        else{Event::KeyUp{timestamp:0,window_id:1,keycode:None,scancode:Some(scan),keymod:mods,repeat:false}}
+    }
+    fn focus(event:WindowEvent)->Event{Event::Window{timestamp:0,window_id:1,win_event:event}}
+    fn send(input:&mut Input,focused:&mut bool,events:impl IntoIterator<Item=Event>)->Vec<serde_json::Value>{
+        translate(events,input,Viewport::fit((800,600),(1920,1080)),focused).1
+    }
+    fn codes(messages:&[serde_json::Value])->Vec<(&str,i64)>{
+        messages.iter().map(|m|(m["action"].as_str().unwrap(),m["key"].as_i64().unwrap())).collect()
+    }
+    #[test] fn held_left_and_right_modifiers_recover_after_focus_return(){
+        for mac in [false,true]{for (scan,flag) in [(S::LCtrl,M::LCTRLMOD),(S::LShift,M::LSHIFTMOD),
+            (S::LAlt,M::LALTMOD),(S::LGui,M::LGUIMOD),(S::RCtrl,M::RCTRLMOD),(S::RShift,M::RSHIFTMOD),
+            (S::RAlt,M::RALTMOD),(S::RGui,M::RGUIMOD)]{
+            let code=|scan:S|i64::from(if mac{super::super::input::mac_keycode(scan as i32)}else{super::super::input::windows_vk(scan as i32)}.unwrap());
+            let mut input=Input::default();input.set_mac(mac);let mut focused=true;
+            let out=send(&mut input,&mut focused,[key(scan,true,flag),focus(WindowEvent::FocusLost)]);
+            assert_eq!(codes(&out),vec![("kbd_press",code(scan)),("kbd_release",code(scan))]);
+            assert!(!focused);
+            let out=send(&mut input,&mut focused,[focus(WindowEvent::FocusGained),key(S::Num2,true,flag),
+                key(S::Num2,false,flag),key(scan,false,M::NOMOD)]);
+            assert_eq!(codes(&out),vec![("kbd_press",code(scan)),("kbd_press",code(S::Num2)),
+                ("kbd_release",code(S::Num2)),("kbd_release",code(scan))]);
+            assert!(input.release_all().is_empty());
+        }}
+    }
+    #[test] fn combined_snapshot_releases_stale_modifiers_before_new_chord(){
+        let mut input=Input::default();input.set_mac(true);let mut focused=true;
+        send(&mut input,&mut focused,[key(S::LShift,true,M::LSHIFTMOD),key(S::RGui,true,M::LSHIFTMOD|M::RGUIMOD)]);
+        let mods=M::RSHIFTMOD|M::LCTRLMOD|M::LALTMOD;
+        let out=send(&mut input,&mut focused,[key(S::A,true,mods),key(S::A,false,mods),
+            key(S::B,true,M::NOMOD),key(S::B,false,M::NOMOD)]);
+        assert_eq!(codes(&out),vec![("kbd_release",56),("kbd_release",54),
+            ("kbd_press",59),("kbd_press",58),("kbd_press",60),("kbd_press",0),("kbd_release",0),
+            ("kbd_release",59),("kbd_release",58),("kbd_release",60),("kbd_press",11),("kbd_release",11)]);
+        assert!(input.release_all().is_empty());
+    }
+    #[test] fn complete_chords_and_overlapping_letters_are_not_duplicated(){
+        let mut input=Input::default();input.set_mac(true);let mut focused=true;
+        let mods=M::LSHIFTMOD|M::RSHIFTMOD;
+        let out=send(&mut input,&mut focused,[key(S::LShift,true,M::LSHIFTMOD),key(S::RShift,true,mods),
+            key(S::A,true,mods),key(S::B,true,mods),key(S::A,false,mods),key(S::LShift,false,M::RSHIFTMOD),
+            key(S::B,false,M::RSHIFTMOD),key(S::RShift,false,M::NOMOD)]);
+        assert_eq!(codes(&out),vec![("kbd_press",56),("kbd_press",60),("kbd_press",0),("kbd_press",11),
+            ("kbd_release",0),("kbd_release",56),("kbd_release",11),("kbd_release",60)]);
+        assert!(input.release_all().is_empty());
+    }
+    #[test] fn snapshot_is_event_time_and_does_not_create_lock_or_view_only_keys(){
+        let mut input=Input::default();let mut focused=true;
+        let out=send(&mut input,&mut focused,[key(S::Num2,true,M::LSHIFTMOD|M::CAPSMOD|M::NUMMOD|M::MODEMOD),
+            key(S::Num2,false,M::LSHIFTMOD),key(S::A,true,M::NOMOD),key(S::A,false,M::NOMOD)]);
+        assert_eq!(codes(&out),vec![("kbd_press",0xa0),("kbd_press",0x32),("kbd_release",0x32),
+            ("kbd_release",0xa0),("kbd_press",0x41),("kbd_release",0x41)]);
+        for watch in [false,true]{
+            let mut input=Input::new(watch);let mut focused=false;
+            assert!(send(&mut input,&mut focused,[key(S::A,true,M::LSHIFTMOD)]).is_empty());
+            if watch{assert!(send(&mut input,&mut focused,[focus(WindowEvent::FocusGained),key(S::A,true,M::LSHIFTMOD)]).is_empty());}
+            assert!(input.release_all().is_empty());
         }
     }
 }
