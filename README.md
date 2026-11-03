@@ -537,6 +537,8 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 
 组合键使用 SDL 按键事件携带的左右修饰键状态；窗口失焦时释放远端按键，重新聚焦后的下一次普通按键会恢复仍按住的 Shift/Ctrl/Alt/Win（Mac 为 Command）。此行为内置，无需适配库或开关。
 
+控制端会同步远端以 PNG 发送的指针形状（如文本光标和窗口缩放箭头），并保留正确热点。离开远控画面或打开本地菜单时恢复本机箭头。
+
 SDL 剪贴板复用桌面窗口，避免 GNOME Wayland 上临时窗口引起的 Dock 跳动（#37）。niri 改用支持 data-control 的
 `wl-clipboard`，不需要桌面窗口保持焦点；其他 SDL 后端仅在桌面窗口获得焦点时同步。
 保留 30 KiB 文本上限；跳过不含支持的文本格式的本地选择，空文本的识别取决于 SDL2 后端。不带 SDL 的构建保留命令后端。

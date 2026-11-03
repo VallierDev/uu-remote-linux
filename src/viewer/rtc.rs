@@ -45,6 +45,7 @@ pub struct Peer {
     clipboard:super::clipboard::Bridge,
     pub tools:super::tools::Inbox,
     pub rumble:super::native_rumble::Feedback,
+    pub cursor:super::cursor::State,
     pub pc:Arc<RTCPeerConnection>,
     pub channels:Vec<Arc<RTCDataChannel>>,
     pub observed:Arc<Observed>,
@@ -80,6 +81,7 @@ impl Peer {
         let pc=Arc::new(api.new_peer_connection(config).await.map_err(|e|format!("Peer creation failed: {}",crate::auth::transport_error(&e)))?);
         let tools:super::tools::Inbox=Arc::new(std::sync::Mutex::new(None));
         let rumble=super::native_rumble::Feedback::default();
+        let cursor=super::cursor::State::default();
         let inbox=tools.clone();
         pc.on_peer_connection_state_change(Box::new(move |state|{
             use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -205,11 +207,11 @@ impl Peer {
                     if [0,3,4].contains(&index){closed.lock().unwrap().take();}
                 })}));
                 let state=observed.clone();let inbox=tools.clone();let clipboard_tx=clipboard.sender();
-                let feedback=rumble.clone();
+                let feedback=rumble.clone();let pointer=cursor.clone();
                 let control_for_echo=if index==0 {Arc::downgrade(&channel)} else {std::sync::Weak::new()};
-                channel.on_message(Box::new(move |message| {let state=state.clone();let inbox=inbox.clone();let control_for_echo=control_for_echo.clone();let clipboard_tx=clipboard_tx.clone();let feedback=feedback.clone();Box::pin(async move {
+                channel.on_message(Box::new(move |message| {let state=state.clone();let inbox=inbox.clone();let control_for_echo=control_for_echo.clone();let clipboard_tx=clipboard_tx.clone();let feedback=feedback.clone();let pointer=pointer.clone();Box::pin(async move {
                     if index==0 {
-                        feedback.receive(&message.data);
+                        feedback.receive(&message.data);pointer.receive(&message.data);
                         let (codecs,chroma)=wire::media_control(&message.data);
                         if let Some(codecs)=codecs {state.encoder_codecs.store(codecs,Ordering::Release);}
                         if let Some(chroma)=chroma {
@@ -257,7 +259,7 @@ impl Peer {
             Ok::<_,String>((channels,tools,clipboard))
         }.await;
         match result {
-            Ok((channels,tools,clipboard))=>Ok(Self{clipboard,tools,rumble,pc,channels,observed,desktop,audio,answered:false,early:Vec::new(),app_id:app_id.into(),ice_id:ice_id.into(),remote_client:remote_client.into()}),
+            Ok((channels,tools,clipboard))=>Ok(Self{clipboard,tools,rumble,cursor,pc,channels,observed,desktop,audio,answered:false,early:Vec::new(),app_id:app_id.into(),ice_id:ice_id.into(),remote_client:remote_client.into()}),
             Err(e)=>{let _=pc.close().await;Err(e)},
         }
     }
