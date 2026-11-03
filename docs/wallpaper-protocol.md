@@ -36,7 +36,11 @@ advertised limit. HTTPS is required and upload redirects are disabled.
 GNOME/Unity/Cinnamon use GSettings (GNOME dark preference included); KDE reads the first image
 wallpaper containment, including image packages, or the installed look-and-feel's default wallpaper
 when no explicit wallpaper is configured; Xfce reads the first `last-image`. Multi-monitor selection, slideshow/XML
-wallpapers, compositor-specific wallpaper daemons, and unsupported formats are not inferred.
+wallpapers and unsupported formats are not inferred.
+On Hyprland, Omarchy's `omarchy/current/background` link is read from `XDG_STATE_HOME`
+(default `~/.local/state`), falling back to the older `XDG_CONFIG_HOME` location
+(default `~/.config`). Wallpaper/theme changes are followed on the next check.
+Other compositor-specific wallpaper daemons are not inferred.
 `UU_WALLPAPER=/absolute/path/image.png` selects a file explicitly; `UU_WALLPAPER_UPLOAD=0` disables
 reporting. PNG, JPEG, and WebP are supported. No desktop screenshot fallback is used.
 
