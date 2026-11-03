@@ -22,8 +22,14 @@ namespace {
 std::vector<Input_MouseEvent> events;
 int next_result = INPUT_SUCCESS;
 constexpr int kInjectedFailure = -10;
+constexpr int kNoFailingAction = -1;
+int failing_action = kNoFailingAction;
 constexpr int kX11LeftButton = 1;
 constexpr int kX11RightButton = 3;
+constexpr int kX11WheelUpButton = 4;
+constexpr int kX11WheelDownButton = 5;
+constexpr int kX11WheelLeftButton = 6;
+constexpr int kX11WheelRightButton = 7;
 }  // namespace
 
 extern "C" {
@@ -41,6 +47,10 @@ void OH_Input_SetMouseEventAxisType(Input_MouseEvent* event, int32_t value) { ev
 void OH_Input_SetMouseEventAxisValue(Input_MouseEvent* event, float value) { event->value = value; }
 int32_t OH_Input_InjectMouseEvent(const Input_MouseEvent* event) {
   events.push_back(*event);
+  if (event->action == failing_action) {
+    failing_action = kNoFailingAction;
+    return kInjectedFailure;
+  }
   int result = next_result;
   next_result = INPUT_SUCCESS;
   return result;
@@ -116,6 +126,52 @@ int main() {
   assert(x11_mouse_relative(10, 20) == INPUT_SUCCESS);
   assert(events.back().x == 110 && events.back().y == 120);
 
+  struct WheelCase {
+    int button;
+    int axis;
+    float value;
+  };
+  const WheelCase wheels[] = {
+      {kX11WheelUpButton, MOUSE_AXIS_SCROLL_VERTICAL, -45},
+      {kX11WheelDownButton, MOUSE_AXIS_SCROLL_VERTICAL, 45},
+      {kX11WheelLeftButton, MOUSE_AXIS_SCROLL_HORIZONTAL, -45},
+      {kX11WheelRightButton, MOUSE_AXIS_SCROLL_HORIZONTAL, 45},
+  };
+  for (const auto& wheel : wheels) {
+    before = events.size();
+    assert(x11_mouse_button(wheel.button, 1) == INPUT_SUCCESS);
+    assert(x11_mouse_button(wheel.button, 0) == INPUT_SUCCESS);
+    assert(events.size() == before + 3);
+    assert(events[before].action == MOUSE_ACTION_AXIS_BEGIN);
+    assert(events[before].value == wheel.value);
+    assert(events[before + 1].action == MOUSE_ACTION_AXIS_UPDATE);
+    assert(events[before + 1].value == wheel.value);
+    assert(events[before + 2].action == MOUSE_ACTION_AXIS_END);
+    assert(events[before + 2].value == 0);
+    for (size_t i = before; i < events.size(); ++i) {
+      assert(events[i].button == MOUSE_BUTTON_NONE);
+      assert(events[i].axis == wheel.axis);
+      assert(events[i].x == 110 && events[i].y == 120);
+      assert(events[i].display == 7);
+    }
+  }
+  // End a started gesture even if UPDATE fails. Never send UPDATE after a
+  // rejected BEGIN, and preserve held buttons across unrelated wheel events.
+  failing_action = MOUSE_ACTION_AXIS_UPDATE;
+  before = events.size();
+  assert(x11_mouse_button(kX11WheelDownButton, 1) == kInjectedFailure);
+  assert(events.size() == before + 3);
+  assert(events.back().action == MOUSE_ACTION_AXIS_END);
+  failing_action = MOUSE_ACTION_AXIS_BEGIN;
+  before = events.size();
+  assert(x11_mouse_button(kX11WheelDownButton, 1) == kInjectedFailure);
+  assert(events.size() == before + 1);
+  assert(x11_mouse_button(kX11LeftButton, 1) == INPUT_SUCCESS);
+  assert(x11_mouse_button(kX11WheelDownButton, 1) == INPUT_SUCCESS);
+  assert(x11_mouse_relative(0, 0) == INPUT_SUCCESS);
+  assert(events.back().button == MOUSE_BUTTON_LEFT);
+  assert(x11_mouse_button(kX11LeftButton, 0) == INPUT_SUCCESS);
+
   // Stopping capture rejects new input but still permits releasing our buttons.
   assert(x11_mouse_button(kX11LeftButton, 1) == INPUT_SUCCESS);
   accept_input.store(false);
@@ -123,6 +179,8 @@ int main() {
   assert(x11_mouse_move(100, 200) != INPUT_SUCCESS);
   assert(x11_mouse_relative(10, 10) != INPUT_SUCCESS);
   assert(x11_mouse_button(kX11RightButton, 1) != INPUT_SUCCESS);
+  assert(x11_mouse_button(kX11WheelDownButton, 1) != INPUT_SUCCESS);
+  assert(x11_mouse_button(kX11WheelDownButton, 0) == INPUT_SUCCESS);
   assert(events.size() == before);
   assert(x11_release_all() == INPUT_SUCCESS);
   assert(events.size() == before + 1);

@@ -51,6 +51,15 @@ constexpr unsigned long kKeypadDigitFirst = 0xffb0;
 constexpr unsigned long kKeypadDigitLast = 0xffb9;
 constexpr size_t kMaxFrames = 4;
 constexpr size_t kMaxFrameBytes = 8 * 1024 * 1024;
+constexpr int kWheelUpButton = 4;
+constexpr int kWheelDownButton = 5;
+constexpr int kWheelLeftButton = 6;
+constexpr int kWheelRightButton = 7;
+// MMI uses wheel angle multiplied by the configured row count; its default
+// mouse mapping is three rows for a 15-degree detent (MouseTransformProcessor).
+constexpr float kWheelDegreesPerDetent = 15.0f;
+constexpr float kDefaultWheelRows = 3.0f;
+constexpr float kWheelStep = kWheelDegreesPerDetent * kDefaultWheelRows;
 std::mutex api_mutex;
 std::mutex frame_mutex;
 std::mutex ui_mutex;
@@ -197,6 +206,21 @@ int SendMouse(int action, int button, int axis = -1, float value = 0,
   return code;
 }
 
+int SendWheelLocked(int button) {
+  const int axis = button <= kWheelDownButton ? MOUSE_AXIS_SCROLL_VERTICAL
+                                            : MOUSE_AXIS_SCROLL_HORIZONTAL;
+  const float value = (button == kWheelUpButton || button == kWheelLeftButton)
+                          ? -kWheelStep : kWheelStep;
+  // ArkUI removes zero-valued BEGIN axes from hit testing. Keep the direction
+  // on BEGIN, then send UPDATE explicitly for injected events with no tool ID.
+  int code = SendMouse(MOUSE_ACTION_AXIS_BEGIN, MOUSE_BUTTON_NONE, axis, value);
+  if (code != INPUT_SUCCESS) return code;
+  // BEGIN/END delimit the gesture; UPDATE carries the actual scroll distance.
+  code = SendMouse(MOUSE_ACTION_AXIS_UPDATE, MOUSE_BUTTON_NONE, axis, value);
+  const int end = SendMouse(MOUSE_ACTION_AXIS_END, MOUSE_BUTTON_NONE, axis, 0);
+  return code == INPUT_SUCCESS ? end : code;
+}
+
 // input_mutex also protects the pressed-button state used by move events.
 int MoveMouseLocked(int x, int y) {
   if (!accept_input.load()) return -1;
@@ -325,13 +349,9 @@ extern "C" int x11_mouse_relative(int dx, int dy) {
 extern "C" int x11_mouse_button(int button, int down) {
   if (down && !accept_input.load()) return -1;
   std::lock_guard<std::mutex> lock(input_mutex);
-  if (button >= 4 && button <= 7) {
+  if (button >= kWheelUpButton && button <= kWheelRightButton) {
     if (!down) return 0;
-    const int axis = button <= 5 ? MOUSE_AXIS_SCROLL_VERTICAL : MOUSE_AXIS_SCROLL_HORIZONTAL;
-    const float value = (button == 4 || button == 7) ? -1 : 1;
-    int code = SendMouse(MOUSE_ACTION_AXIS_BEGIN, MOUSE_BUTTON_NONE, axis, value);
-    if (code == 0) code = SendMouse(MOUSE_ACTION_AXIS_END, MOUSE_BUTTON_NONE, axis, 0);
-    return code;
+    return SendWheelLocked(button);
   }
   const int mapped = button == 1 ? MOUSE_BUTTON_LEFT : button == 2 ? MOUSE_BUTTON_MIDDLE : button == 3 ? MOUSE_BUTTON_RIGHT : MOUSE_BUTTON_NONE;
   if (mapped == MOUSE_BUTTON_NONE) return -1;
