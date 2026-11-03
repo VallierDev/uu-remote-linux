@@ -229,19 +229,19 @@ async fn exercise_locked_video(codec: VideoCodec) {
             .expect("locked video task returned an error");
 
         let live_data = black_frame(codec).await.expect("encode live test sample");
-        peers.track.write_sample_with_extensions(codec, &Sample {
+        peers.track.write_sample_at(codec, &Sample {
             data: live_data,
             duration: Duration::from_millis(20),
             ..Default::default()
-        }, &[]).await.unwrap();
+        }, std::time::Instant::now(), &[]).await.unwrap();
         let live_frame = receive_frame(&mut peers.packets, Duration::from_secs(5)).await;
         assert_single_rtp_frame(&live_frame);
         let first_live_packet = &live_frame[0];
         assert_eq!(first_live_packet.header.ssrc, last_locked_packet.header.ssrc);
         assert_eq!(first_live_packet.header.sequence_number,
             last_locked_packet.header.sequence_number.wrapping_add(1));
-        assert_eq!(first_live_packet.header.timestamp,
-            last_locked_packet.header.timestamp.wrapping_add(90_000));
+        let advance = first_live_packet.header.timestamp.wrapping_sub(last_locked_packet.header.timestamp);
+        assert!(advance > 0 && advance < (1 << 31), "unlock must move media time forward");
 
         peers.close().await;
     }).await.expect("locked video WebRTC test exceeded its deadline");

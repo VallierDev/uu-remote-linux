@@ -1127,16 +1127,15 @@ fn run_wayland_vaapi(
     stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
 ) -> Result<(), String> {
     let _capture = crate::wayland::DmaCaptureGuard::acquire()?;
-    let interval = Duration::from_nanos(1_000_000_000 / u64::from(config.fps.max(1)));
     let dynamic = std::env::var("UU_WAYLAND_DYNAMIC_FPS").as_deref() != Ok("0");
-    let mut next = Instant::now();
+    let mut schedule = crate::wayland::pacing::CaptureSchedule::new(Instant::now(), config.fps);
     let mut pacing = crate::wayland::pacing::FramePacing::new(dynamic);
     let mut report = Instant::now();
     let (mut changed_count, mut keepalive_count) = (0u64,0u64);
     while !stop.load(Ordering::Relaxed) && !units.is_closed() {
-        while Instant::now() < next {
+        while Instant::now() < schedule.deadline() {
             if stop.load(Ordering::Relaxed) || units.is_closed() { return Ok(()); }
-            std::thread::sleep(next.saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+            std::thread::sleep(schedule.deadline().saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
         }
         let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
         let mut packet = None;
@@ -1158,17 +1157,19 @@ fn run_wayland_vaapi(
             packet = Some(vaapi_packet(engine,&idr)?);
             keepalive_count += 1;
         }
+        let mut encoded = false;
         if let Some(data) = packet {
             if !data.is_empty() {
                 if units.blocking_send(EncodedUnit {data,permit,completed_at:Instant::now()}).is_err() { return Ok(()); }
                 pacing.sent(Instant::now());
+                encoded = true;
             }
         }
         if report.elapsed() >= Duration::from_secs(5) {
             log::info!("Wayland VAAPI cadence: seconds={:.2} changed={} keepalive={} target_fps={} dynamic={}",report.elapsed().as_secs_f64(),changed_count,keepalive_count,config.fps,dynamic);
             report=Instant::now(); changed_count=0; keepalive_count=0;
         }
-        next = (next + interval).max(Instant::now());
+        schedule.completed(Instant::now(), encoded);
     }
     Ok(())
 }

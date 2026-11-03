@@ -39,9 +39,13 @@ FPS setting is an upper bound. A static output sends approximately one keepalive
 picture per second; IDR requests can encode the last imported picture sooner.
 The alternate buffer remains pending, so an idle keepalive does not overwrite a
 compositor-owned capture buffer. Capture checks readiness without blocking under
-the input mutex; retries are paced in Rust outside that mutex. A cancelled encoder
+the input mutex; retries are paced in Rust outside that mutex. Pending protocol
+work retries independently of the encoded-frame FPS deadline, with a short retry
+and a 10 ms idle backoff. A cancelled encoder
 releases its pending request before the next stream starts. Current-frame RTP
 timestamps follow encoder completion time, including idle gaps and resumed motion.
+Distinct pictures advance by at least one 90 kHz tick even when FFmpeg splits
+several pictures from one read. Locked-desktop pictures use the same clock.
 
 `UU_WAYLAND_DYNAMIC_FPS=0` restores fixed-rate capture for comparison. This option
 affects only native Wayland VAAPI. It does not change Portal or CPU encoding.
