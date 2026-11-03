@@ -751,7 +751,11 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
     });
     let _idle_watch = idle_watch.map(|task| AbortOnDrop(task.abort_handle()));
     let mut auth = if let Some(session) = assist.as_ref() { session.client.clone() } else {
-        let creds = match config::read_fresh().and_then(|file| Credentials::load(file.as_ref())) {
+        #[cfg(target_env = "ohos")]
+        let credentials = config::read_fresh().and_then(|file| Credentials::load(file.as_ref()));
+        #[cfg(not(target_env = "ohos"))]
+        let credentials = config::file().and_then(Credentials::load);
+        let creds = match credentials {
             Ok(creds) => creds,
             Err(e) => {
                 log::warn!("Not logged in: {e} ({} or UU_* environment variables)", config::path().display());

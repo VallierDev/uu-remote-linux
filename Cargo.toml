@@ -19,13 +19,6 @@ name = "uuremote-viewer"
 path = "src/viewer_main.rs"
 required-features = ["native-viewer"]
 
-[lib]
-name = "uu_remote_harmony"
-path = "src/harmony_lib.rs"
-crate-type = ["staticlib"]
-test = false
-bench = false
-
 [features]
 default = []
 native-viewer = []
@@ -77,7 +70,6 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 cc = "1.0"
 
 [patch.crates-io]
-webrtc-util = { path = "vendor/webrtc-util" }
 # RTP rollover counter survives delayed NACK retransmissions (vendor/webrtc-srtp/PATCHES.md).
 webrtc-srtp = { path = "vendor/webrtc-srtp" }
 webrtc-dtls = { path = "vendor/webrtc-dtls" }

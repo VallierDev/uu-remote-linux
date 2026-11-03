@@ -20,6 +20,16 @@ Rust 静态库与 N-API 模块在该目录内构建，HAP 输出位于
 `project/entry/build/default/outputs/default/`。Linux 的 X11、GTK、PAM、FFmpeg
 和 PulseAudio 不会链接到鸿蒙模块。
 
+鸿蒙 Rust 工程由脚本生成在构建目录的 `rust/` 下，拥有独立的静态库目标和
+`harmony/Cargo.lock`。根目录的 `Cargo.toml`、`Cargo.lock` 保持 Linux 上游定义，
+普通 Linux 构建不创建鸿蒙库，也不启用 `webrtc-util` 本地补丁。
+鸿蒙仅裁减 `nix 0.26.4` 的默认特性，保留 `net/socket`，不升级其版本。
+修改根工程依赖后，可用 `python3 scripts/build-harmony.py --update-lock`
+从根锁文件重新生成并构建鸿蒙锁文件；更新后的 `harmony/Cargo.lock` 需要提交。
+
+构建隔离回归检查：`python3 tests/harmony/build_isolation_test.py`。
+该检查实际解析两个平台的 Cargo 目标和依赖特性，并确认根清单、锁文件未被修改。
+
 未设置签名时生成 unsigned HAP。使用 DevEco Studio 为**这个包名**生成调试签名，
 把 `build-profile.json5` 的本地 `app.signingConfigs` 和产品签名选择放入
 `harmony/signing.local.json` 的 `app` 字段。该文件被 Git 忽略。不要提交证书、
@@ -77,9 +87,15 @@ Rust 静态库与 N-API 模块在该目录内构建，HAP 输出位于
 已通过 ARM64 鸿蒙原生库交叉编译、ArkTS/HAP 编译、独立调试签名及真机安装/启动。
 接入上游 v0.2.47 后，macOS 上原有 Rust 测试为 304 passed，5 ignored；
 托盘关闭、恢复、停止、退出、异常清理及中英文标签另有 5 项测试。
+构建隔离修复后，在 Ubuntu 25.10 / aarch64、Rust 1.96.0 上通过
+`cargo test --locked --offline`（310 passed，8 ignored）、普通 `cargo build`
+及主机程序 `--help` 启动检查。根 Cargo 清单、锁文件与上游 v0.2.47 完全一致，
+Linux 实际依赖图的版本、来源、特性和边均与上游一致。
+鸿蒙静态库与签名 HAP 已重新构建，并在真机安装启动；用户确认画面、点击、拖动和候选栏正常。
+另有 3 项构建隔离回归测试，检查真实 Cargo 目标及特性选择、重复生成与现存文件保护。
 `python3 scripts/test-harmony-native.py` 在 macOS 上使用真实适配代码
 和 SDK 声明，验证拖动、松开、相对移动、注入失败和停止采集时的鼠标事件序列。
 ID/验证码协助复用上游账号协助协议，跨账号实连仍需验收；
-拖动修复已通过适配层事件序列测试，跨平台窗口拖动仍待实连验收。
+拖动修复已通过适配层事件序列测试及本次控制端实连验证；其他客户端组合仍待验收。
 真机视频连接已观察到持续传输，输入法候选栏已由用户确认恢复；
 不能将构建成功视为其他功能的实连验收。

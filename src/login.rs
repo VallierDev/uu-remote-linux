@@ -260,7 +260,10 @@ pub async fn run(gui: bool) -> Result<(), String> {
 
 /// Local installation identifiers only; guest creation does not require device/init.
 pub fn prepare_identity() -> Result<(Value, Credentials), String> {
+    #[cfg(target_env = "ohos")]
     let mut cfg = crate::config::read_fresh()?.unwrap_or_else(|| json!({}));
+    #[cfg(not(target_env = "ohos"))]
+    let mut cfg = crate::config::file()?.cloned().unwrap_or_else(|| json!({}));
     let get = |cfg: &Value, k: &str| std::env::var(format!("UU_{}", k.to_uppercase())).ok().filter(|v| !v.is_empty())
         .or_else(|| cfg.get(k).and_then(|v| v.as_str()).map(str::to_owned)).unwrap_or_default();
     let sign_key = Some(get(&cfg, "sign_key")).filter(|k| !k.is_empty()).unwrap_or_else(|| crate::auth::DEFAULT_SIGN_KEY.into());
