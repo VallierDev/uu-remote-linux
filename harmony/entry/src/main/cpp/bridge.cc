@@ -56,7 +56,7 @@ napi_value Stop(napi_env env, napi_callback_info) {
   uu_host_stop();
   uu_media_stop();
   x11_release_all();
-  OH_Input_CancelInjection();
+  // Ending a sharing session releases input without revoking the user's grant.
   return Integer(env, 0);
 }
 napi_value StartCapture(napi_env env, napi_callback_info info) {
@@ -70,7 +70,18 @@ napi_value StartCapture(napi_env env, napi_callback_info info) {
 }
 void OnAuthorized(Input_InjectionStatus) {}
 napi_value RequestInput(napi_env env, napi_callback_info) {
-  return Integer(env, OH_Input_RequestInjection(OnAuthorized));
+  Input_InjectionStatus authorization = UNAUTHORIZED;
+  Input_Result result = OH_Input_QueryAuthorizedStatus(&authorization);
+  if (result != INPUT_SUCCESS) return Integer(env, result);
+  if (authorization == AUTHORIZED || authorization == AUTHORIZING) {
+    return Integer(env, INPUT_SUCCESS);
+  }
+  result = OH_Input_RequestInjection(OnAuthorized);
+  if (result == INPUT_INJECTION_AUTHORIZED ||
+      result == INPUT_INJECTION_AUTHORIZING) {
+    return Integer(env, INPUT_SUCCESS);
+  }
+  return Integer(env, result);
 }
 napi_value Refresh(napi_env env, napi_callback_info) {
   std::lock_guard<std::mutex> lock(ui_mutex); refresh = true; return Integer(env, 0);
