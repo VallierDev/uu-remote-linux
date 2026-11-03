@@ -101,6 +101,8 @@ jobs:
           cargo build --locked --features wayland,portal,engine-plugins --bin uuremote-server
           for lib in libuu-wayland.so libuu-portal.so; do test -f "target/debug/$lib"; done
           ! readelf -d target/debug/uuremote-server | grep NEEDED | grep -E 'libei|libpipewire|libwayland-client|libxkbcommon'
+      - name: Native Wayland DMA-BUF lease and damage regression (ASan/UBSan)
+        run: sh tests/run-wayland-dmabuf-tests.sh
       - name: Native portal and EIS regression tests (ASan/UBSan)
         env:
           ASAN_OPTIONS: detect_leaks=1
@@ -136,6 +138,7 @@ jobs:
             xvfb-run -a /tmp/uu-uinput-keymap-test
       - run: cargo test --locked --features inproc-av
       - run: cargo test --locked --features inproc-av,wayland,portal
+      - run: cargo check --tests --locked --features inproc-av,wayland,portal,engine-plugins
 
   test-linux-arm64:
     # aarch64 hosts (Ampere A1, arm64 VMs, Apple-silicon VMs) build from source, so keep that

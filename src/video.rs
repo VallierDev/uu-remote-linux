@@ -729,7 +729,8 @@ pub(crate) enum NativeDisplayKind { X11, Wayland, Portal, Kms, None }
 
 pub(crate) fn native_engine_eligible(encoder: Encoder, kind: NativeDisplayKind) -> bool {
     #[cfg(feature = "inproc-av")]
-    { (kind == NativeDisplayKind::X11 || (kind == NativeDisplayKind::Portal && encoder == Encoder::Vaapi))
+    { (kind == NativeDisplayKind::X11 || (encoder == Encoder::Vaapi && (kind == NativeDisplayKind::Portal ||
+        (kind == NativeDisplayKind::Wayland && std::env::var("UU_WAYLAND_VAAPI_INPROC").as_deref() == Ok("1")))))
         && crate::inproc_encoder::selected(encoder) }
     #[cfg(not(feature = "inproc-av"))]
     { let _ = (encoder, kind); false }
@@ -1592,6 +1593,21 @@ mod tests {
             ld_library_path: Some(OsString::from("/opt/ffmpeg/lib/x86_64-linux-gnu")), path: None };
         assert_ne!(path, other_path);
         assert_ne!(path, bundled);
+    }
+
+    #[test]
+    fn damage_driven_idle_then_motion_preserves_rtp_wall_time() {
+        let origin = Instant::now();
+        let mut timeline = RtpTimeline { fps: 30, ..Default::default() };
+        let mut ticks = 0u64;
+        for millis in [0, 1000, 2000, 2033, 2067, 3067] {
+            let duration = timeline.duration_after(origin + Duration::from_millis(millis));
+            let advance = (duration.as_secs_f64() * RTP_CLOCK as f64) as u64;
+            assert!(advance > 0);
+            ticks += advance;
+            let expected = millis * 90 + RTP_CLOCK / 30;
+            assert!(ticks.abs_diff(expected) <= 1, "idle time must not collapse to nominal frame time");
+        }
     }
 
     #[test]

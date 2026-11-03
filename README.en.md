@@ -511,6 +511,9 @@ sends about 12 kbit/s. `UU_VIDEO_CODEC=h265` selects H.265 explicitly for A/B di
 
 ### VAAPI
 
+Hyprland native capture can opt into **DMA-BUF → in-process VAAPI** with damage-driven pacing and low-rate idle keepalives. Build `wayland,inproc-av`, set `UU_WAYLAND_DMABUF=1 UU_WAYLAND_VAAPI_INPROC=1`, and select `vaapi`. It reuses the existing VAAPI engine; see [native Wayland VAAPI](docs/wayland-vaapi.md) for limits, fallback and verification.
+
+
 `UU_VIDEO_ENCODER=vaapi` or `set-encoder vaapi` selects Intel/AMD H.264 VAAPI explicitly.
 `UU_VAAPI_DEVICE` defaults to `/dev/dri/renderD128` (render-node permissions required).
 `auto` is NVENC then CPU when an NVIDIA driver is present, and CPU otherwise. VAAPI is
