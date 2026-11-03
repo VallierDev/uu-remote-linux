@@ -44,6 +44,15 @@ is aimed at the virtual output's region. Needs GTK3.
   `UU_PRIVACY_BLOCK_INPUT=0` to keep local input. KWin saves the device flag, so a `privacy-guard`
   child restores devices and outputs from the record whenever the host ends, including SIGKILL; the
   next start retries too. Devices plugged in during privacy are not blocked.
+- 自动开启：`UU_PRIVACY_AUTO=picture`（或 `2`）在第一个桌面控制端连上后自动启用隐私屏保，
+  `UU_PRIVACY_AUTO=screen-off`（或 `3`）自动关屏；默认关闭。控制端自己的请求优先：一次会话里
+  只要客户端发过隐私请求，待执行的自动开启就不再触发；断开后照常恢复。主机不支持或依赖缺失时
+  只记日志，不影响连接。
+  Auto: `UU_PRIVACY_AUTO=picture` (or `2`) enables picture mode when the first desktop controller
+  connects; `screen-off` (or `3`) turns the physical screens off. Off by default. The viewer's own
+  request wins for that session: once it sends a privacy request, a pending auto-enable does not run,
+  and a disconnect restores as usual. Unsupported hosts or missing tools only log; the connection is
+  unaffected.
 - 这是尽力而为的遮挡，不是保密边界。/ This is best-effort obscuring, not a confidentiality boundary.
 - 恢复记录保存在配置文件旁的 `privacy-power.json`（0600）；崩溃后下次启动重新启用记录的物理屏。
   若主机无法启动，可在本机终端执行 `kscreen-doctor output.<name>.enable`。

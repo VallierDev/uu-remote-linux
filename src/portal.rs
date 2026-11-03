@@ -883,6 +883,10 @@ pub fn monitor_key(connector: &str) -> String { permissions::monitor_key(connect
 pub fn register(session: &Arc<PortalSession>) {
     *ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(session));
 }
+/// Whether a desktop capture session is registered for monitor/virtual switching.
+pub fn available() -> bool {
+    ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(std::sync::Weak::upgrade).is_some()
+}
 /// Privacy screen: see `Session::set_virtual`. Restoring without a live session is a no-op;
 /// failures switching a live session must reach the controller so its recovery record survives.
 pub fn set_virtual_active(on: bool) -> Result<(), String> {
