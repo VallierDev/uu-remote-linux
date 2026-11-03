@@ -197,7 +197,21 @@ int SendMouse(int action, int button, int axis = -1, float value = 0,
   return code;
 }
 
-
+// input_mutex also protects the pressed-button state used by move events.
+int MoveMouseLocked(int x, int y) {
+  if (!accept_input.load()) return -1;
+  x = std::clamp(x, 0, display_width.load() - 1);
+  y = std::clamp(y, 0, display_height.load() - 1);
+  // WindowManager's MoveDragController rejects mouse moves without LEFT.
+  // OH_Input_InjectMouseEvent replaces ButtonId on every event, including MOVE.
+  const int button = held_buttons.count(MOUSE_BUTTON_LEFT)
+                         ? MOUSE_BUTTON_LEFT
+                         : held_buttons.empty() ? MOUSE_BUTTON_NONE
+                                                : *held_buttons.begin();
+  int code = SendMouse(MOUSE_ACTION_MOVE, button, -1, 0, x, y);
+  if (code == 0) { pointer_x.store(x); pointer_y.store(y); }
+  return code;
+}
 }  // namespace steamsir::ohos
 using namespace steamsir::ohos;
 
@@ -301,15 +315,12 @@ extern "C" int x11_key_symbol(unsigned long symbol, int down) {
   return code;
 }
 extern "C" int x11_mouse_move(int x, int y) {
-  if (!accept_input.load()) return -1;
-  x = std::clamp(x, 0, display_width.load() - 1);
-  y = std::clamp(y, 0, display_height.load() - 1);
-  int code = SendMouse(MOUSE_ACTION_MOVE, MOUSE_BUTTON_NONE, -1, 0, x, y);
-  if (code == 0) { pointer_x.store(x); pointer_y.store(y); }
-  return code;
+  std::lock_guard<std::mutex> lock(input_mutex);
+  return MoveMouseLocked(x, y);
 }
 extern "C" int x11_mouse_relative(int dx, int dy) {
-  return x11_mouse_move(pointer_x.load() + dx, pointer_y.load() + dy);
+  std::lock_guard<std::mutex> lock(input_mutex);
+  return MoveMouseLocked(pointer_x.load() + dx, pointer_y.load() + dy);
 }
 extern "C" int x11_mouse_button(int button, int down) {
   if (down && !accept_input.load()) return -1;
