@@ -25,6 +25,8 @@
 
 ## Appearance / 外观
 
+Launcher icons use the system icon theme instead of emoji glyphs, so they do not depend on emoji font coverage.
+
 Signed-in graphical hosts report the system wallpaper for disconnected device cards in official clients
 (no desktop-window screenshot). GNOME/Cinnamon, KDE, Xfce and Omarchy on Hyprland are supported (following the current wallpaper); checks run every 60 seconds
 and unchanged content is not uploaded again. Other desktops can set `UU_WALLPAPER=/absolute/path/image.png`
