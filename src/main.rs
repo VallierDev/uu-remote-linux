@@ -855,8 +855,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                 Arc::new(cli)
             }
             Err(e) => {
-                let _ = e;
-                log::error!("Failed to connect signaling; retrying in 5s (details omitted)");
+                // ws_transport errors carry only a category or HTTP status, never the token or URL.
+                log::error!("Failed to connect signaling; retrying in 5s: {e}");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
