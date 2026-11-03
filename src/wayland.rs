@@ -575,7 +575,7 @@ unsafe extern "C" fn consume_dma_frame<F: FnMut(&crate::portal::DmaFrame) -> Res
     context.result = Some(result); code
 }
 /// A DMA-BUF lease: the consumer must synchronize GPU reads before returning.
-/// `false` means no damage arrived during this bounded wait; the request stays pending.
+/// `false` means damage is not ready; the request stays pending without blocking input.
 pub fn capture_dmabuf<F: FnMut(&crate::portal::DmaFrame) -> Result<(), String>>(damage: bool, consume: F) -> Result<bool, String> {
     #[cfg(all(target_os="linux", feature="wayland"))]
     {

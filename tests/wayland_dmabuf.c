@@ -54,7 +54,7 @@ static int dispatch(struct wl_display *d) {
     return 0;
 }
 static int test_poll(struct pollfd *fd,nfds_t n,int ms) {
-    assert(n==1 && ms>0 && ms<=100); now_ms+=(unsigned)ms;
+    assert(n==1 && ms==0); /* Native capture must never block the input mutex. */ now_ms+=(unsigned)ms;
     fd->revents=pending_event ? POLLIN:0; return pending_event ? 1:0;
 }
 static int test_clock(clockid_t id,struct timespec *out) {
@@ -116,7 +116,7 @@ static void damage_timeout_then_ready_and_cancel(void) {
         assert(frames[0].handle && pending==0 && !consume_calls && !destroy_calls);
         unlocked();
     }
-    assert(now_ms==100 && cancel_calls==2);
+    assert(now_ms==0 && cancel_calls==2); /* No damage wait under the input mutex. */
     // Another engine call can dispatch readiness after the direct call timed out.
     assert(!dma_direct_capture);copy_ready(&frames[0],NULL,0,0,0);
     assert(!map_calls && !frames[0].pixels && frames[0].done);
@@ -124,6 +124,9 @@ static void damage_timeout_then_ready_and_cancel(void) {
     setup();ready_frame(&frames[0],0);frames[0].damage_requested=1;
     assert(uu_wl_capture_dmabuf(consume,(void*)9,1)==1);
     assert(uu_wl_capture_dmabuf_cancel()==0 && destroy_calls==1 && !frames[0].handle);
+    setup();ready_frame(&frames[0],0);frames[0].damage_requested=1;pending_event=1;
+    assert(uu_wl_capture_dmabuf(consume,(void*)9,1)==0 && consume_calls==1);
+    assert(!pending_event && !map_calls);
     unlocked();
 }
 static void restart_and_capture_request_policy(void) {

@@ -121,6 +121,24 @@ static int dispatch_until_timeout(int *condition,int timeout_ms) {
     }
     return 0;
 }
+/* Native capture shares this connection with input. Never wait for damage
+ * while owning lock: Rust paces retries outside the engine mutex. */
+static int dispatch_available(int *condition) {
+    while (wl_display_prepare_read(display)!=0) {
+        if (wl_display_dispatch_pending(display)<0) return -1;
+        if (*condition) return 0;
+    }
+    if (wl_display_flush(display)<0) { wl_display_cancel_read(display); return -1; }
+    struct pollfd fd={wl_display_get_fd(display),POLLIN,0};
+    int ready=poll(&fd,1,0);
+    if (ready>0 && (fd.revents&POLLIN)) {
+        if (wl_display_read_events(display)<0 || wl_display_dispatch_pending(display)<0) return -1;
+    } else {
+        wl_display_cancel_read(display);
+        if (ready<0 || (fd.revents&(POLLERR|POLLHUP))) return -1;
+    }
+    return *condition ? 0:1;
+}
 static int dispatch_until(int *condition) { return dispatch_until_timeout(condition,3000)==0 ? 0:-1; }
 static void sync_done(void *data,struct wl_callback *cb,uint32_t serial) { *(int*)data=1; wl_callback_destroy(cb); }
 static const struct wl_callback_listener sync_listener={sync_done};
@@ -673,7 +691,7 @@ int uu_wl_capture_dmabuf(int (*consume)(const UuDmaFrame*,void*),void *context,i
     dma_direct_capture=1;
     if(frame->handle && (!frame->direct_dma || frame->damage_requested!=damage)) frame_clear(frame);
     if(!frame->handle) { frame->damage_requested=damage; request_frame(frame); }
-    int waited=dispatch_until_timeout(&frame->done,50);
+    int waited=frame->done ? 0:dispatch_available(&frame->done);
     if(waited==1) { result=1; goto end; } /* Keep the pending damage request alive. */
     if(waited!=0 || frame->failed || !frame->dmabuf_used ||
        !frame->bo || frame->bo_fd<0 || (frame->flags&ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT)) goto clear;

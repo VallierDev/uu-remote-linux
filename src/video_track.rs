@@ -18,7 +18,7 @@ pub fn register_hevc(media: &mut webrtc::api::media_engine::MediaEngine) -> Resu
 }
 
 #[derive(Debug)]
-struct Timeline { sequence: u16, timestamp: u32, h264: webrtc::rtp::codecs::h264::H264Payloader }
+struct Timeline { sequence: u16, timestamp: u32, origin: Option<(std::time::Instant, u32)>, h264: webrtc::rtp::codecs::h264::H264Payloader }
 #[derive(Debug)]
 pub struct VideoTrack {
     h264: TrackLocalStaticRTP, h265: TrackLocalStaticRTP,
@@ -32,7 +32,7 @@ impl VideoTrack {
             "video_0".into(), "video_0".into());
         let (progress, _) = tokio::sync::watch::channel((0, VideoCodec::H264));
         Self { progress, h264: track(VideoCodec::H264), h265: track(VideoCodec::H265), has_h264: AtomicBool::new(false),
-            has_h265: AtomicBool::new(false), timeline: Mutex::new(Timeline { sequence: rand::random(), timestamp: rand::random(), h264: Default::default() }) }
+            has_h265: AtomicBool::new(false), timeline: Mutex::new(Timeline { sequence: rand::random(), timestamp: rand::random(), origin: None, h264: Default::default() }) }
     }
     pub fn supports(&self, codec: VideoCodec) -> bool {
         match codec { VideoCodec::H264 => &self.has_h264, VideoCodec::H265 => &self.has_h265 }.load(Ordering::Acquire)
@@ -50,6 +50,13 @@ impl VideoTrack {
         }).await.unwrap_or(false)
     }
     pub async fn write_sample_with_extensions(&self, codec: VideoCodec, sample: &Sample, extensions: &[webrtc::rtp::extension::HeaderExtension]) -> Result<()> {
+        self.write_sample(codec, sample, None, extensions).await
+    }
+    /// Assign this frame's media time before packetization, including idle gaps.
+    pub async fn write_sample_at(&self, codec: VideoCodec, sample: &Sample, completed_at: std::time::Instant, extensions: &[webrtc::rtp::extension::HeaderExtension]) -> Result<()> {
+        self.write_sample(codec, sample, Some(completed_at), extensions).await
+    }
+    async fn write_sample(&self, codec: VideoCodec, sample: &Sample, completed_at: Option<std::time::Instant>, extensions: &[webrtc::rtp::extension::HeaderExtension]) -> Result<()> {
         if !self.supports(codec) { return Err(Error::ErrUnsupportedCodec); }
         let track = match codec { VideoCodec::H264 => &self.h264, VideoCodec::H265 => &self.h265 };
         if track.all_binding_paused().await { return Ok(()); }
@@ -61,7 +68,13 @@ impl VideoTrack {
         };
         let count = payloads.len();
         let mut complete = count > 0;
-        let timestamp = state.timestamp;
+        let timestamp = if let Some(at) = completed_at {
+            let base = state.timestamp;
+            let (origin, stamp) = *state.origin.get_or_insert((at, base));
+            let ticks = (at.saturating_duration_since(origin).as_nanos() * 90_000 + 500_000_000) / 1_000_000_000;
+            stamp.wrapping_add(ticks as u32)
+        } else { state.timestamp };
+        state.timestamp = timestamp;
         state.timestamp = state.timestamp.wrapping_add((sample.duration.as_secs_f64() * 90_000.0) as u32);
         for (index, payload) in payloads.into_iter().enumerate() {
             let packet = Packet { header: Header { version: 2, sequence_number: state.sequence, timestamp,
@@ -147,22 +160,30 @@ mod tests {
         }).await.unwrap();
         let codecs = if !h264 { vec![VideoCodec::H265] } else if hevc { vec![VideoCodec::H264, VideoCodec::H265, VideoCodec::H264] } else { vec![VideoCodec::H264] };
         let mut previous: Option<Packet> = None;
-        for codec in codecs {
+        // Exercise idle -> motion, codec changes and u32 wrap on wire.
+        track.timeline.lock().await.timestamp = u32::MAX - 1000;
+        let origin = std::time::Instant::now();
+        let offsets = [0, 17, 33, 1000, 2000, 2033, 2067, 3067, 3_600_000];
+        let mut first_stamp = None;
+        for (index, millis) in offsets.into_iter().enumerate() {
+            let codec = codecs[index % codecs.len()];
             let data = match codec { VideoCodec::H264 => bytes::Bytes::from_static(&[0,0,1,65,1,2]),
                 VideoCodec::H265 => bytes::Bytes::from_static(&[0,0,1,38,1,2]) };
             let (settings, _) = tokio::sync::watch::channel(crate::capture_setting::VideoSettings { codec, ..Default::default() });
             let applied = track.wait_for_applied(track.revision(), &settings);
             tokio::pin!(applied);
             assert!(tokio::time::timeout(std::time::Duration::from_millis(1), &mut applied).await.is_err());
-            track.write_sample_with_extensions(codec, &Sample { data, duration: std::time::Duration::from_millis(20), ..Default::default() }, &[]).await.unwrap();
+            track.write_sample_at(codec, &Sample { data, duration: std::time::Duration::from_millis(33), ..Default::default() }, origin + std::time::Duration::from_millis(millis), &[]).await.unwrap();
             assert!(applied.await);
             let packet = tokio::time::timeout(std::time::Duration::from_secs(3), packets_rx.recv()).await.unwrap().unwrap();
             assert_eq!(packet.header.payload_type, if codec == VideoCodec::H264 { 102 } else { 126 });
             assert!(packet.header.marker);
+            if index == 0 { assert_eq!(packet.header.timestamp, u32::MAX - 1000); }
+            let first = *first_stamp.get_or_insert(packet.header.timestamp);
+            assert_eq!(packet.header.timestamp.wrapping_sub(first), millis as u32 * 90);
             if let Some(previous) = previous {
                 assert_eq!(packet.header.ssrc, previous.header.ssrc);
                 assert_eq!(packet.header.sequence_number, previous.header.sequence_number.wrapping_add(1));
-                assert_eq!(packet.header.timestamp, previous.header.timestamp.wrapping_add(1800));
             }
             previous = Some(packet);
         }

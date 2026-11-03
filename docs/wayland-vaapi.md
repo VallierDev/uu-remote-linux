@@ -38,8 +38,10 @@ After the first picture, `copy_with_damage` waits for output changes. The viewer
 FPS setting is an upper bound. A static output sends approximately one keepalive
 picture per second; IDR requests can encode the last imported picture sooner.
 The alternate buffer remains pending, so an idle keepalive does not overwrite a
-compositor-owned capture buffer. Waiting is bounded to 50 ms per call, and a
-cancelled encoder releases its pending request before the next stream starts.
+compositor-owned capture buffer. Capture checks readiness without blocking under
+the input mutex; retries are paced in Rust outside that mutex. A cancelled encoder
+releases its pending request before the next stream starts. Current-frame RTP
+timestamps follow encoder completion time, including idle gaps and resumed motion.
 
 `UU_WAYLAND_DYNAMIC_FPS=0` restores fixed-rate capture for comparison. This option
 affects only native Wayland VAAPI. It does not change Portal or CPU encoding.
