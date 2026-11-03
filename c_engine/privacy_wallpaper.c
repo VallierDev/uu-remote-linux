@@ -73,6 +73,9 @@ int uu_privacy_wallpaper_run(const char *image, const int *rects, int count) {
         shown++;
     }
     if (!shown) return 2;
+    /* Map the covers before reporting ready: the host marks them skip-taskbar through KWin right
+       after this line, and KWin can only list windows whose surfaces already exist. */
+    while (gtk_events_pending()) gtk_main_iteration_do(FALSE);
     /* EOF follows the host process, including crashes, rather than its spawning worker thread. */
     GIOChannel *host = g_io_channel_unix_new(0);
     guint watch = g_io_add_watch(host, G_IO_HUP | G_IO_ERR | G_IO_NVAL, host_closed, NULL);

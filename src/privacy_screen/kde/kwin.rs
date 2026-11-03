@@ -23,3 +23,12 @@ pub fn move_windows_to(output: &str) -> Result<(), String> {
     script(&format!(r#"const v = workspace.screens.find(o => o.name == "{output}");
 if (v) for (const w of workspace.windowList()) if (w.normalWindow || w.dialog) workspace.sendClientToScreen(w, v);"#))
 }
+/// Hides the cover window from the task manager. GTK's skip-taskbar hint is an X11 hint and KWin
+/// ignores it on Wayland, so the cover showed up as an unidentified window with the theme's
+/// generic "wayland" icon. `skipTaskbar` is writable through KWin scripting. Picture mode creates
+/// one cover per physical monitor with the same title, and KWin appends " <2>" and so on to
+/// duplicate captions, so match the title as a prefix.
+pub fn hide_cover_from_taskbar() -> Result<(), String> {
+    script(r#"for (const w of workspace.windowList())
+if (w.resourceClass === "uuremote-server" && w.caption.indexOf("uu-remote-linux privacy") === 0) w.skipTaskbar = true;"#)
+}

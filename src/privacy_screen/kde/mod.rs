@@ -47,6 +47,13 @@ fn cover(data: &Data) -> Result<[f64; 4], String> {
     if physical.len() != data.outputs.len() { return Err("physical outputs did not come back".into()); }
     let region = outputs::region(&layout, &virtual_name).ok_or("virtual output geometry")?;
     super::cover::show(wallpaper().as_deref(), &physical)?;
+    // The cover is a plain Wayland toplevel: GTK's skip-taskbar hint is X11-only, so without this
+    // the task manager shows it as an unidentified window with the theme's generic "wayland" icon.
+    // KWin lists a freshly mapped window asynchronously, so one more pass catches a late cover.
+    for pass in 0..2 {
+        if let Err(e) = kwin::hide_cover_from_taskbar() { log::warn!("Privacy cover taskbar: {e}"); break; }
+        if pass == 0 { std::thread::sleep(std::time::Duration::from_millis(200)); }
+    }
     Ok(region)
 }
 
