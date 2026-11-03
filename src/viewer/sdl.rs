@@ -4,9 +4,10 @@ use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum
 #[derive(Debug)] enum Command { Files, Type }
 struct PendingPaste {task:tokio::task::JoinHandle<()>,reply:tokio::sync::oneshot::Receiver<Result<bool,()>>,events:Vec<Event>}
 impl PendingPaste {
-    fn following_events(&mut self,held:&mut bool)->Vec<Event>{
+    fn following_events(&mut self,held:&mut bool,failed:bool)->Vec<Event>{
         *held=true;
-        std::mem::take(&mut self.events).into_iter().skip(1).filter(|e|!suppress_paste_key(held,e)).collect()
+        std::mem::take(&mut self.events).into_iter().skip(1).filter(|e|
+            !if failed{suppress_failed_paste_key(held,e)}else{suppress_paste_key(held,e)}).collect()
     }
 }
 impl Drop for PendingPaste {fn drop(&mut self){self.task.abort();}}
@@ -25,6 +26,13 @@ fn suppress_paste_key(held:&mut bool,event:&Event)->bool {
         Event::KeyDown{scancode:Some(sdl2::keyboard::Scancode::V),repeat,..}=>{if *repeat{true}else{*held=false;false}},
         _=>false,
     }
+}
+// Queued retries share the failed transfer: never replay them against the old
+// remote clipboard. Ordinary V presses still pass, including after a retry's release.
+fn suppress_failed_paste_key(held:&mut bool,event:&Event)->bool {
+    if suppress_paste_key(held,event){return true}
+    if paste_chord(event){*held=true;return true}
+    false
 }
 fn cancels_paste(event:&Event)->bool {
     use sdl2::keyboard::{Mod,Scancode};
@@ -128,9 +136,9 @@ impl Window {
         if let Some(result)=finished {
             let mut pending=self.paste.take().unwrap();
             match result {
-                Ok(true)=>{self.clipboard_dirty=false;prefix.extend(image_paste_keys(input));forward.extend(pending.following_events(&mut self.paste_key_held));self.notice=None;redraw=true;},
+                Ok(true)=>{self.clipboard_dirty=false;prefix.extend(image_paste_keys(input));forward.extend(pending.following_events(&mut self.paste_key_held,false));self.notice=None;redraw=true;},
                 Ok(false)=>{forward.append(&mut pending.events);self.notice=None;redraw=true;},
-                Err(())=>{prefix.extend(input.release_all());forward.extend(pending.following_events(&mut self.paste_key_held));self.notice=Some((crate::i18n::s("图片粘贴失败，请重新复制截图后重试", "Image paste failed; copy the screenshot and try again").into(),std::time::Instant::now()+std::time::Duration::from_secs(5)));redraw=true;},
+                Err(())=>{prefix.extend(input.release_all());forward.extend(pending.following_events(&mut self.paste_key_held,true));self.notice=Some((crate::i18n::s("图片粘贴失败，请重新复制截图后重试", "Image paste failed; copy the screenshot and try again").into(),std::time::Instant::now()+std::time::Duration::from_secs(5)));redraw=true;},
             }
         }
         if self.notice.as_ref().is_some_and(|(_,until)|*until<std::time::Instant::now()){self.notice=None;redraw=true;}
@@ -163,8 +171,8 @@ impl Window {
                     // Keep the queue bounded without discarding what was typed while
                     // the transfer stalled. Cancel only the paste, including its held V.
                     let mut pending=self.paste.take().unwrap();prefix.extend(input.release_all());
-                    forward.extend(pending.following_events(&mut self.paste_key_held));
-                    if !suppress_paste_key(&mut self.paste_key_held,&event){forward.push(event);}
+                    forward.extend(pending.following_events(&mut self.paste_key_held,true));
+                    if !suppress_failed_paste_key(&mut self.paste_key_held,&event){forward.push(event);}
                     self.notice=Some((crate::i18n::s("已取消图片粘贴，后续输入已保留", "Image paste cancelled; subsequent typing preserved").into(),std::time::Instant::now()+std::time::Duration::from_secs(5)));redraw=true;
                 }
                 continue
@@ -952,6 +960,62 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             assert_eq!(presses,vec![9,0,37,32,14]); // Only subsequent "value", never the failed paste.
             assert!(window.paste.is_none());assert!(window.notice.is_some());assert!(input.release_all().is_empty());
         }
+    }
+    #[cfg_attr(target_os="macos",ignore)]
+    #[tokio::test] async fn image_paste_failure_suppresses_queued_retries(){
+        if isolated_image_test("viewer::sdl::tests::image_paste_failure_suppresses_queued_retries"){return}
+        use sdl2::keyboard::{Scancode as S,Mod as M};
+        let mut window=Window::new().unwrap();window.mac=true;window.chrome.font=None;
+        let id=window.canvas.window().id();
+        for (modifier,mods) in [(S::LCtrl,M::LCTRLMOD),(S::RCtrl,M::RCTRLMOD),(S::LGui,M::LGUIMOD),(S::RGui,M::RGUIMOD)]{
+            for result in 0..4 {for released in [false,true]{
+                let mut input=Input::default();input.set_mac(true);input.key(modifier as i32,true);window.paste_key_held=false;
+                let key=|scan,down,mods|image_test_key(id,scan,down,mods);
+                let mut events=vec![key(S::V,true,mods),key(S::V,false,mods),key(modifier,false,M::NOMOD)];
+                for scan in [S::V,S::A,S::L,S::U,S::E]{events.extend([key(scan,true,M::NOMOD),key(scan,false,M::NOMOD)]);}
+                events.extend([key(modifier,true,mods),key(S::V,true,mods),key(S::V,false,mods),key(S::V,true,mods)]);
+                let mut repeat=key(S::V,true,mods);if let Event::KeyDown{repeat:flag,..}=&mut repeat{*flag=true;}
+                events.push(repeat.clone());
+                let release=vec![key(S::V,false,mods),key(modifier,false,M::NOMOD)];
+                if released{events.extend(release.clone());}
+                let(reply,rx)=tokio::sync::oneshot::channel();
+                window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events});
+                match result{0=>reply.send(Err(())).unwrap(),1=>drop(reply),2=>reply.send(Ok(true)).unwrap(),_=>reply.send(Ok(false)).unwrap()}
+                let mut messages=window.poll_batch(&mut input,vec![]).1;
+                assert!(window.paste.is_none());assert_eq!(window.notice.is_some(),result<2);
+                let mut later=if released{vec![]}else{let mut e=vec![repeat];e.extend(release);e};
+                for scan in [S::V,S::A,S::L,S::U,S::E]{later.extend([key(scan,true,M::NOMOD),key(scan,false,M::NOMOD)]);}
+                messages.extend(window.poll_batch(&mut input,later).1);
+                let letters:Vec<_>=messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"].as_i64().is_some_and(|k|k<54)).map(|m|m["key"].as_i64().unwrap()).collect();
+                let expected=if result<2{vec![9,0,37,32,14,9,0,37,32,14]}else{vec![9,9,0,37,32,14,9,9,9,0,37,32,14]};
+                assert_eq!(letters,expected,"result={result}, released={released}, modifier={modifier:?}");
+                assert!(input.release_all().is_empty());assert!(!window.paste_key_held);
+            }}
+        }
+    }
+    #[cfg_attr(target_os="macos",ignore)]
+    #[tokio::test] async fn image_paste_overflow_suppresses_queued_retries(){
+        if isolated_image_test("viewer::sdl::tests::image_paste_overflow_suppresses_queued_retries"){return}
+        use sdl2::keyboard::{Scancode as S,Mod as M};
+        let mut window=Window::new().unwrap();window.mac=true;window.chrome.font=None;
+        let id=window.canvas.window().id();
+        for (modifier,mods) in [(S::LCtrl,M::LCTRLMOD),(S::RCtrl,M::RCTRLMOD),(S::LGui,M::LGUIMOD),(S::RGui,M::RGUIMOD)]{for at_limit in [false,true]{
+            let key=|scan,down,mods|image_test_key(id,scan,down,mods);
+            let mut input=Input::default();input.set_mac(true);input.key(modifier as i32,true);window.paste_key_held=false;
+            let mut events=vec![key(S::V,true,mods),key(S::V,false,mods),key(modifier,false,M::NOMOD)];
+            for _ in 0..121{events.extend([key(S::A,true,M::NOMOD),key(S::A,false,M::NOMOD)]);}
+            for scan in [S::V,S::A,S::L,S::U,S::E]{events.extend([key(scan,true,M::NOMOD),key(scan,false,M::NOMOD)]);}
+            events.push(key(modifier,true,mods));assert_eq!(events.len(),256);
+            let overflow=if at_limit{key(S::V,true,mods)}else{events.pop();events.push(key(S::V,true,mods));key(S::V,false,mods)};
+            let(reply,rx)=tokio::sync::oneshot::channel();
+            window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events});
+            let mut messages=window.poll_batch(&mut input,vec![overflow]).1;
+            assert!(reply.is_closed());assert!(window.paste.is_none());assert!(window.notice.is_some());
+            messages.extend(window.poll_batch(&mut input,vec![key(S::V,false,mods),key(modifier,false,M::NOMOD),key(S::V,true,M::NOMOD),key(S::V,false,M::NOMOD)]).1);
+            assert_eq!(messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"]==9).count(),2,"at_limit={at_limit}, modifier={modifier:?}");
+            assert_eq!(messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"]==0).count(),122);
+            assert!(input.release_all().is_empty());assert!(!window.paste_key_held);
+        }}
     }
     #[cfg_attr(target_os="macos",ignore)]
     #[tokio::test] async fn image_paste_queue_limit_preserves_typing(){

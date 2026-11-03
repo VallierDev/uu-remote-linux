@@ -16,7 +16,9 @@ It never sends Enter or submits a chat.
   Files, image lists, JPEG-only selections and reverse image synchronization are not implemented.
 - No PNG: retain the normal text/key path. Read/transfer failure: suppress paste and show an
   in-window message, so the previous remote image is not pasted accidentally. Subsequent
-  buffered typing is replayed if focus and selection are unchanged.
+  buffered typing is replayed if focus and selection are unchanged. Paste shortcuts queued
+  during a failed transfer (including queue overflow) are suppressed with their V repeats
+  and releases, so they cannot bypass the image barrier and paste stale remote content.
 - While a transfer is pending, at most 256 key events are buffered. Reaching the limit
   cancels the image paste and preserves subsequent typing, with an in-window notice.
 - Focus loss, menu activation, a new clipboard selection or closing the window cancels the
@@ -32,9 +34,11 @@ It never sends Enter or submits a chat.
 目前实机确认的是官方 Mac 接收与 X11/XWayland 控制端路径。SDL2 原生 Wayland
 按需读取仍需各桌面验证，辅助进程引起失焦时会取消本次粘贴。
 缺少可选的 `wl-paste` 程序时，原有文字粘贴仍可使用。复制新内容会结束上一张图片的
-文字去重状态；传输期间继续打字时，仅过滤最初粘贴快捷键的 V，后续输入保留。
+文字去重状态；传输成功后回放打字时，仅过滤最初粘贴快捷键的 V，后续输入保留。
 传输失败时也保留后续输入；取消粘贴时，先按顺序处理先前按键，再释放修饰键。
 等待期间输入较多、达到暂存上限时，会取消图片粘贴并保留后续打字，不会静默丢字。
+传输失败或暂存达到上限时，等待期间重复按下的粘贴快捷键及其 V 长按、松开也会取消，
+避免误贴远端旧内容；普通打字（包括单独输入 V）仍会保留。
 
 ## 协议证据 / Protocol evidence
 
@@ -86,5 +90,5 @@ xvfb-run -a /tmp/viewer-clipboard-test
 The Xvfb test owns an isolated selection and checks normal, 700 KB INCR, oversize and
 unsupported conversions. Rust checks cover PNG bounds, block ordering/ACK correlation,
 text compatibility, absent Wayland helpers, text copied again after a PNG, subsequent V
-keystrokes on success/failure, same-batch target/selection changes, modifier release before
-clicks, and balanced Mac modifier release.
+keystrokes on success/failure, queued paste retries on errors/closed workers/queue overflow,
+same-batch target/selection changes, modifier release before clicks, and balanced Mac modifier release.
