@@ -166,7 +166,7 @@ impl State{
             let key=text_field(ask,2)?;
             if key.len()>256||key.is_empty(){return Err("invalid clipboard block key");}
             let format=if number(ask,1)?==UNICODE_TEXT{Some(TextFormat::Windows)}else if text_field(ask,3).is_ok_and(|s|s==MAC_TEXT){Some(TextFormat::Mac)}else{None};
-            let png=number(ask,1)?==0 && text_field(ask,3)?==PNG;
+            let png=number(ask,1)?==0 && text_field(ask,3).is_ok_and(|s|s==PNG);
             let data=if png {self.image.clone()}else{format.zip(self.local.as_ref()).map(|(format,text)|format.encode(text))};
             let block_bytes=if png {IMAGE_BLOCK_BYTES}else{BLOCK_BYTES};
             if png {log::info!("Viewer PNG data requested: available={} bytes={}",data.is_some(),data.as_ref().map_or(0,Vec::len));}
@@ -239,6 +239,27 @@ impl State{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test] fn optional_format_names_do_not_abort_requests_or_change_text_paste(){
+        let mut source=State::default();let mut id=100;let mut next=||{id+=1;id};
+        let mut empty=Vec::new();string(3,"",&mut empty);
+        let mut invalid_utf8=Vec::new();nested(3,&[0xff],&mut invalid_utf8);
+        let mut wrong_type=Vec::new();int(3,1,&mut wrong_type);
+        let mut unknown=Vec::new();string(3,"unsupported",&mut unknown);
+        for name in [Vec::new(),empty,invalid_utf8,wrong_type,unknown]{
+            source.offer_png(1,include_bytes!("../tests/fixtures/clipboard-test.png").to_vec()).unwrap();
+            let mut ask=Vec::new();int(1,0,&mut ask);string(2,"format-key",&mut ask);ask.extend_from_slice(&name);
+            let out=source.request(&request(2,2,&ask),&mut next).unwrap();
+            assert_eq!(out.messages.len(),1);assert_eq!(out.messages[0].0,22);
+            let confirm=bytes(bytes(&out.messages[0].1,5).unwrap().unwrap(),2).unwrap().unwrap();
+            assert_eq!(number(confirm,1),Ok(2));assert!(source.image_transfer.is_none());
+            // Windows identifies text by numeric id even when the optional name is unusable.
+            source.offer_any_host(3,"text remains available".into()).unwrap();
+            let mut ask=Vec::new();int(1,UNICODE_TEXT,&mut ask);string(2,"text-key",&mut ask);ask.extend_from_slice(&name);
+            let out=source.request(&request(4,2,&ask),&mut next).unwrap();assert_eq!(out.messages.len(),2);
+            let block=bytes(bytes(&out.messages[1].1,9).unwrap().unwrap(),3).unwrap().unwrap();
+            assert_eq!(decode_windows(bytes(block,3).unwrap().unwrap()).unwrap(),"text remains available");
+        }
+    }
     #[test] fn png_offer_and_acknowledgements_are_scoped_and_complete(){
         let mut source=State::default();let mut id=100;let mut next=||{id+=1;id};
         let png=include_bytes!("../tests/fixtures/clipboard-test.png").to_vec();

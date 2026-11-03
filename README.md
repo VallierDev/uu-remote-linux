@@ -1,8 +1,5 @@
 # uu-remote-linux · UU 远程 Linux 被控端 + 控制端（非官方）
 
-
-Mac 远控窗口支持直接 **Ctrl+V / Command+V 粘贴 PNG 截图**：原生剪贴板通道确认完整后才粘贴，无须额外开关或远端文件/终端工具。范围与平台限制见[原生图片粘贴](docs/native-image-clipboard.md)。
-
 **简体中文** | [English](README.en.md)
 
 > **写在前面**
@@ -545,6 +542,8 @@ SDL 剪贴板复用桌面窗口，避免 GNOME Wayland 上临时窗口引起的 
 保留 30 KiB 文本上限；跳过不含支持的文本格式的本地选择，空文本的识别取决于 SDL2 后端。不带 SDL 的构建保留命令后端。
 SDL2 同步读取选择内容，慢速的剪贴板提供者可能暂时阻塞窗口，桥接超时无法中断该原生调用。
 GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不解决被控端兼容问题。
+
+Mac 远控窗口支持直接 **Ctrl+V / Command+V 粘贴 PNG 截图**：原生剪贴板通道确认完整后才粘贴，无须额外开关或远端文件/终端工具。范围与平台限制见[原生图片粘贴](docs/native-image-clipboard.md)。
 
 **使用**：
 - `uuremote-viewer login`：扫码登录（复用同目录下 `uuremote-server` 的登录窗口；`--no-gui` 为终端二维码）。控制端与主机共用
