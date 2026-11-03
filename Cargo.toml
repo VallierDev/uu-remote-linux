@@ -70,6 +70,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 cc = "1.0"
 
 [patch.crates-io]
+webrtc-util = { path = "vendor/webrtc-util" }
 # RTP rollover counter survives delayed NACK retransmissions (vendor/webrtc-srtp/PATCHES.md).
 webrtc-srtp = { path = "vendor/webrtc-srtp" }
 webrtc-dtls = { path = "vendor/webrtc-dtls" }
