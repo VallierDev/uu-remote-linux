@@ -41,7 +41,7 @@ fn image_paste_keys(input:&mut Input)->Vec<serde_json::Value>{
     for (scan,down) in [(227,true),(25,true),(25,false),(227,false)]{if let Some(m)=input.key(scan,down){out.push(m);}}
     out
 }
-pub struct Window { clipboard_selection:Arc<AtomicU64>,paste_key_held:bool,image_reader:super::image_paste::Reader,image_tx:Option<super::image_paste::Sender>,paste:Option<PendingPaste>,notice:Option<(String,std::time::Instant)>,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
+pub struct Window {cursor:super::cursor::Display,clipboard_selection:Arc<AtomicU64>,paste_key_held:bool,image_reader:super::image_paste::Reader,image_tx:Option<super::image_paste::Sender>,paste:Option<PendingPaste>,notice:Option<(String,std::time::Instant)>,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest>,
     pub last_frame:Option<Frame>, chrome:Chrome }
 /// In-window chrome state (src/viewer/hud.rs): menu, network panel, loading screen.
@@ -74,10 +74,18 @@ impl Window {
         let image_reader=super::image_paste::Reader::for_driver(video.current_video_driver());
         log::info!("Viewer clipboard display backend: {}",video.current_video_driver());
         let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
-        Ok(Self{clipboard_selection:Arc::default(),paste_key_held:false,image_reader,image_tx:None,paste:None,notice:None,canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
+        Ok(Self{cursor:super::cursor::Display::new(),clipboard_selection:Arc::default(),paste_key_held:false,image_reader,image_tx:None,paste:None,notice:None,canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
     }
     pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone(),self.clipboard_selection.clone())}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
+    fn sync_cursor(&mut self,state:&super::cursor::State){
+        let mouse=self.events.mouse_state();let(x,y)=(mouse.x() as f64,mouse.y() as f64);let v=self.viewport();
+        let tab=hud::tab_rect(self.chrome.font.as_ref(),self.canvas.window().size(),self.chrome.scale);
+        let active=self.focused&&self.canvas.window().has_mouse_focus()&&!self.chrome.menu.open
+            &&x>=v.x&&y>=v.y&&x<v.x+v.width&&y<v.y+v.height
+            &&!(self.tab_visible()&&tab.contains(x as f32,y as f32));
+        self.cursor.update(state.take(),active);
+    }
     fn viewport(&self)->Viewport {
         let window=self.canvas.window().size();
         if !self.chrome.state.one_to_one {return Viewport::fit(window,self.frame)}
@@ -592,6 +600,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
             _=tick.tick()=>{
                 if let Some(playback)=audio.as_mut(){if playback.pump().is_err(){log::warn!("Viewer audio playback stopped");audio=None;}}
                 let (quit,mut messages)=window.poll(&mut input);
+                window.sync_cursor(&session.peer.cursor);
                 if !window.has_picture() {window.loading_frame(false);}
                 if !restored && session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false) {restored=true;window.restore_remote_settings();}
                 for command in window.take_commands() {
