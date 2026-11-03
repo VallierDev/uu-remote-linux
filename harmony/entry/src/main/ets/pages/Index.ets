@@ -159,7 +159,7 @@ struct Index {
             })
         }
         Blank()
-        Text(text('非官方开源客户端 · 与网易无关', "Unofficial open-source client · Not affiliated with NetEase"))
+        Text(text('非官方开源客户端 · 与网易无关\n关闭窗口会收起到托盘并保持共享；在托盘菜单中选择“退出”可结束运行。', "Unofficial open-source client · Not affiliated with NetEase\nClosing the window keeps sharing in the tray. Choose “Quit” in the tray menu to exit."))
           .fontSize(13).fontColor('#8295B4').textAlign(TextAlign.Center)
       }.padding(40).width('100%')
     }.width('100%').height('100%').backgroundColor('#10182A').align(Alignment.Top)
