@@ -19,6 +19,13 @@ name = "uuremote-viewer"
 path = "src/viewer_main.rs"
 required-features = ["native-viewer"]
 
+[lib]
+name = "uu_remote_harmony"
+path = "src/harmony_lib.rs"
+crate-type = ["staticlib"]
+test = false
+bench = false
+
 [features]
 default = []
 native-viewer = []

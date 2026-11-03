@@ -9,7 +9,7 @@
 use std::sync::{Arc, OnceLock};
 use tokio::sync::watch;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 extern "C" {
     fn x11_cursor_open(display_name: *const libc::c_char) -> libc::c_int;
     fn x11_cursor_wait(timeout_ms: libc::c_int) -> libc::c_int;
@@ -17,17 +17,17 @@ extern "C" {
         hot_x: *mut libc::c_int, hot_y: *mut libc::c_int, force: libc::c_int) -> libc::c_int;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 const MAX_EDGE: usize = 256;
 /// Upper bound between checks; cursor-change events wake the monitor immediately.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 const WAIT_MS: libc::c_int = 250;
 
 #[derive(Debug, PartialEq)]
 pub struct CursorImage { pub width: u32, pub height: u32, pub hot_x: i32, pub hot_y: i32, pub png: Vec<u8> }
 
 /// XFixes delivers premultiplied ARGB32; PNG needs straight-alpha RGBA.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(all(target_os = "linux", not(target_env = "ohos"))), allow(dead_code))]
 fn argb_premultiplied_to_rgba(pixels: &[u32]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(pixels.len() * 4);
     for &pixel in pixels {
@@ -42,7 +42,7 @@ fn argb_premultiplied_to_rgba(pixels: &[u32]) -> Vec<u8> {
 }
 
 /// Minimal 8-bit RGBA PNG (filter 0) using the existing flate2 dependency.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(all(target_os = "linux", not(target_env = "ohos"))), allow(dead_code))]
 pub(crate) fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     use std::io::Write;
     fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -113,7 +113,7 @@ pub fn monitor(display: &str) -> watch::Receiver<Option<Arc<CursorImage>>> {
     }).subscribe()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn start_thread(display: String, tx: watch::Sender<Option<Arc<CursorImage>>>) {
     let spawned = std::thread::Builder::new().name("cursor-shape".into()).spawn(move || {
         let Ok(name) = std::ffi::CString::new(display) else { return };
@@ -139,7 +139,7 @@ fn start_thread(display: String, tx: watch::Sender<Option<Arc<CursorImage>>>) {
     if let Err(e) = spawned { log::warn!("Cursor shape thread failed: {}", e); }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn start_thread(_: String, _: watch::Sender<Option<Arc<CursorImage>>>) {}
 
 #[cfg(test)]

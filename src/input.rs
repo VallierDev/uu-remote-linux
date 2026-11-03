@@ -237,7 +237,7 @@ impl InputInjector {
             if is_press { held.buttons.insert(button); } else { held.buttons.remove(&button); }
         } else if self.backend != crate::desktop_backend::DesktopBackend::Portal { log::warn!("Desktop mouse injection failed: {}",result); }
         static BUTTON_AUDIT:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
-        if self.backend==crate::desktop_backend::DesktopBackend::X11 && BUTTON_AUDIT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
+        if !cfg!(target_env = "ohos") && self.backend==crate::desktop_backend::DesktopBackend::X11 && BUTTON_AUDIT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
             let (mut x,mut y,mut mask)=(0,0,0);
             let query=unsafe {x11_pointer_state(&mut x,&mut y,&mut mask)};
             log::info!("Pointer button audit: button={} down={} result={} query={} x={} y={} mask={}",button,is_press,result,query,x,y,mask);

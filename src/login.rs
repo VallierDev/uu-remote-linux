@@ -33,6 +33,7 @@ fn machine_guid() -> String {
 }
 
 fn os_name() -> String {
+    if cfg!(target_env = "ohos") { return "HarmonyOS".into(); }
     read("/etc/os-release").lines().find_map(|l| l.strip_prefix("PRETTY_NAME=")).map(|v| v.trim_matches('"').to_string())
         .unwrap_or_else(|| "Linux".into())
 }
@@ -97,6 +98,7 @@ fn screen() -> String {
 }
 
 fn hostname() -> String {
+    if cfg!(target_env = "ohos") { return "HarmonyOS".into(); }
     let h = read("/proc/sys/kernel/hostname");
     if h.is_empty() { "Linux".into() } else { h }
 }
@@ -258,7 +260,7 @@ pub async fn run(gui: bool) -> Result<(), String> {
 
 /// Local installation identifiers only; guest creation does not require device/init.
 pub fn prepare_identity() -> Result<(Value, Credentials), String> {
-    let mut cfg = crate::config::file()?.cloned().unwrap_or_else(|| json!({}));
+    let mut cfg = crate::config::read_fresh()?.unwrap_or_else(|| json!({}));
     let get = |cfg: &Value, k: &str| std::env::var(format!("UU_{}", k.to_uppercase())).ok().filter(|v| !v.is_empty())
         .or_else(|| cfg.get(k).and_then(|v| v.as_str()).map(str::to_owned)).unwrap_or_default();
     let sign_key = Some(get(&cfg, "sign_key")).filter(|k| !k.is_empty()).unwrap_or_else(|| crate::auth::DEFAULT_SIGN_KEY.into());
@@ -360,11 +362,21 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
             let (status, resp) = match client.post_with_timeout("/api/v1/qrcode/login/status", Some(&query), timeout).await {
                 Ok(r) => r,
                 Err(e) => {
+                    #[cfg(target_env = "ohos")]
+                    {
+                        log::warn!("QR status transport failed; retrying: {e}");
+                        if ui.take_refresh() { break ""; }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    #[cfg(not(target_env = "ohos"))]
+                    {
                     eprintln!("QR status query failed: {e}; last_status={login_status}");
                     break match e.kind {
                         QrRequestErrorKind::Timeout => crate::i18n::s("二维码状态查询超时（不代表二维码已失效）","QR status check timed out (the QR code may still be valid)"),
                         _ => crate::i18n::s("二维码状态查询失败（不代表二维码已失效）","QR status check failed (the QR code may still be valid)"),
                     };
+                    }
                 }
             };
             match qr_poll_action(login_status, status, &resp) {
@@ -410,7 +422,10 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
                         for (k, v) in fresh { if cfg.get(&k).is_none() { cfg[k] = v; } }
                     }
                     let path = write_config(&cfg)?;
+                    #[cfg(not(target_env = "ohos"))]
                     println!("Logged in as {} ({}); saved to {}", nickname, user, path.display());
+                    #[cfg(target_env = "ohos")]
+                    let _ = path;
                     return Ok(if nickname.is_empty() { user.to_string() } else { nickname.to_string() });
                 }
                 QrPollAction::Failed(reason) => {

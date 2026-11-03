@@ -20,8 +20,16 @@ fn main() {
     println!("cargo:rerun-if-env-changed=UU_NO_GTK");
     println!("cargo:rustc-check-cfg=cfg(uu_gtk)");
 
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("ohos") {
+        println!("cargo:rerun-if-changed=src/ohos/engine.cc");
+        cc::Build::new().cpp(true).file("src/ohos/engine.cc")
+            .flag("-std=c++17").flag("-fno-exceptions").compile("uu_ohos_engine");
+        for library in ["native_avscreen_capture", "native_media_venc", "native_media_codecbase", "native_media_core", "native_window", "ohinput", "hilog_ndk.z"] {
+            println!("cargo:rustc-link-lib={library}");
+        }
+    }
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "linux" {
+    if target_os == "linux" && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos") {
         if std::env::var_os("CARGO_FEATURE_KMS").is_some() {
             println!("cargo:rerun-if-changed=c_engine/kms_engine.c");
             let output=std::process::Command::new("pkg-config").args(["--cflags","libdrm"]).output().expect("KMS requires pkg-config and libdrm development headers");
