@@ -163,6 +163,7 @@ for a new QR login.
 | `src/privacy_screen/`, `c_engine/privacy_wallpaper.c` | host privacy screen (RPC 7): desktop-independent controller, recovery record, guard and cover processes; `Backend` per desktop (`kde/`: KWin virtual output, kscreen-doctor, KWin input devices). See docs/privacy-screen.md |
 | `src/session_lock.rs`, `c_engine/pam_check.c` | lock state reporting, auto unlock via PAM + logind |
 | `src/system_actions.rs`, `src/system_metrics.rs` | SimpleAction system commands, mute, auto-lock, SystemMetrics |
+| `src/annotation.rs`, `c_engine/annotation_overlay.c` | viewer annotation (RPC 27 `draw_req` → RpcResponse 23): click-through X11 ARGB overlay, needs a compositing manager |
 | `src/initialization.rs`, `src/control_protocol.rs`, `src/protocol.rs` | protobuf encoders/decoders for CONTROL |
 | `src/session_ice.rs`, `src/network_diagnostics.rs` | cloud ICE servers, address-free path diagnostics |
 | `src/desktop_backend.rs`, `src/wayland.rs`, `src/portal*.rs` | backend selection, Hyprland, GNOME/KDE portal |
@@ -194,7 +195,7 @@ started a second full host server instead, so check that a subcommand exists in 
 - RPC = Message 21 `RpcRequest {1 header{1 request_id}, <case>}`, answered with Message 22
   `RpcResponse {1 header (same id), <case>}`. Cases used: 2 capture_setting, 3 fps, 4 video_quality,
   6 resolution, 8 file transfer, 9 clipboard, 15 send_video_track, 16–20 plugins, 21 virtual audio policy,
-  28/29 terminal.
+  27 draw (annotation; answered on TEXT, a CONTROL reply times out with 9998), 28/29 terminal.
 - CaptureSettingRequest: field 1 is an **fps option index** (1=30, 2=60, 3=90); the real frame rate is
   field 18 `fpsCount`. Field 2 quality: 1 Fast, 2 General (高清 2M), 3 HD (超清 8M), 4 Bluray (原画 20M),
   5 Auto, 6 Custom. Resolution: 16/17 pixel size or 5/6, 10 resolution_type (3 = follow remote).

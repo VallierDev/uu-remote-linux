@@ -140,6 +140,8 @@ fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_acti
             let closed = matches!(end_pc.connection_state(), State::Closed | State::Failed);
             let ending = actions.clone();
             let _ = tokio::task::spawn_blocking(move || ending.session_ended()).await;
+            // Strokes belong to the viewer that drew them: never leave them on the host screen.
+            crate::annotation::reset(crate::annotation::owner(&actions));
             if closed { return; }
         }
     });
@@ -1201,6 +1203,16 @@ impl WebRtcSession {
                                 return;
                             }
                             if let Some(response) = rpc_fields.as_deref().and_then(crate::privacy_screen::screensaver_response) {
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                return;
+                            }
+                            if let Some((header, body)) = rpc_fields.as_deref().and_then(crate::annotation::draw_request) {
+                                // A toggle waits for the X overlay to open: keep it off the async workers.
+                                let owner = crate::annotation::owner(&actions);
+                                let Ok(response) = tokio::task::spawn_blocking(move || crate::annotation::respond(owner, &header, &body)).await else { return };
+                                // draw_req arrives on CONTROL, but a CONTROL reply timed out (9998) on Mac 4.42.0:
+                                // answer on TEXT like the privacy RPCs above.
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
                                 return;
