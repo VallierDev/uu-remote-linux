@@ -1,39 +1,10 @@
 use super::{desktop::{Frame,FrameSink},input::{Input,Viewport},session::Session};
+use super::paste_input::{Buffer as PasteBuffer,Modifiers,InputEvent,paste_chord,suppress_paste_key,suppress_queued_paste};
 use std::sync::{Arc,atomic::{AtomicU64,Ordering}};
 use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum,rect::Rect};
 #[derive(Debug)] enum Command { Files, Type }
-struct PendingPaste {task:tokio::task::JoinHandle<()>,reply:tokio::sync::oneshot::Receiver<Result<bool,()>>,events:Vec<Event>}
-impl PendingPaste {
-    fn following_events(&mut self,held:&mut bool,failed:bool)->Vec<Event>{
-        *held=true;
-        std::mem::take(&mut self.events).into_iter().skip(1).filter(|e|
-            !if failed{suppress_failed_paste_key(held,e)}else{suppress_paste_key(held,e)}).collect()
-    }
-}
+struct PendingPaste {task:tokio::task::JoinHandle<()>,reply:tokio::sync::oneshot::Receiver<Result<bool,()>>,events:PasteBuffer}
 impl Drop for PendingPaste {fn drop(&mut self){self.task.abort();}}
-fn paste_chord(event:&Event)->bool {
-    use sdl2::keyboard::{Mod,Scancode};
-    matches!(event,Event::KeyDown{scancode:Some(Scancode::V),keymod,repeat:false,..}
-        if keymod.intersects(Mod::LCTRLMOD|Mod::RCTRLMOD|Mod::LGUIMOD|Mod::RGUIMOD)
-        && !keymod.intersects(Mod::LSHIFTMOD|Mod::RSHIFTMOD|Mod::LALTMOD|Mod::RALTMOD))
-}
-// Suppress only the original held V, including repeats/release arriving after
-// transfer completion. A fresh V press belongs to subsequent typing.
-fn suppress_paste_key(held:&mut bool,event:&Event)->bool {
-    if !*held{return false}
-    match event {
-        Event::KeyUp{scancode:Some(sdl2::keyboard::Scancode::V),..}=>{*held=false;true},
-        Event::KeyDown{scancode:Some(sdl2::keyboard::Scancode::V),repeat,..}=>{if *repeat{true}else{*held=false;false}},
-        _=>false,
-    }
-}
-// Queued retries share the failed transfer: never replay them against the old
-// remote clipboard. Ordinary V presses still pass, including after a retry's release.
-fn suppress_failed_paste_key(held:&mut bool,event:&Event)->bool {
-    if suppress_paste_key(held,event){return true}
-    if paste_chord(event){*held=true;return true}
-    false
-}
 fn cancels_paste(event:&Event)->bool {
     use sdl2::keyboard::{Mod,Scancode};
     matches!(event,Event::Quit{..}|Event::ClipboardUpdate{..}|Event::MouseButtonDown{..}|
@@ -49,7 +20,7 @@ fn image_paste_keys(input:&mut Input)->Vec<serde_json::Value>{
     for (scan,down) in [(227,true),(25,true),(25,false),(227,false)]{if let Some(m)=input.key(scan,down){out.push(m);}}
     out
 }
-pub struct Window {cursor:super::cursor::Display,clipboard_selection:Arc<AtomicU64>,paste_key_held:bool,image_reader:super::image_paste::Reader,image_tx:Option<super::image_paste::Sender>,paste:Option<PendingPaste>,notice:Option<(String,std::time::Instant)>,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
+pub struct Window {physical_modifiers:Modifiers,cursor:super::cursor::Display,clipboard_selection:Arc<AtomicU64>,paste_key_held:bool,image_reader:super::image_paste::Reader,image_tx:Option<super::image_paste::Sender>,paste:Option<PendingPaste>,notice:Option<(String,std::time::Instant)>,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest>,
     pub last_frame:Option<Frame>, chrome:Chrome }
 /// In-window chrome state (src/viewer/hud.rs): menu, network panel, loading screen.
@@ -82,7 +53,7 @@ impl Window {
         let image_reader=super::image_paste::Reader::for_driver(video.current_video_driver());
         log::info!("Viewer clipboard display backend: {}",video.current_video_driver());
         let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
-        Ok(Self{cursor:super::cursor::Display::new(),clipboard_selection:Arc::default(),paste_key_held:false,image_reader,image_tx:None,paste:None,notice:None,canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
+        Ok(Self{physical_modifiers:Modifiers::default(),cursor:super::cursor::Display::new(),clipboard_selection:Arc::default(),paste_key_held:false,image_reader,image_tx:None,paste:None,notice:None,canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
     }
     pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone(),self.clipboard_selection.clone())}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
@@ -136,14 +107,15 @@ impl Window {
         if let Some(result)=finished {
             let mut pending=self.paste.take().unwrap();
             match result {
-                Ok(true)=>{self.clipboard_dirty=false;prefix.extend(image_paste_keys(input));forward.extend(pending.following_events(&mut self.paste_key_held,false));self.notice=None;redraw=true;},
-                Ok(false)=>{forward.append(&mut pending.events);self.notice=None;redraw=true;},
-                Err(())=>{prefix.extend(input.release_all());forward.extend(pending.following_events(&mut self.paste_key_held,true));self.notice=Some((crate::i18n::s("图片粘贴失败，请重新复制截图后重试", "Image paste failed; copy the screenshot and try again").into(),std::time::Instant::now()+std::time::Duration::from_secs(5)));redraw=true;},
+                Ok(true)=>{self.clipboard_dirty=false;prefix.extend(image_paste_keys(input));forward.extend(pending.events.following_events(&mut self.paste_key_held));self.notice=None;redraw=true;},
+                Ok(false)=>{forward.extend(pending.events.take());self.notice=None;redraw=true;},
+                Err(())=>{prefix.extend(input.release_all());forward.extend(pending.events.following_events(&mut self.paste_key_held));self.notice=Some((crate::i18n::s("图片粘贴失败，请重新复制截图后重试", "Image paste failed; copy the screenshot and try again").into(),std::time::Instant::now()+std::time::Duration::from_secs(5)));redraw=true;},
             }
         }
         if self.notice.as_ref().is_some_and(|(_,until)|*until<std::time::Instant::now()){self.notice=None;redraw=true;}
         let mut event_focused=self.focused;
         for event in events {
+            let modifiers=self.physical_modifiers.observe(&event);
             // The pre-pass protects an already finished transfer; this also
             // cancels one started by an earlier event in this same SDL batch.
             if cancels_paste(&event) && self.paste.take().is_some(){prefix.extend(input.release_all());self.notice=None;redraw=true;}
@@ -158,30 +130,30 @@ impl Window {
                 if let Some(tx)=self.image_tx.clone(){
                     // Commit earlier presses before buffering this shortcut. A later
                     // same-batch cancellation must release them before forwarding a click.
-                    let(stopped,messages)=translate_actions(std::mem::take(&mut forward),input,viewport,&mut self.focused,&mut self.files);
+                    let(stopped,messages)=translate_input(std::mem::take(&mut forward),input,viewport,&mut self.focused,&mut self.files);
                     quit|=stopped;prefix.extend(messages);if quit{break}
                     let reader=self.image_reader;let selection=self.clipboard_selection.load(Ordering::Acquire);let(reply,rx)=tokio::sync::oneshot::channel();
                     let task=tokio::spawn(async move{let result=super::image_paste::prepare(reader,tx,selection).await;let _=reply.send(result);});
-                    self.paste=Some(PendingPaste{task,reply:rx,events:vec![event]});
+                    self.paste=Some(PendingPaste{task,reply:rx,events:PasteBuffer::new(event)});
                     self.notice=Some((crate::i18n::s("正在准备粘贴…", "Preparing paste…").into(),std::time::Instant::now()+std::time::Duration::from_secs(25)));redraw=true;continue
                 }
             }
             // A wheel must not overtake buffered modifier releases and become
             // an unintended Ctrl/Command-wheel action on the remote host.
             if let Some(pending)=self.paste.as_mut(){if matches!(event,Event::KeyDown{..}|Event::KeyUp{..}|Event::MouseWheel{..}){
-                if pending.events.len()<256 {pending.events.push(event);}else{
+                if let Err(event)=pending.events.push(InputEvent{event,modifiers}){
                     // Keep the queue bounded without discarding what was typed while
                     // the transfer stalled. Cancel only the paste, including its held V.
                     let mut pending=self.paste.take().unwrap();prefix.extend(input.release_all());
-                    forward.extend(pending.following_events(&mut self.paste_key_held,true));
-                    if !suppress_failed_paste_key(&mut self.paste_key_held,&event){forward.push(event);}
+                    forward.extend(pending.events.following_events(&mut self.paste_key_held));
+                    if !suppress_queued_paste(&mut self.paste_key_held,&event.event){forward.push(event);}
                     self.notice=Some((crate::i18n::s("已取消图片粘贴，后续输入已保留", "Image paste cancelled; subsequent typing preserved").into(),std::time::Instant::now()+std::time::Duration::from_secs(5)));redraw=true;
                 }
                 continue
             }}
-            forward.push(event);
+            forward.push(InputEvent{event,modifiers});
         }
-        let (stopped,messages)=translate_actions(forward,input,viewport,&mut self.focused,&mut self.files);
+        let (stopped,messages)=translate_input(forward,input,viewport,&mut self.focused,&mut self.files);
         prefix.extend(messages);let result=(quit||stopped,prefix);
         // A compositor resize (tiling, maximize) leaves the surface without a buffer of the new size
         // until the next frame; a static remote desktop sends none, so repaint the last frame now.
@@ -446,8 +418,12 @@ fn translate(events:impl IntoIterator<Item=Event>,input:&mut Input,viewport:View
     translate_actions(events,input,viewport,focused,&mut false)
 }
 fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewport:Viewport,focused:&mut bool,files:&mut bool)->(bool,Vec<serde_json::Value>){
+        translate_input(events.into_iter().map(InputEvent::from),input,viewport,focused,files)
+}
+fn translate_input(events:impl IntoIterator<Item=InputEvent>,input:&mut Input,viewport:Viewport,focused:&mut bool,files:&mut bool)->(bool,Vec<serde_json::Value>){
         let mut messages=Vec::new();let mut quit=false;
-        for event in events{
+        for InputEvent{event,modifiers} in events{
+            if *focused&&input.enabled(){if let Some(modifiers)=modifiers{messages.extend(sync_modifiers(input,modifiers));}}
             let message=match event {
                 Event::Quit{..}|Event::Window{win_event:WindowEvent::Close,..}=>{quit=true;messages.extend(input.release_all());None},
                 Event::Window{win_event:WindowEvent::FocusLost,..}=>{*focused=false;messages.extend(input.release_all());None},
@@ -955,7 +931,7 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             let mut events=vec![image_test_key(id,S::V,true,M::LCTRLMOD),image_test_key(id,S::V,false,M::LCTRLMOD),image_test_key(id,S::LCtrl,false,M::NOMOD)];
             for scan in [S::V,S::A,S::L,S::U,S::E]{events.push(image_test_key(id,scan,true,M::NOMOD));events.push(image_test_key(id,scan,false,M::NOMOD));}
             let(reply,rx)=tokio::sync::oneshot::channel();
-            window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events});
+            window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:events.into()});
             if closed{drop(reply)}else{reply.send(Err(())).unwrap();}
             let messages=window.poll_batch(&mut input,vec![]).1;
             let presses:Vec<_>=messages.iter().filter(|m|m["action"]=="kbd_press").map(|m|m["key"].as_i64().unwrap()).collect();
@@ -972,31 +948,33 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         window.image_tx=Some(tx);window.image_reader=super::super::image_paste::Reader::Unavailable;
         let key=|scan,down,mods|image_test_key(id,scan,down,mods);
         let wheel=|y,direction|Event::MouseWheel{timestamp:0,window_id:id,which:0,mouse_x:300,mouse_y:300,x:0,y,precise_x:0.,precise_y:0.,direction};
-        for (modifier,mods) in [(S::LCtrl,M::LCTRLMOD),(S::RCtrl,M::RCTRLMOD),(S::LGui,M::LGUIMOD),(S::RGui,M::RGUIMOD)]{for same_batch in [false,true]{for result in 0..4{
+        for (modifier,mods,remote) in [(S::LCtrl,M::LCTRLMOD,59),(S::RCtrl,M::RCTRLMOD,62),(S::LGui,M::LGUIMOD,55),(S::RGui,M::RGUIMOD,54)]{for schedule in 0..3{for result in 0..4{for keep_held in [false,true]{
             let mut input=Input::default();input.set_mac(true);window.paste_key_held=false;
             let mut start=vec![key(modifier,true,mods),key(S::V,true,mods)];
-            let mut following=vec![key(S::V,false,mods),key(modifier,false,M::NOMOD),
-                wheel(1,D::Normal),key(S::LShift,true,M::LSHIFTMOD),wheel(2,D::Flipped),key(S::LShift,false,M::NOMOD),
-                key(S::V,true,M::NOMOD),key(S::V,false,M::NOMOD)];
-            if same_batch{start.append(&mut following);}
+            let current=if keep_held{mods}else{M::NOMOD};
+            let mut following=vec![key(S::V,false,mods)];if !keep_held{following.push(key(modifier,false,M::NOMOD));}
+            following.extend([wheel(1,D::Normal),key(S::LShift,true,current|M::LSHIFTMOD),wheel(2,D::Flipped),key(S::LShift,false,current),
+                key(modifier,false,M::NOMOD),key(S::V,true,M::NOMOD),key(S::V,false,M::NOMOD)]);
+            if schedule==0{start.append(&mut following);}
             let mut messages=window.poll_batch(&mut input,start).1;
             let(reply,rx)=tokio::sync::oneshot::channel();let pending=window.paste.as_mut().unwrap();
             pending.task.abort();pending.task=tokio::spawn(std::future::pending());pending.reply=rx;
-            if !same_batch{messages.extend(window.poll_batch(&mut input,following).1);}
+            let later=if schedule==2{following.split_off(1+usize::from(!keep_held))}else{vec![]};
+            if schedule!=0{messages.extend(window.poll_batch(&mut input,following).1);}
             assert!(messages.iter().all(|m|m["action"]!="mouse_scroll"),"wheel escaped while modifiers were buffered");
             match result{0=>reply.send(Err(())).unwrap(),1=>drop(reply),2=>reply.send(Ok(true)).unwrap(),_=>reply.send(Ok(false)).unwrap()}
-            messages.extend(window.poll_batch(&mut input,vec![]).1);
+            messages.extend(window.poll_batch(&mut input,later).1);
             let mut held=std::collections::BTreeSet::new();let mut wheels=Vec::new();
             for m in &messages{match m["action"].as_str(){
                 Some("kbd_press")=>{held.insert(m["key"].as_i64().unwrap());},
                 Some("kbd_release")=>{held.remove(&m["key"].as_i64().unwrap());},
-                Some("mouse_scroll")=>{wheels.push(m["delta_y"].as_i64().unwrap());assert_eq!(held,if wheels.len()==1{Default::default()}else{[56].into_iter().collect()});},
+                Some("mouse_scroll")=>{wheels.push(m["delta_y"].as_i64().unwrap());let mut expected=std::collections::BTreeSet::new();if keep_held{expected.insert(remote);}if wheels.len()==2{expected.insert(56);}assert_eq!(held,expected,"result={result}, keep_held={keep_held}, modifier={modifier:?}");},
                 _=>(),
             }}
             assert_eq!(wheels,vec![120,-240]);assert!(held.is_empty());assert!(input.release_all().is_empty());
             assert_eq!(messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"]==9).count(),if result<2{1}else{2});
             assert!(window.paste.is_none());
-        }}}
+        }}}}
     }
     #[cfg_attr(target_os="macos",ignore)]
     #[tokio::test] async fn image_paste_wheel_overflow_preserves_scroll(){
@@ -1006,22 +984,28 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         let id=window.canvas.window().id();let(tx,_requests)=tokio::sync::mpsc::channel(1);
         window.image_tx=Some(tx);window.image_reader=super::super::image_paste::Reader::Unavailable;
         let key=|scan,down,mods|image_test_key(id,scan,down,mods);
-        let mut input=Input::default();input.set_mac(true);
-        let mut messages=window.poll_batch(&mut input,vec![key(S::LCtrl,true,M::LCTRLMOD),key(S::V,true,M::LCTRLMOD)]).1;
-        let(reply,rx)=tokio::sync::oneshot::channel();let pending=window.paste.as_mut().unwrap();
-        pending.task.abort();pending.task=tokio::spawn(std::future::pending());pending.reply=rx;
-        let mut events=vec![key(S::V,false,M::LCTRLMOD),key(S::LCtrl,false,M::NOMOD)];
-        for _ in 0..260{events.push(Event::MouseWheel{timestamp:0,window_id:id,which:0,mouse_x:300,mouse_y:300,x:0,y:1,precise_x:0.,precise_y:0.,direction:D::Normal});}
-        messages.extend(window.poll_batch(&mut input,events).1);
-        assert!(reply.is_closed());assert!(window.paste.is_none());assert!(window.notice.is_some());
-        let release=messages.iter().position(|m|m["action"]=="kbd_release"&&m["key"]==59).unwrap();
-        let first_wheel=messages.iter().position(|m|m["action"]=="mouse_scroll").unwrap();assert!(release<first_wheel);
-        assert_eq!(messages.iter().filter(|m|m["action"]=="mouse_scroll").count(),260);
-        assert!(messages.iter().all(|m|!(m["action"]=="kbd_press"&&m["key"]==9)));assert!(input.release_all().is_empty());
+        for (modifier,mods,remote) in [(S::LCtrl,M::LCTRLMOD,59),(S::RCtrl,M::RCTRLMOD,62),(S::LGui,M::LGUIMOD,55),(S::RGui,M::RGUIMOD,54)]{for keep_held in [false,true]{
+            let mut input=Input::default();input.set_mac(true);window.paste_key_held=false;
+            let mut messages=window.poll_batch(&mut input,vec![key(modifier,true,mods),key(S::V,true,mods)]).1;
+            let(reply,rx)=tokio::sync::oneshot::channel();let pending=window.paste.as_mut().unwrap();
+            pending.task.abort();pending.task=tokio::spawn(std::future::pending());pending.reply=rx;
+            let mut events=vec![key(S::V,false,mods)];if !keep_held{events.push(key(modifier,false,M::NOMOD));}
+            for _ in 0..260{events.push(Event::MouseWheel{timestamp:0,window_id:id,which:0,mouse_x:300,mouse_y:300,x:0,y:1,precise_x:0.,precise_y:0.,direction:D::Normal});}
+            events.push(key(modifier,false,M::NOMOD));messages.extend(window.poll_batch(&mut input,events).1);
+            assert!(reply.is_closed());assert!(window.paste.is_none());assert!(window.notice.is_some());
+            let mut held=std::collections::BTreeSet::new();let mut wheels=0;
+            for m in &messages{match m["action"].as_str(){
+                Some("kbd_press")=>{held.insert(m["key"].as_i64().unwrap());},
+                Some("kbd_release")=>{held.remove(&m["key"].as_i64().unwrap());},
+                Some("mouse_scroll")=>{wheels+=1;assert_eq!(held,if keep_held{[remote].into_iter().collect()}else{Default::default()});},_=>(),
+            }}
+            assert_eq!(wheels,260);assert!(held.is_empty());
+            assert!(messages.iter().all(|m|!(m["action"]=="kbd_press"&&m["key"]==9)));assert!(input.release_all().is_empty());
+        }}
     }
     #[cfg_attr(target_os="macos",ignore)]
-    #[tokio::test] async fn image_paste_failure_suppresses_queued_retries(){
-        if isolated_image_test("viewer::sdl::tests::image_paste_failure_suppresses_queued_retries"){return}
+    #[tokio::test] async fn image_paste_coalesces_retries_and_preserves_text_fallback(){
+        if isolated_image_test("viewer::sdl::tests::image_paste_coalesces_retries_and_preserves_text_fallback"){return}
         use sdl2::keyboard::{Scancode as S,Mod as M};
         let mut window=Window::new().unwrap();window.mac=true;window.chrome.font=None;
         let id=window.canvas.window().id();
@@ -1037,7 +1021,7 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
                 let release=vec![key(S::V,false,mods),key(modifier,false,M::NOMOD)];
                 if released{events.extend(release.clone());}
                 let(reply,rx)=tokio::sync::oneshot::channel();
-                window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events});
+                window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:events.into()});
                 match result{0=>reply.send(Err(())).unwrap(),1=>drop(reply),2=>reply.send(Ok(true)).unwrap(),_=>reply.send(Ok(false)).unwrap()}
                 let mut messages=window.poll_batch(&mut input,vec![]).1;
                 assert!(window.paste.is_none());assert_eq!(window.notice.is_some(),result<2);
@@ -1045,8 +1029,15 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
                 for scan in [S::V,S::A,S::L,S::U,S::E]{later.extend([key(scan,true,M::NOMOD),key(scan,false,M::NOMOD)]);}
                 messages.extend(window.poll_batch(&mut input,later).1);
                 let letters:Vec<_>=messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"].as_i64().is_some_and(|k|k<54)).map(|m|m["key"].as_i64().unwrap()).collect();
-                let expected=if result<2{vec![9,0,37,32,14,9,0,37,32,14]}else{vec![9,9,0,37,32,14,9,9,9,0,37,32,14]};
+                let expected=if result<2{vec![9,0,37,32,14,9,0,37,32,14]}else if result==2{vec![9,9,0,37,32,14,9,0,37,32,14]}else{vec![9,9,0,37,32,14,9,9,9,0,37,32,14]};
                 assert_eq!(letters,expected,"result={result}, released={released}, modifier={modifier:?}");
+                if result==2{
+                    let mut held=std::collections::BTreeSet::new();let mut pastes=0;
+                    for m in &messages{match m["action"].as_str(){
+                        Some("kbd_press")=>{let k=m["key"].as_i64().unwrap();if k==9&&!held.is_empty(){assert_eq!(held,[55].into_iter().collect());pastes+=1;}held.insert(k);},
+                        Some("kbd_release")=>{held.remove(&m["key"].as_i64().unwrap());},_=>(),
+                    }}assert_eq!(pastes,1);assert!(held.is_empty());
+                }
                 assert!(input.release_all().is_empty());assert!(!window.paste_key_held);
             }}
         }
@@ -1066,7 +1057,7 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             events.push(key(modifier,true,mods));assert_eq!(events.len(),256);
             let overflow=if at_limit{key(S::V,true,mods)}else{events.pop();events.push(key(S::V,true,mods));key(S::V,false,mods)};
             let(reply,rx)=tokio::sync::oneshot::channel();
-            window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events});
+            window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:events.into()});
             let mut messages=window.poll_batch(&mut input,vec![overflow]).1;
             assert!(reply.is_closed());assert!(window.paste.is_none());assert!(window.notice.is_some());
             messages.extend(window.poll_batch(&mut input,vec![key(S::V,false,mods),key(modifier,false,M::NOMOD),key(S::V,true,M::NOMOD),key(S::V,false,M::NOMOD)]).1);
@@ -1199,7 +1190,7 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         let event=Event::KeyDown{timestamp:0,window_id:window.canvas.window().id(),keycode:None,scancode:Some(sdl2::keyboard::Scancode::V),keymod:sdl2::keyboard::Mod::LGUIMOD,repeat:false};
         input.key(227,true);
         let(reply,rx)=tokio::sync::oneshot::channel();
-        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:vec![event.clone()]});
+        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:vec![event.clone()].into()});
         assert!(window.poll(&mut input).1.is_empty());assert!(window.paste.is_some());
         reply.send(Ok(true)).unwrap();
         window._sdl.event().unwrap().push_event(Event::Window{timestamp:0,window_id:window.canvas.window().id(),win_event:WindowEvent::FocusLost}).unwrap();
@@ -1207,7 +1198,7 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         assert!(messages.iter().all(|v|v["action"]=="kbd_release"));assert!(window.paste.is_none());assert!(!window.focused);
         window.focused=true;
         let(reply,rx)=tokio::sync::oneshot::channel();
-        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:vec![event]});
+        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:vec![event].into()});
         reply.send(Ok(false)).unwrap();
         let messages=window.poll(&mut input).1;
         assert!(messages.iter().any(|v|v["action"]=="kbd_press"&&v["key"]==9));assert!(window.clipboard_dirty);
@@ -1237,14 +1228,14 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         let mut events=vec![paste.clone(),key(S::V,true,M::LGUIMOD,true),key(S::V,false,M::LGUIMOD,false),key(S::LGui,false,M::NOMOD,false)];
         for scan in [S::V,S::A,S::L,S::U,S::E]{events.push(key(scan,true,M::NOMOD,false));events.push(key(scan,false,M::NOMOD,false));}
         let(reply,rx)=tokio::sync::oneshot::channel();
-        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events});reply.send(Ok(true)).unwrap();
+        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:events.into()});reply.send(Ok(true)).unwrap();
         let messages=window.poll(&mut input).1;
         let presses:Vec<_>=messages.iter().filter(|v|v["action"]=="kbd_press").map(|v|v["key"].as_i64().unwrap()).collect();
         assert_eq!(presses,vec![55,9,9,0,37,32,14]); // Cmd+V, then the complete word "value".
         assert!(input.release_all().is_empty());
         // Completion can precede the original V release; suppress only its remaining hold.
         let(reply,rx)=tokio::sync::oneshot::channel();
-        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:vec![paste.clone()]});reply.send(Ok(true)).unwrap();
+        window.paste=Some(PendingPaste{task:tokio::spawn(std::future::pending()),reply:rx,events:vec![paste.clone()].into()});reply.send(Ok(true)).unwrap();
         window.poll(&mut input);assert!(window.paste_key_held);
         for event in [key(S::V,true,M::LGUIMOD,true),key(S::V,false,M::NOMOD,false)]{window._sdl.event().unwrap().push_event(event).unwrap();}
         assert!(window.poll(&mut input).1.is_empty());assert!(!window.paste_key_held);

@@ -23,6 +23,10 @@ It never sends Enter or submits a chat.
   Wheels wait behind earlier modifier transitions, preventing an unintended modified scroll.
   Reaching the limit cancels the image paste and preserves subsequent typing and scrolling,
   with an in-window notice.
+- The input buffer stores each wheel's event-time physical modifiers independently of remote
+  key state. Replay restores that snapshot even if atomic paste released the remote keys.
+  Repeated Ctrl/Command+V shortcuts during one PNG transfer are coalesced: success pastes
+  once with Command+V, failure pastes nothing. No-PNG text fallback retains ordinary keys.
 - Focus loss, menu activation, a new clipboard selection or closing the window cancels the
   pending paste and releases held keys. View-only sessions and `UU_VIEWER_CLIPBOARD=0` do not read images.
 - X11/XWayland: native Xlib selection read through an unmapped requestor on a separate connection;
@@ -36,13 +40,16 @@ It never sends Enter or submits a chat.
 目前实机确认的是官方 Mac 接收与 X11/XWayland 控制端路径。SDL2 原生 Wayland
 按需读取仍需各桌面验证，辅助进程引起失焦时会取消本次粘贴。
 缺少可选的 `wl-paste` 程序时，原有文字粘贴仍可使用。复制新内容会结束上一张图片的
-文字去重状态；传输成功后回放打字时，仅过滤最初粘贴快捷键的 V，后续输入保留。
+文字去重状态；原始快捷键及排队的粘贴重试会一起处理，普通输入保留。
 传输失败时也保留后续输入；取消粘贴时，先按顺序处理先前按键，再释放修饰键。
 等待期间输入较多、达到暂存上限时，会取消图片粘贴并保留后续打字，不会静默丢字。
 传输失败或暂存达到上限时，等待期间重复按下的粘贴快捷键及其 V 长按、松开也会取消，
 避免误贴远端旧内容；普通打字（包括单独输入 V）仍会保留。
 滚轮与按键共用有上限的顺序队列，避免滚动先于 Ctrl／Command 松键而变成缩放；
 达到上限取消图片粘贴时，也会保留已暂存的滚动。
+输入缓冲层独立记录滚轮发生时的修饰键状态，回放时恢复当时仍按住的键。
+同一次 PNG 传输期间重复按粘贴会合并处理：成功只执行一次 Command+V，失败不粘贴；
+没有 PNG 时仍保留原有文字按键路径。
 
 ## 协议证据 / Protocol evidence
 
@@ -95,5 +102,6 @@ The Xvfb test owns an isolated selection and checks normal, 700 KB INCR, oversiz
 unsupported conversions. Rust checks cover PNG bounds, block ordering/ACK correlation,
 text compatibility, absent Wayland helpers, text copied again after a PNG, subsequent V
 keystrokes on success/failure, queued paste retries on errors/closed workers/queue overflow,
-same-batch target/selection changes, modifier release before clicks, wheel ordering behind modifier
-transitions and on queue overflow, and balanced Mac modifier release.
+same-batch target/selection changes, modifier release before clicks, wheel ordering and held/released
+modifier snapshots before/at completion and on queue overflow, coalesced successful paste retries,
+and balanced Mac modifier release.
