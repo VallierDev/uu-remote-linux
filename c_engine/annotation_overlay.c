@@ -15,10 +15,11 @@
 
 typedef struct {
     Display *dpy;
-    Window win;
+    Window win, root;
     Colormap cmap;
     GC gc;
     int x, y, width, height;
+    int root_width, root_height;
 } uu_annotation;
 
 static int has_compositor(Display *dpy, int screen) {
@@ -64,12 +65,15 @@ void *uu_annotation_open(const char *display, int x, int y, int width, int heigh
     XChangeProperty(dpy, win, XInternAtom(dpy, "_NET_WM_BYPASS_COMPOSITOR", False), XA_CARDINAL, 32,
         PropModeReplace, (unsigned char *)&bypass, 1);
     XMapRaised(dpy, win);
+    // Root ConfigureNotify reports RandR resizes, so the caller can rebuild at the new geometry.
+    XSelectInput(dpy, root, StructureNotifyMask);
     GC gc = XCreateGC(dpy, win, 0, NULL);
     XFlush(dpy);
     uu_annotation *a = calloc(1, sizeof *a);
     if (!a) { XFreeGC(dpy, gc); XDestroyWindow(dpy, win); XFreeColormap(dpy, cmap); XCloseDisplay(dpy); *error = 1; return NULL; }
-    a->dpy = dpy; a->win = win; a->cmap = cmap; a->gc = gc;
+    a->dpy = dpy; a->win = win; a->root = root; a->cmap = cmap; a->gc = gc;
     a->x = x; a->y = y; a->width = width; a->height = height;
+    a->root_width = DisplayWidth(dpy, screen); a->root_height = DisplayHeight(dpy, screen);
     return a;
 }
 
@@ -103,16 +107,23 @@ void uu_annotation_flush(void *handle) {
     XFlush(a->dpy);
 }
 
-// Drains pending events; returns 1 when the window needs a full repaint (exposed or remapped).
+// Drains pending events: 2 when the root was resized (reopen the overlay), 1 when the window needs
+// a full repaint (exposed or remapped), else 0.
 int uu_annotation_poll(void *handle) {
     uu_annotation *a = handle;
-    int repaint = 0;
+    int result = 0;
     while (XPending(a->dpy)) {
         XEvent event;
         XNextEvent(a->dpy, &event);
-        if ((event.type == Expose && event.xexpose.count == 0) || event.type == MapNotify) repaint = 1;
+        if (event.type == ConfigureNotify && event.xconfigure.window == a->root
+            && (event.xconfigure.width != a->root_width || event.xconfigure.height != a->root_height)) {
+            a->root_width = event.xconfigure.width; a->root_height = event.xconfigure.height;
+            result = 2;
+        } else if (result == 0 && ((event.type == Expose && event.xexpose.count == 0) || event.type == MapNotify)) {
+            result = 1;
+        }
     }
-    return repaint;
+    return result;
 }
 
 void uu_annotation_close(void *handle) {

@@ -141,7 +141,7 @@ fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_acti
             let ending = actions.clone();
             let _ = tokio::task::spawn_blocking(move || ending.session_ended()).await;
             // Strokes belong to the viewer that drew them: never leave them on the host screen.
-            crate::annotation::reset();
+            crate::annotation::reset(crate::annotation::owner(&actions));
             if closed { return; }
         }
     });
@@ -1209,7 +1209,8 @@ impl WebRtcSession {
                             }
                             if let Some((header, body)) = rpc_fields.as_deref().and_then(crate::annotation::draw_request) {
                                 // A toggle waits for the X overlay to open: keep it off the async workers.
-                                let Ok(response) = tokio::task::spawn_blocking(move || crate::annotation::respond(&header, &body)).await else { return };
+                                let owner = crate::annotation::owner(&actions);
+                                let Ok(response) = tokio::task::spawn_blocking(move || crate::annotation::respond(owner, &header, &body)).await else { return };
                                 // draw_req arrives on CONTROL, but a CONTROL reply timed out (9998) on Mac 4.42.0:
                                 // answer on TEXT like the privacy RPCs above.
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();

@@ -147,8 +147,14 @@ pub fn draw_request(rpc: &[WireField]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((bytes_field(rpc, 1).unwrap_or(&[]).to_vec(), body.to_vec()))
 }
 
-/// Applies a draw_req and builds its RpcResponse. Blocking: a toggle waits for the overlay.
-pub fn respond(header: &[u8], body: &[u8]) -> Vec<u8> {
+/// The peer a request came from: the address of that peer's `PeerActions`. Its session tracker
+/// holds the Arc until it has sent its last reset, so a newer peer cannot reuse the key meanwhile.
+pub type Owner = usize;
+
+pub fn owner<T>(peer: &std::sync::Arc<T>) -> Owner { std::sync::Arc::as_ptr(peer) as *const () as usize }
+
+/// Applies a draw_req from `owner` and builds its RpcResponse. Blocking: a toggle waits for the overlay.
+pub fn respond(owner: Owner, header: &[u8], body: &[u8]) -> Vec<u8> {
     let Some(request) = parse(body) else {
         log::warn!("Annotation request not understood: {}", crate::protocol::wire_shape(body, 3));
         return encode_response(header, SLOT_TOGGLE, ERR_UNAVAILABLE);
@@ -156,7 +162,7 @@ pub fn respond(header: &[u8], body: &[u8]) -> Vec<u8> {
     let (slot, code) = match request {
         Request::Toggle(enable) => {
             let (reply, result) = mpsc::channel();
-            send(Command::Toggle(enable, reply));
+            send(Command::Toggle { owner, enable, reply });
             // Opening the overlay is a few X round trips; never stall the channel for long.
             let code = result.recv_timeout(Duration::from_secs(2)).unwrap_or(ERR_UNAVAILABLE);
             log::info!("Annotation toggle: enable={} error_code={}", enable, code);
@@ -164,29 +170,33 @@ pub fn respond(header: &[u8], body: &[u8]) -> Vec<u8> {
         }
         Request::Clear { all, id } => {
             log::info!("Annotation clear: all={} stroke_present={}", all, id != 0);
-            send(Command::Clear { all, id });
+            send(Command::Clear { owner, all, id });
             (SLOT_CLEAR, 0)
         }
         stroke @ Request::Stroke { .. } => {
-            send(Command::Stroke(stroke));
+            send(Command::Stroke(owner, stroke));
             (SLOT_STROKE, 0)
         }
     };
     encode_response(header, slot, code)
 }
 
-/// The viewer session ended: remove the overlay and its strokes.
-pub fn reset() {
+/// `owner`'s desktop session ended: remove its overlay and strokes. A delayed reset from a replaced
+/// peer leaves the annotation of the viewer that took over alone.
+pub fn reset(owner: Owner) {
     if let Some(worker) = WORKER.get() {
-        let _ = worker.lock().unwrap().send(Command::Reset);
+        let _ = worker.lock().unwrap().send(Command::Reset(owner));
     }
 }
 
 enum Command {
-    Toggle(bool, mpsc::Sender<i32>),
-    Stroke(Request),
-    Clear { all: bool, id: u32 },
-    Reset,
+    Toggle { owner: Owner, enable: bool, reply: mpsc::Sender<i32> },
+    Stroke(Owner, Request),
+    Clear { owner: Owner, all: bool, id: u32 },
+    Reset(Owner),
+    /// Tests: (owner, overlay size, stroke count) while an overlay is shown.
+    #[cfg(test)]
+    Probe(mpsc::Sender<Option<(Owner, i32, i32, usize)>>),
 }
 
 static WORKER: OnceLock<Mutex<mpsc::Sender<Command>>> = OnceLock::new();
@@ -200,12 +210,28 @@ fn send(command: Command) {
     let _ = worker.lock().unwrap().send(command);
 }
 
-struct Stroke { id: u32, normalized: bool, argb: u32, width: i32, points: Vec<i16> }
+/// A stroke keeps the viewer's points, so it can be laid out again when the overlay is rebuilt.
+struct Stroke { id: u32, normalized: bool, argb: u32, line: Option<f32>, raw: Vec<(f32, f32)>, width: i32, points: Vec<i16> }
 
-struct Overlay { handle: *mut libc::c_void, region: (i32, i32, i32, i32), width: i32, height: i32 }
+impl Stroke {
+    fn new(id: u32, raw: Vec<(f32, f32)>, line: Option<f32>, color: Option<u32>) -> Self {
+        let normalized = raw.iter().all(|&(x, y)| x.abs() <= 1.5 && y.abs() <= 1.5);
+        Self { id, normalized, argb: argb(color), line, raw, width: 0, points: Vec::new() }
+    }
+
+    /// Overlay pixels for all points; a single point is a dot (a zero-length round-capped segment).
+    fn layout(&mut self, width: i32, height: i32) {
+        self.width = line_width(self.line, height);
+        self.points = to_pixels(&self.raw, self.normalized, width, height);
+        if self.points.len() == 2 { self.points.extend_from_within(0..2); }
+    }
+}
+
+struct Overlay { handle: *mut libc::c_void, screen: Option<i32>, region: (i32, i32, i32, i32), width: i32, height: i32 }
 
 impl Overlay {
-    fn open(region: (i32, i32, i32, i32)) -> Result<Self, i32> {
+    fn open(screen: Option<i32>) -> Result<Self, i32> {
+        let region = region(screen);
         let display = crate::capture::x11_display().and_then(|d| std::ffi::CString::new(d).ok());
         let mut error = 0;
         let handle = unsafe {
@@ -215,7 +241,7 @@ impl Overlay {
         let (mut width, mut height) = (0, 0);
         unsafe { uu_annotation_size(handle, &mut width, &mut height) };
         log::info!("Annotation overlay shown: {}x{}+{}+{}", width, height, region.0, region.1);
-        Ok(Self { handle, region, width, height })
+        Ok(Self { handle, screen, region, width, height })
     }
 
     fn draw(&self, stroke: &Stroke, from: usize) {
@@ -277,87 +303,114 @@ pub fn to_pixels(points: &[(f32, f32)], normalized: bool, width: i32, height: i3
     out
 }
 
-fn run(rx: mpsc::Receiver<Command>) {
-    let mut overlay: Option<Overlay> = None;
-    let mut strokes: Vec<Stroke> = Vec::new();
-    let mut logged = 0usize;
-    let mut unavailable = false;
-    loop {
-        let wait = if overlay.is_some() { Duration::from_millis(50) } else { Duration::from_secs(3600) };
-        let command = match rx.recv_timeout(wait) {
-            Ok(command) => Some(command),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        };
+/// The worker's state: one overlay at a time, owned by the peer that last toggled it on or drew.
+#[derive(Default)]
+struct Annotation { overlay: Option<Overlay>, strokes: Vec<Stroke>, owner: Owner, unavailable: bool, logged: usize }
+
+impl Annotation {
+    fn close(&mut self) { self.overlay = None; self.strokes.clear(); }
+
+    /// A request from another peer: the newer viewer takes over and the old strokes go.
+    fn claim(&mut self, owner: Owner) {
+        if self.owner != owner { self.close(); self.owner = owner; self.unavailable = false; }
+    }
+
+    fn open(&mut self, screen: Option<i32>) -> bool {
+        match Overlay::open(screen) {
+            Ok(o) => { self.overlay = Some(o); true }
+            Err(error) => { log::warn!("Annotation overlay unavailable: error={}", error); self.unavailable = true; false }
+        }
+    }
+
+    fn stroke(&mut self, id: u32, points: Vec<(f32, f32)>, screen: Option<i32>, width: Option<f32>, color: Option<u32>) {
+        if self.overlay.as_ref().is_some_and(|o| o.region != region(screen)) { self.close(); }
+        // A stroke without a toggle (e.g. after a host restart) shows the overlay anyway, but only
+        // one attempt until the next toggle instead of one per batch.
+        if self.overlay.is_none() && (self.unavailable || !self.open(screen)) { return; }
+        if self.logged < 8 {
+            // Counts and presence only: the drawing itself is the viewer's content.
+            self.logged += 1;
+            let normalized = points.iter().all(|&(x, y)| x.abs() <= 1.5 && y.abs() <= 1.5);
+            log::info!("Annotation stroke batch: points={} normalized={} screen_set={} width_set={} color_set={}",
+                points.len(), normalized, screen.is_some(), width.is_some(), color.is_some());
+        }
+        let o = self.overlay.as_ref().unwrap();
+        match self.strokes.iter_mut().find(|s| s.id == id) {
+            Some(stroke) => {
+                let from = stroke.points.len().saturating_sub(2);
+                stroke.points.extend(to_pixels(&points, stroke.normalized, o.width, o.height));
+                stroke.raw.extend(points);
+                o.draw(stroke, from);
+            }
+            None => {
+                let mut stroke = Stroke::new(id, points, width, color);
+                stroke.layout(o.width, o.height);
+                o.draw(&stroke, 0);
+                self.strokes.push(stroke);
+            }
+        }
+        o.flush();
+    }
+
+    /// The root was resized (RandR; on X11 the viewer's resolution choice does this): rebuild the
+    /// overlay at the new geometry and lay the strokes out again.
+    fn follow_resize(&mut self) {
+        let Some(screen) = self.overlay.take().map(|o| o.screen) else { return };
+        if !self.open(screen) { self.strokes.clear(); return; }
+        let o = self.overlay.as_ref().unwrap();
+        for stroke in &mut self.strokes { stroke.layout(o.width, o.height); }
+        o.repaint(&self.strokes);
+    }
+
+    fn handle(&mut self, command: Command) {
         match command {
-            Some(Command::Toggle(true, reply)) => {
-                unavailable = false;
-                let code = if overlay.is_some() { 0 } else {
-                    match Overlay::open(region(None)) {
-                        Ok(o) => { overlay = Some(o); 0 }
-                        Err(error) => { log::warn!("Annotation overlay unavailable: error={}", error); ERR_UNAVAILABLE }
-                    }
-                };
+            Command::Toggle { owner, enable: true, reply } => {
+                self.claim(owner);
+                self.unavailable = false;
+                let code = if self.overlay.is_some() || self.open(None) { 0 } else { ERR_UNAVAILABLE };
                 let _ = reply.send(code);
             }
-            Some(Command::Toggle(false, reply)) => {
-                overlay = None;
-                strokes.clear();
+            Command::Toggle { owner, enable: false, reply } => {
+                if owner == self.owner { self.close(); }
                 let _ = reply.send(0);
             }
-            Some(Command::Reset) => {
-                if overlay.take().is_some() { log::info!("Annotation ended with the viewer session"); }
-                strokes.clear();
-                unavailable = false;
+            Command::Reset(owner) => {
+                if owner != self.owner { return; }
+                if self.overlay.is_some() { log::info!("Annotation ended with the viewer session"); }
+                self.close();
+                self.unavailable = false;
             }
-            Some(Command::Clear { all, id }) => {
-                if all { strokes.clear(); } else { strokes.retain(|s| s.id != id); }
-                if let Some(o) = &overlay { o.repaint(&strokes); }
+            Command::Clear { owner, all, id } => {
+                if owner != self.owner { return; }
+                if all { self.strokes.clear(); } else { self.strokes.retain(|s| s.id != id); }
+                if let Some(o) = &self.overlay { o.repaint(&self.strokes); }
             }
-            Some(Command::Stroke(Request::Stroke { id, points, screen, width, color })) => {
-                let wanted = region(screen);
-                if overlay.as_ref().is_some_and(|o| o.region != wanted) { overlay = None; strokes.clear(); }
-                if overlay.is_none() {
-                    // A stroke without a toggle (e.g. after a host restart): show the overlay anyway,
-                    // but try only once until the next toggle instead of once per batch.
-                    if unavailable { continue; }
-                    match Overlay::open(wanted) {
-                        Ok(o) => overlay = Some(o),
-                        Err(error) => { log::warn!("Annotation overlay unavailable: error={}", error); unavailable = true; continue; }
-                    }
-                }
-                let o = overlay.as_ref().unwrap();
-                if logged < 8 {
-                    // Counts and presence only: the drawing itself is the viewer's content.
-                    logged += 1;
-                    let normalized = points.iter().all(|&(x, y)| x.abs() <= 1.5 && y.abs() <= 1.5);
-                    log::info!("Annotation stroke batch: points={} normalized={} screen_set={} width_set={} color_set={}",
-                        points.len(), normalized, screen.is_some(), width.is_some(), color.is_some());
-                }
-                match strokes.iter().position(|s| s.id == id) {
-                    Some(index) => {
-                        let stroke = &mut strokes[index];
-                        let from = stroke.points.len().saturating_sub(2);
-                        stroke.points.extend(to_pixels(&points, stroke.normalized, o.width, o.height));
-                        o.draw(stroke, from);
-                    }
-                    None => {
-                        let normalized = points.iter().all(|&(x, y)| x.abs() <= 1.5 && y.abs() <= 1.5);
-                        let mut pixels = to_pixels(&points, normalized, o.width, o.height);
-                        // A single point is drawn as a dot: a zero-length round-capped segment.
-                        if pixels.len() == 2 { pixels.extend_from_within(0..2); }
-                        let stroke = Stroke { id, normalized, argb: argb(color), width: line_width(width, o.height), points: pixels };
-                        o.draw(&stroke, 0);
-                        strokes.push(stroke);
-                    }
-                }
-                o.flush();
+            Command::Stroke(owner, Request::Stroke { id, points, screen, width, color }) => {
+                self.claim(owner);
+                self.stroke(id, points, screen, width, color);
             }
-            Some(Command::Stroke(_)) => {}
-            None => {}
+            Command::Stroke(..) => {}
+            #[cfg(test)]
+            Command::Probe(reply) => {
+                let _ = reply.send(self.overlay.as_ref().map(|o| (self.owner, o.width, o.height, self.strokes.len())));
+            }
         }
-        if let Some(o) = &overlay {
-            if unsafe { uu_annotation_poll(o.handle) } != 0 { o.repaint(&strokes); }
+    }
+}
+
+fn run(rx: mpsc::Receiver<Command>) {
+    let mut state = Annotation::default();
+    loop {
+        let wait = if state.overlay.is_some() { Duration::from_millis(50) } else { Duration::from_secs(3600) };
+        match rx.recv_timeout(wait) {
+            Ok(command) => state.handle(command),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        match state.overlay.as_ref().map_or(0, |o| unsafe { uu_annotation_poll(o.handle) }) {
+            2 => state.follow_resize(),
+            1 => if let Some(o) = &state.overlay { o.repaint(&state.strokes); },
+            _ => {}
         }
     }
 }
@@ -423,21 +476,51 @@ mod tests {
     }
 
     /// Needs a composited X display: DISPLAY=:0 cargo test -- --ignored annotation_overlay_smoke
+    /// On a disposable display, UU_ANNOTATION_SMOKE_RESIZE=1024x768 also resizes the root (xrandr --fb).
     #[test]
     #[ignore]
     fn annotation_overlay_smoke() {
-        let (reply, result) = mpsc::channel();
-        send(Command::Toggle(true, reply));
-        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        let wait = Duration::from_secs(5);
+        let toggle = |owner, enable| { let (reply, r) = mpsc::channel(); send(Command::Toggle { owner, enable, reply }); r.recv_timeout(wait).unwrap() };
+        let probe = || { let (reply, r) = mpsc::channel(); send(Command::Probe(reply)); r.recv_timeout(wait).unwrap() };
+        let stroke = |owner, id, points: &[(f32, f32)], width, color| send(Command::Stroke(owner, Request::Stroke {
+            id, points: points.to_vec(), screen: None, width, color }));
+        assert_eq!(toggle(1, true), 0);
         let diagonal: Vec<(f32, f32)> = (0..=20).map(|i| (0.3 + i as f32 * 0.02, 0.3 + i as f32 * 0.01)).collect();
-        send(Command::Stroke(Request::Stroke { id: 1, points: diagonal[..10].to_vec(), screen: None, width: None, color: None }));
-        send(Command::Stroke(Request::Stroke { id: 1, points: diagonal[10..].to_vec(), screen: None, width: None, color: None }));
-        send(Command::Stroke(Request::Stroke { id: 2, points: vec![(0.5, 0.6)], screen: None, width: Some(30.0), color: Some(0x0000FF) }));
+        stroke(1, 1, &diagonal[..10], None, None);
+        stroke(1, 1, &diagonal[10..], None, None);
+        stroke(1, 2, &[(0.5, 0.6)], Some(30.0), Some(0x0000FF));
         std::thread::sleep(Duration::from_secs(
             std::env::var("UU_ANNOTATION_SMOKE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3)));
-        let (reply, result) = mpsc::channel();
-        send(Command::Toggle(false, reply));
-        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        assert_eq!(probe().map(|p| (p.0, p.3)), Some((1, 2)));
+        if let Ok(size) = std::env::var("UU_ANNOTATION_SMOKE_RESIZE") {
+            // xrandr may report an error for an output larger than the new size yet still resize.
+            let _ = std::process::Command::new("xrandr").args(["--fb", &size]).status();
+            std::thread::sleep(Duration::from_millis(500));
+            let (w, h) = size.split_once('x').map(|(w, h)| (w.parse().unwrap(), h.parse().unwrap())).unwrap();
+            assert_eq!(probe().map(|p| (p.1, p.2, p.3)), Some((w, h, 2)), "overlay follows the {size} root");
+        }
+        // A newer viewer takes over; the replaced peer's delayed reset and toggle-off leave it alone.
+        assert_eq!(toggle(2, true), 0);
+        reset(1);
+        assert_eq!(toggle(1, false), 0);
+        assert_eq!(probe().map(|p| (p.0, p.3)), Some((2, 0)));
+        stroke(2, 1, &diagonal, None, None);
+        assert_eq!(probe().map(|p| (p.0, p.3)), Some((2, 1)));
+        reset(2);
+        assert_eq!(probe(), None);
+    }
+
+    #[test]
+    fn strokes_are_laid_out_again_after_a_resize() {
+        let mut dot = Stroke::new(1, vec![(0.5, 0.5)], None, None);
+        dot.layout(100, 200);
+        assert_eq!((dot.points.clone(), dot.width), (vec![50, 100, 50, 100], 3));
+        dot.layout(3840, 2160);
+        assert_eq!((dot.points.clone(), dot.width), (vec![1920, 1080, 1920, 1080], 6));
+        let mut pixels = Stroke::new(2, vec![(10.0, 20.0), (30.0, 40.0)], Some(8.0), None);
+        pixels.layout(100, 200);
+        assert_eq!((pixels.normalized, pixels.points.clone(), pixels.width), (false, vec![10, 20, 30, 40], 8));
     }
 
     #[test]
