@@ -181,10 +181,12 @@ impl InputInjector {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 input.pointer_wake.notified().await;
+                // The first event is immediate; later events coalesce until the next tick.
+                tick.reset();
                 loop {
                     input.flush_pointer();
-                    if input.pointer_idle() { break; }
                     tick.tick().await;
+                    if input.pointer_idle() { break; }
                 }
             }
         })
@@ -251,9 +253,9 @@ impl InputInjector {
         }
     }
     pub fn mouse_button(&self, button: i32, is_press: bool) {
-        // A press may open a touch gesture whose hold resolves on worker ticks; wake it.
-        self.pointer_wake.notify_one();
         let _serial=self.serial.lock().unwrap();
+        // The worker cannot consume the wake and flush until this transition is published.
+        self.pointer_wake.notify_one();
         self.flush_pointer_locked();
         if button == 1 && self.touch_button(is_press) { return; }
         let result = self.inject_button(button,is_press);
@@ -886,6 +888,77 @@ mod motion_tests {
         assert!(!input.pointer_idle());
         *input.touch.lock().unwrap() = TouchDrag::default();
         assert!(input.pointer_idle());
+    }
+    #[test]
+    fn button_wake_waits_for_the_serialized_transition() {
+        use futures_util::FutureExt;
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let serial = input.serial.lock().unwrap();
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let pressing = input.clone();
+        let started = ready.clone();
+        let button = std::thread::spawn(move || { started.wait(); pressing.mouse_button(1,true); });
+        ready.wait();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let premature = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(50), input.pointer_wake.notified()).await.is_ok()
+        });
+        drop(serial);
+        button.join().unwrap();
+        assert!(!premature, "a parked worker must not wake before the button owns the serial lock");
+        assert!(input.pointer_wake.notified().now_or_never().is_some());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_coalesces_one_ms_motion_on_four_ms_ticks() {
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let worker = input.start_pointer_worker();
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1, "first motion is immediate");
+        for ms in 1..=12 {
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            input.mouse_relative(1,0);
+            tokio::task::yield_now().await;
+            assert_eq!(input.portal_input_counts_for_test()[0],1+ms/4, "motion at {ms} ms bypassed the cadence");
+        }
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],5);
+        assert_eq!(input.pending.lock().unwrap().relative,(0,0));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_parks_and_resets_the_tick_after_a_quiet_period() {
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let worker = input.start_pointer_worker();
+        tokio::task::yield_now().await;
+        // Without a notification, raw queued state must remain untouched while parked.
+        input.pending.lock().unwrap().relative = (1,0);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],0);
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1);
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        input.pending.lock().unwrap().relative = (1,0);
+        tokio::time::advance(std::time::Duration::from_millis(997)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1, "idle ticks must stop after activity");
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],2);
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],2, "a stale interval must not flush a second time immediately");
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],3);
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
     }
 }
 
