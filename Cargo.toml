@@ -1,6 +1,6 @@
 [package]
 name = "uu-remote-linux"
-version = "0.2.49"
+version = "0.2.50"
 edition = "2021"
 default-run = "uuremote-server"
 authors = ["uu-remote-linux contributors"]
