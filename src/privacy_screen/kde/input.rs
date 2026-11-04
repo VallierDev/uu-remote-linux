@@ -36,16 +36,17 @@ fn number(text: &str, key: &str) -> Option<u32> { variant(text, key)?.split_whit
 struct Flags { keyboard: bool, pointer: bool, touch: bool, switch: bool, enabled: bool }
 
 /// Every device KWin lists, blocked or not: restore must find a device that is still disabled.
-/// `strict` fails on a device whose properties cannot be read; a restore then keeps its record
-/// instead of treating the device as absent. The lenient form skips it, which blocking can accept.
-fn enumerate_with(strict: bool) -> Result<Vec<(Device, Flags)>, String> {
+/// The flag says whether a property read failed. A restore re-enables the readable devices, then
+/// returns the flag as an error so its record and the guard stay for another attempt; blocking
+/// skips such a device, which is all it can do.
+fn enumerate() -> Result<(Vec<(Device, Flags)>, bool), String> {
     let list = call("/org/kde/KWin/InputDevice", "org.freedesktop.DBus.Properties.Get", &["org.kde.KWin.InputDeviceManager", "devicesSysNames"])?;
     let mut devices = Vec::new();
+    let mut incomplete = false;
     for sys in list.split('\'').skip(1).step_by(2).filter(|n| n.strip_prefix("event").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))) {
         let text = match call(&format!("/org/kde/KWin/InputDevice/{sys}"), "org.freedesktop.DBus.Properties.GetAll", &["org.kde.KWin.InputDevice"]) {
             Ok(text) => text,
-            Err(e) if strict => return Err(format!("read input device properties: {e}")),
-            Err(_) => continue,
+            Err(_) => { incomplete = true; continue; }
         };
         let yes = |key| variant(&text, key) == Some("true");
         devices.push((Device::Named {
@@ -55,16 +56,14 @@ fn enumerate_with(strict: bool) -> Result<Vec<(Device, Flags)>, String> {
             vendor: number(&text, "vendor").unwrap_or(0),
         }, Flags { keyboard: yes("keyboard"), pointer: yes("pointer"), touch: yes("touch"), switch: yes("switchDevice"), enabled: yes("enabled") }));
     }
-    Ok(devices)
+    Ok((devices, incomplete))
 }
-
-fn enumerate() -> Result<Vec<(Device, Flags)>, String> { enumerate_with(true) }
 
 /// Keyboards, pointers and touch to block: everything except our own uinput devices, the power
 /// button and switches (lid). Software devices fed by local hardware (gesture daemons, ydotoold)
 /// are blocked too.
 pub fn local() -> Result<Vec<Device>, String> {
-    Ok(enumerate_with(false)?.into_iter().filter(|(d, f)| {
+    Ok(enumerate()?.0.into_iter().filter(|(d, f)| {
         (f.keyboard || f.pointer || f.touch) && !f.switch && f.enabled
             && !d.name().starts_with("uu-remote-linux") && d.name() != "Power Button"
     }).map(|(d, _)| d).collect())
@@ -120,11 +119,16 @@ fn restore_targets<'a>(now: &'a [Device], recorded: &[Device]) -> (Vec<&'a str>,
 /// next attempt.
 pub fn restore(devices: &[Device]) -> Result<(), String> {
     if devices.is_empty() { return Ok(()); }
-    let now: Vec<Device> = enumerate()?.into_iter().map(|(d, _)| d).collect();
+    let (found, incomplete) = enumerate()?;
+    let now: Vec<Device> = found.into_iter().map(|(d, _)| d).collect();
     let (targets, gone) = restore_targets(&now, devices);
     // Counts only: device names and sysNames are not logged (AGENTS.md).
     if gone > 0 { log::warn!("Privacy restore: {gone} recorded device(s) are gone; skipping"); }
-    set_sys(targets.into_iter(), true)
+    // Re-enable the readable devices first: one unreadable device must not keep every other one
+    // off. The error afterwards keeps the record and the guard for another attempt.
+    set_sys(targets.into_iter(), true)?;
+    if incomplete { return Err("input device properties could not be read; retrying later".into()); }
+    Ok(())
 }
 
 #[cfg(test)]
