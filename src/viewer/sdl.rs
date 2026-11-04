@@ -166,7 +166,9 @@ impl Window {
                     self.notice=Some((crate::i18n::s("正在准备粘贴…", "Preparing paste…").into(),std::time::Instant::now()+std::time::Duration::from_secs(25)));redraw=true;continue
                 }
             }
-            if let Some(pending)=self.paste.as_mut(){if matches!(event,Event::KeyDown{..}|Event::KeyUp{..}){
+            // A wheel must not overtake buffered modifier releases and become
+            // an unintended Ctrl/Command-wheel action on the remote host.
+            if let Some(pending)=self.paste.as_mut(){if matches!(event,Event::KeyDown{..}|Event::KeyUp{..}|Event::MouseWheel{..}){
                 if pending.events.len()<256 {pending.events.push(event);}else{
                     // Keep the queue bounded without discarding what was typed while
                     // the transfer stalled. Cancel only the paste, including its held V.
@@ -960,6 +962,62 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
             assert_eq!(presses,vec![9,0,37,32,14]); // Only subsequent "value", never the failed paste.
             assert!(window.paste.is_none());assert!(window.notice.is_some());assert!(input.release_all().is_empty());
         }
+    }
+    #[cfg_attr(target_os="macos",ignore)]
+    #[tokio::test] async fn image_paste_orders_wheel_after_modifier_transitions(){
+        if isolated_image_test("viewer::sdl::tests::image_paste_orders_wheel_after_modifier_transitions"){return}
+        use sdl2::{keyboard::{Scancode as S,Mod as M},mouse::MouseWheelDirection as D};
+        let mut window=Window::new().unwrap();window.mac=true;window.chrome.font=None;
+        let id=window.canvas.window().id();let(tx,_requests)=tokio::sync::mpsc::channel(1);
+        window.image_tx=Some(tx);window.image_reader=super::super::image_paste::Reader::Unavailable;
+        let key=|scan,down,mods|image_test_key(id,scan,down,mods);
+        let wheel=|y,direction|Event::MouseWheel{timestamp:0,window_id:id,which:0,mouse_x:300,mouse_y:300,x:0,y,precise_x:0.,precise_y:0.,direction};
+        for (modifier,mods) in [(S::LCtrl,M::LCTRLMOD),(S::RCtrl,M::RCTRLMOD),(S::LGui,M::LGUIMOD),(S::RGui,M::RGUIMOD)]{for same_batch in [false,true]{for result in 0..4{
+            let mut input=Input::default();input.set_mac(true);window.paste_key_held=false;
+            let mut start=vec![key(modifier,true,mods),key(S::V,true,mods)];
+            let mut following=vec![key(S::V,false,mods),key(modifier,false,M::NOMOD),
+                wheel(1,D::Normal),key(S::LShift,true,M::LSHIFTMOD),wheel(2,D::Flipped),key(S::LShift,false,M::NOMOD),
+                key(S::V,true,M::NOMOD),key(S::V,false,M::NOMOD)];
+            if same_batch{start.append(&mut following);}
+            let mut messages=window.poll_batch(&mut input,start).1;
+            let(reply,rx)=tokio::sync::oneshot::channel();let pending=window.paste.as_mut().unwrap();
+            pending.task.abort();pending.task=tokio::spawn(std::future::pending());pending.reply=rx;
+            if !same_batch{messages.extend(window.poll_batch(&mut input,following).1);}
+            assert!(messages.iter().all(|m|m["action"]!="mouse_scroll"),"wheel escaped while modifiers were buffered");
+            match result{0=>reply.send(Err(())).unwrap(),1=>drop(reply),2=>reply.send(Ok(true)).unwrap(),_=>reply.send(Ok(false)).unwrap()}
+            messages.extend(window.poll_batch(&mut input,vec![]).1);
+            let mut held=std::collections::BTreeSet::new();let mut wheels=Vec::new();
+            for m in &messages{match m["action"].as_str(){
+                Some("kbd_press")=>{held.insert(m["key"].as_i64().unwrap());},
+                Some("kbd_release")=>{held.remove(&m["key"].as_i64().unwrap());},
+                Some("mouse_scroll")=>{wheels.push(m["delta_y"].as_i64().unwrap());assert_eq!(held,if wheels.len()==1{Default::default()}else{[56].into_iter().collect()});},
+                _=>(),
+            }}
+            assert_eq!(wheels,vec![120,-240]);assert!(held.is_empty());assert!(input.release_all().is_empty());
+            assert_eq!(messages.iter().filter(|m|m["action"]=="kbd_press"&&m["key"]==9).count(),if result<2{1}else{2});
+            assert!(window.paste.is_none());
+        }}}
+    }
+    #[cfg_attr(target_os="macos",ignore)]
+    #[tokio::test] async fn image_paste_wheel_overflow_preserves_scroll(){
+        if isolated_image_test("viewer::sdl::tests::image_paste_wheel_overflow_preserves_scroll"){return}
+        use sdl2::{keyboard::{Scancode as S,Mod as M},mouse::MouseWheelDirection as D};
+        let mut window=Window::new().unwrap();window.mac=true;window.chrome.font=None;
+        let id=window.canvas.window().id();let(tx,_requests)=tokio::sync::mpsc::channel(1);
+        window.image_tx=Some(tx);window.image_reader=super::super::image_paste::Reader::Unavailable;
+        let key=|scan,down,mods|image_test_key(id,scan,down,mods);
+        let mut input=Input::default();input.set_mac(true);
+        let mut messages=window.poll_batch(&mut input,vec![key(S::LCtrl,true,M::LCTRLMOD),key(S::V,true,M::LCTRLMOD)]).1;
+        let(reply,rx)=tokio::sync::oneshot::channel();let pending=window.paste.as_mut().unwrap();
+        pending.task.abort();pending.task=tokio::spawn(std::future::pending());pending.reply=rx;
+        let mut events=vec![key(S::V,false,M::LCTRLMOD),key(S::LCtrl,false,M::NOMOD)];
+        for _ in 0..260{events.push(Event::MouseWheel{timestamp:0,window_id:id,which:0,mouse_x:300,mouse_y:300,x:0,y:1,precise_x:0.,precise_y:0.,direction:D::Normal});}
+        messages.extend(window.poll_batch(&mut input,events).1);
+        assert!(reply.is_closed());assert!(window.paste.is_none());assert!(window.notice.is_some());
+        let release=messages.iter().position(|m|m["action"]=="kbd_release"&&m["key"]==59).unwrap();
+        let first_wheel=messages.iter().position(|m|m["action"]=="mouse_scroll").unwrap();assert!(release<first_wheel);
+        assert_eq!(messages.iter().filter(|m|m["action"]=="mouse_scroll").count(),260);
+        assert!(messages.iter().all(|m|!(m["action"]=="kbd_press"&&m["key"]==9)));assert!(input.release_all().is_empty());
     }
     #[cfg_attr(target_os="macos",ignore)]
     #[tokio::test] async fn image_paste_failure_suppresses_queued_retries(){

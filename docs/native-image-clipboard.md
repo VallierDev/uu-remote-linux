@@ -19,8 +19,10 @@ It never sends Enter or submits a chat.
   buffered typing is replayed if focus and selection are unchanged. Paste shortcuts queued
   during a failed transfer (including queue overflow) are suppressed with their V repeats
   and releases, so they cannot bypass the image barrier and paste stale remote content.
-- While a transfer is pending, at most 256 key events are buffered. Reaching the limit
-  cancels the image paste and preserves subsequent typing, with an in-window notice.
+- While a transfer is pending, at most 256 keyboard and wheel events are buffered in order.
+  Wheels wait behind earlier modifier transitions, preventing an unintended modified scroll.
+  Reaching the limit cancels the image paste and preserves subsequent typing and scrolling,
+  with an in-window notice.
 - Focus loss, menu activation, a new clipboard selection or closing the window cancels the
   pending paste and releases held keys. View-only sessions and `UU_VIEWER_CLIPBOARD=0` do not read images.
 - X11/XWayland: native Xlib selection read through an unmapped requestor on a separate connection;
@@ -39,6 +41,8 @@ It never sends Enter or submits a chat.
 等待期间输入较多、达到暂存上限时，会取消图片粘贴并保留后续打字，不会静默丢字。
 传输失败或暂存达到上限时，等待期间重复按下的粘贴快捷键及其 V 长按、松开也会取消，
 避免误贴远端旧内容；普通打字（包括单独输入 V）仍会保留。
+滚轮与按键共用有上限的顺序队列，避免滚动先于 Ctrl／Command 松键而变成缩放；
+达到上限取消图片粘贴时，也会保留已暂存的滚动。
 
 ## 协议证据 / Protocol evidence
 
@@ -91,4 +95,5 @@ The Xvfb test owns an isolated selection and checks normal, 700 KB INCR, oversiz
 unsupported conversions. Rust checks cover PNG bounds, block ordering/ACK correlation,
 text compatibility, absent Wayland helpers, text copied again after a PNG, subsequent V
 keystrokes on success/failure, queued paste retries on errors/closed workers/queue overflow,
-same-batch target/selection changes, modifier release before clicks, and balanced Mac modifier release.
+same-batch target/selection changes, modifier release before clicks, wheel ordering behind modifier
+transitions and on queue overflow, and balanced Mac modifier release.
