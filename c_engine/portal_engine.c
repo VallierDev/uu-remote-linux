@@ -594,8 +594,14 @@ static int read_stream_result(struct uu_portal *p, GVariant *results) {
     if (streams) g_variant_unref(streams);
     return error;
 }
+static void save_restore_token(struct uu_portal *p, void (*save_token)(const char *, void *),
+    uu_portal_save_detailed_fn save_detailed, void *save_data) {
+    if (!p->restore_token) return;
+    if (save_token) save_token(p->restore_token, save_data);
+    if (save_detailed) save_detailed(p->restore_token, save_data, p->has_position, p->position_x, p->position_y);
+}
 static struct uu_portal *open_persist(const char *restore, void (*save_token)(const char *, void *),
-    void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
+    uu_portal_save_detailed_fn save_detailed, void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
     int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height, uint32_t source_types) {
     *error = 0; *width = *height = 0;
     struct uu_portal *p = calloc(1, sizeof(*p));
@@ -675,7 +681,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
         fprintf(stderr, "Portal persistence: requested=%d restore_attempted=%d token_returned=%d\n",
             version >= 2, restore && *restore, p->restore_token && *p->restore_token);
     }
-    if (!*error && p->restore_token && save_token) save_token(p->restore_token, save_data);
+    if (!*error) save_restore_token(p, save_token, save_detailed, save_data);
     g_variant_unref(results);
     if (*error) goto done;
     p->main_loop = g_main_loop_new(p->context, FALSE);
@@ -708,21 +714,27 @@ struct uu_portal *uu_portal_open_persist_cancellable(const char *restore,
     void (*save_token)(const char *, void *), void *save_data,
     uu_portal_cancelled_fn cancelled, void *cancel_data,
     int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, save_data, cancelled, cancel_data, 0, error, width, height, 1);
+    return open_persist(restore, save_token, NULL, save_data, cancelled, cancel_data, 0, error, width, height, 1);
 }
 struct uu_portal *uu_portal_open_persist_capture(const char *restore,
     void (*save_token)(const char *, void *), void *save_data,
     uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf,
     int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height, 1);
+    return open_persist(restore, save_token, NULL, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height, 1);
 }
 struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *),
     void *data, int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, data, NULL, NULL, 0, error, width, height, 1);
+    return open_persist(restore, save_token, NULL, data, NULL, NULL, 0, error, width, height, 1);
 }
 struct uu_portal *uu_portal_open_virtual(const char *restore, void (*save_token)(const char *, void *),
     void *data, int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, data, NULL, NULL, 0, error, width, height, 4);
+    return open_persist(restore, save_token, NULL, data, NULL, NULL, 0, error, width, height, 4);
+}
+struct uu_portal *uu_portal_open_detailed(const char *restore, uu_portal_save_detailed_fn save_token,
+    void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf,
+    uint32_t source_types, int *error, uint32_t *width, uint32_t *height) {
+    if (source_types != 1 && source_types != 4) { *error = 3; *width = *height = 0; return NULL; }
+    return open_persist(restore, NULL, save_token, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height, source_types);
 }
 struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32_t *width, uint32_t *height) {
     return uu_portal_open_persist(restore, NULL, NULL, error, width, height);

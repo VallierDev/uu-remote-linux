@@ -419,7 +419,24 @@ static void authorization_still_required(void) {
         g_variant_unref(reply);
     }
 }
+static void saved_token_with_position(const char *token, void *data, int has_position, int32_t x, int32_t y) {
+    int *calls = data;
+    assert(!strcmp(token, "synthetic-grant"));
+    assert(has_position && x == 25 && y == 50);
+    (*calls)++;
+}
+static void rotated_token_callback(void) {
+    struct uu_portal p = {0};
+    int calls = 0;
+    save_restore_token(&p, NULL, saved_token_with_position, &calls);
+    assert(calls == 0);
+    p.restore_token = "synthetic-grant";
+    p.has_position = 1; p.position_x = 25; p.position_y = 50;
+    save_restore_token(&p, NULL, saved_token_with_position, &calls);
+    assert(calls == 1);
+}
 int main(void) {
+    rotated_token_callback();
     portal_renegotiation_timeout();
     portal_renegotiation_recovery();
     portal_renegotiation_event_order_and_healthy_states();

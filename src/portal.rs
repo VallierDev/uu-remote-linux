@@ -41,6 +41,7 @@ mod native {
         fn uu_portal_open_virtual(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_open_persist_cancellable(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), save_data: *mut c_void, cancelled: extern "C" fn(*mut c_void) -> i32, cancel_data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_open_persist_capture(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), save_data: *mut c_void, cancelled: Option<extern "C" fn(*mut c_void) -> i32>, cancel_data: *mut c_void, prefer_dmabuf: i32, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
+        fn uu_portal_open_detailed(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void, i32, i32, i32), save_data: *mut c_void, cancelled: Option<extern "C" fn(*mut c_void) -> i32>, cancel_data: *mut c_void, prefer_dmabuf: i32, source_types: u32, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_clipboard_supported(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_ready(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_set(portal: *mut c_void, text: *const u8, length: usize) -> i32;
@@ -153,6 +154,7 @@ mod native {
             let directory = super::permissions::directory();
             let key = super::permissions::desktop_key();
             let wanted = if virtual_output { None } else { monitor.map(str::to_owned).or_else(crate::wayland::portal_monitor) };
+            let wanted_key = wanted.as_deref().map(super::permissions::monitor_key);
             let virtual_key = format!("{key}-virtual");
             // One opener at a time: consent tokens are single-use, and two concurrent openers
             // (privacy virtual-output switch and closure recovery after a quick reconnect) each
@@ -163,66 +165,97 @@ mod native {
             let taken = directory.as_deref().filter(|_| !fresh).and_then(|dir| {
                 let take = |k: String| super::permissions::take(dir, &k).map(|v| (k, v));
                 if virtual_output { return take(virtual_key.clone()); }
-                wanted.as_deref().and_then(|name| take(super::permissions::monitor_key(name))).or_else(|| take(key.to_owned()))
+                wanted_key.as_ref().and_then(|name| take(super::permissions::pending_key(name)).or_else(|| take(name.clone())))
+                    .or_else(|| take(super::permissions::pending_key(key))).or_else(|| take(key.to_owned()))
             });
             let token = taken.as_ref().and_then(|(_, value)| std::ffi::CString::new(value.as_str()).ok());
-            // The new token is saved once the granted monitor is known (after open).
-            let mut cache: Option<String> = None;
-            extern "C" fn save_token(token: *const libc::c_char, data: *mut c_void) {
-                // Callback is synchronous during open; cache lives through the call.
+            let requested_key = if virtual_output { &virtual_key } else { wanted_key.as_deref().unwrap_or(key) };
+            struct TokenCache { rotation: super::permissions::Rotation, virtual_key: Option<String>, fresh: bool }
+            let mut cache = TokenCache {
+                rotation: super::permissions::Rotation::new(directory.clone(), requested_key),
+                virtual_key: virtual_output.then(|| virtual_key.clone()), fresh,
+            };
+            extern "C" fn save_detailed(token: *const libc::c_char, data: *mut c_void, has_position: i32, x: i32, y: i32) {
                 let result = std::panic::catch_unwind(|| unsafe {
-                    let cache = &mut *(data as *mut Option<String>);
-                    *cache = std::ffi::CStr::from_ptr(token).to_str().ok().map(str::to_owned);
+                    let cache = &mut *(data as *mut TokenCache);
+                    if let Ok(token) = std::ffi::CStr::from_ptr(token).to_str() {
+                        if cache.fresh { cache.rotation.remember(token); return; }
+                        let granted = cache.virtual_key.clone().or_else(||
+                            (has_position != 0).then(|| crate::wayland::portal_monitor_at(x, y)).flatten()
+                                .map(|name| super::permissions::monitor_key(&name)));
+                        if cache.rotation.record(token, granted.as_deref()).is_err() { log::warn!("Portal permission cache could not be saved"); }
+                    }
                 });
                 if result.is_err() { log::warn!("Portal permission cache callback failed"); }
             }
+            // Older plugins lack the position-aware entry point; use the pending slot.
+            extern "C" fn save_token(token: *const libc::c_char, data: *mut c_void) {
+                save_detailed(token, data, 0, 0, 0);
+            }
             let restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
-            // A failed open must not cost the saved consent: put the token back unless the
-            // portal handed out a new one. A stale token only makes the next open ask again.
-            let failed = |code: i32, cache: &Option<String>| {
-                if let (Some(dir), Some((k, value)), None) = (directory.as_deref(), taken.as_ref(), cache.as_ref()) {
+            let failed = |code: i32, cache: &TokenCache| {
+                if let (Some(dir), Some((k, value)), false) = (directory.as_deref(), taken.as_ref(), cache.rotation.received()) {
                     if super::permissions::save(dir, k, value).is_err() { log::warn!("Portal permission cache could not be restored"); }
                 }
                 super::PortalError { code }
             };
+            // Release packages can temporarily have an older libuu-portal.so than the host.
+            #[cfg(feature = "engine-plugins")]
+            let detailed = crate::engine_plugin::symbol(crate::engine_plugin::Engine::Portal, "uu_portal_open_detailed\0") != 0;
+            #[cfg(not(feature = "engine-plugins"))]
+            let detailed = true;
             #[allow(unused_mut)]
-            let mut pointer: *mut c_void = std::ptr::null_mut();
+            let mut prefer_dmabuf = false;
             #[cfg(feature = "inproc-av")]
             if !virtual_output && crate::video::native_engine_eligible(crate::video_select::selection().encoder, crate::video::NativeDisplayKind::Portal)
                 && !std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v| v == "0") {
-                let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
-                let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
-                pointer = unsafe { uu_portal_open_persist_capture(
-                    restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
-                    &mut error, &mut width, &mut height,
-                ) };
-                if pointer.is_null() && error != 0 { return Err(failed(error, &cache)); }
-                if pointer.is_null() { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
+                prefer_dmabuf = true;
             }
-            let pointer = if !pointer.is_null() { pointer } else { unsafe {
-                if virtual_output {
-                    uu_portal_open_virtual(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
-                } else if let Some(cancelled) = cancelled {
-                    uu_portal_open_persist_cancellable(
-                        restore, save_token, &mut cache as *mut _ as *mut c_void,
-                        is_cancelled, cancelled as *const _ as *mut c_void,
+            let pointer = if detailed {
+                let cancel = cancelled.filter(|_| !virtual_output);
+                let callback = cancel.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
+                let cancel_data = cancel.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
+                unsafe { uu_portal_open_detailed(
+                    restore, save_detailed, &mut cache as *mut _ as *mut c_void, callback, cancel_data,
+                    i32::from(prefer_dmabuf), if virtual_output { 4 } else { 1 },
+                    &mut error, &mut width, &mut height,
+                ) }
+            } else {
+                #[allow(unused_mut)]
+                let mut pointer: *mut c_void = std::ptr::null_mut();
+                #[cfg(feature = "inproc-av")]
+                if prefer_dmabuf {
+                    let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
+                    let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
+                    pointer = unsafe { uu_portal_open_persist_capture(
+                        restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
                         &mut error, &mut width, &mut height,
-                    )
-                } else {
-                    uu_portal_open_persist(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
+                    ) };
+                    if pointer.is_null() && error != 0 { return Err(failed(error, &cache)); }
+                    if pointer.is_null() { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
                 }
-            } };
-            let Some(handle) = NonNull::new(pointer) else { return Err(failed(error, &cache)) };
+                if !pointer.is_null() { pointer } else { unsafe {
+                    if virtual_output {
+                        uu_portal_open_virtual(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
+                    } else if let Some(cancelled) = cancelled {
+                        uu_portal_open_persist_cancellable(restore, save_token, &mut cache as *mut _ as *mut c_void,
+                            is_cancelled, cancelled as *const _ as *mut c_void, &mut error, &mut width, &mut height)
+                    } else {
+                        uu_portal_open_persist(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
+                    }
+                } }
+            };
+            let Some(handle) = NonNull::new(pointer) else { return Err(failed(if error == 0 { 15 } else { error }, &cache)) };
             let (mut x, mut y) = (0, 0);
             let granted = (!virtual_output && unsafe { uu_portal_stream_position(handle.as_ptr(), &mut x, &mut y) } == 0)
                 .then(|| crate::wayland::portal_monitor_at(x, y)).flatten();
-            if let (Some(dir), Some(token)) = (directory.as_deref(), cache.take()) {
-                let saved = match &granted {
-                    _ if virtual_output => virtual_key.clone(),
-                    Some(name) => super::permissions::monitor_key(name),
-                    None => key.to_owned(),
-                };
-                if super::permissions::save(dir, &saved, &token).is_err() { log::warn!("Portal permission cache could not be saved"); }
+            let saved = match &granted {
+                _ if virtual_output => virtual_key.clone(),
+                Some(name) => super::permissions::monitor_key(name),
+                None => key.to_owned(),
+            };
+            if cache.rotation.finish(&saved, fresh || virtual_output || granted.is_some()).is_err() {
+                log::warn!("Portal permission cache could not be saved");
             }
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
@@ -880,6 +913,7 @@ impl PortalSession {
 static ACTIVE: std::sync::Mutex<Option<std::sync::Weak<PortalSession>>> = std::sync::Mutex::new(None);
 pub fn permissions_directory() -> Option<std::path::PathBuf> { permissions::directory() }
 pub fn monitor_key(connector: &str) -> String { permissions::monitor_key(connector) }
+pub fn permission_exists(dir: &std::path::Path, key: &str) -> bool { permissions::exists(dir, key) }
 pub fn register(session: &Arc<PortalSession>) {
     *ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(session));
 }
