@@ -63,6 +63,7 @@ ab_glyph = { version = "0.2", optional = true }
 png = { version = "0.18", optional = true }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 # Synthetic loopback WSS certificates only; both crates already occur in Cargo.lock.
 rcgen = "0.11.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }

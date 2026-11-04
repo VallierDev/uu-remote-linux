@@ -99,7 +99,7 @@ impl Controller {
 #[derive(Default)]
 struct CmdState { held: bool, pending: bool, passthrough: bool, combos: std::collections::BTreeMap<i32, bool> }
 
-pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag> }
+pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag>, pointer_wake: tokio::sync::Notify }
 
 fn active_output_count(json: &[u8]) -> Option<usize> {
     let data: serde_json::Value = serde_json::from_slice(json).ok()?;
@@ -135,7 +135,7 @@ impl InputInjector {
             || (backend == crate::desktop_backend::DesktopBackend::Portal && single_portal_output()));
         if uinput_pointer { log::info!("Input pointer backend: uinput (motion, buttons and wheel)"); }
         else if backend == crate::desktop_backend::DesktopBackend::Portal { log::info!("Input pointer backend: portal (monitor-local coordinates)"); }
-        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()) }
+        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
     }
 
     pub fn bind_portal(&self,session:Option<std::sync::Arc<crate::portal::PortalSession>>) {
@@ -153,6 +153,7 @@ impl InputInjector {
             let mut pending = self.pending.lock().unwrap();
             pending.absolute = Some(position);
             pending.relative = (0,0);
+            self.pointer_wake.notify_one();
         }
     }
     pub fn mouse_relative(&self, dx: i32, dy: i32) {
@@ -160,6 +161,7 @@ impl InputInjector {
             let mut pending = self.pending.lock().unwrap();
             pending.relative.0 = (pending.relative.0 + i64::from(dx)).clamp(-65535,65535);
             pending.relative.1 = (pending.relative.1 + i64::from(dy)).clamp(-65535,65535);
+            self.pointer_wake.notify_one();
         }
     }
     pub fn mouse_scroll(&self, dx: i32, dy: i32) {
@@ -167,14 +169,37 @@ impl InputInjector {
         let mut pending = self.pending.lock().unwrap();
         pending.scroll.0 = (pending.scroll.0 + i64::from(dx)).clamp(-12000,12000);
         pending.scroll.1 = (pending.scroll.1 + i64::from(dy)).clamp(-12000,12000);
+        self.pointer_wake.notify_one();
     }
     pub fn start_pointer_worker(self: &std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
         let input = self.clone();
         tokio::spawn(async move {
+            // Parked until pointer work exists: a fixed 4 ms tick burned ~250 wakeups/s
+            // (≈3% CPU with pow-heavy flush math) even with no viewer connected.
+            // notify_one() stores a permit, so an event racing the park check cannot be lost.
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(4));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop { tick.tick().await; input.flush_pointer(); }
+            loop {
+                input.pointer_wake.notified().await;
+                // The first event is immediate; later events coalesce until the next tick.
+                tick.reset();
+                loop {
+                    input.flush_pointer();
+                    tick.tick().await;
+                    if input.pointer_idle() { break; }
+                }
+            }
         })
+    }
+    /// Whether the worker may park: nothing accumulated, no full scroll notch waiting and no
+    /// touch gesture in flight (`Pending` needs ticks until its hold resolves, `Scroll`/`Select`
+    /// and `down` until release). Sub-notch scroll residue cannot inject alone, so it parks.
+    fn pointer_idle(&self) -> bool {
+        let pending = self.pending.lock().unwrap();
+        let touch = self.touch.lock().unwrap();
+        pending.absolute.is_none() && pending.relative == (0,0)
+            && pending.scroll.0 / 120 == 0 && pending.scroll.1 / 120 == 0
+            && !touch.down && touch.finger == Finger::Up
     }
     pub fn discard_pointer(&self) { *self.pending.lock().unwrap() = PendingPointer::default(); }
     pub fn flush_pointer(&self) {
@@ -229,6 +254,8 @@ impl InputInjector {
     }
     pub fn mouse_button(&self, button: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
+        // The worker cannot consume the wake and flush until this transition is published.
+        self.pointer_wake.notify_one();
         self.flush_pointer_locked();
         if button == 1 && self.touch_button(is_press) { return; }
         let result = self.inject_button(button,is_press);
@@ -841,6 +868,98 @@ mod motion_tests {
         input.mouse_relative(1,2); input.discard_pointer();
         assert_eq!(input.pending.lock().unwrap().relative,(0,0));
     }
+    #[test]
+    fn parks_when_pointer_state_is_idle() {
+        let input = InputInjector::new();
+        assert!(input.pointer_idle());
+        input.mouse_relative(5,5);
+        assert!(!input.pointer_idle());
+        input.flush_pointer();
+        assert!(input.pointer_idle());
+        input.mouse_scroll(0,125); input.flush_pointer();
+        assert!(input.pointer_idle(), "sub-notch scroll residue cannot inject alone");
+    }
+    #[test]
+    fn live_touch_gesture_stays_busy_until_it_resolves() {
+        let input = InputInjector::new();
+        input.touch.lock().unwrap().finger = Finger::Pending { start: (5,5), at: std::time::Instant::now() };
+        assert!(!input.pointer_idle());
+        input.touch.lock().unwrap().finger = Finger::Scroll { last: (9,9) };
+        assert!(!input.pointer_idle());
+        *input.touch.lock().unwrap() = TouchDrag::default();
+        assert!(input.pointer_idle());
+    }
+    #[test]
+    fn button_wake_waits_for_the_serialized_transition() {
+        use futures_util::FutureExt;
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let serial = input.serial.lock().unwrap();
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let pressing = input.clone();
+        let started = ready.clone();
+        let button = std::thread::spawn(move || { started.wait(); pressing.mouse_button(1,true); });
+        ready.wait();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let premature = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(50), input.pointer_wake.notified()).await.is_ok()
+        });
+        drop(serial);
+        button.join().unwrap();
+        assert!(!premature, "a parked worker must not wake before the button owns the serial lock");
+        assert!(input.pointer_wake.notified().now_or_never().is_some());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_coalesces_one_ms_motion_on_four_ms_ticks() {
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let worker = input.start_pointer_worker();
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1, "first motion is immediate");
+        for ms in 1..=12 {
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            input.mouse_relative(1,0);
+            tokio::task::yield_now().await;
+            assert_eq!(input.portal_input_counts_for_test()[0],1+ms/4, "motion at {ms} ms bypassed the cadence");
+        }
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],5);
+        assert_eq!(input.pending.lock().unwrap().relative,(0,0));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_parks_and_resets_the_tick_after_a_quiet_period() {
+        let input = std::sync::Arc::new(InputInjector::without_desktop());
+        let worker = input.start_pointer_worker();
+        tokio::task::yield_now().await;
+        // Without a notification, raw queued state must remain untouched while parked.
+        input.pending.lock().unwrap().relative = (1,0);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],0);
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1);
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        input.pending.lock().unwrap().relative = (1,0);
+        tokio::time::advance(std::time::Duration::from_millis(997)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],1, "idle ticks must stop after activity");
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],2);
+        input.mouse_relative(1,0);
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],2, "a stale interval must not flush a second time immediately");
+        tokio::time::advance(std::time::Duration::from_millis(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(input.portal_input_counts_for_test()[0],3);
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1088,7 +1207,7 @@ impl InputInjector {
             portal_outcomes:std::array::from_fn(|_|std::sync::atomic::AtomicUsize::new(0)),
             portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::DesktopBackend::Portal,
             pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()),
-            touch:std::sync::Mutex::new(TouchDrag::default()) }
+            touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
     }
 }
 
