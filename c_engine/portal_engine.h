@@ -5,6 +5,9 @@
 #include "dmabuf_frame.h"
 struct uu_portal;
 typedef int (*uu_portal_cancelled_fn)(void *data);
+typedef void (*uu_portal_save_detailed_fn)(const char *token, void *data, int has_position, int32_t x, int32_t y);
+/* Reports the granted position alongside the rotated token before video initialization. */
+struct uu_portal *uu_portal_open_detailed(const char *restore, uu_portal_save_detailed_fn save_token, void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf, uint32_t source_types, int *error, uint32_t *width, uint32_t *height);
 /* One object owns one consent/session and one PipeWire stream. */
 struct uu_portal *uu_portal_open(int *error, uint32_t *width, uint32_t *height);
 /* Saves the rotated token immediately after Start, before video initialization. */
