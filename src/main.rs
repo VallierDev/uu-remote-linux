@@ -48,6 +48,7 @@ mod audio;
 mod virtual_audio;
 mod privacy_screen;
 mod system_actions;
+mod annotation;
 mod capability;
 mod protocol;
 mod control_protocol;

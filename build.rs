@@ -3,6 +3,7 @@ fn main() {
     println!("cargo:rerun-if-changed=c_engine/wayland_transform.h");
     println!("cargo:rerun-if-changed=c_engine/portal_clipboard.inc");
     println!("cargo:rerun-if-changed=c_engine/x11_engine.c");
+    println!("cargo:rerun-if-changed=c_engine/annotation_overlay.c");
     println!("cargo:rerun-if-changed=c_engine/uinput_keymap.c");
     println!("cargo:rerun-if-changed=c_engine/uinput_keymap.h");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.c");
@@ -34,6 +35,7 @@ fn main() {
         }
         let mut x11_build = cc::Build::new();
         x11_build.file("c_engine/x11_engine.c")
+            .file("c_engine/annotation_overlay.c")
             .file("c_engine/uinput_keymap.c")
             .file("c_engine/clipboard.c")
             .file("c_engine/pam_check.c");
