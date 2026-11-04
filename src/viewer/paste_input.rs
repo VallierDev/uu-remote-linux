@@ -9,11 +9,11 @@ pub(super) struct Modifiers(Mod);
 impl Default for Modifiers {fn default()->Self{Self(Mod::NOMOD)}}
 impl Modifiers {
     pub fn observe(&mut self,event:&Event)->Option<Mod> {
-        // SDL wheels have no keymod field. Derive their state from the ordered
+        // SDL buttons/wheels have no keymod field. Derive their state from the ordered
         // keyboard stream, never from SDL's final state after polling a batch.
         if let Event::KeyDown{keymod,..}|Event::KeyUp{keymod,..}=event{self.0=*keymod;}
         if matches!(event,Event::Window{win_event:sdl2::event::WindowEvent::FocusLost,..}){self.0=Mod::NOMOD;}
-        matches!(event,Event::MouseWheel{..}).then_some(self.0)
+        matches!(event,Event::MouseWheel{..}|Event::MouseButtonDown{..}|Event::MouseButtonUp{..}).then_some(self.0)
     }
 }
 pub(super) struct Buffer {events:Vec<InputEvent>}

@@ -15,7 +15,7 @@ fn cancels_paste(event:&Event)->bool {
 }
 fn image_paste_keys(input:&mut Input)->Vec<serde_json::Value>{
     // Release the physical PC modifiers before an atomic, balanced Mac Cmd+V.
-    // The next real SDL key restores any modifiers the user is still holding.
+    // Subsequent keys, buttons and wheels restore modifiers the user is still holding.
     let mut out=input.release_all();
     for (scan,down) in [(227,true),(25,true),(25,false),(227,false)]{if let Some(m)=input.key(scan,down){out.push(m);}}
     out
@@ -896,6 +896,68 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
     fn image_test_key(id:u32,scan:sdl2::keyboard::Scancode,down:bool,mods:sdl2::keyboard::Mod)->Event {
         if down{Event::KeyDown{timestamp:0,window_id:id,keycode:None,scancode:Some(scan),keymod:mods,repeat:false}}
         else{Event::KeyUp{timestamp:0,window_id:id,keycode:None,scancode:Some(scan),keymod:mods,repeat:false}}
+    }
+    fn image_test_button(id:u32,mouse_btn:MouseButton,down:bool)->Event {
+        if down{Event::MouseButtonDown{timestamp:0,window_id:id,which:0,mouse_btn,clicks:1,x:300,y:300}}
+        else{Event::MouseButtonUp{timestamp:0,window_id:id,which:0,mouse_btn,clicks:1,x:300,y:300}}
+    }
+    #[cfg_attr(target_os="macos",ignore)]
+    #[tokio::test] async fn image_paste_preserves_modifiers_on_later_clicks(){
+        if isolated_image_test("viewer::sdl::tests::image_paste_preserves_modifiers_on_later_clicks"){return}
+        use sdl2::keyboard::{Scancode as S,Mod as M};
+        let mut window=Window::new().unwrap();window.mac=true;window.chrome.font=None;
+        let id=window.canvas.window().id();let(tx,_requests)=tokio::sync::mpsc::channel(1);
+        window.image_tx=Some(tx);window.image_reader=super::super::image_paste::Reader::Unavailable;
+        for (modifier,mods,remote) in [(S::LCtrl,M::LCTRLMOD,59),(S::RCtrl,M::RCTRLMOD,62),(S::LGui,M::LGUIMOD,55),(S::RGui,M::RGUIMOD,54)]{
+            for result in 0..5{for keep_held in [true,false]{for mouse in [MouseButton::Left,MouseButton::Right,MouseButton::Middle]{
+                let mut input=Input::default();input.set_mac(true);window.paste_key_held=false;
+                let mut messages=window.poll_batch(&mut input,vec![image_test_key(id,modifier,true,mods),
+                    image_test_key(id,S::V,true,mods),image_test_key(id,S::V,false,mods)]).1;
+                let(reply,rx)=tokio::sync::oneshot::channel();let pending=window.paste.as_mut().unwrap();
+                pending.task.abort();pending.task=tokio::spawn(std::future::pending());pending.reply=rx;
+                if !keep_held{messages.extend(window.poll_batch(&mut input,vec![image_test_key(id,modifier,false,M::NOMOD)]).1);}
+                // Completion is consumed in an earlier poll, without a key/wheel restoring modifiers.
+                // Case 4 instead cancels a still-pending transfer with the click itself.
+                match result{0=>reply.send(Ok(true)).unwrap(),1=>reply.send(Err(())).unwrap(),2=>drop(reply),3=>reply.send(Ok(false)).unwrap(),_=>()}
+                if result!=4{messages.extend(window.poll_batch(&mut input,vec![]).1);assert!(window.paste.is_none());}
+                messages.extend(window.poll_batch(&mut input,vec![image_test_button(id,mouse,true)]).1);
+                messages.extend(window.poll_batch(&mut input,vec![image_test_button(id,mouse,false)]).1);
+                messages.extend(window.poll_batch(&mut input,vec![image_test_key(id,modifier,false,M::NOMOD)]).1);
+                let mut held=std::collections::BTreeSet::new();let mut buttons=Vec::new();let mut pastes=0;
+                for m in &messages{match m["action"].as_str(){
+                    Some("kbd_press")=>{let code=m["key"].as_i64().unwrap();held.insert(code);if code==9{pastes+=1;}},
+                    Some("kbd_release")=>{held.remove(&m["key"].as_i64().unwrap());},
+                    Some(action @ ("mouse_press"|"mouse_release"))=>{
+                        let expected=if keep_held{std::collections::BTreeSet::from([remote])}else{Default::default()};
+                        assert_eq!(held,expected,"result={result}, keep_held={keep_held}, modifier={modifier:?}, action={action}");
+                        buttons.push((action,m["button"].as_i64().unwrap()));
+                    },_=>(),
+                }}
+                assert_eq!(buttons,vec![("mouse_press",i64::from(button(mouse).unwrap())),("mouse_release",i64::from(button(mouse).unwrap()))]);
+                assert_eq!(pastes,usize::from(result==0||result==3));
+                assert!(held.is_empty());assert!(input.release_all().is_empty());assert!(window.paste.is_none());
+            }}}
+        }
+    }
+    #[test] fn mouse_buttons_reconcile_event_time_modifiers(){
+        use sdl2::keyboard::{Scancode as S,Mod as M};
+        // Each button transition must restore modifiers on its own, including combinations.
+        for (mods,codes) in [(M::LCTRLMOD,vec![59]),(M::RCTRLMOD,vec![62]),(M::LGUIMOD,vec![55]),(M::RGUIMOD,vec![54]),
+            (M::LSHIFTMOD|M::LALTMOD,vec![56,58]),(M::RSHIFTMOD|M::RALTMOD,vec![60,61])]{
+            for down in [true,false]{for allowed in [0,1,2]{
+                let mut input=Input::new(allowed==2);input.set_mac(true);
+                let mut physical=Modifiers::default();physical.observe(&image_test_key(1,S::V,false,mods));
+                let mut focused=allowed!=1;let mut files=false;
+                if !down&&allowed==0{input.button(1,true);}
+                let event=image_test_button(1,MouseButton::Left,down);
+                let event=InputEvent{modifiers:physical.observe(&event),event};
+                let messages=translate_input([event],&mut input,Viewport::fit((800,600),(800,600)),&mut focused,&mut files).1;
+                if allowed!=0{assert!(messages.is_empty());assert!(input.release_all().is_empty());continue}
+                let mut expected:Vec<_>=codes.iter().map(|code|serde_json::json!({"action":"kbd_press","key":code})).collect();
+                expected.push(serde_json::json!({"action":if down{"mouse_press"}else{"mouse_release"},"button":1}));
+                assert_eq!(messages,expected,"mods={mods:?}, down={down}");
+            }}
+        }
     }
     #[cfg_attr(target_os="macos",ignore)]
     #[tokio::test] async fn image_paste_cancellation_preserves_modifier_order(){
