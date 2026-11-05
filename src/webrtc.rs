@@ -1177,7 +1177,8 @@ impl WebRtcSession {
                             }
                             return;
                         }
-                        if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
+                        let proto_fields = crate::protocol::decode_wire(&msg.data).ok();
+                        if let Some(fields) = proto_fields.as_deref() {
                             use crate::protocol::WireValue;
                             let rpc = fields.iter().find_map(|f| match (f.number, &f.value) { (21, WireValue::Bytes(b)) => Some(*b), _ => None });
                             let rpc_fields = rpc.and_then(|r| crate::protocol::decode_wire(r).ok());
@@ -1222,18 +1223,18 @@ impl WebRtcSession {
                                 let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
                                 return;
                             }
-                            if let Some(response) = rpc.and_then(|r| crate::protocol::decode_wire(r).ok()).and_then(|r| crate::terminal::rpc_response(&r)) {
+                            if let Some(response) = rpc_fields.as_deref().and_then(crate::terminal::rpc_response) {
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
                                 return;
                             }
                         }
-                        if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
-                            if mapping.handle(&fields, &channel_name) { return; }
+                        if let Some(fields) = proto_fields.as_deref() {
+                            if mapping.handle(fields, &channel_name) { return; }
                         }
                         if let Some(files) = &file_worker {
-                            if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
-                                if files.handle(&fields) {
+                            if let Some(fields) = proto_fields.as_deref() {
+                                if files.handle(fields) {
                                     static ROUTE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                                     if ROUTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
                                         log::info!("File transfer RPC received on {}", channel_name);
@@ -1259,16 +1260,16 @@ impl WebRtcSession {
                                         }
                                     }
                                     shape(&value,0).to_string()
-                                } else if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
+                                } else if let Some(fields) = proto_fields.as_deref() {
                                     format!("protobuf fields={:?}",fields.iter().map(|f|f.number).collect::<Vec<_>>())
                                 } else { "opaque".to_string() };
                                 log::info!("Clipboard channel schema: channel={} bytes={} schema={}",channel_name,msg.data.len(),shape);
                             }
                         }
                         if channel_name == "CONTROL_DATA_CHANNEL" || channel_name == "TEXT_DATA_CHANNEL" {
-                            if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
+                            if let Some(fields) = proto_fields.as_deref() {
                                 use crate::protocol::WireValue;
-                                for field in &fields {
+                                for field in fields {
                                     if let (22,WireValue::Bytes(payload))=(field.number,&field.value) {
                                         let update=rich_incoming.lock().unwrap().response(payload);
                                         match update {
@@ -1285,8 +1286,6 @@ impl WebRtcSession {
                                             }
                                         }
                                     }
-                                }
-                                for field in &fields {
                                     if let (21, WireValue::Bytes(payload)) = (field.number,&field.value) {
                                         let ids=crate::clipboard_rich::format_ids(payload);
                                         if !ids.is_empty(){log::info!("Clipboard offered format IDs: {:?}",ids);}
@@ -1324,8 +1323,6 @@ impl WebRtcSession {
                                             Err(reason)=>log::warn!("Clipboard RPC rejected: {}",reason),
                                         }
                                     }
-                                }
-                                for field in &fields {
                                     if let (17, WireValue::Bytes(payload)) = (field.number, &field.value) {
                                         match clipboard_assembly.lock().unwrap().accept(payload) {
                                             Ok(Some(text)) => {
