@@ -196,6 +196,8 @@ sudo apt install build-essential pkg-config \
 sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # 可选：GNOME/KDE portal 后端
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
+# 同时启用 portal 和 inproc-av：EGLImage 导入辅助代码的开发头文件
+sudo apt install libegl-dev libdrm-dev
 # 可选：inproc-av 的 VAAPI/DRI3 引擎编译所需（libva 本体运行时加载）
 sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
 # inproc-av 的进程内音频采集与 Opus 编码
@@ -218,7 +220,7 @@ cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 服务端可选的 `--features inproc-av` 是 X11 下的进程内硬件编码：不链接 FFmpeg 开发库，NVENC 运行时加载 NVIDIA 驱动库（`libcuda.so.1`、`libnvidia-encode.so.1`，需要支持 NVENC API 12.1 的驱动，530 及以上），VAAPI 运行时加载 `libva.so.2`/`libva-drm.so.2`。截屏与编码尺寸一致时 NVENC 直接读取 XShm 缓冲，省去一次主机到显存的拷贝；VAAPI 在同一特性下也进程内运行（DRI3 DMA-BUF 零拷贝，无 DRI3 时 XShm 上传，VPP 转 NV12 后送 VCN，支持 H.264/H.265）。CPU 编码或 `UU_CAPTURE=grab` 仍走外部 FFmpeg 进程；进程内硬件编码启动失败时先回退到对应的 FFmpeg 进程管线，再回退到 CPU。默认构建和预编译包都不需要该特性。
 
 GNOME/KDE Wayland 的进程内编码用 `cargo build --release --features wayland,portal,inproc-av` 配合 `set-encoder vaapi` 启用，目前仅支持 Portal + VAAPI。
-`UU_PORTAL_DMABUF=0` 禁用 DMA-BUF、改用进程内上传；`UU_VIDEO_PIPELINE=process` 恢复外部 FFmpeg 管线。
+为避免 VAAPI 出错后 GPU 仍访问已归还的帧，Portal VAAPI DMA-BUF 导入已禁用（无环境变量可强制启用），改用 CPU 捕获和进程内上传；额外拷贝可能增加 CPU 开销并降低帧率，尚无性能测量。`UU_VIDEO_PIPELINE=process` 恢复外部 FFmpeg 管线。
 
 ### 3. 登录
 
@@ -604,3 +606,7 @@ SDL 控制端可通过现有桌面 CONTROL 通道向 Windows 被控端转发一�
 不支持 Guide 键、多手柄和自适应扳机；休眠、强制退出及断网恢复尚未全面验证。
 一名报告用户在一组 Windows + Steam Deck 上测试了输入、手机热点、重连与震动。
 详见[协议证据、设计与限制](docs/deckpad-native-gamepad.md)。
+
+### 实验性 Portal → NVIDIA 低复制
+
+默认关闭的显式配置入口已接入视频任务，单台测试主机 H.264 配置已通过实际客户端画面与操作验收，其他配置仍需验证。配置、同步契约及恢复限制见 [实验说明](docs/portal-nvidia-experimental.md)。

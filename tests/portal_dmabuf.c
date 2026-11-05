@@ -6,6 +6,10 @@
 static struct pw_buffer *incoming[8], *returned[32];
 static unsigned input_count, input_next, return_count, loop_depth, updates;
 static int requested_dma;
+static int disconnects, disconnect_error;
+static int test_disconnect(struct pw_stream *stream) {
+    (void)stream; assert(loop_depth == 1); disconnects++; return disconnect_error;
+}
 static struct pw_buffer *test_dequeue(struct pw_stream *stream) {
     (void)stream;
     assert(loop_depth == 1);
@@ -33,6 +37,7 @@ static int test_update(struct pw_stream *stream, const struct spa_pod **params, 
 #define pw_stream_dequeue_buffer test_dequeue
 #define pw_stream_queue_buffer test_queue
 #define pw_stream_update_params test_update
+#define pw_stream_disconnect test_disconnect
 #define pw_thread_loop_lock test_loop_lock
 #define pw_thread_loop_unlock test_loop_unlock
 #include "../c_engine/portal_engine.c"
@@ -181,7 +186,33 @@ static void initial_dma_transport(void) {
     close_portal(p);
 }
 int main(void) {
+    /* Reproduce a modifier-bearing fixed format delivered to a SHM-only opener.
+     * It must fail immediately, without advertising DMA buffers or waiting. */
+    struct uu_portal *p=make_portal();
+    p->dma_requested=0; p->dma_format=0; p->sequence=0;
+    uint8_t storage[512]; struct spa_pod_builder builder=SPA_POD_BUILDER_INIT(storage,sizeof(storage));
+    const struct spa_pod *format=spa_format_video_raw_build(&builder,SPA_PARAM_Format,
+        &SPA_VIDEO_INFO_RAW_INIT(.format=SPA_VIDEO_FORMAT_BGRA,.size=SPA_RECTANGLE(2,2),
+            .flags=SPA_VIDEO_FLAG_MODIFIER,.modifier=0x1234));
+    unsigned before=updates;
+    test_loop_lock(p->pw_loop); stream_format(p,SPA_PARAM_Format,format); test_loop_unlock(p->pw_loop);
+    assert(p->error==14 && !p->dma_requested && !p->dma_format && updates==before);
+    assert(wait_for_first_frame(p)==14);
+    close_portal(p);
     descriptor_bounds();
+    p=make_portal(); disconnects=0;
+    assert(uu_portal_disconnect_capture(p)==-EBUSY && !disconnects);
+    atomic_store(&p->closed,1);
+    p->dma_async=(void *)1;
+    assert(uu_portal_disconnect_capture(p)==-EBUSY && !disconnects);
+    p->dma_async=NULL; p->dma_current=(void *)1;
+    assert(uu_portal_disconnect_capture(p)==-EBUSY && !disconnects);
+    p->dma_current=NULL; disconnect_error=-EIO;
+    assert(uu_portal_disconnect_capture(p)==-EIO && !p->capture_disconnected);
+    disconnect_error=0;
+    assert(!uu_portal_disconnect_capture(p) && p->capture_disconnected && disconnects==2);
+    assert(!uu_portal_disconnect_capture(p) && disconnects==2);
+    close_portal(p);
     ownership_and_reset();
     negotiation_and_black();
     initial_dma_transport();
