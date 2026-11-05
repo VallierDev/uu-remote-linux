@@ -1467,20 +1467,33 @@ impl WebRtcSession {
                                         if RECEIPTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
                                             log::info!("CONTROL input received: kind={}", kind);
                                         }
-                                        if let Some(session)=message_input_session.as_ref() {session.with_input(|| {
-                                        if !crate::wayland::input_ready() {return;}
-                                        match &event {
-                                            ControlInput::MouseAbsolute {x,y} => input_worker.mouse_absolute_normalized(*x,*y,crate::wayland::input_size(if live_x11 {crate::capture::x11_last_size().unwrap_or(input_size)} else {input_size})),
-                                            ControlInput::MouseRelative {dx,dy} => input_worker.mouse_relative(*dx,*dy),
-                                            ControlInput::MouseScroll {dx,dy} => input_worker.mouse_scroll(*dx,*dy),
-                                            ControlInput::Keyboard {key, pressed} => input_worker.windows_key_event(*key, *pressed),
-                                            ControlInput::TextInput {text} => input_worker.text_input(text),
-                                            ControlInput::KeyboardClick {key} => {input_worker.windows_key_event(*key, true);input_worker.windows_key_event(*key, false);},
-                                            ControlInput::MouseButton {button,pressed} => input_worker.wire_mouse_button(*button,*pressed),
-                                            ControlInput::MouseClick {button} => {input_worker.wire_mouse_button(*button,true);input_worker.wire_mouse_button(*button,false);},
-                                            _ => {}
+                                        if let Some(session)=message_input_session.as_ref() {
+                                            if matches!(&event, ControlInput::TextInput {..}) {
+                                                let (session, input, text) = match &event {
+                                                    ControlInput::TextInput {text} => (session.clone(), input_worker.clone(), text.clone()),
+                                                    _ => unreachable!(),
+                                                };
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    session.with_input(|| {
+                                                        if crate::wayland::input_ready() { input.text_input(&text); }
+                                                    });
+                                                }).await;
+                                            } else {
+                                                session.with_input(|| {
+                                                    if !crate::wayland::input_ready() {return;}
+                                                    match &event {
+                                                        ControlInput::MouseAbsolute {x,y} => input_worker.mouse_absolute_normalized(*x,*y,crate::wayland::input_size(if live_x11 {crate::capture::x11_last_size().unwrap_or(input_size)} else {input_size})),
+                                                        ControlInput::MouseRelative {dx,dy} => input_worker.mouse_relative(*dx,*dy),
+                                                        ControlInput::MouseScroll {dx,dy} => input_worker.mouse_scroll(*dx,*dy),
+                                                        ControlInput::Keyboard {key, pressed} => input_worker.windows_key_event(*key, *pressed),
+                                                        ControlInput::KeyboardClick {key} => {input_worker.windows_key_event(*key, true);input_worker.windows_key_event(*key, false);},
+                                                        ControlInput::MouseButton {button,pressed} => input_worker.wire_mouse_button(*button,*pressed),
+                                                        ControlInput::MouseClick {button} => {input_worker.wire_mouse_button(*button,true);input_worker.wire_mouse_button(*button,false);},
+                                                        _ => {}
+                                                    }
+                                                });
+                                            }
                                         }
-                                        });}
 
                                     },
                                     Ok(crate::control_protocol::ControlMessage::Unsupported(v)) => {
@@ -1507,7 +1520,14 @@ impl WebRtcSession {
                                     }
                                 }
                                 if let Ok(crate::control_protocol::ControlMessage::Input(crate::control_protocol::ControlInput::TextInput {text})) = crate::control_protocol::decode_control(&msg.data) {
-                                    if let Some(session)=message_input_session.as_ref() { session.with_input(|| {if crate::wayland::input_ready() {input_worker.text_input(&text);}}); }
+                                    if let Some(session)=message_input_session.as_ref() {
+                                        let (session, input) = (session.clone(), input_worker.clone());
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            session.with_input(|| {
+                                                if crate::wayland::input_ready() { input.text_input(&text); }
+                                            });
+                                        }).await;
+                                    }
                                 }
                                 if channel_name.contains("STREAMER") {
                                     log::debug!("STREAMER channel JSON received");
