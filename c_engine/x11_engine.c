@@ -331,12 +331,26 @@ static int class_is_terminal(const char *value) {
     return 0;
 }
 
-/* Returns 1 when the focused window belongs to a terminal emulator, else 0. */
+/* Returns 1 when the focused window belongs to a terminal emulator, else 0.
+   Cached for 100ms to eliminate redundant synchronous X11 tree queries on key bursts. */
 int x11_terminal_shortcut_state(void) {
+    static int cached_terminal = 0;
+    static struct timespec last_query = {0, 0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long diff_ms = (now.tv_sec - last_query.tv_sec) * 1000 + (now.tv_nsec - last_query.tv_nsec) / 1000000;
+    if (last_query.tv_sec != 0 && diff_ms >= 0 && diff_ms < 100) {
+        return cached_terminal;
+    }
+
     if (!g_probe && !(g_probe = XOpenDisplay(NULL))) return 0;
     Window focus = 0; int revert = 0;
     XGetInputFocus(g_probe, &focus, &revert);
-    if (focus == None || focus == PointerRoot) return 0;
+    if (focus == None || focus == PointerRoot) {
+        cached_terminal = 0;
+        last_query = now;
+        return 0;
+    }
     Window cur = focus;
     for (int depth = 0; depth < 12 && cur; depth++) {
         XClassHint hint = {0};
@@ -344,14 +358,26 @@ int x11_terminal_shortcut_state(void) {
             int terminal = class_is_terminal(hint.res_name) || class_is_terminal(hint.res_class);
             if (hint.res_name) XFree(hint.res_name);
             if (hint.res_class) XFree(hint.res_class);
+            cached_terminal = terminal;
+            last_query = now;
             return terminal;
         }
         Window root, parent, *children = NULL; unsigned int n = 0;
-        if (!XQueryTree(g_probe, cur, &root, &parent, &children, &n)) return 0;
+        if (!XQueryTree(g_probe, cur, &root, &parent, &children, &n)) {
+            cached_terminal = 0;
+            last_query = now;
+            return 0;
+        }
         if (children) XFree(children);
-        if (parent == root) return 0;
+        if (parent == root) {
+            cached_terminal = 0;
+            last_query = now;
+            return 0;
+        }
         cur = parent;
     }
+    cached_terminal = 0;
+    last_query = now;
     return 0;
 }
 
