@@ -154,8 +154,25 @@ fn is_independent_frame_for(bytes: &[u8], codec: VideoCodec) -> bool {
     match codec {
         VideoCodec::H264 => !nal_offsets_for(bytes, 5, codec).is_empty() && nal_offsets_for(bytes, 1, codec).is_empty(),
         // BLA/IDR/CRA are IRAP (RFC 7798 §4.1); no leading pictures with our no-B-frame encoder.
-        VideoCodec::H265 => (16..=21).any(|kind| !nal_offsets_for(bytes, kind, codec).is_empty())
-            && !(0..16).any(|kind| !nal_offsets_for(bytes, kind, codec).is_empty()),
+        VideoCodec::H265 => {
+            let mut has_irap = false;
+            let mut has_non_irap_vcl = false;
+            let mut i = 0;
+            while i + 3 < bytes.len() {
+                let prefix = if bytes[i..].starts_with(&[0, 0, 0, 1]) { 4 }
+                    else if bytes[i..].starts_with(&[0, 0, 1]) { 3 } else { i += 1; continue };
+                let header = i + prefix;
+                if let Some(kind) = hevc_nal_kind(bytes, header) {
+                    if (16..=21).contains(&kind) {
+                        has_irap = true;
+                    } else if kind < 16 {
+                        has_non_irap_vcl = true;
+                    }
+                }
+                i += prefix;
+            }
+            has_irap && !has_non_irap_vcl
+        }
     }
 }
 #[cfg(test)]
