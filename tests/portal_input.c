@@ -5,13 +5,18 @@
 #include <sys/socket.h>
 static GVariant *test_call(GDBusConnection *, const gchar *, const gchar *, const gchar *,
     const gchar *, GVariant *, const GVariantType *, GDBusCallFlags, gint, GCancellable *, GError **);
+static void test_call_async(GDBusConnection *, const gchar *, const gchar *, const gchar *,
+    const gchar *, GVariant *, const GVariantType *, GDBusCallFlags, gint,
+    GCancellable *, GAsyncReadyCallback, gpointer);
 static GVariant *test_connect(GDBusConnection *, const gchar *, const gchar *, const gchar *,
     const gchar *, GVariant *, const GVariantType *, GDBusCallFlags, gint,
     GUnixFDList *, GUnixFDList **, GCancellable *, GError **);
 #define g_dbus_connection_call_sync test_call
+#define g_dbus_connection_call test_call_async
 #define g_dbus_connection_call_with_unix_fd_list_sync test_connect
 #include "../c_engine/portal_engine.c"
 #undef g_dbus_connection_call_sync
+#undef g_dbus_connection_call
 #undef g_dbus_connection_call_with_unix_fd_list_sync
 
 enum response_mode { UNKNOWN_METHOD, NOT_SUPPORTED, TEMPORARY_FAILURE, NO_FDS, BAD_INDEX, DISCONNECTED };
@@ -55,6 +60,16 @@ static GVariant *test_call(GDBusConnection *bus, const gchar *dest, const gchar 
     legacy_calls++;
     g_variant_ref_sink(parameters); g_variant_unref(parameters);
     return g_variant_ref_sink(g_variant_new("()"));
+}
+
+static void test_call_async(GDBusConnection *bus, const gchar *dest, const gchar *path,
+    const gchar *interface, const gchar *method, GVariant *parameters,
+    const GVariantType *type, GDBusCallFlags flags, gint timeout,
+    GCancellable *cancel, GAsyncReadyCallback callback, gpointer user_data) {
+    (void)type; (void)flags; (void)timeout; (void)cancel; (void)callback; (void)user_data;
+    GError *error = NULL;
+    GVariant *res = test_call(bus, dest, path, interface, method, parameters, type, flags, timeout, cancel, &error);
+    if (res) g_variant_unref(res);
 }
 
 static GVariant *test_connect(GDBusConnection *bus, const gchar *dest, const gchar *path,

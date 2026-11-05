@@ -883,8 +883,10 @@ static int notify(struct uu_portal *p, const char *method, GVariant *parameters)
     if (!uu_portal_alive(p)) { g_variant_ref_sink(parameters); g_variant_unref(parameters); return 9; }
     /* Fire-and-forget asynchronous D-Bus call to avoid 1-3ms synchronous round-trip latency
      * on 250Hz input streams, while still freeing parameters and handling failure logs in callback. */
+    g_main_context_push_thread_default(p->context);
     g_dbus_connection_call(p->bus, DEST, PATH, REMOTE, method, parameters,
         NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, notify_async_cb, NULL);
+    g_main_context_pop_thread_default(p->context);
     return 0;
 }
 void uu_portal_logical_size(struct uu_portal *p, uint32_t *width, uint32_t *height) {
