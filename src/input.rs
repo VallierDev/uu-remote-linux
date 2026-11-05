@@ -742,14 +742,21 @@ impl InputInjector {
         self.emit_uinput_text(&crate::uinput::text_plan(text))
     }
 
-    /// Mobile input-method text (`text_input`). uinput types the layout-mappable ASCII prefix
-    /// without clipboard access. X11 types directly; native Wayland re-maps a spare
-    /// keycode in the virtual keyboard's keymap. Portal and other Wayland environments inject
-    /// via clipboard paste (Shift+Insert). Set UU_WAYLAND_TEXT=0 to disable Wayland text injection.
+    /// Mobile input-method text (`text_input`). X11 types directly. Native Wayland uses the text
+    /// keyboard's Unicode keysyms first: uinput sends physical keycodes, which a running input
+    /// method composes as pinyin, so "hello" would become candidates instead of text. uinput stays
+    /// as the fallback when the keymap path is unavailable. Portal and other Wayland environments
+    /// inject via clipboard paste (Shift+Insert).
+    /// Set UU_WAYLAND_TEXT=0 to disable Wayland text injection.
     pub fn text_input(&self, text: &str) {
         let _serial=self.serial.lock().unwrap();
         if self.backend != crate::desktop_backend::DesktopBackend::X11 {
             if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v| v == "0") { return; }
+            if self.backend == crate::desktop_backend::DesktopBackend::Wayland
+                && crate::wayland::type_utf8(text) >= 0 {
+                log::info!("Desktop text input: chars={} result=keysyms", text.chars().count());
+                return;
+            }
             let typed = self.type_uinput_text(text);
             if typed > 0 { log::info!("Desktop text input (uinput): chars={typed}"); }
             if typed == text.len() { return; }
