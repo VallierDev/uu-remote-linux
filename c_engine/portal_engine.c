@@ -879,14 +879,36 @@ static void notify_async_cb(GObject *source_object, GAsyncResult *res, gpointer 
     g_variant_unref(reply);
 }
 
+struct notify_task {
+    GDBusConnection *bus;
+    char *method;
+    GVariant *parameters;
+};
+
+static gboolean notify_invoke_action(gpointer user_data) {
+    struct notify_task *t = user_data;
+    g_dbus_connection_call(t->bus, DEST, PATH, REMOTE, t->method, t->parameters,
+        NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, notify_async_cb, NULL);
+    if (t->bus) g_object_unref(t->bus);
+    g_free(t->method);
+    g_free(t);
+    return G_SOURCE_REMOVE;
+}
+
 static int notify(struct uu_portal *p, const char *method, GVariant *parameters) {
     if (!uu_portal_alive(p)) { g_variant_ref_sink(parameters); g_variant_unref(parameters); return 9; }
-    /* Fire-and-forget asynchronous D-Bus call to avoid 1-3ms synchronous round-trip latency
-     * on 250Hz input streams, while still freeing parameters and handling failure logs in callback. */
-    g_main_context_push_thread_default(p->context);
-    g_dbus_connection_call(p->bus, DEST, PATH, REMOTE, method, parameters,
-        NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, notify_async_cb, NULL);
-    g_main_context_pop_thread_default(p->context);
+    /* Dispatch asynchronous call to the D-Bus thread owning p->context.
+     * Avoids both synchronous round-trip latency on Tokio threads and
+     * g_main_context_push_thread_default conflicts while run_dbus holds p->context. */
+    struct notify_task *t = g_new0(struct notify_task, 1);
+    t->bus = p->bus ? g_object_ref(p->bus) : NULL;
+    t->method = g_strdup(method);
+    t->parameters = parameters;
+    if (p->context) {
+        g_main_context_invoke_full(p->context, G_PRIORITY_DEFAULT, notify_invoke_action, t, NULL);
+    } else {
+        notify_invoke_action(t);
+    }
     return 0;
 }
 void uu_portal_logical_size(struct uu_portal *p, uint32_t *width, uint32_t *height) {
