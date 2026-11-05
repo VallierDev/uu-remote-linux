@@ -631,17 +631,21 @@ fn check_viewer_version_compatibility(viewer_ver: &str) {
         _ => false,
     };
 
+    let v_count = v_parts.len();
+    let h_count = h_parts.len();
     if is_newer {
         log::warn!(
-            "Incoming controller client_version is newer than host reported version (viewer: {:?} > host: {:?}). \
+            "Incoming controller client_version is newer than host reported version: \
+            controller_newer=true viewer_parts_count={} host_parts_count={}. \
             Potential protocol incompatibility or breaking RPC changes may exist. \
             If needed, test overriding via UU_CLIENT_VERSION or ~/.config/uuremote/config.json.",
-            viewer_ver, host_ver
+            v_count, h_count
         );
     } else {
         log::info!(
-            "Incoming controller client_version: {:?} (host reported: {:?})",
-            viewer_ver, host_ver
+            "Incoming controller client_version checked: controller_newer=false \
+            viewer_parts_count={} host_parts_count={}",
+            v_count, h_count
         );
     }
 }
