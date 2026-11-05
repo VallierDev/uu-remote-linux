@@ -179,8 +179,6 @@ impl CompleteFrame {
     }
 }
 
-const RTP_CLOCK: u64 = 90_000;
-
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) enum Encoder { Cpu, Nvenc, Vaapi }
 impl Encoder {
@@ -623,29 +621,6 @@ async fn probe_hevc(spec: FfmpegSpec, requested: Encoder) -> bool {
     false
 }
 
-/// Round UP (+1ns float guard) so webrtc's floor(duration*90000) yields exactly `ticks`.
-fn ticks_to_duration(ticks: u64) -> Duration {
-    Duration::from_nanos((ticks * 1_000_000_000 + RTP_CLOCK - 1) / RTP_CLOCK + 1)
-}
-
-/// RTP timestamps follow when frames actually leave the encoder, not a nominal
-/// 60fps count: a starved X11 capture would otherwise stamp 5fps as 60fps.
-/// webrtc-rs stamps a sample with the running timestamp and only then advances it
-/// by the sample duration, so each duration predicts the gap to the NEXT frame
-/// (one nominal frame after this one). A stall costs one frame of timing error
-/// and is corrected on the following frame instead of accumulating.
-struct RtpTimeline { origin: Option<Instant>, stamp: u64, fps: u64 }
-impl Default for RtpTimeline { fn default() -> Self { Self { origin: None, stamp: 0, fps: FPS } } }
-impl RtpTimeline {
-    fn duration_after(&mut self, completed_at: Instant) -> Duration {
-        let origin = *self.origin.get_or_insert(completed_at);
-        let real = ((completed_at.saturating_duration_since(origin).as_nanos() * u128::from(RTP_CLOCK) + 500_000_000) / 1_000_000_000) as u64;
-        let advance = (real + RTP_CLOCK / self.fps).saturating_sub(self.stamp).max(1);
-        self.stamp += advance;
-        ticks_to_duration(advance)
-    }
-}
-
 /// Frames travel through a short queue so P-frames are never silently replaced.
 /// After an overflow, dependent frames are skipped until the next IDR, so the
 /// viewer never receives a broken prediction chain and no backlog can build up.
@@ -729,7 +704,8 @@ pub(crate) enum NativeDisplayKind { X11, Wayland, Portal, Kms, None }
 
 pub(crate) fn native_engine_eligible(encoder: Encoder, kind: NativeDisplayKind) -> bool {
     #[cfg(feature = "inproc-av")]
-    { (kind == NativeDisplayKind::X11 || (kind == NativeDisplayKind::Portal && encoder == Encoder::Vaapi))
+    { (kind == NativeDisplayKind::X11 || (encoder == Encoder::Vaapi && (kind == NativeDisplayKind::Portal ||
+        (kind == NativeDisplayKind::Wayland && std::env::var("UU_WAYLAND_VAAPI_INPROC").as_deref() == Ok("1")))))
         && crate::inproc_encoder::selected(encoder) }
     #[cfg(not(feature = "inproc-av"))]
     { let _ = (encoder, kind); false }
@@ -1204,7 +1180,6 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
     // The privacy screen swaps the portal stream to a virtual output that can have another size.
     let mut portal_size = portal.as_ref().map(|p| p.size());
     let mut previous = None;
-    let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
     let mut settings_open = true;
     let mut frames = 0u64;
     let mut skipped = 0u64;
@@ -1258,7 +1233,6 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         if next != current || send_interrupted {
             let discard = next.codec != current.codec || next.source_generation != current.source_generation || next.source_id != current.source_id || send_interrupted;
             current = next;
-            timeline.fps = u64::from(next.fps);
             // A viewer resolution choice may have changed the X11 display mode (desktop_mode).
             if let Some(resized) = x11_resized(&display, portal_stream, size) { size = resized; }
             if discard {
@@ -1325,16 +1299,15 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 // A closed queue means the reader ended; its JoinHandle carries the reason.
                 let Some(frame) = frame else { return (&mut reader.0).await.map_err(|e| format!("Encoder reader task: {e}"))?; };
                 if !frame.matches(&current) { continue; }
-                let duration = timeline.duration_after(frame.completed_at);
                 if let Some(last) = previous { skipped += frame.sequence.saturating_sub(last + 1); }
                 max_age_ms = max_age_ms.max(frame.completed_at.elapsed().as_millis());
                 // Continue monitoring close even if the network send stalls.
                 let sample = Sample {
-                    data: frame.data.clone().into(), duration, ..Default::default()
+                    data: frame.data.clone().into(), ..Default::default()
                 };
                 let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::new_frame()];
                 let sent_before=track.revision();
-                let send = track.write_sample_with_extensions(frame.codec, &sample, &extensions);
+                let send = track.write_sample_at(frame.codec, &sample, frame.completed_at, &extensions);
                 let send_started=Instant::now();
                 tokio::pin!(send);
                 loop {
@@ -1688,48 +1661,6 @@ mod tests {
         assert!(is_independent_frame(&bytes[..16]));
         assert!(!is_independent_frame(&[0,0,1,9,240,0,0,1,1,42]));
         assert!(!is_independent_frame(&[0,0,1,7,1,0,0,0,1]));
-    }
-    #[test]
-    fn rtp_ticks_survive_webrtc_floor_conversion(){
-        for ticks in (1..=200_000).chain([90_000*60, 90_000*3600]) {
-            assert_eq!((ticks_to_duration(ticks).as_secs_f64()*90000.) as u64,ticks);
-        }
-    }
-    fn stamps(offsets_ms:&[u64])->Vec<u64>{
-        let start=Instant::now();
-        let mut timeline=RtpTimeline::default();
-        let mut stamp=0;
-        offsets_ms.iter().map(|ms|{
-            let current=stamp;
-            stamp+=(timeline.duration_after(start+Duration::from_millis(*ms)).as_secs_f64()*90000.) as u64;
-            current
-        }).collect()
-    }
-    #[test]
-    fn steady_60fps_keeps_exact_1500_tick_spacing_for_an_hour(){
-        let start=Instant::now();
-        let mut timeline=RtpTimeline::default();
-        let mut stamp=0u64;
-        for frame in 0..216_000u64 {
-            let at=start+Duration::from_nanos(frame*1_000_000_000/FPS);
-            assert_eq!(stamp,frame*1500);
-            stamp+=(timeline.duration_after(at).as_secs_f64()*90000.) as u64;
-        }
-    }
-    #[test]
-    fn starved_capture_is_stamped_at_real_time_not_nominal_60fps(){
-        // 5fps capture: frames 200ms apart must be ~18000 ticks apart, not 1500.
-        let s=stamps(&[0,200,400,600,800]);
-        assert_eq!(s[0],0);
-        for pair in s.windows(2).skip(1) { assert_eq!(pair[1]-pair[0],18_000); }
-    }
-    #[test]
-    fn stall_costs_one_frame_then_timeline_matches_real_time(){
-        let s=stamps(&[0,17,517,534,551]);
-        assert_eq!(s[2],17*90+1500);     // predicted before the stall was visible
-        assert_eq!(s[3],517*90+1500);    // realigned: one nominal frame after real stall end
-        assert_eq!(s[4],534*90+1500);    // no residual offset accumulates
-        assert!(s.windows(2).all(|p|p[1]>p[0]));
     }
     #[tokio::test]
     async fn bounded_queue_never_sends_broken_prediction_chain_after_overload(){

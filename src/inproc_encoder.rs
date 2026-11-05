@@ -286,6 +286,9 @@ fn run_vaapi(
         return run_portal_vaapi(&config, portal, &engine, units, stop, idr, budget);
     }
 
+    if config.display.starts_with("wayland:") {
+        return run_wayland_vaapi(&config, &engine, units, stop, idr, budget);
+    }
     // Capture stays at the full input size; VPP scales (or pads) to the encoder size.
     let display = CString::new(config.display.as_str()).map_err(|_| "DISPLAY contains NUL".to_string())?;
     let dri3 = Some(SafeDri3Capture(unsafe { dri3_capture_create(display.as_ptr(), cap_width, cap_height) }))
@@ -1114,5 +1117,115 @@ mod portal_hardware_tests {
         runner.finish().await;
         println!("portal_restart_resources_passed cycles=20 fd_growth={} rss_growth_kb={} injected_lock_cycles=3",
             last.0 as i64 - warm.0 as i64, last.1 as i64 - warm.1 as i64);
+    }
+}
+
+/// No raw-video pipe, CPU mapping or host upload. The C lease owns the buffer
+/// until vaapi_packet synchronizes encoding and copies only the compressed packet.
+fn run_wayland_vaapi(
+    config: &Config, engine: &SafeVaapiEngine, units: mpsc::Sender<EncodedUnit>,
+    stop: Arc<AtomicBool>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
+) -> Result<(), String> {
+    let _capture = crate::wayland::DmaCaptureGuard::acquire()?;
+    let dynamic = std::env::var("UU_WAYLAND_DYNAMIC_FPS").as_deref() != Ok("0");
+    let mut schedule = crate::wayland::pacing::CaptureSchedule::new(Instant::now(), config.fps);
+    let mut pacing = crate::wayland::pacing::FramePacing::new(dynamic);
+    let mut report = Instant::now();
+    let (mut changed_count, mut keepalive_count) = (0u64,0u64);
+    while !stop.load(Ordering::Relaxed) && !units.is_closed() {
+        while Instant::now() < schedule.deadline() {
+            if stop.load(Ordering::Relaxed) || units.is_closed() { return Ok(()); }
+            std::thread::sleep(schedule.deadline().saturating_duration_since(Instant::now()).min(Duration::from_millis(10)));
+        }
+        let Some(permit) = acquire(&budget, &units) else { return Ok(()); };
+        let mut packet = None;
+        let captured = crate::wayland::capture_dmabuf(pacing.wait_for_damage(), |frame| {
+            if (frame.width,frame.height) != config.input { return Err("Wayland DMA-BUF size changed".into()); }
+            let code = unsafe { vaapi_import_frame(engine.0, frame) };
+            if code != 0 { return Err(format!("Wayland VAAPI DMA-BUF import failed ({code})")); }
+            packet = Some(vaapi_packet(engine, &idr)?);
+            Ok(())
+        })?;
+        if captured {
+            if !pacing.has_frame() {
+                log::info!("Native Wayland VAAPI pipeline=dma-buf zero_cpu_copy=true source={}x{} dynamic_fps={}",config.input.0,config.input.1,dynamic);
+            }
+            changed_count += 1;
+        } else if pacing.keepalive_due(Instant::now(), idr.load(Ordering::Acquire)) {
+            // The last imported surface remains leased by VAAPI. The pending
+            // screencopy targets the alternate buffer, so this surface is stable.
+            packet = Some(vaapi_packet(engine,&idr)?);
+            keepalive_count += 1;
+        }
+        let mut encoded = false;
+        if let Some(data) = packet {
+            if !data.is_empty() {
+                if units.blocking_send(EncodedUnit {data,permit,completed_at:Instant::now()}).is_err() { return Ok(()); }
+                pacing.sent(Instant::now());
+                encoded = true;
+            }
+        }
+        if report.elapsed() >= Duration::from_secs(5) {
+            log::info!("Wayland VAAPI cadence: seconds={:.2} changed={} keepalive={} target_fps={} dynamic={}",report.elapsed().as_secs_f64(),changed_count,keepalive_count,config.fps,dynamic);
+            report=Instant::now(); changed_count=0; keepalive_count=0;
+        }
+        schedule.completed(Instant::now(), encoded);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux", feature = "wayland"))]
+mod wayland_hardware_tests {
+    use super::*;
+    fn is_idr(bytes: &[u8]) -> bool {
+        bytes.windows(4).any(|w| w[..3] == [0,0,1] && w[3] & 31 == 5)
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires an unlocked wlroots desktop, UU_WAYLAND_DMABUF=1, Intel/AMD VAAPI and a static test scene"]
+    async fn wayland_dma_idle_idr_and_restarts() {
+        assert_eq!(std::env::var("UU_WAYLAND_DMABUF").as_deref(), Ok("1"));
+        let input = crate::wayland::init().expect("native Wayland desktop");
+        let config = || Config {
+            portal: None, display: "wayland:native".into(), input, output: None,
+            fps: 30, gop: 15, cq: 26, target_bps: 1_500_000, max_bps: 2_000_000,
+            buffer_bits: 250_000, codec: crate::capture_setting::VideoCodec::H264,
+            chroma: crate::capture_setting::CHROMA_420, vaapi: true,
+        };
+        let fd_count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let mut warm_fds = 0;
+        for cycle in 0..10 {
+            let (tx, mut rx) = mpsc::channel(4);
+            let stop = Arc::new(AtomicBool::new(false));
+            let idr = Arc::new(AtomicBool::new(false));
+            let job = tokio::task::spawn_blocking({
+                let (config, stop, idr) = (config(), stop.clone(), idr.clone());
+                move || run(config, tx, stop, idr, Arc::new(Semaphore::new(4)))
+            });
+            let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+            assert!(is_idr(&first.data), "restart must start with an IDR");
+            drop(first);
+            // Drain initial output damage, then request an IDR during the idle wait.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while let Ok(Some(frame)) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                drop(frame);
+                assert!(Instant::now() < deadline, "test scene is not static");
+            }
+            idr.store(true, Ordering::Release);
+            let forced = tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    let frame = rx.recv().await.expect("encoder ended before requested IDR");
+                    if is_idr(&frame.data) { return frame; }
+                }
+            }).await.expect("idle PLI/IDR request must not wait for screen damage");
+            drop(forced);
+            assert!(tokio::time::timeout(Duration::from_millis(75), rx.recv()).await.is_err(), "test scene must remain idle");
+            // Stop with a damage-only screencopy outstanding; cleanup must not hang.
+            stop.store(true, Ordering::Release);
+            drop(rx);
+            tokio::time::timeout(Duration::from_secs(2), job).await.unwrap().unwrap().unwrap();
+            if cycle == 1 { warm_fds = fd_count(); }
+        }
+        assert!(fd_count() <= warm_fds + 4, "file descriptors grew across native restarts");
+        println!("native_wayland_restart_pass cycles=10 idle_idr=true cancellation_bounded=true fd_growth={}", fd_count() as isize - warm_fds as isize);
     }
 }

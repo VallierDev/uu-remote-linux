@@ -78,7 +78,7 @@ where F: FnMut(VideoCodec) -> Fut, Fut: std::future::Future<Output = Result<Byte
                 if !updates.borrow().waiting || *locked.borrow() != Some(true)
                     || pc.connection_state() != RTCPeerConnectionState::Connected { continue; }
                 let (codec, data) = frame.as_ref().unwrap();
-                let sample = Sample { data: data.clone(), duration: Duration::from_secs(1), ..Default::default() };
+                let sample = Sample { data: data.clone(), ..Default::default() };
                 let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::new_frame()];
                 let revision = track.revision();
                 // No monitor inventory or permission claims: 1280x720 is only this synthetic bitstream.
@@ -87,7 +87,7 @@ where F: FnMut(VideoCodec) -> Fut, Fut: std::future::Future<Output = Result<Byte
                     _ = updates.changed() => continue,
                     _ = locked.changed() => continue,
                     result = tokio::time::timeout(Duration::from_secs(2),
-                        track.write_sample_with_extensions(*codec, &sample, &extensions)) => {
+                        track.write_sample_at(*codec, &sample, std::time::Instant::now(), &extensions)) => {
                         if crate::video::transport_closed(pc) { return Ok(()); }
                         result.map_err(|_| "Locked desktop video send timed out".to_string())?
                             .map_err(|error| format!("Locked desktop video send: {error}"))?;

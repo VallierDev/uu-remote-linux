@@ -1,5 +1,6 @@
 /* Native Hyprland/wlroots desktop bridge. Protocol XMLs retain upstream licenses. */
 #define _GNU_SOURCE
+#include "dmabuf_frame.h"
 #include "wayland_transform.h"
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
@@ -28,6 +29,7 @@ static struct wl_seat *seat;
 static struct zwlr_screencopy_manager_v1 *copy_manager;
 static struct zwp_linux_dmabuf_v1 *dmabuf;
 static int dmabuf_requested,dmabuf_disabled,dmabuf_reported;
+static int dma_direct_capture;
 static unsigned dmabuf_linear_formats;
 /* GBM is loaded only for explicit opt-in; default builds need no GBM headers. */
 struct gbm_device;
@@ -83,6 +85,7 @@ struct frame {
     uint32_t shm_width,shm_height,shm_stride,shm_format;
     uint32_t width,height,stride,format,flags;
     int done,failed,submitted,released;
+    int direct_dma,damage_requested;
     struct zwp_linux_buffer_params_v1 *params;
     struct gbm_bo *bo;
     int bo_fd,dmabuf_used;
@@ -98,7 +101,7 @@ static uint32_t timestamp(void) {
     return (uint32_t)((uint64_t)t.tv_sec*1000+t.tv_nsec/1000000);
 }
 /* Never let a disappearing compositor block a worker indefinitely. */
-static int dispatch_until(int *condition) {
+static int dispatch_until_timeout(int *condition,int timeout_ms) {
     uint32_t start=timestamp();
     while (!*condition) {
         while (wl_display_prepare_read(display)!=0) {
@@ -107,15 +110,36 @@ static int dispatch_until(int *condition) {
         }
         if (wl_display_flush(display)<0) { wl_display_cancel_read(display); return -1; }
         struct pollfd fd={wl_display_get_fd(display),POLLIN,0};
-        int wait=poll(&fd,1,100);
+        int left=timeout_ms-(int)(uint32_t)(timestamp()-start);
+        if(left<=0) { wl_display_cancel_read(display); return 1; }
+        int wait=poll(&fd,1,left<100 ? left:100);
         if (wait>0 && (fd.revents&POLLIN)) {
             if (wl_display_read_events(display)<0) return -1;
             if (wl_display_dispatch_pending(display)<0) return -1;
         } else { wl_display_cancel_read(display); if (wait<0 || fd.revents&(POLLERR|POLLHUP)) return -1; }
-        if ((uint32_t)(timestamp()-start)>3000) return -1;
+        if (!*condition && (uint32_t)(timestamp()-start)>=(uint32_t)timeout_ms) return 1;
     }
     return 0;
 }
+/* Native capture shares this connection with input. Never wait for damage
+ * while owning lock: Rust paces retries outside the engine mutex. */
+static int dispatch_available(int *condition) {
+    while (wl_display_prepare_read(display)!=0) {
+        if (wl_display_dispatch_pending(display)<0) return -1;
+        if (*condition) return 0;
+    }
+    if (wl_display_flush(display)<0) { wl_display_cancel_read(display); return -1; }
+    struct pollfd fd={wl_display_get_fd(display),POLLIN,0};
+    int ready=poll(&fd,1,0);
+    if (ready>0 && (fd.revents&POLLIN)) {
+        if (wl_display_read_events(display)<0 || wl_display_dispatch_pending(display)<0) return -1;
+    } else {
+        wl_display_cancel_read(display);
+        if (ready<0 || (fd.revents&(POLLERR|POLLHUP))) return -1;
+    }
+    return *condition ? 0:1;
+}
+static int dispatch_until(int *condition) { return dispatch_until_timeout(condition,3000)==0 ? 0:-1; }
 static void sync_done(void *data,struct wl_callback *cb,uint32_t serial) { *(int*)data=1; wl_callback_destroy(cb); }
 static const struct wl_callback_listener sync_listener={sync_done};
 static int sync_display(void) {
@@ -372,11 +396,17 @@ static void frame_clear(struct frame *frame) {
     frame->pixels=NULL; frame->map_data=NULL; frame->dmabuf_used=0;
     frame->width=frame->height=frame->stride=frame->format=frame->flags=0;
     frame->done=frame->failed=frame->submitted=0;
+    frame->direct_dma=frame->damage_requested=0;
     frame->dma_format=frame->dma_width=frame->dma_height=0;
 }
 static void buffer_release(void*d,struct wl_buffer*b) { ((struct frame*)d)->released=1; }
 static const struct wl_buffer_listener buffer_listener={buffer_release};
 static void frame_fail(struct frame *frame) { frame->failed=frame->done=frame->submitted=1; }
+static void frame_copy(struct frame *frame,struct wl_buffer *buffer) {
+    if(frame->damage_requested && zwlr_screencopy_frame_v1_get_version(frame->handle)>=2)
+        zwlr_screencopy_frame_v1_copy_with_damage(frame->handle,buffer);
+    else zwlr_screencopy_frame_v1_copy(frame->handle,buffer);
+}
 static void copy_buffer(void*d,struct zwlr_screencopy_frame_v1*f,uint32_t fmt,uint32_t w,uint32_t h,uint32_t s) {
     struct frame *frame=d;
     frame->format=fmt; frame->width=w; frame->height=h; frame->stride=s;
@@ -410,7 +440,7 @@ static void copy_flags(void*d,struct zwlr_screencopy_frame_v1*f,uint32_t value) 
 static void copy_ready(void*d,struct zwlr_screencopy_frame_v1*f,uint32_t hi,uint32_t lo,uint32_t ns) {
     struct frame *frame=d;
     frame->shm_busy=0;
-    if(frame->dmabuf_used) {
+    if(frame->dmabuf_used && !frame->direct_dma) {
         /* GBM READ mapping synchronizes readback, possibly via a staging buffer. */
         uint32_t stride=0;
         frame->pixels=gbm.bo_map(frame->bo,0,0,frame->width,frame->height,1,&stride,&frame->map_data);
@@ -433,7 +463,7 @@ static void copy_dmabuf(void*d,struct zwlr_screencopy_frame_v1*f,uint32_t fmt,ui
 }
 static void submit_shm(struct frame *frame) {
     if(frame->shm_buffer && !frame->shm_busy && !frame->failed) {
-        zwlr_screencopy_frame_v1_copy(frame->handle,frame->shm_buffer); frame->shm_busy=frame->submitted=1;
+        frame_copy(frame,frame->shm_buffer); frame->shm_busy=frame->submitted=1;
     } else frame_fail(frame);
 }
 static void dma_created(void*d,struct zwp_linux_buffer_params_v1*params,struct wl_buffer*buffer) {
@@ -446,7 +476,7 @@ static void dma_created(void*d,struct zwp_linux_buffer_params_v1*params,struct w
         frame->dma_format==0x34325241 ? WL_SHM_FORMAT_ARGB8888:frame->dma_format;
     wl_buffer_add_listener(buffer,&buffer_listener,frame);
     frame->released=0;
-    zwlr_screencopy_frame_v1_copy(frame->handle,buffer); frame->submitted=1;
+    frame_copy(frame,buffer); frame->submitted=1;
 }
 static void dma_failed(void*d,struct zwp_linux_buffer_params_v1*params) {
     struct frame *frame=d;
@@ -463,7 +493,7 @@ static int dma_start(struct frame *frame) {
         frame->width=frame->dma_width; frame->height=frame->dma_height;
         frame->format=frame->dma_format==0x34325258 ? WL_SHM_FORMAT_XRGB8888:
             frame->dma_format==0x34325241 ? WL_SHM_FORMAT_ARGB8888:frame->dma_format;
-        zwlr_screencopy_frame_v1_copy(frame->handle,frame->buffer); frame->submitted=1; return 1;
+        frame_copy(frame,frame->buffer); frame->submitted=1; return 1;
     }
     dma_clear(frame);
     /* Single-plane linear RGB only; unsupported imports are asynchronous failures,
@@ -488,6 +518,7 @@ static void copy_buffer_done(void*d,struct zwlr_screencopy_frame_v1*f) {
 }
 static const struct zwlr_screencopy_frame_v1_listener copy_listener={copy_buffer,copy_flags,copy_ready,copy_failed,copy_damage,copy_dmabuf,copy_buffer_done};
 static void request_frame(struct frame *frame) {
+    frame->direct_dma=dma_direct_capture;
     /* Initial milestone: video excludes cursor, viewer draws its own pointer. */
     frame->handle=zwlr_screencopy_manager_v1_capture_output(copy_manager,0,outputs[selected].handle);
     zwlr_screencopy_frame_v1_add_listener(frame->handle,&copy_listener,frame);
@@ -622,6 +653,45 @@ int uu_wl_wake(void) {
         if(sync_display()==0 && !power_failed) result=0;
     }
     pthread_mutex_unlock(&lock); return result;
+}
+/* The callback borrows the DMA-BUF under the capture lock. It must finish GPU
+ * reads before returning; only then may this buffer be reused by the compositor. */
+int uu_wl_capture_dmabuf(int (*consume)(const UuDmaFrame*,void*),void *context,int damage) {
+    pthread_mutex_lock(&lock);
+    int result=-1;
+    struct frame *frame=&frames[pending];
+    if(!initialized || !consume || !dmabuf_requested || dmabuf_disabled) goto end;
+    if(outputs[selected].transform!=WL_OUTPUT_TRANSFORM_NORMAL) goto end;
+    dma_direct_capture=1;
+    if(frame->handle && (!frame->direct_dma || frame->damage_requested!=damage)) frame_clear(frame);
+    if(!frame->handle) { frame->damage_requested=damage; request_frame(frame); }
+    int waited=frame->done ? 0:dispatch_available(&frame->done);
+    if(waited==1) { result=1; goto end; } /* Keep the pending damage request alive. */
+    if(waited!=0 || frame->failed || !frame->dmabuf_used ||
+       !frame->bo || frame->bo_fd<0 || (frame->flags&ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT)) goto clear;
+    uint32_t stride=gbm.bo_get_stride(frame->bo);
+    uint32_t offset=gbm.bo_get_offset(frame->bo,0);
+    uint64_t size=(uint64_t)offset+(uint64_t)stride*frame->height;
+    if(!frame->width || !frame->height || stride<(uint64_t)frame->width*4 || size>UINT32_MAX ||
+       gbm.bo_get_plane_count(frame->bo)!=1 || gbm.bo_get_modifier(frame->bo)!=0) goto clear;
+    UuDmaFrame dma={.fd=frame->bo_fd,.fourcc=frame->dma_format,
+        .width=frame->width,.height=frame->height,.stride=stride,
+        .offset=offset,.size=(uint32_t)size,
+        .modifier=gbm.bo_get_modifier(frame->bo)};
+    result=consume(&dma,context);
+clear:
+    frame_clear(frame);
+    pending=1-pending;
+end:
+    dma_direct_capture=0;
+    pthread_mutex_unlock(&lock);
+    return result;
+}
+int uu_wl_capture_dmabuf_cancel(void) {
+    pthread_mutex_lock(&lock);
+    if(frames[pending].direct_dma) frame_clear(&frames[pending]);
+    pthread_mutex_unlock(&lock);
+    return 0;
 }
 int uu_wl_capture(uint8_t *out,size_t length) {
     pthread_mutex_lock(&lock);

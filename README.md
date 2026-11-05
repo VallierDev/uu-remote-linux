@@ -444,6 +444,9 @@ HEVC 的访问单元按 RFC 7798 的图片边界切分，不依赖 AUD：`hevc_v
 
 ### VAAPI 硬件编码
 
+Hyprland 原生采集可选启用 **DMA-BUF → 进程内 VAAPI**，并根据画面变化调整编码帧率；静止时低频保活。需构建 `wayland,inproc-av`，设置 `UU_WAYLAND_DMABUF=1 UU_WAYLAND_VAAPI_INPROC=1` 并选择 `vaapi`。它复用现有 VAAPI 引擎，支持范围、回退和验证方式见 [原生 Wayland VAAPI](docs/wayland-vaapi.md)。
+
+
 `UU_VIDEO_ENCODER=vaapi` 或 `set-encoder vaapi` 显式选择 Intel/AMD H.264 VAAPI。
 `UU_VAAPI_DEVICE` 默认 `/dev/dri/renderD128`，运行用户需要 render 节点权限。
 `auto` 有 NVIDIA 驱动时是 NVENC → CPU，没有 NVIDIA 时是 CPU。VAAPI 只通过显式选择启用，进入 auto 要等 #33。

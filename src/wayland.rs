@@ -1,9 +1,13 @@
 //! Hyprland/wlroots native backend. No XWayland fallback and no input logging.
+#[path = "wayland_pacing.rs"]
+pub(crate) mod pacing;
 #[cfg(all(target_os="linux", feature="wayland"))]
 crate::engine_ffi! { crate::engine_plugin::Engine::Wayland;
     fn uu_wl_select_output(name: *const libc::c_char, width: u32, height: u32) -> i32;
     fn uu_wl_init(out_w: *mut i32, out_h: *mut i32) -> i32;
     fn uu_wl_capture(buffer: *mut u8, length: usize) -> i32;
+    fn uu_wl_capture_dmabuf_cancel() -> i32;
+    fn uu_wl_capture_dmabuf(callback: unsafe extern "C" fn(*const crate::portal::DmaFrame, *mut libc::c_void) -> i32, context: *mut libc::c_void, damage: i32) -> i32;
     fn uu_wl_move(x: i32, y: i32, relative: i32) -> i32;
     fn uu_wl_button(button: i32, pressed: i32) -> i32;
     fn uu_wl_key(symbol: u64, pressed: i32) -> i32;
@@ -556,5 +560,86 @@ mod selection_regressions {
         assert_eq!(sync_native("wayland:wayland-0",9,(800,600)),(800,600));
         assert_eq!(sync_native(":0",1,(1920,1080)),(1920,1080));
         *test_outputs().lock().unwrap()=None;
+    }
+}
+
+struct DmaConsumer<F> { consume: F, result: Option<Result<(), String>> }
+unsafe extern "C" fn consume_dma_frame<F: FnMut(&crate::portal::DmaFrame) -> Result<(), String>>(
+    frame: *const crate::portal::DmaFrame, raw: *mut libc::c_void,
+) -> i32 {
+    if frame.is_null() || raw.is_null() { return -1; }
+    let context = &mut *(raw as *mut DmaConsumer<F>);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (context.consume)(&*frame)))
+        .unwrap_or_else(|_| Err("DMA-BUF consumer panicked".into()));
+    let code = if result.is_ok() { 0 } else { -1 };
+    context.result = Some(result); code
+}
+/// A DMA-BUF lease: the consumer must synchronize GPU reads before returning.
+/// `false` means damage is not ready; the request stays pending without blocking input.
+pub fn capture_dmabuf<F: FnMut(&crate::portal::DmaFrame) -> Result<(), String>>(damage: bool, consume: F) -> Result<bool, String> {
+    #[cfg(all(target_os="linux", feature="wayland"))]
+    {
+        let mut context = DmaConsumer { consume, result: None };
+        let code = unsafe { uu_wl_capture_dmabuf(consume_dma_frame::<F>, &mut context as *mut _ as *mut libc::c_void, i32::from(damage)) };
+        if code == 1 { return Ok(false); }
+        return context.result.unwrap_or_else(|| Err(format!("Wayland direct DMA-BUF capture unavailable ({code})"))).map(|()| true);
+    }
+    #[cfg(not(all(target_os="linux", feature="wayland")))]
+    { let _ = (damage,consume); Err("Wayland DMA-BUF capture unavailable".into()) }
+}
+
+#[cfg(test)]
+mod dma_consumer_tests {
+    use super::*;
+    fn invoke<F: FnMut(&crate::portal::DmaFrame) -> Result<(), String>>(consume: F) -> (i32, Option<Result<(), String>>) {
+        let frame = crate::portal::DmaFrame { width: 1920, ..Default::default() };
+        let mut context = DmaConsumer { consume, result: None };
+        let code = unsafe { consume_dma_frame::<F>(&frame, &mut context as *mut _ as *mut libc::c_void) };
+        (code, context.result)
+    }
+    #[test]
+    fn consumer_result_crosses_the_ffi_boundary() {
+        let mut widths = Vec::new();
+        assert_eq!(invoke(|f| { widths.push(f.width); Ok(()) }), (0, Some(Ok(()))));
+        assert_eq!(widths, vec![1920]);
+        assert_eq!(invoke(|_| Err("unsupported layout".into())), (-1, Some(Err("unsupported layout".into()))));
+    }
+    #[test]
+    fn consumer_panic_becomes_an_error_instead_of_unwinding_through_c() {
+        assert_eq!(invoke(|_| panic!("synthetic consumer panic")), (-1, Some(Err("DMA-BUF consumer panicked".into()))));
+    }
+}
+
+/// Release a pending damage-only request on encoder cancellation or fallback.
+pub(crate) struct DmaCaptureGuard { _slot: std::sync::MutexGuard<'static, ()> }
+impl DmaCaptureGuard {
+    pub(crate) fn acquire() -> Result<Self, String> {
+        // The engine has one shared connection and buffer pair. A second native
+        // stream must fall back instead of reusing another encoder's idle surface.
+        static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let slot = match SLOT.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err("Native Wayland DMA-BUF capture is already in use".into()),
+        };
+        Ok(Self { _slot: slot })
+    }
+}
+impl Drop for DmaCaptureGuard {
+    fn drop(&mut self) {
+        #[cfg(all(target_os="linux", feature="wayland"))]
+        unsafe { uu_wl_capture_dmabuf_cancel(); }
+    }
+}
+
+#[cfg(test)]
+mod dma_session_tests {
+    use super::*;
+    #[test]
+    fn overlapping_stream_cannot_reuse_an_encoders_idle_surface() {
+        let first = DmaCaptureGuard::acquire().unwrap();
+        assert!(DmaCaptureGuard::acquire().is_err());
+        drop(first);
+        assert!(DmaCaptureGuard::acquire().is_ok());
     }
 }
