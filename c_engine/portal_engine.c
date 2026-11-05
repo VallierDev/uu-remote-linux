@@ -862,21 +862,30 @@ static int prepare_input(struct uu_portal *p) {
     }
     return 0;
 }
-static int notify(struct uu_portal *p, const char *method, GVariant *parameters) {
-    if (!uu_portal_alive(p)) { g_variant_ref_sink(parameters); g_variant_unref(parameters); return 9; }
+static void notify_async_cb(GObject *source_object, GAsyncResult *res, gpointer user_data) {
+    (void)user_data;
     GError *error = NULL;
-    GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH, REMOTE, method, parameters,
-        NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, &error);
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source_object), res, &error);
     if (!reply) {
         static atomic_uint failures = 0;
         if (atomic_fetch_add(&failures, 1) < 12) {
             char *name = error ? g_dbus_error_get_remote_error(error) : NULL;
-            fprintf(stderr, "Portal input method failed: method=%s remote_error=%s\n", method, name ? name : "unavailable");
+            fprintf(stderr, "Portal async input method failed: remote_error=%s\n", name ? name : "unavailable");
             g_free(name);
         }
-        g_clear_error(&error); return 9;
+        g_clear_error(&error);
+        return;
     }
-    g_variant_unref(reply); return 0;
+    g_variant_unref(reply);
+}
+
+static int notify(struct uu_portal *p, const char *method, GVariant *parameters) {
+    if (!uu_portal_alive(p)) { g_variant_ref_sink(parameters); g_variant_unref(parameters); return 9; }
+    /* Fire-and-forget asynchronous D-Bus call to avoid 1-3ms synchronous round-trip latency
+     * on 250Hz input streams, while still freeing parameters and handling failure logs in callback. */
+    g_dbus_connection_call(p->bus, DEST, PATH, REMOTE, method, parameters,
+        NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, notify_async_cb, NULL);
+    return 0;
 }
 void uu_portal_logical_size(struct uu_portal *p, uint32_t *width, uint32_t *height) {
     /* Stream size is optional; unknown logical geometry keeps the existing
