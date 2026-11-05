@@ -159,37 +159,10 @@ static size_t symbols_close(const char *text) {
     }
     return 0;
 }
-/* Named keycodes the keymap gives no symbol to. Reading the compositor's own list is the only
-   portable way: pressing an unmapped keycode types nothing, and uu_wl_key never matches one
-   because it searches by keysym. Highest first, since uu_wl_key takes the lowest match. */
+/* Reusable codes for the separate text-only keyboard. Remapping real printable keys on that device
+   keeps the physical-key map untouched and is the form Chromium accepts; the evdev "reserved" codes
+   that have no symbol are discarded by some clients. */
 static unsigned find_spare_codes(xkb_keycode_t *out,unsigned limit) {
-    unsigned count=0;
-    xkb_keycode_t min=xkb_keymap_min_keycode(keymap);
-    for(xkb_keycode_t code=xkb_keymap_max_keycode(keymap);code>min && count<limit;code--) {
-        if(code<8 || code>=sizeof(held_keys) || !xkb_keymap_key_get_name(keymap,code)) continue;
-        int mapped=0;
-        for(xkb_level_index_t level=0;level<xkb_keymap_num_levels_for_key(keymap,code,0) && !mapped;level++) {
-            const xkb_keysym_t *syms;
-            if(xkb_keymap_key_get_syms_by_level(keymap,code,0,level,&syms)>0) mapped=1;
-        }
-        if(!mapped) out[count++]=code;
-    }
-    return count;
-}
-/* A keycode the session keymap already produces this symbol with, unshifted. Typing through it
-   needs no upload, so no client can mistranslate it - and it is how plain latin text and spaces
-   arrive without touching the keymap at all. Spares never match: the pristine keymap leaves them
-   unmapped. */
-static xkb_keycode_t existing_keycode(xkb_keysym_t symbol) {
-    for(xkb_keycode_t code=xkb_keymap_min_keycode(keymap);code<=xkb_keymap_max_keycode(keymap);code++) {
-        if(code<8 || code>=sizeof(held_keys)) continue;
-        const xkb_keysym_t *syms;
-        if(xkb_keymap_key_get_syms_by_level(keymap,code,0,0,&syms)==1 && syms[0]==symbol) return code;
-    }
-    return 0;
-}
-static unsigned find_niri_text_codes(xkb_keycode_t *out,unsigned limit) {
-    /* Printable physical keys work in Chromium; reserved evdev codes can be discarded. */
     static const xkb_keycode_t text_codes[]={24,25,26,27,28,29,30,31,32,33,38,39,40,41,42,43,44,45,46,52,53,54,55,56,57,58};
     unsigned count=0;
     for(unsigned i=0;i<sizeof(text_codes)/sizeof(text_codes[0]) && count<limit;i++)
@@ -216,8 +189,12 @@ static void release_held_keys_locked(void) {
    key_state and held_keys: pressed and released here. */
 static int flush_batch(char *buffer,size_t capacity,const char names[][64],const xkb_keycode_t *codes,unsigned count,int *typed) {
     release_held_keys_locked();
-    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
-    else if(rekey_keyboard()!=0) return -1;
+    if(sync_display()!=0) return -1;
+    usleep(8000);
+    /* A keymap re-sent on a keyboard the client already knows is not handed to it again, so the
+       next batch would still decode with the previous one and repeat it. Re-attaching the text
+       keyboard is what makes the compositor deliver the new keymap. */
+    if(rekey_keyboard()!=0) return -1;
     size_t at=keymap_insert;
     memcpy(buffer,keymap_text,at);
     for(unsigned i=0;i<count;i++) {
@@ -227,16 +204,16 @@ static int flush_batch(char *buffer,size_t capacity,const char names[][64],const
     }
     memcpy(buffer+at,keymap_text+keymap_insert,keymap_text_len-keymap_insert);
     if(upload_keymap(buffer,at+(keymap_text_len-keymap_insert))!=0) return -1;
-    if(getenv("NIRI_SOCKET")) zwp_virtual_keyboard_v1_modifiers(keyboard,0,0,0,0);
+    zwp_virtual_keyboard_v1_modifiers(keyboard,0,0,0,0);
     if(sync_display()!=0) return -1;
-    if(getenv("NIRI_SOCKET")) usleep(8000);
+    usleep(8000);
     for(unsigned i=0;i<count;i++) { press_keycode(codes[i]); (*typed)++; }
-    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
+    if(sync_display()!=0) return -1;
     return 0;
 }
-/* Type UTF-8 like xdotool type does on X11, but on Wayland: characters the session keymap already
-   has go out as ordinary keycodes, the rest share the spares of one keymap upload (~70 KB, so one
-   batch per upload), in text order. Never logs the text. */
+/* Type UTF-8 like xdotool type does on X11: each character is a Unicode keysym carried by the
+   text-only keyboard's printable codes, one keymap upload (~70 KB, so one batch per upload) in text
+   order. Never logs the text. */
 static int type_utf8_locked(const char *text) {
     size_t capacity=keymap_text_len+(size_t)UU_TEXT_SPARE*96+64;
     char *buffer=malloc(capacity);
@@ -258,16 +235,11 @@ static int type_utf8_locked(const char *text) {
         if(cp=='\n') sym=0xff0d;                                       /* Return */
         else if(cp=='\t') sym=0xff09;                                  /* Tab */
         else if(cp<0x20 || cp==0x7f || (cp>=0x80 && cp<0xa0)) continue; /* controls carry no text */
-        else if(cp<0x100) sym=cp;                                      /* Latin-1 keysyms equal the code point */
-        else sym=(xkb_keysym_t)(0x1000000|cp);                         /* Unicode keysym */
-        xkb_keycode_t existing=getenv("NIRI_SOCKET")?0:existing_keycode(sym);
-        if(existing) {
-            if(count && flush_batch(buffer,capacity,names,codes,count,&typed)!=0) { failed=1; break; }
-            count=0;
-            press_keycode(existing); typed++;
-            continue;
-        }
-        if(count==(getenv("NIRI_SOCKET")?spare_count:UU_TEXT_SPARE)) {
+        /* Every character goes out as a Unicode keysym, including ASCII: a plain Latin-1 keysym
+           is what a running input method composes as pinyin, so "abc" would turn into candidates
+           instead of reaching the field. */
+        else sym=(xkb_keysym_t)(0x1000000|cp);
+        if(count==spare_count) {
             if(flush_batch(buffer,capacity,names,codes,count,&typed)!=0) { failed=1; break; }
             count=0;
         }
@@ -278,23 +250,25 @@ static int type_utf8_locked(const char *text) {
     }
     if(!failed && count) failed=flush_batch(buffer,capacity,names,codes,count,&typed)!=0;
     free(buffer);
-    /* Restore the pristine keymap whatever happened above, so uu_wl_key keeps its own symbol map. */
-    if(getenv("NIRI_SOCKET")) {if(sync_display()!=0) return -1;usleep(8000);}
-    else if(upload_keymap(keymap_text,keymap_text_len)!=0) return -1;
     return failed && !typed?-1:typed;
 }
 int uu_wl_type_utf8(const char *text) {
     pthread_mutex_lock(&lock);
     int typed=-1;
     if(initialized && text && keymap_text && keymap_insert && spare_count) {
-        if(getenv("NIRI_SOCKET")) {
-            /* Only niri uses printable codes on a separate text device; preserve the Hyprland path. */
-            release_held_keys_locked();
-            struct zwp_virtual_keyboard_v1 *saved=keyboard;
-            keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
-            if(keyboard) {typed=type_utf8_locked(text);sync_display();usleep(8000);if(keyboard) zwp_virtual_keyboard_v1_destroy(keyboard);}
-            keyboard=saved;
-        } else typed=type_utf8_locked(text);
+        if(!keyboard_manager) { pthread_mutex_unlock(&lock); return -1; }
+        /* Text has its own device: remapping printable codes must not change physical-key input. */
+        release_held_keys_locked();
+        /* The original device stays alive, so key-up alone must not leave its modifiers held. */
+        zwp_virtual_keyboard_v1_modifiers(keyboard,
+            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_DEPRESSED),
+            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_LATCHED),
+            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_LOCKED),
+            xkb_state_serialize_layout(key_state,XKB_STATE_LAYOUT_EFFECTIVE));
+        struct zwp_virtual_keyboard_v1 *saved=keyboard;
+        keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
+        if(keyboard) {typed=type_utf8_locked(text);sync_display();usleep(8000);if(keyboard) zwp_virtual_keyboard_v1_destroy(keyboard);}
+        keyboard=saved;
     }
     if(typed>=0 && wl_display_flush(display)<0) typed=-1;
     pthread_mutex_unlock(&lock); return typed;
@@ -597,7 +571,7 @@ int uu_wl_init(int32_t *w,int32_t *h) {
         /* Text typing needs unmapped keycodes and a place to declare them. A keymap without either
            only costs that path - uu_wl_type_utf8 refuses and the caller keeps its own fallback. */
         keymap_insert=symbols_close(keymap_text);
-        spare_count=getenv("NIRI_SOCKET")?find_niri_text_codes(spare_codes,UU_TEXT_SPARE):find_spare_codes(spare_codes,UU_TEXT_SPARE);
+        spare_count=find_spare_codes(spare_codes,UU_TEXT_SPARE);
     }
     initialized=1; *w=width; *h=height; result=0;
 end:
