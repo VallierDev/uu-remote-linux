@@ -1452,69 +1452,67 @@ impl WebRtcSession {
                         }
                         if let Ok(txt) = std::str::from_utf8(&msg.data) {
                             log::debug!("DataChannel [{}] received UTF-8 data: {} bytes", channel_name, txt.len());
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt) {
-                                if !channel_name.contains("CONTROL") {
-                                    // Input JSON on another channel (mobile input-method text was missing from CONTROL, #13/#46):
-                                    // record action names only, once per name, and accept text_input wherever it arrives.
-                                    if let Some(action) = val.get("action").and_then(serde_json::Value::as_str) {
-                                        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-                                        let mut seen = SEEN.lock().unwrap();
-                                        if seen.len() < 32 && action.len() <= 40 && action.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !seen.iter().any(|s| s == action) {
-                                            seen.push(action.to_owned());
-                                            log::info!("JSON action on {} channel: action={}", if channel_name.contains("STREAMER") {"STREAMER"} else if channel_name.contains("TEXT") {"TEXT"} else {"other"}, action);
+                            if channel_name.contains("CONTROL") {
+                                match crate::control_protocol::decode_control(&msg.data) {
+                                    Ok(crate::control_protocol::ControlMessage::Input(event)) => {
+                                        // A ready compositor source remains controllable on its lock screen.
+                                        if screen.backend == crate::desktop_backend::DesktopBackend::Portal
+                                            && (screen.init_error.is_some() || !desktop_ready) { return; }
+                                        if !crate::wayland::input_ready() {return;}
+                                        use crate::control_protocol::ControlInput;
+                                        // Separate receipt budgets keep motion floods from hiding clicks.
+                                        static RECEIPTS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+                                        let (slot, kind) = match &event {
+                                            ControlInput::MouseButton {..} | ControlInput::MouseClick {..} => (0, "button"),
+                                            ControlInput::Keyboard {..} | ControlInput::KeyboardClick {..} | ControlInput::TextInput {..} => (1, "keyboard"),
+                                            _ => (2, "motion"),
+                                        };
+                                        if RECEIPTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                                            log::info!("CONTROL input received: kind={}", kind);
                                         }
-                                    }
-                                    if let Ok(crate::control_protocol::ControlMessage::Input(crate::control_protocol::ControlInput::TextInput {text})) = crate::control_protocol::decode_control(&msg.data) {
-                                        if let Some(session)=message_input_session.as_ref() { session.with_input(|| {if crate::wayland::input_ready() {input_worker.text_input(&text);}}); }
+                                        if let Some(session)=message_input_session.as_ref() {session.with_input(|| {
+                                        if !crate::wayland::input_ready() {return;}
+                                        match &event {
+                                            ControlInput::MouseAbsolute {x,y} => input_worker.mouse_absolute_normalized(*x,*y,crate::wayland::input_size(if live_x11 {crate::capture::x11_last_size().unwrap_or(input_size)} else {input_size})),
+                                            ControlInput::MouseRelative {dx,dy} => input_worker.mouse_relative(*dx,*dy),
+                                            ControlInput::MouseScroll {dx,dy} => input_worker.mouse_scroll(*dx,*dy),
+                                            ControlInput::Keyboard {key, pressed} => input_worker.windows_key_event(*key, *pressed),
+                                            ControlInput::TextInput {text} => input_worker.text_input(text),
+                                            ControlInput::KeyboardClick {key} => {input_worker.windows_key_event(*key, true);input_worker.windows_key_event(*key, false);},
+                                            ControlInput::MouseButton {button,pressed} => input_worker.wire_mouse_button(*button,*pressed),
+                                            ControlInput::MouseClick {button} => {input_worker.wire_mouse_button(*button,true);input_worker.wire_mouse_button(*button,false);},
+                                            _ => {}
+                                        }
+                                        });}
+
+                                    },
+                                    Ok(crate::control_protocol::ControlMessage::Unsupported(v)) => {
+                                        // Action name and key names only, never values (an IME text event would carry typed text).
+                                        static UNSUPPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                                        if UNSUPPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                                            let action = v.get("action").and_then(serde_json::Value::as_str)
+                                                .filter(|a| a.len() <= 40 && a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')).unwrap_or("?");
+                                            let keys: Vec<&str> = v.as_object().map(|o| o.keys().map(String::as_str).take(12).collect()).unwrap_or_default();
+                                            log::info!("Unsupported CONTROL input: action={action} keys={keys:?}");
+                                        }
+                                    },
+                                    _ => {}
+                                }
+                            } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt) {
+                                // Input JSON on another channel (mobile input-method text was missing from CONTROL, #13/#46):
+                                // record action names only, once per name, and accept text_input wherever it arrives.
+                                if let Some(action) = val.get("action").and_then(serde_json::Value::as_str) {
+                                    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                                    let mut seen = SEEN.lock().unwrap();
+                                    if seen.len() < 32 && action.len() <= 40 && action.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !seen.iter().any(|s| s == action) {
+                                        seen.push(action.to_owned());
+                                        log::info!("JSON action on {} channel: action={}", if channel_name.contains("STREAMER") {"STREAMER"} else if channel_name.contains("TEXT") {"TEXT"} else {"other"}, action);
                                     }
                                 }
-                                if channel_name.contains("CONTROL") {
-                                    match crate::control_protocol::decode_control(&msg.data) {
-                                        Ok(crate::control_protocol::ControlMessage::Input(event)) => {
-                                            // A ready compositor source remains controllable on its lock screen.
-                                            if screen.backend == crate::desktop_backend::DesktopBackend::Portal
-                                                && (screen.init_error.is_some() || !desktop_ready) { return; }
-                                            if !crate::wayland::input_ready() {return;}
-                                            use crate::control_protocol::ControlInput;
-                                            // Separate receipt budgets keep motion floods from hiding clicks.
-                                            static RECEIPTS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
-                                            let (slot, kind) = match &event {
-                                                ControlInput::MouseButton {..} | ControlInput::MouseClick {..} => (0, "button"),
-                                                ControlInput::Keyboard {..} | ControlInput::KeyboardClick {..} | ControlInput::TextInput {..} => (1, "keyboard"),
-                                                _ => (2, "motion"),
-                                            };
-                                            if RECEIPTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
-                                                log::info!("CONTROL input received: kind={}", kind);
-                                            }
-                                            if let Some(session)=message_input_session.as_ref() {session.with_input(|| {
-                                            if !crate::wayland::input_ready() {return;}
-                                            match &event {
-                                                ControlInput::MouseAbsolute {x,y} => input_worker.mouse_absolute_normalized(*x,*y,crate::wayland::input_size(if live_x11 {crate::capture::x11_last_size().unwrap_or(input_size)} else {input_size})),
-                                                ControlInput::MouseRelative {dx,dy} => input_worker.mouse_relative(*dx,*dy),
-                                                ControlInput::MouseScroll {dx,dy} => input_worker.mouse_scroll(*dx,*dy),
-                                                ControlInput::Keyboard {key, pressed} => input_worker.windows_key_event(*key, *pressed),
-                                                ControlInput::TextInput {text} => input_worker.text_input(text),
-                                                ControlInput::KeyboardClick {key} => {input_worker.windows_key_event(*key, true);input_worker.windows_key_event(*key, false);},
-                                                ControlInput::MouseButton {button,pressed} => input_worker.wire_mouse_button(*button,*pressed),
-                                                ControlInput::MouseClick {button} => {input_worker.wire_mouse_button(*button,true);input_worker.wire_mouse_button(*button,false);},
-                                                _ => {}
-                                            }
-                                            });}
-
-                                        },
-                                        Ok(crate::control_protocol::ControlMessage::Unsupported(v)) => {
-                                            // Action name and key names only, never values (an IME text event would carry typed text).
-                                            static UNSUPPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                                            if UNSUPPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
-                                                let action = v.get("action").and_then(serde_json::Value::as_str)
-                                                    .filter(|a| a.len() <= 40 && a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')).unwrap_or("?");
-                                                let keys: Vec<&str> = v.as_object().map(|o| o.keys().map(String::as_str).take(12).collect()).unwrap_or_default();
-                                                log::info!("Unsupported CONTROL input: action={action} keys={keys:?}");
-                                            }
-                                        },
-                                        _ => {}
-                                    }
-                                } else if channel_name.contains("STREAMER") {
+                                if let Ok(crate::control_protocol::ControlMessage::Input(crate::control_protocol::ControlInput::TextInput {text})) = crate::control_protocol::decode_control(&msg.data) {
+                                    if let Some(session)=message_input_session.as_ref() { session.with_input(|| {if crate::wayland::input_ready() {input_worker.text_input(&text);}}); }
+                                }
+                                if channel_name.contains("STREAMER") {
                                     log::debug!("STREAMER channel JSON received");
                                     if let Some(event)=val.get("connection_period_stats_event") {
                                         let nums=crate::viewer_metrics::collect(event);
