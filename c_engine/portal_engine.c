@@ -33,6 +33,7 @@ struct uu_portal {
     GDBusConnection *bus;
     GMainContext *context;
     GMainLoop *main_loop;
+    GCancellable *notify_cancellable;
     pthread_t dbus_thread;
     int dbus_started;
     char *session;
@@ -618,6 +619,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     g_strfreev(desktops);
     pthread_mutex_init(&p->lock, NULL); pthread_cond_init(&p->changed, NULL);
     p->context = g_main_context_new(); g_main_context_push_thread_default(p->context);
+    p->notify_cancellable = g_cancellable_new();
     p->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
     if (!p->bus) { *error = 1; goto done; }
     if (open_cancelled(p)) { *error = 13; goto done; }
@@ -747,6 +749,7 @@ static gboolean quit_dbus_loop(gpointer data) { g_main_loop_quit(data); return G
 void uu_portal_close(struct uu_portal *p) {
     if (!p) return;
     atomic_store(&p->closed, 1);
+    if (p->notify_cancellable) g_cancellable_cancel(p->notify_cancellable);
     portal_eis_close(p);
     if (p->bus && p->session) {
         GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
@@ -773,7 +776,12 @@ void uu_portal_close(struct uu_portal *p) {
     if (p->pw_context) pw_context_destroy(p->pw_context);
     if (p->pw_loop) pw_thread_loop_destroy(p->pw_loop);
     if (p->main_loop) g_main_loop_unref(p->main_loop);
-    if (p->context) g_main_context_unref(p->context);
+    if (p->context) {
+        /* Drain any pending sources or cancelled async completions on p->context */
+        while (g_main_context_iteration(p->context, FALSE)) {}
+        g_main_context_unref(p->context);
+    }
+    if (p->notify_cancellable) g_object_unref(p->notify_cancellable);
     if (p->bus) g_object_unref(p->bus);
     g_free(p->mapping_id);
     g_free(p->clipboard_text); g_free(p->clipboard_mime); g_free(p->restore_token); free(p->session); free(p->frame);
@@ -867,11 +875,13 @@ static void notify_async_cb(GObject *source_object, GAsyncResult *res, gpointer 
     GError *error = NULL;
     GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source_object), res, &error);
     if (!reply) {
-        static atomic_uint failures = 0;
-        if (atomic_fetch_add(&failures, 1) < 12) {
-            char *name = error ? g_dbus_error_get_remote_error(error) : NULL;
-            fprintf(stderr, "Portal async input method failed: remote_error=%s\n", name ? name : "unavailable");
-            g_free(name);
+        if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+            static atomic_uint failures = 0;
+            if (atomic_fetch_add(&failures, 1) < 12) {
+                char *name = g_dbus_error_get_remote_error(error);
+                fprintf(stderr, "Portal async input method failed: remote_error=%s\n", name ? name : "unavailable");
+                g_free(name);
+            }
         }
         g_clear_error(&error);
         return;
@@ -883,13 +893,15 @@ struct notify_task {
     GDBusConnection *bus;
     char *method;
     GVariant *parameters;
+    GCancellable *cancellable;
 };
 
 static gboolean notify_invoke_action(gpointer user_data) {
     struct notify_task *t = user_data;
     g_dbus_connection_call(t->bus, DEST, PATH, REMOTE, t->method, t->parameters,
-        NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, notify_async_cb, NULL);
+        NULL, G_DBUS_CALL_FLAGS_NONE, 3000, t->cancellable, notify_async_cb, NULL);
     if (t->bus) g_object_unref(t->bus);
+    if (t->cancellable) g_object_unref(t->cancellable);
     g_free(t->method);
     g_free(t);
     return G_SOURCE_REMOVE;
@@ -904,6 +916,7 @@ static int notify(struct uu_portal *p, const char *method, GVariant *parameters)
     t->bus = p->bus ? g_object_ref(p->bus) : NULL;
     t->method = g_strdup(method);
     t->parameters = parameters;
+    t->cancellable = p->notify_cancellable ? g_object_ref(p->notify_cancellable) : NULL;
     if (p->context) {
         g_main_context_invoke_full(p->context, G_PRIORITY_DEFAULT, notify_invoke_action, t, NULL);
     } else {
