@@ -259,6 +259,12 @@ int uu_wl_type_utf8(const char *text) {
         if(!keyboard_manager) { pthread_mutex_unlock(&lock); return -1; }
         /* Text has its own device: remapping printable codes must not change physical-key input. */
         release_held_keys_locked();
+        /* The original device stays alive, so key-up alone must not leave its modifiers held. */
+        zwp_virtual_keyboard_v1_modifiers(keyboard,
+            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_DEPRESSED),
+            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_LATCHED),
+            xkb_state_serialize_mods(key_state,XKB_STATE_MODS_LOCKED),
+            xkb_state_serialize_layout(key_state,XKB_STATE_LAYOUT_EFFECTIVE));
         struct zwp_virtual_keyboard_v1 *saved=keyboard;
         keyboard=zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(keyboard_manager,seat);
         if(keyboard) {typed=type_utf8_locked(text);sync_display();usleep(8000);if(keyboard) zwp_virtual_keyboard_v1_destroy(keyboard);}
