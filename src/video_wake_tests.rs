@@ -31,7 +31,7 @@ pub(super) async fn encode(latest: mpsc::Sender<Arc<CompleteFrame>>, settings: V
         let frame = Arc::new(CompleteFrame {
             source_generation: settings.source_generation, source_id: settings.source_id,
             codec: settings.codec, sequence: sequence.fetch_add(1, Ordering::Relaxed) + 1,
-            completed_at: Instant::now(), data: vec![0, 0, 1, 65, 1, 2], _permit: Some(permit),
+            completed_at: Instant::now(), data: vec![0, 0, 1, 65, 1, 2].into(), _permit: Some(permit),
         });
         if latest.send(frame).await.is_err() { return Ok(()); }
     }
