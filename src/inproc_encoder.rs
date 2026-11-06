@@ -450,7 +450,18 @@ fn run_portal_vaapi(
     if dma_disabled { log::info!("Portal VAAPI DMA-BUF disabled by setting; pipeline=host-upload"); }
     loop {
         if stop.load(Ordering::Relaxed) || units.is_closed() { return Ok(()); }
-        std::thread::sleep(next_poll.saturating_duration_since(Instant::now()).min(Duration::from_millis(20)));
+        let wait_dur = next_poll.saturating_duration_since(Instant::now());
+        if wait_dur > Duration::ZERO {
+            match portal.wait_frame(wait_dur) {
+                Ok(true) | Ok(false) => (),
+                Err(_) => {
+                    // Frame wait failed or stream closed/stalled: back off to next_poll
+                    // (preventing 100% core busy-spin) and allow existing recovery in with_dmabuf
+                    // and capture_changed to handle lock/scaling without prematurely aborting the encoder.
+                    std::thread::sleep(wait_dur);
+                }
+            }
+        }
         let now = Instant::now();
         if now < next_poll { continue; }
         next_poll = (next_poll + interval).max(now);

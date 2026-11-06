@@ -35,7 +35,7 @@ mod permissions;
 
 #[cfg(all(target_os = "linux", feature = "portal"))]
 mod native {
-    use std::{ffi::c_void, ptr::NonNull, sync::{Mutex, MutexGuard, TryLockError}};
+    use std::{ffi::c_void, ptr::NonNull, sync::{Arc, Mutex, MutexGuard, TryLockError}};
     crate::engine_ffi! { crate::engine_plugin::Engine::Portal;
         fn uu_portal_open_persist(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_open_virtual(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
@@ -49,6 +49,7 @@ mod native {
         fn uu_portal_close(portal: *mut c_void);
         fn uu_portal_alive(portal: *mut c_void) -> i32;
         fn uu_portal_capture_alive(portal: *mut c_void) -> i32;
+        fn uu_portal_wait_frame(portal: *mut c_void, timeout_us: i64) -> i32;
         fn uu_portal_input_dispatch(portal: *mut c_void);
         fn uu_portal_reset_frame(portal: *mut c_void);
         fn uu_portal_capture_since(portal: *mut c_void, bgra: *mut u8, length: usize, revision: *mut u64) -> i32;
@@ -68,9 +69,14 @@ mod native {
     }
     struct Handle(NonNull<c_void>);
     fn pack(width: u32, height: u32) -> u64 { (u64::from(width) << 32) | u64::from(height) }
-    // The engine owns callback threads; public calls are serialized by Mutex.
+    // Calls are serialized by Session's mutex except wait_frame, whose C-side
+    // condition wait synchronizes with callbacks and input through the engine lock.
     unsafe impl Send for Handle {}
+    unsafe impl Sync for Handle {}
     impl Drop for Handle { fn drop(&mut self) { unsafe { uu_portal_close(self.0.as_ptr()) } } }
+    fn lease_handle<T>(current: &Mutex<Arc<T>>) -> Result<Arc<T>, String> {
+        current.lock().map(|handle| Arc::clone(&handle)).map_err(|_| "Portal session lock poisoned".into())
+    }
     fn blank_changed(frame: &mut [u8], version: &mut Option<super::FrameVersion>) -> bool {
         if *version == Some(super::FrameVersion(0, 0)) { return false; }
         super::blank(frame); *version = Some(super::FrameVersion(0, 0)); true
@@ -112,7 +118,7 @@ mod native {
             was_locked.store(false, std::sync::atomic::Ordering::Release);
         }
     }
-    pub struct Session { handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool }
+    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool }
     impl Session {
         fn take_lock_observation(&self) -> Result<bool, String> {
             // A recovery in progress must see the lock even if another capture
@@ -260,7 +266,7 @@ mod native {
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
             // before new damage can leave a static desktop permanently blank (#2).
-            Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into() })
+            Ok(Self { handle: Mutex::new(Arc::new(Handle(handle))), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into() })
         }
         /// Frame pixels of the monitor the stream currently follows.
         pub fn size(&self) -> (u32, u32) {
@@ -524,6 +530,17 @@ mod native {
         pub fn clipboard_supported(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_clipboard_supported(handle.0.as_ptr()) != 0 })
         }
+        pub fn wait_frame(&self, timeout: std::time::Duration) -> Result<bool, String> {
+            let handle = lease_handle(&self.handle)?;
+            // Retain sub-millisecond precision across the FFI boundary and clamp to 5s.
+            let us = (timeout.as_micros().min(5_000_000) as i64).max(1);
+            let ret = unsafe { uu_portal_wait_frame(handle.0.as_ptr(), us) };
+            if ret < 0 {
+                Err("Portal stream closed or failed during frame wait".into())
+            } else {
+                Ok(ret > 0)
+            }
+        }
         pub fn clipboard_ready(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_clipboard_ready(handle.0.as_ptr()) != 0 })
         }
@@ -601,7 +618,7 @@ mod native {
             fn new(physical: (u32, u32)) -> Self {
                 let (_, locked) = tokio::sync::watch::channel(None);
                 Self(ManuallyDrop::new(Session {
-                    handle: Mutex::new(Handle(NonNull::dangling())),
+                    handle: Mutex::new(Arc::new(Handle(NonNull::dangling()))),
                     locked,
                     was_locked: std::sync::atomic::AtomicBool::new(false),
                     recovery: Mutex::new(Recovery::default()),
@@ -639,6 +656,35 @@ mod native {
             key_held: bool,
             button_held: bool,
             retirement: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        }
+        #[test]
+        fn frame_wait_lease_keeps_replaced_handle_alive_without_blocking_input() {
+            use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::channel};
+            struct Tracked(Arc<AtomicBool>);
+            impl Drop for Tracked { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+            let dropped = Arc::new(AtomicBool::new(false));
+            let current = Arc::new(Mutex::new(Arc::new(Tracked(dropped.clone()))));
+            let (waiting, ready) = channel();
+            let (resume, resumed) = channel();
+            let worker = {
+                let current = current.clone();
+                std::thread::spawn(move || {
+                    let lease = lease_handle(&current).unwrap();
+                    waiting.send(()).unwrap();
+                    resumed.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+                    assert!(!lease.0.load(Ordering::SeqCst));
+                })
+            };
+            ready.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+            let old = {
+                let mut guard = current.try_lock().expect("frame wait must not block input");
+                std::mem::replace(&mut *guard, Arc::new(Tracked(Arc::new(AtomicBool::new(false)))))
+            };
+            drop(old);
+            assert!(!dropped.load(Ordering::SeqCst));
+            resume.send(()).unwrap();
+            worker.join().unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
         }
         impl Drop for TestHandle {
             fn drop(&mut self) {
@@ -896,6 +942,7 @@ impl PortalSession {
     pub fn capture(&self, _: &mut [u8]) -> Result<(), String> { Err(error(15)) }
     pub fn capture_changed(&self, _: &mut [u8], _: &mut Option<FrameVersion>) -> Result<bool, String> { Err(error(15)) }
     pub fn disable_dmabuf(&self) {}
+    pub fn wait_frame(&self, _: std::time::Duration) -> Result<bool, String> { Err(error(15)) }
     pub fn with_dmabuf<T>(&self, _: &mut Option<FrameVersion>, _: impl FnOnce(&DmaFrame, bool) -> Result<T, String>) -> Result<DmaCapture<T>, String> {
         Ok(DmaCapture::Unavailable(-1))
     }

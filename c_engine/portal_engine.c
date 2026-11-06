@@ -558,7 +558,7 @@ static int wait_for_first_frame(struct uu_portal *p) {
     while (!p->sequence && !p->error && !open_cancelled(p) && !(p->dma_requested && p->dma_bad)) {
         gint64 remaining = deadline - g_get_monotonic_time();
         if (remaining <= 0) break;
-        clock_gettime(CLOCK_REALTIME, &until);
+        clock_gettime(CLOCK_MONOTONIC, &until);
         gint64 wait_us = MIN(100000, remaining);
         until.tv_nsec += wait_us * 1000;
         if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
@@ -616,7 +616,12 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     for (gchar **desktop = desktops; *desktop; desktop++)
         if (!g_ascii_strcasecmp(*desktop, "GNOME")) p->absolute_stream_pixels = 1;
     g_strfreev(desktops);
-    pthread_mutex_init(&p->lock, NULL); pthread_cond_init(&p->changed, NULL);
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&p->changed, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
     p->context = g_main_context_new(); g_main_context_push_thread_default(p->context);
     p->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
     if (!p->bus) { *error = 1; goto done; }
@@ -831,6 +836,36 @@ int uu_portal_capture_alive(struct uu_portal *p) {
     int alive = !stream_stalled(p);
     pthread_mutex_unlock(&p->lock);
     return alive;
+}
+int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
+    if (!p || atomic_load(&p->closed)) return -1;
+    pthread_mutex_lock(&p->lock);
+    if (p->error || atomic_load(&p->closed) || stream_stalled(p)) {
+        pthread_mutex_unlock(&p->lock);
+        return -1;
+    }
+    uint64_t prev_seq = p->sequence;
+    if (timeout_us <= 0) {
+        int ready = (p->sequence != prev_seq);
+        pthread_mutex_unlock(&p->lock);
+        return ready;
+    }
+    struct timespec until;
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    until.tv_sec += timeout_us / 1000000LL;
+    until.tv_nsec += (long)(timeout_us % 1000000LL) * 1000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec += 1;
+        until.tv_nsec -= 1000000000L;
+    }
+    while (p->sequence == prev_seq && !p->error && !atomic_load(&p->closed) && !stream_stalled(p)) {
+        int rc = pthread_cond_timedwait(&p->changed, &p->lock, &until);
+        if (rc != 0) break; // timeout or error
+    }
+    int res = (p->error || atomic_load(&p->closed) || stream_stalled(p)) ? -1 :
+              (p->sequence != prev_seq) ? 1 : 0;
+    pthread_mutex_unlock(&p->lock);
+    return res;
 }
 void uu_portal_input_dispatch(struct uu_portal *p) {
     if (p->ei) portal_eis_dispatch(p);
