@@ -558,7 +558,7 @@ static int wait_for_first_frame(struct uu_portal *p) {
     while (!p->sequence && !p->error && !open_cancelled(p) && !(p->dma_requested && p->dma_bad)) {
         gint64 remaining = deadline - g_get_monotonic_time();
         if (remaining <= 0) break;
-        clock_gettime(CLOCK_REALTIME, &until);
+        clock_gettime(CLOCK_MONOTONIC, &until);
         gint64 wait_us = MIN(100000, remaining);
         until.tv_nsec += wait_us * 1000;
         if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
