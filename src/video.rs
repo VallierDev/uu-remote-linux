@@ -1351,6 +1351,10 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 let sample = Sample {
                     data: frame.data.clone(), duration, ..Default::default()
                 };
+                // Official GameViewer (streamer.dll) negotiates WebRTC-VideoIsNewFrame/Enabled and tracks
+                // both `frames` and `newFrames`/`newFramesPerSecond`. Static repeat/keepalive frames are
+                // sent with is_new=false (video-frame-is-new-frame=0) so viewer stats and jitter buffer
+                // recognize idle repetitions without registering spurious new frame updates or watchdog stalls.
                 let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::is_new_frame(frame.is_new)];
                 let sent_before=track.revision();
                 let send = track.write_sample_with_extensions(frame.codec, &sample, &extensions);
