@@ -832,6 +832,36 @@ int uu_portal_capture_alive(struct uu_portal *p) {
     pthread_mutex_unlock(&p->lock);
     return alive;
 }
+int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
+    if (!p || atomic_load(&p->closed)) return -1;
+    pthread_mutex_lock(&p->lock);
+    if (p->error || atomic_load(&p->closed) || stream_stalled(p)) {
+        pthread_mutex_unlock(&p->lock);
+        return -1;
+    }
+    uint64_t prev_seq = p->sequence;
+    if (timeout_us <= 0) {
+        int ready = (p->sequence != prev_seq);
+        pthread_mutex_unlock(&p->lock);
+        return ready;
+    }
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += timeout_us / 1000000LL;
+    until.tv_nsec += (long)(timeout_us % 1000000LL) * 1000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec += 1;
+        until.tv_nsec -= 1000000000L;
+    }
+    while (p->sequence == prev_seq && !p->error && !atomic_load(&p->closed) && !stream_stalled(p)) {
+        int rc = pthread_cond_timedwait(&p->changed, &p->lock, &until);
+        if (rc != 0) break; // timeout or error
+    }
+    int res = (p->error || atomic_load(&p->closed) || stream_stalled(p)) ? -1 :
+              (p->sequence != prev_seq) ? 1 : 0;
+    pthread_mutex_unlock(&p->lock);
+    return res;
+}
 void uu_portal_input_dispatch(struct uu_portal *p) {
     if (p->ei) portal_eis_dispatch(p);
 }
