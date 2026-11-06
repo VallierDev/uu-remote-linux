@@ -154,8 +154,25 @@ fn is_independent_frame_for(bytes: &[u8], codec: VideoCodec) -> bool {
     match codec {
         VideoCodec::H264 => !nal_offsets_for(bytes, 5, codec).is_empty() && nal_offsets_for(bytes, 1, codec).is_empty(),
         // BLA/IDR/CRA are IRAP (RFC 7798 §4.1); no leading pictures with our no-B-frame encoder.
-        VideoCodec::H265 => (16..=21).any(|kind| !nal_offsets_for(bytes, kind, codec).is_empty())
-            && !(0..16).any(|kind| !nal_offsets_for(bytes, kind, codec).is_empty()),
+        VideoCodec::H265 => {
+            let mut has_irap = false;
+            let mut has_non_irap_vcl = false;
+            let mut i = 0;
+            while i + 3 < bytes.len() {
+                let prefix = if bytes[i..].starts_with(&[0, 0, 0, 1]) { 4 }
+                    else if bytes[i..].starts_with(&[0, 0, 1]) { 3 } else { i += 1; continue };
+                let header = i + prefix;
+                if let Some(kind) = hevc_nal_kind(bytes, header) {
+                    if (16..=21).contains(&kind) {
+                        has_irap = true;
+                    } else if kind < 16 {
+                        has_non_irap_vcl = true;
+                    }
+                }
+                i += prefix;
+            }
+            has_irap && !has_non_irap_vcl
+        }
     }
 }
 #[cfg(test)]
@@ -170,7 +187,7 @@ struct CompleteFrame {
     codec: VideoCodec,
     sequence: u64,
     completed_at: Instant,
-    data: Vec<u8>,
+    data: bytes::Bytes,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -799,7 +816,7 @@ async fn read_inprocess(
     let mut gate = DependencyGate::default();
     while let Some(unit) = units.recv().await {
         let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        gate.submit(&latest, Arc::new(CompleteFrame { validity: unit.validity, source_generation: source.1, source_id: source.0, codec, sequence, completed_at: unit.completed_at, data: unit.data, _permit: Some(unit.permit) }));
+        gate.submit(&latest, Arc::new(CompleteFrame { validity: unit.validity, source_generation: source.1, source_id: source.0, codec, sequence, completed_at: unit.completed_at, data: unit.data.into(), _permit: Some(unit.permit) }));
         if latest.is_closed() { break; }
     }
     // Dropping the receiver also unblocks the encoder if it is waiting to send.
@@ -1086,7 +1103,7 @@ async fn read_encoder_with(
             if aud.len() < 2 { break; }
             let next = aud[1];
             if next > MAX_ACCESS_UNIT { return Err("Encoder access unit exceeds limit".into()); }
-            let frame: Vec<u8> = pending.drain(..next).collect();
+            let frame: bytes::Bytes = pending.drain(..next).collect::<Vec<u8>>().into();
             let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let permit=if wayland {Some(permits_rx.recv().await.ok_or("Capture producer stopped")?)} else {None};
             gate.submit(&latest, Arc::new(CompleteFrame { validity: None, source_generation: settings.source_generation, source_id: settings.source_id,
@@ -1456,7 +1473,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 max_age_ms = max_age_ms.max(frame.completed_at.elapsed().as_millis());
                 // Continue monitoring close even if the network send stalls.
                 let sample = Sample {
-                    data: frame.data.clone().into(), duration, ..Default::default()
+                    data: frame.data.clone(), duration, ..Default::default()
                 };
                 let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::new_frame()];
                 let sent_before=track.revision();
@@ -1631,7 +1648,7 @@ mod tests {
         for sequence in 1..=2 {
             let permit=budget.clone().acquire_owned().await.unwrap();
             gate.submit(&tx,Arc::new(CompleteFrame { validity: None, source_generation: 0, source_id: 0,codec:VideoCodec::H264,sequence,completed_at:Instant::now(),
-                data:vec![0,0,1,5,42],_permit:Some(permit)}));
+                data:vec![0,0,1,5,42].into(),_permit:Some(permit)}));
         }
         let sending=rx.recv().await.unwrap();
         assert_eq!(budget.available_permits(),0);
@@ -1793,7 +1810,7 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let frame = |sequence, idr| Arc::new(CompleteFrame { validity: None, source_generation: 0, source_id: 0, _permit: None,
             sequence, codec: VideoCodec::H264, completed_at: Instant::now(),
-            data: vec![0, 0, 1, 9, 240, 0, 0, 1, if idr { 5 } else { 1 }, 42],
+            data: vec![0, 0, 1, 9, 240, 0, 0, 1, if idr { 5 } else { 1 }, 42].into(),
         });
         let mut reader = EncoderTask(tokio::spawn(async move {
             let _stopped = MarkStopped(old_stopped);
@@ -1886,7 +1903,7 @@ mod tests {
     async fn bounded_queue_never_sends_broken_prediction_chain_after_overload(){
         let(tx,mut rx)=mpsc::channel(1);
         let mut gate=DependencyGate::default();
-        let frame=|sequence,idr|Arc::new(CompleteFrame{validity:None,source_generation:0,source_id:0,_permit:None,sequence,codec:VideoCodec::H264,completed_at:Instant::now(),data:vec![0,0,1,9,240,0,0,1,if idr{5}else{1},42]});
+        let frame=|sequence,idr|Arc::new(CompleteFrame{validity:None,source_generation:0,source_id:0,_permit:None,sequence,codec:VideoCodec::H264,completed_at:Instant::now(),data:vec![0,0,1,9,240,0,0,1,if idr{5}else{1},42].into()});
         gate.submit(&tx,frame(1,false));assert!(rx.try_recv().is_err()); // no IDR yet
         gate.submit(&tx,frame(2,true));
         gate.submit(&tx,frame(3,false)); // queue full: P3 lost
@@ -1959,7 +1976,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut gate = DependencyGate::default();
         let frame = |sequence, irap| Arc::new(CompleteFrame { validity: None, source_generation: 0, source_id: 0, _permit: None, codec: VideoCodec::H265,
-            sequence, completed_at: Instant::now(), data: vec![0,0,1,if irap { 38 } else { 2 },1,42] });
+            sequence, completed_at: Instant::now(), data: vec![0,0,1,if irap { 38 } else { 2 },1,42].into() });
         gate.submit(&tx, frame(1, false));
         assert!(rx.try_recv().is_err());
         gate.submit(&tx, frame(2, true));
@@ -2055,7 +2072,7 @@ mod screen_frame_tests {
         let guard=crate::portal::FrameValidity::new({let revoked=revoked.clone(); move || revoked.load(std::sync::atomic::Ordering::Acquire)});
         let frame=Arc::new(CompleteFrame {validity:Some(guard),source_id:0,source_generation:7,
             codec:VideoCodec::H264,sequence:1,completed_at:Instant::now(),
-            data:vec![0,0,1,5,42],_permit:None});
+            data:vec![0,0,1,5,42].into(),_permit:None});
         let settings=VideoSettings {source_id:0,source_generation:7,..Default::default()};
         let (tx,mut rx)=mpsc::channel(2);
         let mut gate=DependencyGate::default();
@@ -2069,7 +2086,7 @@ mod screen_frame_tests {
     }
     #[test]
     fn source_restart_rejects_queued_frames_even_with_same_screen_and_codec() {
-        let frame=CompleteFrame {validity:None,source_id:0,source_generation:7,codec:VideoCodec::H264,sequence:1,completed_at:Instant::now(),data:vec![],_permit:None};
+        let frame=CompleteFrame { validity: None,source_id:0,source_generation:7,codec:VideoCodec::H264,sequence:1,completed_at:Instant::now(),data:vec![].into(),_permit:None};
         let mut settings=VideoSettings {source_id:0,source_generation:7,..Default::default()};
         assert!(frame.matches(&settings));
         settings.source_generation=9;assert!(!frame.matches(&settings));

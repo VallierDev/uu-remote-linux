@@ -57,7 +57,7 @@ impl VideoTrack {
         // Leave room for the RTP header and negotiated UU extensions below the 1200 byte MTU.
         let payloads = match codec {
             VideoCodec::H264 => state.h264.payload(1160, &sample.data).map_err(Error::Rtp)?,
-            VideoCodec::H265 => crate::hevc::payload(1160, &sample.data).map_err(Error::new)?,
+            VideoCodec::H265 => crate::hevc::payload_bytes(1160, &sample.data).map_err(Error::new)?,
         };
         let count = payloads.len();
         let mut complete = count > 0;
