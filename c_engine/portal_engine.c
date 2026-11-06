@@ -616,7 +616,12 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     for (gchar **desktop = desktops; *desktop; desktop++)
         if (!g_ascii_strcasecmp(*desktop, "GNOME")) p->absolute_stream_pixels = 1;
     g_strfreev(desktops);
-    pthread_mutex_init(&p->lock, NULL); pthread_cond_init(&p->changed, NULL);
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&p->changed, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
     p->context = g_main_context_new(); g_main_context_push_thread_default(p->context);
     p->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
     if (!p->bus) { *error = 1; goto done; }
@@ -846,7 +851,7 @@ int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
         return ready;
     }
     struct timespec until;
-    clock_gettime(CLOCK_REALTIME, &until);
+    clock_gettime(CLOCK_MONOTONIC, &until);
     until.tv_sec += timeout_us / 1000000LL;
     until.tv_nsec += (long)(timeout_us % 1000000LL) * 1000L;
     if (until.tv_nsec >= 1000000000L) {
