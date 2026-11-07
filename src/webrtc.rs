@@ -604,14 +604,33 @@ impl WebRtcSession {
                     let out_channel = d.clone();
                     let out_label = label.clone();
                     let outbound_rx = outbound_rx.clone();
+                    let change_sequence = out_sequence.clone();
+                    let terminal_changes = crate::terminal::subscribe_changes();
                     let start_drain = move || {
                         let out_channel = out_channel.clone();
                         let out_label = out_label.clone();
                         let outbound_rx = outbound_rx.clone();
+                        let change_sequence = change_sequence.clone();
+                        let mut terminal_changes = terminal_changes.clone();
                         Box::pin(async move {
                             let Some(mut outbound_rx) = take_outbound_once(&outbound_rx).await else { return; };
                             tokio::spawn(async move {
-                                while let Some(message) = outbound_rx.recv().await {
+                                let mut health = tokio::time::interval(std::time::Duration::from_millis(200));
+                                loop {
+                                    let message = tokio::select! {
+                                        message = outbound_rx.recv() => match message { Some(message) => message, None => break },
+                                        changed = terminal_changes.changed(), if out_label == "BINARY_DATA_CHANNEL" => {
+                                            if changed.is_err() { break; }
+                                            if out_channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { continue; }
+                                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                            crate::terminal::changed_message(change_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts)
+                                        },
+                                        _ = health.tick(), if out_label == "BINARY_DATA_CHANNEL" => {
+                                            use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+                                            if matches!(out_channel.ready_state(), RTCDataChannelState::Closing | RTCDataChannelState::Closed) { break; }
+                                            continue;
+                                        },
+                                    };
                                     if let Err(e) = out_channel.send(&bytes::Bytes::from(message)).await {
                                         log::warn!("{} send failed: {}", out_label, e); break;
                                     }
@@ -796,6 +815,13 @@ impl WebRtcSession {
                     (Outbound::Other(tx), "BINARY_DATA_CHANNEL") => Some(Arc::new(crate::terminal::TerminalConn::new(tx.clone()))),
                     _ => None,
                 };
+                if let Some(terminal) = &terminal_conn {
+                    let closing = terminal.clone();
+                    d.on_close(Box::new(move || {
+                        let closing = closing.clone();
+                        Box::pin(async move { closing.disconnect(); })
+                    }));
+                }
                 if label == "CONTROL_DATA_CHANNEL" || label == "TEXT_DATA_CHANNEL" {
                     let channel = d.clone();
                     let initial_sequence = out_sequence.clone();

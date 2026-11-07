@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -67,6 +67,7 @@ struct Session {
     id: u32,
     shell: String,
     created_ms: u64,
+    last_active_ms: AtomicU64,
     master: OwnedFd,
     pid: i32,
     sink: Mutex<Option<UnboundedSender<Vec<u8>>>>,
@@ -75,9 +76,11 @@ struct Session {
 }
 
 impl Session {
+    fn touch(&self) { self.last_active_ms.fetch_max(now_ms(), Ordering::Relaxed); }
     /// Lock order sink → scrollback matches OPEN, so a reattach snapshot sees each
     /// chunk either in the replay or live, never both.
     fn record_output(&self, data: &[u8]) {
+        self.touch();
         let mut sink = self.sink.lock().unwrap();
         {
             let mut sb = self.scrollback.lock().unwrap();
@@ -123,6 +126,7 @@ impl Session {
         });
     }
     fn write(&self, data: &[u8]) {
+        if !data.is_empty() { self.touch(); }
         let mut off = 0;
         while off < data.len() {
             let n = unsafe { libc::write(self.master.as_raw_fd(), data[off..].as_ptr().cast(), data.len() - off) };
@@ -131,6 +135,31 @@ impl Session {
         }
     }
     fn signal(&self, sig: i32) { unsafe { libc::kill(-self.pid, sig); } }
+    fn signal_foreground(&self, sig: i32) {
+        self.touch();
+        // Job-control shells put commands such as top in their own process group.
+        let pgid = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        if pgid > 0 { unsafe { libc::kill(-pgid, sig); } } else { self.signal(sig); }
+    }
+    fn terminate(&self) {
+        // Job-control shells give foreground/background jobs separate process groups.
+        // Limit cleanup to this PTY's POSIX session, never other desktop/tool peers.
+        if self.pid <= 0 { return; }
+        #[cfg(target_os = "linux")]
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            let mut groups = std::collections::HashSet::new();
+            for entry in entries.flatten() {
+                let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else { continue; };
+                if unsafe { libc::getsid(pid) } == self.pid {
+                    let group = unsafe { libc::getpgid(pid) };
+                    if group > 0 && group != self.pid { groups.insert(group); }
+                }
+            }
+            for group in groups { unsafe { libc::kill(-group, libc::SIGKILL); } }
+        }
+        self.signal_foreground(libc::SIGKILL);
+        self.signal(libc::SIGKILL);
+    }
 }
 
 fn registry() -> &'static Mutex<HashMap<u32, Arc<Session>>> {
@@ -138,6 +167,28 @@ fn registry() -> &'static Mutex<HashMap<u32, Arc<Session>>> {
     REG.get_or_init(Default::default)
 }
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+fn changes() -> &'static tokio::sync::watch::Sender<u64> {
+    static CHANGES: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+    CHANGES.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+fn notify_changes() { changes().send_modify(|revision| *revision = revision.wrapping_add(1)); }
+pub fn subscribe_changes() -> tokio::sync::watch::Receiver<u64> { changes().subscribe() }
+pub fn changed_message(sequence: u64, timestamp: u64) -> Vec<u8> {
+    // Official Mac 4.42.0: Message name map 0x100a1eb98 gives field 28;
+    // notifyTerminalListInvalidated (0x1001a341c) sends the empty message on BINARY (channel 3).
+    crate::initialization::envelope(sequence, timestamp, 28, &[])
+}
+
+fn remove_session(session: &Arc<Session>) -> bool {
+    let mut sessions = registry().lock().unwrap();
+    // An old reader may finish after OPEN has reused the same requested ID.
+    if sessions.get(&session.id).is_some_and(|current| Arc::ptr_eq(current, session)) {
+        sessions.remove(&session.id);
+        drop(sessions);
+        notify_changes(); true
+    } else { false }
+}
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 
@@ -172,9 +223,11 @@ fn spawn(requested_id: u32, cols: u16, rows: u16, shell: Option<&str>) -> Result
             if id != 0 && !registry().lock().unwrap().contains_key(&id) { break id; }
         }
     };
-    let session = Arc::new(Session { id, shell: shell.clone(), created_ms: now_ms(), pid: child.id() as i32,
+    let created_ms = now_ms();
+    let session = Arc::new(Session { id, shell: shell.clone(), created_ms, last_active_ms: AtomicU64::new(created_ms), pid: child.id() as i32,
         master: pty.master, sink: Mutex::new(None), scrollback: Mutex::new(VecDeque::new()), size: Mutex::new((cols, rows)) });
     let mut reader = std::fs::File::from(session.master.try_clone().map_err(|e| format!("pty dup failed: {e}"))?);
+    registry().lock().unwrap().insert(id, session.clone());
     let worker = session.clone();
     std::thread::Builder::new().name(format!("uu-term-{id}")).spawn(move || {
         let mut buf = vec![0u8; OUTPUT_CHUNK];
@@ -187,9 +240,10 @@ fn spawn(requested_id: u32, cols: u16, rows: u16, shell: Option<&str>) -> Result
         let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
         log::info!("Terminal session exited: id={} exit_code={}", worker.id, code);
         worker.emit(EXIT, serde_json::json!({"exit_code": code}).to_string().as_bytes());
-        registry().lock().unwrap().remove(&worker.id);
-    }).map_err(|e| format!("reader thread failed: {e}"))?;
-    registry().lock().unwrap().insert(id, session.clone());
+        remove_session(&worker);
+    }).map_err(|e| {
+        remove_session(&session); session.terminate(); format!("reader thread failed: {e}")
+    })?;
     log::info!("Terminal session spawned: id={} cols={} rows={}", id, cols, rows);
     Ok(session)
 }
@@ -201,7 +255,7 @@ pub fn shutdown_all() {
     for s in &sessions { s.signal(libc::SIGHUP); }
     if !sessions.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(300));
-        for s in &sessions { s.signal(libc::SIGKILL); }
+        for s in &sessions { s.terminate(); }
         log::info!("Terminal sessions closed on shutdown: count={}", sessions.len());
     }
 }
@@ -226,13 +280,26 @@ fn signal_number(payload: &[u8]) -> i32 {
 fn reply(code: i64, message: &str) -> Vec<u8> { serde_json::json!({"code": code, "message": message}).to_string().into_bytes() }
 
 /// One viewer connection's terminal endpoint; `out` sends complete frames on BINARY_DATA_CHANNEL.
-pub struct TerminalConn { out: UnboundedSender<Vec<u8>> }
+pub struct TerminalConn { out: UnboundedSender<Vec<u8>>, closed: AtomicBool }
 
 impl TerminalConn {
-    pub fn new(out: UnboundedSender<Vec<u8>>) -> Self { Self { out } }
+    pub fn new(out: UnboundedSender<Vec<u8>>) -> Self { Self { out, closed: AtomicBool::new(false) } }
     fn send(&self, kind: u8, session: u32, payload: &[u8]) { let _ = self.out.send(encode(kind, session, payload)); }
+    pub fn disconnect(&self) {
+        self.closed.store(true, Ordering::Release);
+        let sessions: Vec<_> = registry().lock().unwrap().values().cloned().collect();
+        let mut changed = false;
+        for s in sessions {
+            let mut sink = s.sink.lock().unwrap();
+            if sink.as_ref().is_some_and(|tx| tx.same_channel(&self.out)) {
+                *sink = None; s.touch(); changed = true;
+            }
+        }
+        if changed { notify_changes(); }
+    }
 
     pub fn handle(&self, data: &[u8]) {
+        if self.closed.load(Ordering::Acquire) { return; }
         let Some(frame) = decode(data) else { log::warn!("Terminal frame rejected: bytes={}", data.len()); return; };
         if frame.kind != STDIN { log::info!("Terminal frame: type={} session={} payload_bytes={}", frame.kind, frame.session, frame.payload.len()); }
         let existing = registry().lock().unwrap().get(&frame.session).cloned();
@@ -247,6 +314,7 @@ impl TerminalConn {
                 };
                 match session {
                     Ok(s) => {
+                        s.touch();
                         // Queue the acknowledgement before the PTY reader can emit live output.
                         let mut sink = s.sink.lock().unwrap();
                         self.send(OPEN_RESP, s.id, &reply(0, "ok"));
@@ -257,30 +325,55 @@ impl TerminalConn {
                         drop(sink);
                         // The replay tail starts mid-redraw for full-screen programs.
                         if reattach { s.force_redraw(); }
+                        notify_changes();
                     }
                     Err(e) => { log::warn!("Terminal open failed: {}", e); self.send(OPEN_RESP, frame.session, &reply(1, &e)); }
                 }
             }
-            STDIN => if let Some(s) = existing { s.write(&frame.payload) },
-            RESIZE => if let Some(s) = existing { let (c, r) = dims(&json(&frame.payload)); s.resize(c, r) },
-            SIGNAL => if let Some(s) = existing { s.signal(signal_number(&frame.payload)) },
-            CLOSE => if let Some(s) = existing { *s.sink.lock().unwrap() = None; s.signal(libc::SIGHUP); },
-            DETACH => if let Some(s) = existing { *s.sink.lock().unwrap() = None },
+            STDIN | RESIZE | SIGNAL | CLOSE | DETACH => if let Some(s) = existing {
+                let mut sink = s.sink.lock().unwrap();
+                // Reattach transfers ownership. Late input/DETACH from the old viewer
+                // must not affect the new attachment or inject a second copy of input.
+                if !sink.as_ref().is_some_and(|tx| tx.same_channel(&self.out)) { return; }
+                match frame.kind {
+                    // PTY writes may block during a large paste. Keep output draining.
+                    STDIN => { drop(sink); s.write(&frame.payload); }
+                    RESIZE => { let (c, r) = dims(&json(&frame.payload)); s.resize(c, r); }
+                    SIGNAL => s.signal_foreground(signal_number(&frame.payload)),
+                    CLOSE | DETACH => {
+                        *sink = None; s.touch();
+                        if frame.kind == CLOSE { s.signal(libc::SIGHUP); }
+                        notify_changes();
+                    }
+                    _ => unreachable!(),
+                }
+            },
             KILL_REQ => {
-                let id = if frame.session != 0 { frame.session } else {
-                    json(&frame.payload).get("session_id").and_then(|x| x.as_u64()).unwrap_or(0) as u32
+                // Official Mac 4.42.0 handleKillSessionReq (0x100189ca0, 0x10018be64):
+                // JSON session_id selects the target; the frame header correlates the reply.
+                let Some(id) = json(&frame.payload).get("session_id").and_then(|x| x.as_u64()).and_then(|id| u32::try_from(id).ok()) else {
+                    self.send(KILL_RESP, frame.session, &reply(400, "Invalid payload")); return;
                 };
-                let target = registry().lock().unwrap().get(&id).cloned();
+                let target = registry().lock().unwrap().remove(&id);
                 match target {
-                    Some(s) => { *s.sink.lock().unwrap() = None; s.signal(libc::SIGHUP); s.signal(libc::SIGKILL); self.send(KILL_RESP, id, &reply(0, "ok")); }
-                    None => self.send(KILL_RESP, id, &reply(1, "Session not found")),
+                    Some(s) => {
+                        s.terminate();
+                        self.send(KILL_RESP, frame.session, &reply(0, "ok"));
+                        notify_changes();
+                        log::info!("Terminal session terminated: id={} request={}", id, frame.session);
+                    }
+                    None => self.send(KILL_RESP, frame.session, &reply(404, "Session not found")),
                 }
             }
             LIST_REQ => {
                 let sessions: Vec<serde_json::Value> = registry().lock().unwrap().values().map(|s| {
-                    let attached = s.sink.lock().unwrap().is_some();
-                    serde_json::json!({"session_id": s.id, "name": format!("bash-{}", s.id), "shell": s.shell,
-                        "state": if attached { "running" } else { "detached" }, "created_at_ms": s.created_ms})
+                    let attached = s.sink.lock().unwrap().as_ref().is_some_and(|tx| !tx.is_closed());
+                    let name = std::path::Path::new(&s.shell).file_name().and_then(|n| n.to_str()).unwrap_or("shell");
+                    // Official Mac 4.42.0 snapshot at 0x1001b82c8–0x1001b8524
+                    // includes last_active_ms even when the session is detached.
+                    serde_json::json!({"session_id": s.id, "name": format!("{}-{}", name, s.id), "shell": s.shell,
+                        "state": if attached { "running" } else { "detached" }, "created_at_ms": s.created_ms,
+                        "last_active_ms": s.last_active_ms.load(Ordering::Relaxed)})
                 }).collect();
                 log::info!("Terminal list sessions: count={}", sessions.len());
                 // Official Mac 4.42.0 (handleListSessionsReq) sends a bare array with the request's header ID.
@@ -323,9 +416,200 @@ mod tests {
         }
     }
     #[test]
+    fn kill_uses_payload_id_preserves_request_id_and_updates_list_before_reply() {
+        let victim = spawn(u32::MAX - 5, 80, 24, Some("/bin/sh")).unwrap();
+        let decoy = spawn(u32::MAX - 6, 80, 24, Some("/bin/sh")).unwrap();
+        struct Cleanup(Vec<Arc<Session>>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { for s in &self.0 { s.signal(libc::SIGHUP); s.signal(libc::SIGKILL); } }
+        }
+        let _cleanup = Cleanup(vec![victim.clone(), decoy.clone()]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = TerminalConn::new(tx);
+        let payload = serde_json::json!({"session_id": victim.id}).to_string();
+        // A request ID may happen to equal another live session ID. Never kill it.
+        conn.handle(&encode(KILL_REQ, decoy.id, payload.as_bytes()));
+        let response = decode(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!((response.kind, response.session), (KILL_RESP, decoy.id));
+        assert_eq!(json(&response.payload)["code"], 0);
+        conn.handle(&encode(LIST_REQ, 123, &[]));
+        let response = decode(&rx.try_recv().unwrap()).unwrap();
+        let list = json(&response.payload);
+        assert!(!list.as_array().unwrap().iter().any(|s| s["session_id"] == victim.id), "terminated session must be absent before acknowledgement");
+        assert!(list.as_array().unwrap().iter().any(|s| s["session_id"] == decoy.id), "request correlation must not select a session");
+        assert_eq!(unsafe { libc::kill(decoy.pid, 0) }, 0);
+        conn.handle(&encode(KILL_REQ, 123, payload.as_bytes()));
+        let response = decode(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(response.session, 123);
+        assert_eq!(json(&response.payload)["code"], 404);
+        for invalid in [b"{}".as_slice(), b"", br#"{"session_id":-1}"#, br#"{"session_id":4294967296}"#] {
+            conn.handle(&encode(KILL_REQ, decoy.id, invalid));
+            let response = decode(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(response.session, decoy.id);
+            assert_eq!(json(&response.payload)["code"], 400);
+            assert!(registry().lock().unwrap().contains_key(&decoy.id));
+        }
+    }
+    #[test]
+    fn session_changed_matches_official_empty_binary_notification() {
+        use crate::protocol::WireValue;
+        let message = changed_message(17, 1234);
+        let fields = crate::protocol::decode_wire(&message).unwrap();
+        assert_eq!(fields.iter().map(|f| f.number).collect::<Vec<_>>(), vec![1, 2, 28]);
+        assert_eq!(fields[2].value, WireValue::Bytes(&[]));
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn kill_ends_foreground_and_background_jobs() {
+        let session = spawn(u32::MAX - 8, 80, 24, Some("/bin/sh")).unwrap();
+        struct Cleanup(Arc<Session>);
+        impl Drop for Cleanup { fn drop(&mut self) { self.0.terminate(); } }
+        let _cleanup = Cleanup(session.clone());
+        session.write(b"sleep 30 & sleep 30\n");
+        let mut jobs = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            jobs = std::fs::read_to_string(format!("/proc/{}/task/{}/children", session.pid, session.pid)).unwrap_or_default()
+                .split_whitespace().filter_map(|s| s.parse::<i32>().ok())
+                .filter(|pid| std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|s| s.trim() == "sleep")).collect();
+            if jobs.len() == 2 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(jobs.len(), 2, "foreground and background jobs must be running");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        TerminalConn::new(tx).handle(&encode(KILL_REQ, 123, serde_json::json!({"session_id":session.id}).to_string().as_bytes()));
+        assert_eq!(json(&decode(&rx.try_recv().unwrap()).unwrap().payload)["code"], 0);
+        jobs.push(session.pid);
+        let alive = |pid| std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| s.rsplit_once(") ").is_some_and(|(_, fields)| !fields.starts_with('Z')));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && jobs.iter().any(|pid| alive(*pid)) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!jobs.iter().any(|pid| alive(*pid)), "termination must end all job-control groups");
+    }
+    #[test]
+    fn reattach_rejects_old_input_and_detach_but_preserves_intentional_repeats() {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let id = u32::MAX - 7;
+        let mut termios = nix::sys::termios::tcgetattr(&pty.slave).unwrap();
+        nix::sys::termios::cfmakeraw(&mut termios);
+        nix::sys::termios::tcsetattr(&pty.slave, nix::sys::termios::SetArg::TCSANOW, &termios).unwrap();
+        let session = Arc::new(Session { id, shell: "/bin/sh".into(), created_ms: now_ms(), last_active_ms: AtomicU64::new(now_ms()),
+            master: pty.master, pid: 0, sink: Mutex::new(None), scrollback: Mutex::new(VecDeque::new()), size: Mutex::new((80, 24)) });
+        registry().lock().unwrap().insert(id, session.clone());
+        struct Cleanup(Arc<Session>);
+        impl Drop for Cleanup { fn drop(&mut self) { remove_session(&self.0); } }
+        let _cleanup = Cleanup(session.clone());
+        let (old_tx, _old_rx) = tokio::sync::mpsc::unbounded_channel();
+        let old = TerminalConn::new(old_tx);
+        let (new_tx, _new_rx) = tokio::sync::mpsc::unbounded_channel();
+        let new = TerminalConn::new(new_tx);
+        old.handle(&encode(OPEN, id, b"{}"));
+        new.handle(&encode(OPEN, id, b"{}"));
+        old.handle(&encode(STDIN, id, b"stale"));
+        old.handle(&encode(DETACH, id, &[]));
+        old.disconnect();
+        let input = b"\x1b[A";
+        new.handle(&encode(STDIN, id, input));
+        new.handle(&encode(STDIN, id, input));
+        let mut slave = std::fs::File::from(pty.slave);
+        let mut bytes = [0; 6];
+        slave.read_exact(&mut bytes).unwrap();
+        assert!(bytes == input.repeat(2).as_slice(), "only current input should arrive, including intentional repeats");
+        assert!(session.sink.lock().unwrap().as_ref().is_some_and(|tx| tx.same_channel(&new.out)));
+        new.disconnect();
+        assert!(session.sink.lock().unwrap().is_none());
+        new.handle(&encode(OPEN, id, b"{}"));
+        assert!(session.sink.lock().unwrap().is_none(), "a closed connection must not reattach");
+    }
+    #[test]
+    fn nonempty_list_matches_official_snapshot_and_survives_reattach() {
+        // Official Mac 4.42.0 TerminalSession snapshot (0x1001b82c8–0x1001b8524):
+        // all six fields exist, including the Int64 last_active_ms timestamp.
+        #[derive(serde::Deserialize)]
+        struct Snapshot { session_id: u32, name: String, shell: String, state: String,
+            created_at_ms: i64, last_active_ms: i64 }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut conn = TerminalConn::new(tx);
+        let id = u32::MAX - 3;
+        conn.handle(&encode(OPEN, id, br#"{"cols":80,"rows":24,"shell":"/bin/sh"}"#));
+        assert_eq!(decode(&rx.blocking_recv().unwrap()).unwrap().kind, OPEN_RESP);
+        struct Cleanup(u32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(s) = registry().lock().unwrap().get(&self.0).cloned() { s.signal(libc::SIGHUP); }
+            }
+        }
+        let _cleanup = Cleanup(id);
+        let snapshot = |request| {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            TerminalConn::new(tx).handle(&encode(LIST_REQ, request, &[]));
+            let reply = decode(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!((reply.kind, reply.session), (LIST_RESP, request));
+            serde_json::from_slice::<Vec<Snapshot>>(&reply.payload).expect("official nonempty session schema")
+                .into_iter().find(|s| s.session_id == id).unwrap()
+        };
+        let first = snapshot(100);
+        assert_eq!(first.state, "running");
+        assert_eq!(first.shell, "/bin/sh");
+        assert_eq!(first.name, format!("sh-{id}"));
+        assert!(first.created_at_ms > 0 && first.last_active_ms >= first.created_at_ms);
+        for request in [101, 102] {
+            conn.handle(&encode(DETACH, id, &[]));
+            let detached = snapshot(request);
+            assert_eq!(detached.state, "detached");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            conn = TerminalConn::new(tx);
+            conn.handle(&encode(OPEN, id, br#"{"cols":80,"rows":24}"#));
+            assert_eq!(decode(&rx.blocking_recv().unwrap()).unwrap().kind, OPEN_RESP);
+            let attached = snapshot(request + 100);
+            assert_eq!(attached.state, "running");
+            assert_eq!(attached.created_at_ms, first.created_at_ms);
+            assert!(attached.last_active_ms > detached.last_active_ms);
+        }
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn interrupt_reaches_foreground_job_without_exiting_shell() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = TerminalConn::new(tx);
+        let id = u32::MAX - 4;
+        conn.handle(&encode(OPEN, id, br#"{"cols":80,"rows":24,"shell":"/bin/sh"}"#));
+        assert_eq!(decode(&rx.blocking_recv().unwrap()).unwrap().kind, OPEN_RESP);
+        let session = registry().lock().unwrap().get(&id).unwrap().clone();
+        struct Cleanup(Arc<Session>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { self.0.signal_foreground(libc::SIGKILL); self.0.signal(libc::SIGHUP); }
+        }
+        let _cleanup = Cleanup(session.clone());
+        let foreground = || unsafe { libc::tcgetpgrp(session.master.as_raw_fd()) };
+        // The shell can foreground its child before exec resets inherited signals.
+        let job_ready = || {
+            let pgid = foreground();
+            pgid > 0 && pgid != session.pid &&
+                std::fs::read_to_string(format!("/proc/{pgid}/comm")).is_ok_and(|name| name.trim() == "sleep")
+        };
+        conn.handle(&encode(STDIN, id, b"sleep 30\n"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !job_ready() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(job_ready(), "job must be executing in a separate foreground group");
+        conn.handle(&encode(SIGNAL, id, br#"{"signal":"SIGINT"}"#));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && foreground() != session.pid {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(foreground(), session.pid, "interrupt must return control to the shell");
+        assert_eq!(unsafe { libc::kill(session.pid, 0) }, 0, "shell must stay alive");
+    }
+    #[test]
     fn force_redraw_shrinks_then_restores_latest_size() {
         let pty = nix::pty::openpty(None, None).unwrap();
         let session = Arc::new(Session { id: u32::MAX - 2, shell: "/bin/sh".into(), created_ms: now_ms(),
+            last_active_ms: AtomicU64::new(now_ms()),
             master: pty.master, pid: 0, sink: Mutex::new(None),
             scrollback: Mutex::new(VecDeque::new()), size: Mutex::new((80, 24)) });
         let rows = |s: &Session| {
@@ -346,6 +630,7 @@ mod tests {
         let id = u32::MAX - 1;
         let history: Vec<u8> = (0..SCROLLBACK).map(|n| (n % 251) as u8).collect();
         let session = Arc::new(Session { id, shell: "/bin/sh".into(), created_ms: now_ms(),
+            last_active_ms: AtomicU64::new(now_ms()),
             master: pty.master, pid: 0, sink: Mutex::new(None),
             scrollback: Mutex::new(history.iter().copied().collect()), size: Mutex::new((80, 24)) });
         registry().lock().unwrap().insert(id, session.clone());
