@@ -80,7 +80,7 @@ Protocol strings and messages that come from the UU servers are shown as the ser
 | Viewer annotation | Strokes drawn with 「批注」 (annotate) in the viewer's watch mode appear on the Linux screen and stream back to the viewer (X11, needs a compositing manager; the overlay lets clicks through); cleared when annotation is turned off or the viewer disconnects. Verified with the Mac viewer 4.42.0; mobile viewers untested |
 | Quality / frame rate / resolution | Auto, Original 20M, Ultra 8M, HD 2M, custom; 30/60/90/144 fps; on X11 a resolution choice changes the desktop resolution itself like the official Windows host (xrandr, adding the mode when missing; restored for "original" or on disconnect), `UU_DESKTOP_RESIZE=0` scales in the encoder instead; Wayland scales in the encoder |
 | Sound | System audio captured from PulseAudio / PipeWire and sent as Opus |
-| File transfer | Upload, download (including folders), create folder, rename, delete |
+| File transfer | Upload, download (including folders), create folder, rename, delete; iOS quick uploads use the default receive directory (the current user’s home) |
 | Terminal | The official "Terminal" tool, PTY sessions, multiple sessions, rename |
 | Lock state and auto unlock | Lock state is reported to the viewer; with "auto unlock" enabled in the client, the password is verified with PAM and the session is unlocked |
 | Lock after remote session | Stored on the host, so it still applies after reconnecting |
