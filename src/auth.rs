@@ -238,10 +238,13 @@ impl UUAuthClient {
             .as_secs();
         let ts = now.to_string();
 
+        let vn = crate::config::client_version();
+        let vc = crate::config::version_code();
+
         let mut param_map = BTreeMap::new();
         param_map.insert("x-param-plat".into(), "1".into());
-        param_map.insert("x-param-vn".into(), "4.42.0.2770".into());
-        param_map.insert("x-param-vc".into(), "2770".into());
+        param_map.insert("x-param-vn".into(), vn.clone());
+        param_map.insert("x-param-vc".into(), vc);
         param_map.insert("x-param-pkgn".into(), "com.netease.gameviewer".into());
         param_map.insert("x-param-chn".into(), "gwqd".into());
         param_map.insert("x-param-lang".into(), "zh-CN".into());
@@ -259,10 +262,13 @@ impl UUAuthClient {
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
         headers.insert("Accept", HeaderValue::from_static("application/json"));
-        headers.insert(
-            "User-Agent",
-            HeaderValue::from_static("UURemote/4.42.0 (Windows NT 10.0; Win64; x64)"),
-        );
+        let short_vn = vn.split('.').take(3).collect::<Vec<_>>().join(".");
+        let ua = format!("UURemote/{} (Windows NT 10.0; Win64; x64)", if short_vn.is_empty() { &vn } else { &short_vn });
+        if let Ok(v) = HeaderValue::from_str(&ua) {
+            headers.insert("User-Agent", v);
+        } else {
+            headers.insert("User-Agent", HeaderValue::from_static("UURemote/4.45.0 (Windows NT 10.0; Win64; x64)"));
+        }
         if !self.creds.token.is_empty() {
             if let Ok(v) = HeaderValue::from_str(&format!("Bearer {}", self.creds.token)) { headers.insert("Authorization", v); }
             if self.guest_id.is_none() {
@@ -432,6 +438,15 @@ mod guest_tests {
     fn proxy_opt_in_accepts_only_explicit_truthy_values() {
         for value in ["1", "true", "TRUE", " yes ", "On"] { assert!(super::proxy_requested(value)); }
         for value in ["", "0", "false", "no", "off", "2"] { assert!(!super::proxy_requested(value)); }
+    }
+
+    #[test]
+    fn version_headers_report_modern_client_version() {
+        let client = UUAuthClient::new(Credentials::default());
+        let headers = client.build_headers("GET", "/api/v1/test", "");
+        assert_eq!(headers["x-param-vn"], "4.45.0.4318");
+        assert_eq!(headers["x-param-vc"], "4318");
+        assert_eq!(headers["user-agent"], "UURemote/4.45.0 (Windows NT 10.0; Win64; x64)");
     }
 }
 
