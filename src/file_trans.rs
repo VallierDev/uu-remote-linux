@@ -147,6 +147,10 @@ fn io_error(e: &std::io::Error) -> u64 {
 /// anything else is rooted at "/".
 pub fn normalize(path: &str) -> PathBuf {
     let p = path.replace('\\', "/");
+    // Official Mac 4.46.0 UURemoteServer (x86_64, 0x10019f8a5–0x10019f9f7)
+    // resolves :/Default to its receive directory. iOS quick upload sends this alias;
+    // our receive directory is HOME, also reported in SystemMetrics/RemoteDownloadPath.
+    if p.trim_end_matches('/') == ":/Default" { return home(); }
     // The host registers as a PC, so the viewer builds drive paths ("C:/x", or ":/" when it
     // knows no drive letter). Linux has a single root: any drive prefix maps to "/".
     let p = match p.split_once(':') {
@@ -455,7 +459,10 @@ impl FileSession {
     /// Upload to this host. receive_request{1 id,2 path,3 files,4 strategy,5 folder_name,6 list_data,7 task_unique_id}
     fn receive_request(&self, rid: u64, f: &[WireField]) {
         let id = TaskId::parse(f);
-        let target = normalize(&get_text(f, 2));
+        let raw_target = get_text(f, 2);
+        let target = normalize(&raw_target);
+        log::info!("File transfer upload destination: default={} exists={}",
+            raw_target.replace('\\', "/").trim_end_matches('/') == ":/Default", target.is_dir());
         let folder = get_text(f, 5);
         let strategy = get_uint(f, 4);
         let files = parse_files(get_all(f, 3), get_bytes(f, 6));
@@ -713,6 +720,61 @@ mod tests {
         let mut plain = Enc::default(); plain = plain.msg(1, files[0].enc());
         gz.write_all(&plain.0).unwrap();
         assert_eq!(parse_files(vec![], Some(&gz.finish().unwrap())), files);
+    }
+    #[test]
+    fn ios_default_path_resolves_to_the_advertised_receive_directory() {
+        for path in [":/Default", ":\\Default", ":/Default/"] {
+            assert_eq!(normalize(path), home());
+            assert!(!is_this_pc(path));
+        }
+        assert_eq!(normalize("/Default"), PathBuf::from("/Default"));
+        assert_eq!(normalize("C:/Default"), PathBuf::from("/Default"));
+        assert_eq!(normalize(":/Default-other"), PathBuf::from("/Default-other"));
+    }
+    #[test]
+    fn ios_quick_upload_checks_conflicts_writes_and_completes_in_default_directory() {
+        let name = format!(".uu-ios-test-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let dir = home().join(&name);
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(dir.clone());
+        let rel = format!("{name}/x.bin");
+        std::fs::write(dir.join("x.bin"), b"old").unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let s = FileSession::new(tx, Arc::new(AtomicU64::new(1)));
+        let call = |case: u32, body: Enc| {
+            let rpc = Enc::default().msg(1, Enc::default().uint(1, 17)).msg(8, Enc::default().msg(case, body));
+            assert!(s.handle(&decode_wire(&crate::initialization::envelope(1, 1, 21, &rpc.0)).unwrap()));
+        };
+        let response = |m: Vec<u8>, case: u32| {
+            let outer = decode_wire(&m).unwrap();
+            let rpc = decode_wire(get_bytes(&outer, 22).unwrap()).unwrap();
+            assert_eq!(get_uint(&decode_wire(get_bytes(&rpc, 1).unwrap()).unwrap(), 1), 17);
+            let ftp = decode_wire(get_bytes(&rpc, 4).unwrap()).unwrap();
+            get_bytes(&ftp, case).unwrap().to_vec()
+        };
+        call(11, Enc::default().text(1, ":/Default").text(2, &rel));
+        let exist = response(rx.try_recv().unwrap(), 8);
+        let exist = decode_wire(&exist).unwrap();
+        assert_eq!(get_text(&exist, 1), ":/Default");
+        assert_eq!(get_uint(&decode_wire(get_bytes(&exist, 2).unwrap()).unwrap(), 2), 1);
+        let id = TaskId { task: 991, index: 1 };
+        let info = FileInfo { rel_path: rel, size: 6, modified: 0 };
+        call(1, Enc::default().msg(1, id.enc()).text(2, ":/Default").bytes(6, &list_data(&[info])));
+        let received = response(rx.try_recv().unwrap(), 1);
+        assert_eq!(get_uint(&decode_wire(&received).unwrap(), 3), FT_SUCCEEDED);
+        call(3, Enc::default().msg(1, id.enc()).uint(3, 6));
+        let confirmed = response(rx.try_recv().unwrap(), 3);
+        assert_eq!(get_uint(&decode_wire(&confirmed).unwrap(), 3), FT_SUCCEEDED);
+        call(4, Enc::default().msg(1, id.enc()).bytes(3, b"abcdef"));
+        let block = response(rx.try_recv().unwrap(), 4);
+        assert_eq!(get_uint(&decode_wire(&block).unwrap(), 3), FT_SUCCEEDED);
+        call(9, Enc::default().msg(1, id.enc()).uint(2, FT_SUCCEEDED));
+        let done = response(rx.try_recv().unwrap(), 6);
+        assert_eq!(get_uint(&decode_wire(&done).unwrap(), 2), FT_SUCCEEDED);
+        assert_eq!(std::fs::read(dir.join("x.bin")).unwrap(), b"abcdef");
     }
     #[test]
     fn upload_writes_blocks_and_confirms() {
