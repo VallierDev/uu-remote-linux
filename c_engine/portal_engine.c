@@ -17,6 +17,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <errno.h>
+#include <fcntl.h>
 
 #define DEST "org.freedesktop.portal.Desktop"
 #define PATH "/org/freedesktop/portal/desktop"
@@ -50,6 +52,10 @@ struct uu_portal {
     pthread_mutex_t lock;
     pthread_cond_t changed;
     atomic_int closed;
+    atomic_int close_request; /* 0 idle/retryable, 1 in flight, 2 acknowledged */
+    atomic_int remote_closed;
+    atomic_int close_origin; /* 0 live, 1 local end began, 2 unsolicited Closed observed */
+    _Atomic uint64_t capture_epoch;
     uu_portal_cancelled_fn cancelled;
     void *cancel_data;
     int error;
@@ -70,15 +76,44 @@ struct uu_portal {
     enum spa_video_format format;
     uint8_t *frame;
     size_t frame_length;
+    int frame_neutral;
     uint64_t sequence;
     uint64_t revision;
     uint32_t buffers_seen, last_buffer_type;
     int dma_requested, dma_negotiated, dma_format, dma_bad, dma_blocked, dma_neutral, dma_seen;
     uint64_t modifier;
+    int explicit_requested;
+    int explicit_protocol; /* 0=unscheduled flag, 1=flagless release-point contract */
+    int explicit_error; /* Negative errno retained for failed explicit frame admission. */
+    int capture_disconnected;
+    uint64_t explicit_modifier;
     gint64 dma_requested_at;
     struct pw_buffer *dma_pending, *dma_current;
+    struct uu_portal_async_lease *dma_async;
+};
+struct uu_portal_async_lease {
+    struct uu_portal *portal;
+    struct pw_buffer *buffer; /* accessed only under the loop lock */
+    UuPortalAsyncFrame frame;
+    int attempted;
 };
 #include "portal_clipboard.inc"
+
+/* Cancellation observation only: it neither pins a lease nor authorizes GPU
+ * access. Saturation permanently invalidates this object's tokens (no ABA). */
+static void invalidate_capture(struct uu_portal *p) {
+    uint64_t epoch = atomic_load(&p->capture_epoch);
+    while (epoch != UINT64_MAX &&
+           !atomic_compare_exchange_weak(&p->capture_epoch, &epoch, epoch + 1)) {}
+}
+uint64_t uu_portal_capture_epoch(struct uu_portal *p) {
+    if (!p || atomic_load(&p->closed)) return UINT64_MAX;
+    return atomic_load(&p->capture_epoch);
+}
+int uu_portal_capture_cancelled(struct uu_portal *p, uint64_t epoch) {
+    return !p || epoch == UINT64_MAX || atomic_load(&p->closed) ||
+        epoch != atomic_load(&p->capture_epoch);
+}
 
 static pthread_once_t pw_once = PTHREAD_ONCE_INIT;
 static atomic_uint token_sequence = 1;
@@ -89,11 +124,39 @@ static int open_cancelled(struct uu_portal *p) {
 }
 static int wait_for_first_frame(struct uu_portal *p);
 #include "portal_eis.inc"
+struct property_call { int done; GVariant *reply; };
+static void property_finished(GObject *source, GAsyncResult *result, gpointer data) {
+    struct property_call *call = data;
+    call->reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, NULL);
+    call->done = 1;
+}
+/* Only side-effect-free property reads use this path. The callback remains on
+ * the opening thread, and its state lives until the async completion runs. */
+static GVariant *get_property(struct uu_portal *p, const char *interface, const char *name, int timeout) {
+    if (!p->cancelled) return g_dbus_connection_call_sync(p->bus, DEST, PATH,
+        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", interface, name),
+        G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, timeout, NULL, NULL);
+    if (open_cancelled(p)) return NULL;
+    GMainContext *context = g_main_context_new();
+    GCancellable *cancel = g_cancellable_new();
+    struct property_call call = {0};
+    g_main_context_push_thread_default(context);
+    g_dbus_connection_call(p->bus, DEST, PATH, "org.freedesktop.DBus.Properties", "Get",
+        g_variant_new("(ss)", interface, name), G_VARIANT_TYPE("(v)"),
+        G_DBUS_CALL_FLAGS_NONE, timeout, cancel, property_finished, &call);
+    while (!call.done) {
+        if (open_cancelled(p)) g_cancellable_cancel(cancel);
+        while (g_main_context_iteration(context, FALSE)) {}
+        if (!call.done) g_usleep(5000);
+    }
+    g_main_context_pop_thread_default(context);
+    g_object_unref(cancel);
+    g_main_context_unref(context);
+    return call.reply;
+}
 /* A uint32 RemoteDesktop property (version, AvailableDeviceTypes); 0 when unreadable. */
 static guint remote_property(struct uu_portal *p, const char *name) {
-    GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH,
-        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", REMOTE, name),
-        G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
+    GVariant *reply = get_property(p, REMOTE, name, 3000);
     guint result = 0;
     if (reply) {
         GVariant *value; g_variant_get(reply, "(v)", &value);
@@ -103,6 +166,7 @@ static guint remote_property(struct uu_portal *p, const char *name) {
     return result;
 }
 static void fail(struct uu_portal *p, int error) {
+    invalidate_capture(p);
     pthread_mutex_lock(&p->lock);
     if (!p->error) p->error = error;
     pthread_cond_broadcast(&p->changed);
@@ -133,10 +197,10 @@ static void close_request(struct uu_portal *p, const char *path) {
         NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
     if (r) g_variant_unref(r);
 }
-/* Subscribe before invocation, using the documented handle_token path. */
+/* Consumes options on every path; subscribe before invocation using handle_token. */
 static GVariant *request(struct uu_portal *p, const char *interface, const char *method,
     GVariantBuilder *options, int mode, int *error) {
-    if (open_cancelled(p)) { *error = 13; return NULL; }
+    if (open_cancelled(p)) { g_variant_builder_clear(options); *error = 13; return NULL; }
     char token[64];
     snprintf(token, sizeof(token), "uu_%u_%u", (unsigned)getpid(), atomic_fetch_add(&token_sequence, 1));
     g_variant_builder_add(options, "{sv}", "handle_token", g_variant_new_string(token));
@@ -179,6 +243,9 @@ static void session_closed(GDBusConnection *bus, const gchar *sender, const gcha
     const gchar *interface, const gchar *signal, GVariant *parameters, gpointer data) {
     (void)bus; (void)sender; (void)path; (void)interface; (void)signal; (void)parameters;
     struct uu_portal *p = data;
+    int origin = 0;
+    atomic_compare_exchange_strong(&p->close_origin, &origin, 2);
+    atomic_store(&p->remote_closed, 1);
     atomic_store(&p->closed, 1); fail(p, 9);
 }
 static void *run_dbus(void *data) {
@@ -189,9 +256,7 @@ static void *run_dbus(void *data) {
     return NULL;
 }
 static int has_interface(struct uu_portal *p, const char *interface) {
-    GVariant *r = g_dbus_connection_call_sync(p->bus, DEST, PATH, "org.freedesktop.DBus.Properties",
-        "Get", g_variant_new("(ss)", interface, "version"), G_VARIANT_TYPE("(v)"),
-        G_DBUS_CALL_FLAGS_NONE, 5000, NULL, NULL);
+    GVariant *r = get_property(p, interface, "version", 5000);
     if (!r) return 0;
     g_variant_unref(r); return 1;
 }
@@ -219,6 +284,7 @@ static void monitors_changed(GDBusConnection *bus, const gchar *sender, const gc
 static void stream_state(void *data, enum pw_stream_state old, enum pw_stream_state state, const char *message) {
     (void)old; (void)message;
     struct uu_portal *p = data;
+    if (state != PW_STREAM_STATE_STREAMING) invalidate_capture(p);
     pthread_mutex_lock(&p->lock);
     p->state = state;
     if (state == PW_STREAM_STATE_STREAMING) {
@@ -229,10 +295,32 @@ static void stream_state(void *data, enum pw_stream_state old, enum pw_stream_st
     pthread_mutex_unlock(&p->lock);
     if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) fail(data, 9);
 }
+static int describe_explicit_buffer(struct uu_portal *, struct spa_buffer *, UuPortalAsyncFrame *);
+static unsigned explicit_buffer_params(struct spa_pod_builder *b, const struct spa_pod **params) {
+#if PW_CHECK_VERSION(1, 2, 0)
+    struct spa_pod_frame f;
+    spa_pod_builder_push_object(b, &f, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
+    spa_pod_builder_add(b, SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4,4,8),
+        SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(3),
+        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_DmaBuf), 0);
+    spa_pod_builder_prop(b, SPA_PARAM_BUFFERS_metaType, SPA_POD_PROP_FLAG_MANDATORY);
+    spa_pod_builder_int(b, 1 << SPA_META_SyncTimeline);
+    params[0] = spa_pod_builder_pop(b, &f);
+    params[1] = spa_pod_builder_add_object(b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+        SPA_PARAM_META_type, SPA_POD_Id(SPA_META_SyncTimeline),
+        SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_sync_timeline)));
+    return 2;
+#else
+    (void)b; (void)params; return 0;
+#endif
+}
 static void return_dma_buffer(struct uu_portal *p, struct pw_buffer **buffer);
 static void stream_format(void *data, uint32_t id, const struct spa_pod *param) {
     struct uu_portal *p = data;
     if (id != SPA_PARAM_Format) return;
+    invalidate_capture(p);
+    /* Explicit leases cannot be silently returned across renegotiation. */
+    if (p->explicit_requested && (p->dma_pending || p->dma_async)) { fail(p, 8); return; }
     if (!param) {
         pthread_mutex_lock(&p->lock);
         if (p->dma_format) {
@@ -250,6 +338,17 @@ static void stream_format(void *data, uint32_t id, const struct spa_pod *param) 
         info.size.width > 8192 || info.size.height > 8192 ||
         (info.format != SPA_VIDEO_FORMAT_BGRA && info.format != SPA_VIDEO_FORMAT_BGRx &&
          info.format != SPA_VIDEO_FORMAT_RGBA && info.format != SPA_VIDEO_FORMAT_RGBx)) { fail(p, 8); return; }
+    if (!p->dma_requested && spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier)) {
+        /* A fixed producer format must not override a fresh CPU-only request.
+         * Otherwise the callback advertises DMA buffers and startup waits for
+         * CPU pixels that can never arrive (observed during fresh SHM recovery). */
+        fprintf(stderr, "Portal SHM format rejected: unexpected DMA-BUF modifier\n");
+        fail(p, 14); return;
+    }
+    if (p->explicit_requested && (info.format != SPA_VIDEO_FORMAT_BGRA ||
+        !spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier) || info.modifier != p->explicit_modifier)) {
+        fail(p, 8); return;
+    }
     pthread_mutex_lock(&p->lock);
     if (p->dma_format) {
         return_dma_buffer(p, &p->dma_pending);
@@ -277,7 +376,12 @@ static void stream_format(void *data, uint32_t id, const struct spa_pod *param) 
         info.format, info.size.width, info.size.height, p->dma_format, p->dma_requested, (unsigned long long)info.modifier);
     /* PipeWire DMA-BUF sharing: modifier formats require DMA buffers exclusively.
      * Keep a current and a pending frame; at least four buffers prevent producer starvation. */
-    if (p->stream) {
+    if (p->stream && p->explicit_requested) {
+        uint8_t storage[512]; struct spa_pod_builder b = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
+        const struct spa_pod *params[2];
+        unsigned n = explicit_buffer_params(&b, params);
+        if (!n || pw_stream_update_params(p->stream, params, n) < 0) fail(p, 8);
+    } else if (p->stream) {
         uint8_t storage[256];
         struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
         const struct spa_pod *buffers = spa_pod_builder_add_object(&builder, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
@@ -290,6 +394,7 @@ static void stream_format(void *data, uint32_t id, const struct spa_pod *param) 
 
 /* All pending/current buffer changes run under the PipeWire loop lock, then p->lock. */
 static void return_dma_buffer(struct uu_portal *p, struct pw_buffer **buffer) {
+    if (buffer == &p->dma_current && *buffer) invalidate_capture(p);
     if (*buffer && p->stream) pw_stream_queue_buffer(p->stream, *buffer);
     *buffer = NULL;
 }
@@ -337,16 +442,20 @@ static void copy_video_buffer(struct uu_portal *p, struct spa_buffer *spa) {
         if (!d->chunk || (d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) ||
             (header && (header->flags & SPA_META_HEADER_FLAG_CORRUPTED))) return;
         if (d->chunk->flags & SPA_CHUNK_FLAG_EMPTY) {
-            /* EMPTY denotes media-neutral (black) video, never old pixels. */
+            /* Reuse the opaque black frame and its revision across repeated EMPTY buffers. */
+            if (p->frame_neutral && p->sequence) return;
             memset(p->frame, 0, p->frame_length);
             for (size_t pixel = 0; pixel < p->frame_length / 4; pixel++) p->frame[pixel * 4 + 3] = 255;
+            p->frame_neutral = 1;
             p->sequence++;
             p->revision++;
             return;
         }
         struct spa_meta_region *crop = spa_buffer_find_meta_data(spa, SPA_META_VideoCrop, sizeof(*crop));
         if (crop && spa_meta_region_is_valid(crop) && (crop->region.position.x || crop->region.position.y ||
-            crop->region.size.width != p->width || crop->region.size.height != p->height)) p->error = 8;
+            crop->region.size.width != p->width || crop->region.size.height != p->height)) {
+            invalidate_capture(p); p->error = 8;
+        }
         if (!d->data || d->chunk->stride < (int32_t)(p->width * 4) || !d->chunk->size ||
             d->chunk->offset > d->maxsize ||
             (d->type != SPA_DATA_MemPtr && d->type != SPA_DATA_MemFd)) return;
@@ -362,6 +471,7 @@ static void copy_video_buffer(struct uu_portal *p, struct spa_buffer *spa) {
                     dst[4*x] = row[4*x+2]; dst[4*x+1] = row[4*x+1]; dst[4*x+2] = row[4*x]; dst[4*x+3] = 255;
                 }
             }
+            p->frame_neutral = 0;
             p->sequence++;
             p->revision++;
         }
@@ -370,6 +480,31 @@ static void copy_video_buffer(struct uu_portal *p, struct spa_buffer *spa) {
 static void stream_process(void *data) {
     struct uu_portal *p = data;
     struct pw_buffer *buffer, *newest = NULL;
+    if (p->explicit_requested) {
+        pthread_mutex_lock(&p->lock);
+        /* Backpressure: never dequeue-and-drop explicit leases. One worker
+         * and one pending buffer are allowed; further buffers stay in PW. */
+        if (!p->dma_pending && !p->error && !atomic_load(&p->closed) && p->format_valid && p->dma_format) {
+            buffer = pw_stream_dequeue_buffer(p->stream);
+            if (buffer) {
+                UuPortalAsyncFrame snapshot;
+                p->dma_pending = buffer; /* Retain even malformed buffers until teardown. */
+                p->buffers_seen++;
+                int described = describe_explicit_buffer(p, buffer->buffer, &snapshot);
+                if (described) {
+                    p->explicit_error = described;
+                    if (described == -EPROTONOSUPPORT)
+                        fprintf(stderr, "Portal explicit frame rejected: unsupported release-flag contract; fresh SHM session required\n");
+                    invalidate_capture(p); p->error = 14; p->dma_bad = 14;
+                } else {
+                    p->dma_seen = 1; p->sequence++; p->revision++;
+                }
+                pthread_cond_broadcast(&p->changed);
+            }
+        }
+        pthread_mutex_unlock(&p->lock);
+        return;
+    }
     while ((buffer = pw_stream_dequeue_buffer(p->stream))) {
         if (newest) pw_stream_queue_buffer(p->stream, newest);
         newest = buffer;
@@ -399,9 +534,11 @@ static void stream_process(void *data) {
 }
 static void stream_remove_buffer(void *data, struct pw_buffer *buffer) {
     struct uu_portal *p = data;
+    invalidate_capture(p);
     pthread_mutex_lock(&p->lock);
     if (p->dma_pending == buffer) p->dma_pending = NULL;
     if (p->dma_current == buffer) p->dma_current = NULL;
+    if (p->dma_async && p->dma_async->buffer == buffer) p->dma_async->buffer = NULL;
     pthread_mutex_unlock(&p->lock);
 }
 static const struct pw_stream_events stream_events = {
@@ -411,6 +548,19 @@ static const struct pw_stream_events stream_events = {
 
 static unsigned capture_formats(struct uu_portal *p, struct spa_pod_builder *b, const struct spa_pod **params, int dma) {
     unsigned count = 0;
+    if (p->explicit_requested) {
+        struct spa_pod_frame f;
+        spa_pod_builder_push_object(b, &f, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+        spa_pod_builder_add(b, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+            SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_BGRA),
+            SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&SPA_RECTANGLE(p->width,p->height)),
+            SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&SPA_FRACTION(60,1), &SPA_FRACTION(0,1), &SPA_FRACTION(60,1)), 0);
+        spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+        spa_pod_builder_long(b, p->explicit_modifier);
+        params[0] = spa_pod_builder_pop(b, &f);
+        return 1 + explicit_buffer_params(b, params + 1);
+    }
     /* Only advertise linear RGB: arbitrary tiling/compression cannot be inferred from an FD.
      * PipeWire page_dma_buf: put the modifier format before the shared-memory fallback. */
     for (int with_modifier = dma; with_modifier >= 0; with_modifier--) {
@@ -447,12 +597,55 @@ static int request_capture_formats(struct uu_portal *p, int dma) {
     return pw_stream_update_params(p->stream, params, count);
 }
 
+int uu_portal_request_explicit(struct uu_portal *p, uint64_t modifier) {
+    return uu_portal_request_explicit_protocol(p, modifier, 0);
+}
+int uu_portal_request_explicit_protocol(struct uu_portal *p, uint64_t modifier, int protocol) {
+    if (protocol != 0 && protocol != 1) return -EINVAL;
+    if (!p || !p->pw_loop || !p->stream || modifier == UINT64_C(0x00ffffffffffffff)) return -EINVAL;
+#if !PW_CHECK_VERSION(1, 2, 0)
+    return -ENOTSUP;
+#else
+    int r = -EBUSY;
+    pw_thread_loop_lock(p->pw_loop); pthread_mutex_lock(&p->lock);
+    if (p->explicit_requested) {
+        /* An exclusive new consumer may reuse an already negotiated source.
+         * Never renegotiate/reset epochs or discard a pending producer buffer. */
+        if (p->explicit_modifier != modifier || p->explicit_protocol != protocol ||
+            p->dma_current || p->dma_async || !p->dma_negotiated || !p->dma_seen) goto done;
+        r = -ECANCELED;
+        if (p->error || p->dma_blocked || atomic_load(&p->closed) ||
+            !p->format_valid || !p->width || !p->height || !p->dma_format ||
+            p->modifier != modifier || atomic_load(&p->capture_epoch) == UINT64_MAX) goto done;
+        r = 0; goto done;
+    }
+    if (p->dma_requested || p->dma_pending || p->dma_current || p->dma_async) goto done;
+    r = -ECANCELED;
+    if (p->error || p->dma_blocked || atomic_load(&p->closed) || !p->format_valid || !p->width || !p->height) goto done;
+    invalidate_capture(p);
+    p->explicit_requested = 1; p->explicit_modifier = modifier; p->explicit_protocol = protocol;
+    p->dma_requested = 1; p->dma_negotiated = 0; p->dma_seen = 0;
+    p->dma_bad = 0; p->dma_neutral = 0;
+    p->format_valid = 0; p->sequence = 0;
+    p->dma_requested_at = g_get_monotonic_time();
+    pthread_mutex_unlock(&p->lock);
+    r = request_capture_formats(p, 1);
+    if (r < 0) fail(p, 8); /* Failed renegotiation needs a fresh SHM session. */
+    pw_thread_loop_unlock(p->pw_loop);
+    return r < 0 ? r : 0;
+done:
+    pthread_mutex_unlock(&p->lock); pw_thread_loop_unlock(p->pw_loop); return r;
+#endif
+}
+
+#include "portal_async_lease.inc"
+
 int uu_portal_dmabuf_acquire(struct uu_portal *p, UuDmaFrame *frame, uint64_t *revision) {
     if (!p || !p->pw_loop || !p->stream || !frame || !revision) return 14;
     pw_thread_loop_lock(p->pw_loop);
     pthread_mutex_lock(&p->lock);
     int result = 10;
-    if (atomic_load(&p->closed) || p->error || p->dma_blocked) result = 14;
+    if (atomic_load(&p->closed) || p->error || p->dma_blocked || p->dma_async || p->explicit_requested) result = 14;
     else if (p->dma_bad) result = p->dma_bad;
     else if (!p->dma_requested) {
         p->dma_requested = 1; p->dma_negotiated = 0; p->dma_seen = 0;
@@ -489,9 +682,16 @@ void uu_portal_dmabuf_release(struct uu_portal *p) {
 }
 void uu_portal_dmabuf_disable(struct uu_portal *p) {
     if (!p || !p->pw_loop || !p->stream) return;
+    invalidate_capture(p);
     pw_thread_loop_lock(p->pw_loop);
     pthread_mutex_lock(&p->lock);
     int requested = p->dma_requested;
+    if (p->explicit_requested) {
+        p->error = 14; p->dma_blocked = 1;
+        pthread_cond_broadcast(&p->changed);
+        pthread_mutex_unlock(&p->lock); pw_thread_loop_unlock(p->pw_loop);
+        return; /* Explicit pending buffers are retained until session teardown. */
+    }
     if (requested) {
         p->dma_requested = 0; p->dma_blocked = 1; p->dma_neutral = 0;
         return_dma_buffer(p, &p->dma_pending); return_dma_buffer(p, &p->dma_current);
@@ -623,6 +823,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     pthread_cond_init(&p->changed, &cond_attr);
     pthread_condattr_destroy(&cond_attr);
     p->context = g_main_context_new(); g_main_context_push_thread_default(p->context);
+    if (open_cancelled(p)) { *error = 13; goto done; }
     p->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
     if (!p->bus) { *error = 1; goto done; }
     if (open_cancelled(p)) { *error = 13; goto done; }
@@ -751,13 +952,13 @@ const char *uu_portal_restore_token(struct uu_portal *p) { return p ? p->restore
 static gboolean quit_dbus_loop(gpointer data) { g_main_loop_quit(data); return G_SOURCE_REMOVE; }
 void uu_portal_close(struct uu_portal *p) {
     if (!p) return;
-    atomic_store(&p->closed, 1);
-    portal_eis_close(p);
-    if (p->bus && p->session) {
-        GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
-            NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
-        if (reply) g_variant_unref(reply);
+    if (p->dma_async) {
+        uu_portal_end(p);
+        fprintf(stderr, "Portal close deferred: asynchronous lease still outstanding\n");
+        return;
     }
+    uu_portal_end(p);
+    portal_eis_close(p);
     if (p->clipboard_owner_subscription) g_dbus_connection_signal_unsubscribe(p->bus,p->clipboard_owner_subscription);
     if (p->clipboard_transfer_subscription) g_dbus_connection_signal_unsubscribe(p->bus,p->clipboard_transfer_subscription);
     if (p->closed_subscription) g_dbus_connection_signal_unsubscribe(p->bus, p->closed_subscription);
@@ -786,10 +987,18 @@ void uu_portal_close(struct uu_portal *p) {
 }
 void uu_portal_reset_frame(struct uu_portal *p) {
     if (!p) return;
+    invalidate_capture(p);
     if (p->pw_loop) pw_thread_loop_lock(p->pw_loop);
     pthread_mutex_lock(&p->lock);
+    if (p->explicit_requested) {
+        p->error = 14; pthread_cond_broadcast(&p->changed);
+        pthread_mutex_unlock(&p->lock);
+        if (p->pw_loop) pw_thread_loop_unlock(p->pw_loop);
+        return;
+    }
     return_dma_buffer(p, &p->dma_pending); return_dma_buffer(p, &p->dma_current);
     p->dma_neutral = 0;
+    p->frame_neutral = 0;
     p->sequence = 0;
     p->revision++;
     if (p->frame) memset(p->frame, 0, p->frame_length);
@@ -813,7 +1022,7 @@ int uu_portal_capture_since(struct uu_portal *p, uint8_t *frame, size_t length, 
     if (!p || !frame) return 11;
     uu_portal_dmabuf_disable(p);
     pthread_mutex_lock(&p->lock);
-    int result = atomic_load(&p->closed) ? 9 : p->error ? p->error : stream_stalled(p) ? 9 :
+    int result = atomic_load(&p->closed) ? 9 : p->error ? p->error : p->explicit_requested ? 18 : stream_stalled(p) ? 9 :
         !p->sequence ? 10 : length != p->frame_length ? 11 : 0;
     if (!result) {
         if (revision && *revision == p->revision) result = 12;
@@ -1028,13 +1237,48 @@ int uu_portal_monitors(char *out, size_t length) {
     g_variant_unref(monitors); g_variant_unref(logical); g_variant_unref(reply);
     return count;
 }
-/* End the compositor session now (screen-share indicator off) while the handle stays valid;
- * captures then report a closed stream until the handle is replaced. */
-void uu_portal_end(struct uu_portal *p) {
-    if (!p || atomic_exchange(&p->closed, 1)) return;
-    if (p->bus && p->session) {
-        GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
-            NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
-        if (reply) g_variant_unref(reply);
+/* Cancellation and remote closure observations are deliberately separate from
+ * GPU completion or irrevocable producer termination. */
+int uu_portal_disconnect_capture(struct uu_portal *p) {
+    if (!p || !p->pw_loop || !p->stream) return -EINVAL;
+    pw_thread_loop_lock(p->pw_loop);
+    pthread_mutex_lock(&p->lock);
+    int result = !atomic_load(&p->closed) || p->dma_async || p->dma_current ? -EBUSY : 0;
+    int disconnected = p->capture_disconnected;
+    pthread_mutex_unlock(&p->lock);
+    /* Disconnect can synchronously deliver callbacks which take the frame lock. */
+    if (!result && !disconnected) {
+        result = pw_stream_disconnect(p->stream);
+        if (result >= 0) { p->capture_disconnected = 1; result = 0; }
     }
+    pw_thread_loop_unlock(p->pw_loop);
+    return result;
+}
+int uu_portal_recovery_status(struct uu_portal *p) {
+    if (!p) return -EINVAL;
+    return atomic_load(&p->close_origin) == 2 ? -ECANCELED : 0;
+}
+int uu_portal_end_checked(struct uu_portal *p) {
+    if (!p) return -EINVAL;
+    int origin = 0;
+    atomic_compare_exchange_strong(&p->close_origin, &origin, 1);
+    atomic_store(&p->closed, 1);
+    if (atomic_load(&p->remote_closed)) return 0;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&p->close_request, &expected, 1))
+        return expected == 2 ? 0 : -EBUSY;
+    int result = -ENOTCONN;
+    if (p->bus && p->session) {
+        GError *error = NULL;
+        GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
+            NULL, G_VARIANT_TYPE_UNIT, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, &error);
+        result = reply ? 0 : -EIO;
+        if (reply) g_variant_unref(reply);
+        if (error) g_error_free(error);
+    }
+    atomic_store(&p->close_request, result == 0 ? 2 : 0);
+    return atomic_load(&p->remote_closed) ? 0 : result;
+}
+void uu_portal_end(struct uu_portal *p) {
+    (void)uu_portal_end_checked(p);
 }

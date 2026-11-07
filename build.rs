@@ -7,6 +7,8 @@ fn main() {
     println!("cargo:rerun-if-changed=c_engine/uinput_keymap.c");
     println!("cargo:rerun-if-changed=c_engine/uinput_keymap.h");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.c");
+    println!("cargo:rerun-if-changed=c_engine/nvenc_gpu.inc");
+    println!("cargo:rerun-if-changed=c_engine/nvenc_egl.inc");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.h");
     println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/dynlink_cuda.h");
     println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/nvEncodeAPI.h");
@@ -47,6 +49,18 @@ fn main() {
             assert!(audio_flags.status.success(), "inproc-av requires libpulse-dev and libopus-dev");
             for flag in String::from_utf8_lossy(&audio_flags.stdout).split_whitespace() { x11_build.flag(flag); }
             x11_build.file("c_engine/nvenc_engine.c");
+            if std::env::var_os("CARGO_FEATURE_PORTAL").is_some() {
+                for source in ["portal_nvenc_image", "portal_nvenc_egl_attrs", "portal_nvenc_device", "portal_nvenc_timeline"] {
+                    x11_build.file(format!("c_engine/{source}.c"));
+                    println!("cargo:rerun-if-changed=c_engine/{source}.c");
+                    println!("cargo:rerun-if-changed=c_engine/{source}.h");
+                }
+                let flags = std::process::Command::new("pkg-config")
+                    .args(["--cflags", "egl", "gbm", "libpipewire-0.3", "libdrm"])
+                    .output().expect("portal + inproc-av requires EGL, PipeWire and DRM headers");
+                assert!(flags.status.success(), "portal + inproc-av requires EGL, PipeWire and DRM development headers");
+                for flag in String::from_utf8_lossy(&flags.stdout).split_whitespace() { x11_build.flag(flag); }
+            }
             x11_build.file("c_engine/vaapi_engine.c");
             x11_build.file("c_engine/dri3_capture.c");
             for f in ["c_engine/vaapi_engine.c", "c_engine/vaapi_engine.h", "c_engine/dri3_capture.c", "c_engine/dri3_capture.h"] {
@@ -63,6 +77,7 @@ fn main() {
             println!("cargo:rustc-link-lib=pulse");
             println!("cargo:rustc-link-lib=opus");
             println!("cargo:rustc-link-lib=gbm");
+            if std::env::var_os("CARGO_FEATURE_PORTAL").is_some() { println!("cargo:rustc-link-lib=drm"); }
             println!("cargo:rustc-link-lib=X11-xcb");
             println!("cargo:rustc-link-lib=xcb");
             println!("cargo:rustc-link-lib=xcb-dri3");
@@ -96,13 +111,14 @@ fn main() {
         let plugins = std::env::var_os("CARGO_FEATURE_ENGINE_PLUGINS").is_some();
         if plugins && std::env::var_os("CARGO_FEATURE_PORTAL").is_some() {
             // Runtime-loaded libuu-portal.so; skipped (with a warning) where libei >= 1.1 is unavailable.
-            for file in ["portal_engine.c", "portal_engine.h", "portal_eis.inc", "desktop_power.c"] { println!("cargo:rerun-if-changed=c_engine/{file}"); }
+            for file in ["portal_engine.c", "portal_engine.h", "portal_async_lease.inc", "portal_eis.inc", "desktop_power.c"] { println!("cargo:rerun-if-changed=c_engine/{file}"); }
             match pkg_config(&["gio-2.0", "gio-unix-2.0", "libpipewire-0.3", "libei-1.0 >= 1.1"]) {
                 Some((cflags, libs)) => shared_engine("libuu-portal.so", &["c_engine/portal_engine.c", "c_engine/desktop_power.c"], &[], &cflags, &libs),
                 None => println!("cargo:warning=GIO/PipeWire/libei >= 1.1 not found: libuu-portal.so not built"),
             }
         } else if std::env::var_os("CARGO_FEATURE_PORTAL").is_some() {
             println!("cargo:rerun-if-changed=c_engine/portal_engine.c");
+            println!("cargo:rerun-if-changed=c_engine/portal_async_lease.inc");
             println!("cargo:rerun-if-changed=c_engine/portal_engine.h");
             println!("cargo:rerun-if-changed=c_engine/portal_eis.inc");
             println!("cargo:rerun-if-changed=c_engine/desktop_power.c");
@@ -174,5 +190,15 @@ fn shared_engine(name: &str, sources: &[&str], includes: &[&std::path::Path], cf
     let status = command.status().expect("C compiler for the engine plugin");
     assert!(status.success(), "building {name} failed");
     // OUT_DIR = target/<profile>/build/<package>-<hash>/out
-    if let Some(profile) = out.ancestors().nth(3) { std::fs::copy(&library, profile.join(name)).expect("copy engine plugin"); }
+    if let Some(profile) = out.ancestors().nth(3) {
+        // Another process may have this plugin mapped. Never truncate its inode
+        // while publishing a rebuild (including a different Cargo feature set).
+        let staged = profile.join(format!(".{name}.{}.tmp", std::process::id()));
+        let published = std::fs::copy(&library, &staged)
+            .and_then(|_| std::fs::rename(&staged, profile.join(name)));
+        if let Err(error) = published {
+            let _ = std::fs::remove_file(&staged);
+            panic!("publish engine plugin: {error}");
+        }
+    }
 }

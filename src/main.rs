@@ -43,6 +43,10 @@ mod hevc;
 mod damage_capture;
 #[cfg(feature = "inproc-av")]
 mod inproc_encoder;
+#[cfg(all(target_os = "linux", feature = "portal", feature = "inproc-av"))]
+mod portal_gpu;
+#[cfg(all(target_os = "linux", feature = "portal", feature = "inproc-av"))]
+mod portal_timeline;
 mod capture_setting;
 mod audio;
 mod virtual_audio;
@@ -675,7 +679,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     input.release_held(); // recover stale input before accepting any peer
     let _pointer_worker = input.start_pointer_worker();
     let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
-    let shutdown_input = input.clone();
     let signal_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         #[cfg(target_os="linux")]
@@ -685,7 +688,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(target_os="linux"))]
         let _ = tokio::signal::ctrl_c().await;
-        if !assist_enabled { privacy_screen::shutdown(); shutdown_input.shutdown(); virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
+        // Do not exit from a runtime worker: NVIDIA atexit handlers can join
+        // driver threads while live encoders still hold their locks. The common
+        // shutdown path closes peers; runtime teardown cancels and drains workers
+        // before libc runs driver exit handlers.
         let _ = signal_tx.send(true);
     });
     let mut assist = if assist_enabled { Some(assist::Assist::start(&mut shutdown, unified).await?) } else { None };
