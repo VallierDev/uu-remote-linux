@@ -5,6 +5,20 @@ use super::Mode;
 
 pub struct Request { pub enable: bool, pub mode: Option<Mode>, requested: u64 }
 
+impl Request {
+    /// iOS viewers encode "turn off the display" as `enable=0, privacy_type=3`: their enable bit is
+    /// the picture-mode switch, and the explicit screen-off type carries the intent. iOS "off" is
+    /// `enable=0, type=1` (seen live), so rewrite only this exact combination. Android 4.43.0 was
+    /// verified with the field-1 semantics, so the rewrite is iOS-only.
+    pub fn normalize_ios_screen_off(&mut self, ios: bool) -> bool {
+        if ios && !self.enable && self.mode == Some(Mode::ScreenOff) {
+            self.enable = true;
+            return true;
+        }
+        false
+    }
+}
+
 pub fn parse(rpc: &[crate::protocol::WireField]) -> Option<(Vec<u8>, Request)> {
     use crate::protocol::{decode_wire, WireValue};
     let body = |n| rpc.iter().find_map(|f| match &f.value { WireValue::Bytes(b) if f.number == n => Some(*b), _ => None });
@@ -70,5 +84,26 @@ mod tests {
         assert_eq!(state_change(2), [42, 4, 16, 2, 24, 2]);
         let saver = crate::protocol::decode_wire(&[10, 2, 8, 7, 0xca, 1, 0]).unwrap();
         assert_eq!(screensaver_response(&saver).unwrap(), [10, 2, 8, 7, 0xaa, 1, 0]);
+    }
+    #[test]
+    fn normalizes_ios_screen_off_only() {
+        let screen_off = crate::protocol::decode_wire(&[10, 2, 8, 42, 58, 4, 8, 0, 16, 3]).unwrap();
+        let (_, mut request) = parse(&screen_off).unwrap();
+        assert!(request.normalize_ios_screen_off(true));
+        assert!(request.enable);
+        assert_eq!(request.mode, Some(Mode::ScreenOff));
+        let (_, mut request) = parse(&screen_off).unwrap();
+        assert!(!request.normalize_ios_screen_off(false));
+        assert!(!request.enable);
+
+        // An iOS "off" (type 1) and a Mac-style enable (1,3) must stay untouched.
+        let off = crate::protocol::decode_wire(&[10, 2, 8, 42, 58, 4, 8, 0, 16, 1]).unwrap();
+        let (_, mut request) = parse(&off).unwrap();
+        assert!(!request.normalize_ios_screen_off(true));
+        assert!(!request.enable);
+        let mac = crate::protocol::decode_wire(&[10, 2, 8, 42, 58, 4, 8, 1, 16, 3]).unwrap();
+        let (_, mut request) = parse(&mac).unwrap();
+        assert!(!request.normalize_ios_screen_off(true));
+        assert!(request.enable);
     }
 }

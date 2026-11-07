@@ -1038,6 +1038,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                             if desktop { portal_desktop.clone() } else { None }).await {
                             Ok(mut sess) => {
                                 sess.controller = controller;
+                                if desktop { crate::privacy_screen::set_viewer_controller(controller); }
                                 if !desktop {
                                     let (requests, peer) = (desktop_requests.clone(), ice.clone());
                                     sess.on_desktop_request(move || { let _ = requests.send(peer.clone()); });
@@ -1119,6 +1120,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                     } else { None };
                     video::warm_auto_probe(); video::check_ffmpeg_usable();
                     input.set_controller(controller);
+                    crate::privacy_screen::set_viewer_controller(controller);
                     input.bind_portal(screen.as_ref().map_or_else(|| sessions[&ice].capture.portal.clone(), |screen| screen.portal.clone()));
                     // One desktop at a time, as for a new desktop offer. Peers offered as desktops
                     // close; a promoted tool peer only stops its desktop and keeps its tools.

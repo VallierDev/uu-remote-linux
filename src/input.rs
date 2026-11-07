@@ -81,15 +81,20 @@ fn finger_held(finger: Finger, now: std::time::Instant) -> Option<(i32,i32)> {
 /// Viewer platform from the connect header `controller_platform` (website enum: 1 windows, 2 android,
 /// 3 ios, 4 macos, 5 tv).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Controller { #[default] Other, Mac, Mobile }
+pub enum Controller { #[default] Other, Mac, Mobile, Ios }
 impl Controller {
+    /// Touch semantics cover both mobile platforms; the iOS RPC 7 screen-off encoding is its own quirk.
+    pub fn is_mobile(self) -> bool { matches!(self, Self::Mobile | Self::Ios) }
     pub fn from_platform(platform: Option<&serde_json::Value>) -> Self {
         let Some(v) = platform else { return Self::Other };
         let text = v.as_str().map(str::to_ascii_lowercase);
         match v.as_i64().or_else(|| text.as_deref().and_then(|s| s.parse().ok())) {
             Some(4) => Self::Mac,
-            Some(2 | 3) => Self::Mobile,
-            _ if text.is_some_and(|s| s.contains("mac") || s.contains("darwin")) => Self::Mac,
+            Some(3) => Self::Ios,
+            Some(2) => Self::Mobile,
+            _ if text.as_deref().is_some_and(|s| s.contains("mac") || s.contains("darwin")) => Self::Mac,
+            _ if text.as_deref().is_some_and(|s| s.contains("ios") || s.contains("iphone") || s.contains("ipad")) => Self::Ios,
+            _ if text.as_deref().is_some_and(|s| s.contains("android")) => Self::Mobile,
             _ => Self::Other,
         }
     }
@@ -303,7 +308,7 @@ impl InputInjector {
         *self.cmd.lock().unwrap() = CmdState::default();
         let mut touch = self.touch.lock().unwrap();
         self.lift_finger(&mut touch);
-        let mode = if controller != Controller::Mobile || self.uinput_pointer { TouchMode::Mouse } else {
+        let mode = if !controller.is_mobile() || self.uinput_pointer { TouchMode::Mouse } else {
             match std::env::var("UU_TOUCH_INPUT").as_deref() { Ok("0") => TouchMode::Mouse, Ok("touch") => TouchMode::Touch, _ => TouchMode::Gesture }
         };
         *touch = TouchDrag { mode, ..TouchDrag::default() };
@@ -1047,7 +1052,7 @@ mod kernel_pointer_tests {
 
     #[test]
     fn full_uinput_bypasses_portal_binding_and_preserves_move_click_order() {
-        for controller in [Controller::Other, Controller::Mobile] {
+        for controller in [Controller::Other, Controller::Mobile, Controller::Ios] {
             let (devices, mut keyboard, mut pointer) = crate::uinput::Devices::recording_for_test();
             let mut input = InputInjector::without_desktop();
             input.uinput = Some(devices);
@@ -1296,7 +1301,13 @@ mod touch_tests {
     fn controller_from_platform_numbers_and_mac_strings() {
         use serde_json::json;
         assert_eq!(Controller::from_platform(Some(&json!(2))), Controller::Mobile);
-        assert_eq!(Controller::from_platform(Some(&json!("3"))), Controller::Mobile);
+        assert_eq!(Controller::from_platform(Some(&json!("3"))), Controller::Ios);
+        assert_eq!(Controller::from_platform(Some(&json!("ios"))), Controller::Ios);
+        assert_eq!(Controller::from_platform(Some(&json!("Android"))), Controller::Mobile);
+        assert_eq!(Controller::from_platform(Some(&json!("iPadOS"))), Controller::Ios);
+        assert!(Controller::Ios.is_mobile());
+        assert!(Controller::Mobile.is_mobile());
+        assert!(!Controller::Mac.is_mobile());
         assert_eq!(Controller::from_platform(Some(&json!(4))), Controller::Mac);
         assert_eq!(Controller::from_platform(Some(&json!("MacOS"))), Controller::Mac);
         assert_eq!(Controller::from_platform(Some(&json!(1))), Controller::Other);

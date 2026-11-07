@@ -25,8 +25,15 @@ static POINTER: Mutex<Option<[f64; 4]>> = Mutex::new(None);
 /// ends. An auto-enable never overrides it, including an RPC that arrives after the connection
 /// opens but before `session_started` bumps the counter.
 static VIEWER_OVERRIDE: AtomicBool = AtomicBool::new(false);
+/// iOS viewers encode "screen off" as `enable=0, type=3`; see
+/// `protocol::Request::normalize_ios_screen_off`.
+static VIEWER_IOS: AtomicBool = AtomicBool::new(false);
 
 pub fn supported() -> bool { backend::detect().is_some() }
+/// Record the desktop controller's platform for the iOS RPC 7 encoder quirk.
+pub fn set_viewer_controller(controller: crate::input::Controller) {
+    VIEWER_IOS.store(controller == crate::input::Controller::Ios, Ordering::Relaxed);
+}
 pub fn active() -> bool { ACTIVE.load(Ordering::Relaxed) }
 /// The viewer's privacy_type now in effect.
 pub fn current_type() -> u8 {
@@ -112,7 +119,13 @@ pub struct Accepted { enable: bool, mode: Option<Mode> }
 /// (error 9998 + n in its RPC failure handler) and a switch takes longer. A later failure is
 /// reported as ReportError -7, which the viewer handles by resetting its privacy menu.
 pub fn rpc_accept(rpc: &[crate::protocol::WireField]) -> Option<(Vec<u8>, Option<Accepted>)> {
-    let (header, request) = protocol::parse(rpc)?;
+    let (header, mut request) = protocol::parse(rpc)?;
+    if request.normalize_ios_screen_off(VIEWER_IOS.load(Ordering::Relaxed)) {
+        // The viewer chose a mode even if the switch is refused below; cancel a pending auto-enable
+        // as an accepted request would.
+        VIEWER_OVERRIDE.store(true, Ordering::Relaxed);
+        log::info!("Privacy request: iOS screen-off encoding normalized (enable=0 type=3)");
+    }
     if let Some(e) = refuse(request.enable, request.mode) {
         log::warn!("Privacy request refused: enable={} mode={:?}: {e}", request.enable, request.mode);
         return Some((protocol::response(&header, &request, true, current_type()), None));

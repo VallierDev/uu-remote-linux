@@ -79,6 +79,8 @@ is aimed at the virtual output's region. Needs GTK3.
   The host answers before switching (the viewer times out with 9998); a failed switch sends ReportError -7.
   成功不发送 ReportError；Mac 4.43.0 的 -9 是系统会话变化提示，不是防窥成功通知。
   Success does not send ReportError; -9 in Mac 4.43.0 reports a system session change, not privacy success.
+- iOS 控制端选“关闭显示器”发 `enable=0, privacy_type=3`：iOS 的 `enable` 是图片模式开关，关屏意图由 `type=3` 表达；iOS“不启用”发 `enable=0, privacy_type=1`。主机只对 iOS 控制端把 `0/3` 归一化为开屏保关屏（日志 `iOS screen-off encoding normalized`），其他控制端（包括已验收的 Android 4.43.0）保持字段 1 的语义。
+  The iOS viewer sends `enable=0, privacy_type=3` for "turn off the display": its `enable` is the picture-mode switch and `type=3` carries the intent; iOS "off" is `enable=0, privacy_type=1`. The host normalizes `0/3` to screen-off for iOS controllers only (log: `iOS screen-off encoding normalized`); other controllers, including the verified Android 4.43.0, keep the field-1 semantics.
 - RPC 25 `update_screen_saver_req` → RpcResponse 21：开启隐私模式前发送，主机回空成功应答，画面仍用本机壁纸。
   Sent before picture mode; answered empty (success), the host keeps its own wallpaper.
 - FeatureFlag 4 `ff_private_screen` = 2 (ENHANCED_PRIVACY)；SettingMetric 4 `private_screen`、7 `private_screen_type`
