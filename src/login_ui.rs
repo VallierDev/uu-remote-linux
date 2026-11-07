@@ -2,7 +2,7 @@
 //! gtk+-3.0 is available (cfg uu_gtk); otherwise, and with `--no-gui` or no display, every call
 //! is a no-op and the terminal QR remains the only UI.
 
-#[cfg(uu_gtk)]
+#[cfg(any(uu_gtk, target_env = "ohos"))]
 extern "C" {
     fn uu_login_ui_start(name: *const libc::c_char, os: *const libc::c_char, cpu: *const libc::c_char, gpu: *const libc::c_char) -> libc::c_int;
     fn uu_login_ui_set_qr(rgba: *const u8, edge: libc::c_int);
@@ -19,7 +19,7 @@ pub enum Tone { Info = 0, Ok = 1, Error = 2 }
 
 pub struct LoginUi { shown: bool, attached: bool }
 
-#[cfg(uu_gtk)]
+#[cfg(any(uu_gtk, target_env = "ohos"))]
 fn cstr(s: &str) -> std::ffi::CString { std::ffi::CString::new(s.replace('\0', "")).unwrap_or_default() }
 
 impl LoginUi {
@@ -28,7 +28,7 @@ impl LoginUi {
     /// Opens the window when built with GTK and a display is present; falls back silently otherwise.
     #[allow(unused_variables)]
     pub fn open(name: &str, os: &str, cpu: &str, gpu: &str) -> Self {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
             let (n, o, c, g) = (cstr(name), cstr(os), cstr(cpu), cstr(gpu));
             if unsafe { uu_login_ui_start(n.as_ptr(), o.as_ptr(), c.as_ptr(), g.as_ptr()) } == 0 {
@@ -43,9 +43,9 @@ impl LoginUi {
     /// (a service's stdout is the journal and the QR URL is a login ticket), and dropping this
     /// handle never closes the shared window.
     pub fn attached() -> Self {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         { unsafe { uu_login_ui_start(std::ptr::null(), std::ptr::null(), std::ptr::null(), std::ptr::null()) }; LoginUi { shown: true, attached: true } }
-        #[cfg(not(uu_gtk))]
+        #[cfg(not(any(uu_gtk, target_env = "ohos")))]
         LoginUi { shown: false, attached: true }
     }
     pub fn quiet(&self) -> bool { self.attached }
@@ -53,37 +53,37 @@ impl LoginUi {
 
     #[allow(unused_variables)]
     pub fn qr(&self, rgba: &[u8], edge: usize) {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if self.shown && rgba.len() == edge * edge * 4 { unsafe { uu_login_ui_set_qr(rgba.as_ptr(), edge as libc::c_int) } }
     }
 
     #[allow(unused_variables)]
     /// Show or hide the 刷新二维码 button (a failed QR waits for the user, like the official client).
     pub fn offer_refresh(&self, visible: bool) {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if self.shown { unsafe { uu_login_ui_offer_refresh(libc::c_int::from(visible)) } }
-        #[cfg(not(uu_gtk))]
+        #[cfg(not(any(uu_gtk, target_env = "ohos")))]
         let _ = visible;
     }
     /// The user clicked 刷新二维码 since the last call.
     pub fn take_refresh(&self) -> bool {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if self.shown { return unsafe { uu_login_ui_take_refresh() } != 0; }
         false
     }
     pub fn status(&self, text: &str, tone: Tone) {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if self.shown { let t = cstr(text); unsafe { uu_login_ui_set_status(t.as_ptr(), tone as libc::c_int) } }
     }
 
     #[allow(unused_variables)]
     pub fn done(&self, text: &str) {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if self.shown { let t = cstr(text); unsafe { uu_login_ui_set_done(t.as_ptr()) } }
     }
 
     pub fn closed(&self) -> bool {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if self.shown { return unsafe { uu_login_ui_closed() } != 0; }
         false
     }
@@ -97,7 +97,7 @@ impl LoginUi {
 
 impl Drop for LoginUi {
     fn drop(&mut self) {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if self.shown && !self.attached { unsafe { uu_login_ui_close() } }
     }
 }

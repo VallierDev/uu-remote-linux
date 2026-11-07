@@ -142,6 +142,7 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64 }
 
 fn spawn(requested_id: u32, cols: u16, rows: u16, shell: Option<&str>) -> Result<Arc<Session>, String> {
+    if cfg!(target_env = "ohos") { return Err("Terminal is unavailable on HarmonyOS".into()); }
     use std::os::unix::process::CommandExt;
     let win = nix::pty::Winsize { ws_row: rows.max(1), ws_col: cols.max(1), ws_xpixel: 0, ws_ypixel: 0 };
     let pty = nix::pty::openpty(Some(&win), None).map_err(|e| format!("openpty failed: {e}"))?;
@@ -427,7 +428,10 @@ pub fn rpc_response(rpc: &[crate::protocol::WireField]) -> Option<Vec<u8>> {
     bytes(1, header, &mut out);
     if rpc.iter().any(|f| f.number == 28) {
         let mut body = Vec::new();
-        bytes(2, b"ok", &mut body); // code 0 (default) = available
+        if cfg!(target_env = "ohos") {
+            varint(1 << 3, &mut body); varint(1, &mut body);
+            bytes(2, b"Terminal is unavailable on HarmonyOS", &mut body);
+        } else { bytes(2, b"ok", &mut body); } // code 0 = available
         bytes(24, &body, &mut out);
         log::info!("Terminal check_env answered: available");
         return Some(out);

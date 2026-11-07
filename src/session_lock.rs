@@ -23,7 +23,7 @@ pub enum UnlockResult { Success, WrongPassword, NoLoggedInUser, NoPermission, Fa
 /// Official ReportError.error_code for a failed auto unlock.
 pub const UNLOCK_FAILED_CODE: i32 = -5;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 extern "C" {
     fn uu_pam_available() -> libc::c_int;
     fn uu_pam_check(service: *const libc::c_char, user: *const libc::c_char, password: *const libc::c_char) -> libc::c_int;
@@ -54,14 +54,14 @@ fn user_name() -> Option<String> {
 }
 
 fn pam_available() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     { unsafe { uu_pam_available() != 0 } }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     { false }
 }
 
 /// PAM "login" service check of the user's own password: 0 ok, 1 wrong, -1 unavailable.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn pam_check(user: &str, password: &str) -> i32 {
     let (Ok(service), Ok(user), Ok(pass)) = (std::ffi::CString::new("login"), std::ffi::CString::new(user),
         std::ffi::CString::new(password)) else { return -1 };
@@ -69,7 +69,7 @@ fn pam_check(user: &str, password: &str) -> i32 {
     pass.into_bytes_with_nul().fill(0);
     verdict
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn pam_check(_user: &str, _password: &str) -> i32 { -1 }
 
 /// Auto unlock is offered when there is a graphical logind session and PAM can be loaded.

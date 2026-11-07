@@ -1,8 +1,20 @@
 target/
 *.log
 .DS_Store
+__pycache__/
 
 # Internal QA records and handoffs stay private (kept under the parent project analysis/)
 /docs/validation/
 /docs/ACTIVE_HANDOFF.md
 /contrib/tests/
+
+/harmony/.hvigor/
+/harmony/oh_modules/
+/harmony/**/oh_modules/
+/harmony/entry/build/
+/harmony/entry/.cxx/
+/harmony/entry/libs/
+/harmony/signing.local.json
+/harmony/local.properties
+/harmony/build-profile.local.json5
+/harmony/.idea/

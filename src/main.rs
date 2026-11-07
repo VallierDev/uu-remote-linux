@@ -1,7 +1,9 @@
-//! UU Remote Pure Native Linux Server (Rust Edition)
-//! Zero-Wine, Zero-Python, Single-Binary, 5 Native Tools Integrated
+// UU Remote Pure Native Linux Server (Rust Edition)
+// Zero-Wine, Zero-Python, Single-Binary, 5 Native Tools Integrated
 
 mod ws_transport;
+#[cfg(target_env = "ohos")]
+mod ohos;
 mod engine_plugin;
 mod doctor;
 mod wol;
@@ -21,6 +23,7 @@ mod i18n;
 mod login;
 mod login_ui;
 mod session_lock;
+#[cfg_attr(target_env = "ohos", path = "ohos/capture.rs")]
 mod capture;
 mod kms;
 mod file_trans;
@@ -749,7 +752,11 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
     });
     let _idle_watch = idle_watch.map(|task| AbortOnDrop(task.abort_handle()));
     let mut auth = if let Some(session) = assist.as_ref() { session.client.clone() } else {
-        let creds = match config::file().and_then(Credentials::load) {
+        #[cfg(target_env = "ohos")]
+        let credentials = config::read_fresh().and_then(|file| Credentials::load(file.as_ref()));
+        #[cfg(not(target_env = "ohos"))]
+        let credentials = config::file().and_then(Credentials::load);
+        let creds = match credentials {
             Ok(creds) => creds,
             Err(e) => {
                 log::warn!("Not logged in: {e} ({} or UU_* environment variables)", config::path().display());
@@ -960,6 +967,10 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                             if s.renewed { break; }
                         }
                         continue;
+                    }
+                    #[cfg(target_env = "ohos")]
+                    if val.get("data").and_then(|d| d.get("publisher_availability_status")).and_then(|s| s.as_str()) == Some("ready") {
+                        ohos::status(i18n::s("已上线，可从其他设备连接", "Online, ready for connections"));
                     }
                     log::info!(
                         "Device status synchronized: status={:?}, availability={:?}",

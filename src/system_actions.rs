@@ -211,6 +211,7 @@ impl PeerActions {
     /// Runs one system action; returns true when the settings report should be resent.
     /// Blocking (spawns system tools); call from spawn_blocking.
     pub fn handle(&self, action: u64, value: Option<u64>, args: &[u8], show_desktop: impl FnOnce()) -> bool {
+        if cfg!(target_env = "ohos") { log::info!("System action unavailable on HarmonyOS: action={action}"); return false; }
         match action {
             SHOW_DESKTOP => { show_desktop(); log::info!("System action show_desktop"); return false }
             LOCK_SYSTEM => { log::info!("System action lock_system: ok={}", lock_session()); return false }
@@ -289,6 +290,9 @@ impl PeerActions {
         use crate::system_metrics::payload_with_settings;
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
         let current = state().lock().unwrap().settings.clone();
+        #[cfg(target_env = "ohos")]
+        return payload_with_settings(desktop, crate::system_metrics::Permission::Reject,
+            crate::ohos::input_permission(), "", &crate::system_metrics::Settings::default());
         payload_with_settings(desktop, desktop, desktop, &home, &crate::system_metrics::Settings {
             sound, keep_mute: current.keep_mute, mute_permanent: current.mute_permanent, auto_lock: current.auto_lock,
             private_screen: crate::privacy_screen::supported().then(crate::privacy_screen::current_type),

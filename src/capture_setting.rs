@@ -54,12 +54,13 @@ pub struct VideoSettings {
 }
 
 impl Default for VideoSettings {
-    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420 } }
+    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: if cfg!(target_env = "ohos") { 30 } else { 60 }, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420 } }
 }
 
 /// Selectable smaller stream sizes with the desktop's aspect ratio (even dimensions).
 /// The host display itself is never reconfigured; the encoder scales.
 pub fn scaled_sizes(native: (u32, u32)) -> Vec<(u32, u32)> {
+    if cfg!(target_env = "ohos") { return Vec::new(); }
     [5u32, 4, 3, 2].iter().map(|sixths| (native.0 * sixths / 6 & !1, native.1 * sixths / 6 & !1))
         .filter(|(w, h)| *w >= 640 && *h >= 360).collect()
 }
@@ -219,6 +220,10 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
         return None;
     }
     next.fps = next.fps.clamp(MIN_FPS, MAX_FPS);
+    // The consented HarmonyOS encoder surface remains fixed for the sharing session.
+    // Report the actual format rather than claiming a requested resize was applied.
+    #[cfg(target_env = "ohos")]
+    { next.fps = 30; next.output = None; next.codec = VideoCodec::H264; next.chroma = CHROMA_420; }
     settings.send_if_modified(|current| if *current != next {
         log::info!("Desktop video settings: fps={} quality={} max_kbps={:?} output={:?} chroma={}", next.fps, next.quality, next.max_kbps(), next.output, next.chroma);
         *current = next; true
