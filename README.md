@@ -546,6 +546,8 @@ SDL 剪贴板复用桌面窗口，避免 GNOME Wayland 上临时窗口引起的 
 SDL2 同步读取选择内容，慢速的剪贴板提供者可能暂时阻塞窗口，桥接超时无法中断该原生调用。
 GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不解决被控端兼容问题。
 
+Mac 远控窗口支持直接 **Ctrl+V / Command+V 粘贴 PNG 截图**：原生剪贴板通道确认完整后才粘贴，无须额外开关或远端文件/终端工具。同一次传输期间重复按粘贴会合并为一次。范围与平台限制见[原生图片粘贴](docs/native-image-clipboard.md)。
+
 **使用**：
 - `uuremote-viewer login`：扫码登录（复用同目录下 `uuremote-server` 的登录窗口；`--no-gui` 为终端二维码）。控制端与主机共用
   `~/.config/uuremote/config.json`（可用 `UU_CONFIG` 另指定），因此**不能用同一身份连接本机上的主机**；控制其他设备不受影响。

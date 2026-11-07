@@ -1,7 +1,7 @@
 //! Session-scoped text clipboard. Payloads never enter logs or process arguments.
 use super::{rtc::Observed,wire};
 use crate::{clipboard_protocol as text,clipboard_rich as rich,protocol::{decode_wire,WireValue}};
-use std::{path::PathBuf,process::Stdio,sync::{Arc,atomic::{AtomicBool,Ordering}},time::Duration};
+use std::{path::PathBuf,process::Stdio,sync::{Arc,atomic::{AtomicBool,AtomicU64,Ordering}},time::Duration};
 use tokio::{io::{AsyncReadExt,AsyncWriteExt},sync::mpsc};
 use webrtc::data_channel::RTCDataChannel;
 
@@ -96,12 +96,12 @@ impl CommandBackend {
 }
 #[derive(Default)]
 // target_mac: Some(true) official Mac host, Some(false) Windows-type host (official or this project), None unknown.
-struct SyncState {last:Option<String>,assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
+struct SyncState {last:Option<String>,image_selection:Option<u64>,assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
 impl SyncState {
     async fn apply(&mut self,backend:&Backend,value:String)->Result<(),()>{
         if backend.write(&value).await? {
             log::info!("Viewer remote clipboard applied: bytes={}",value.len());
-            self.last=Some(value);
+            self.last=Some(value);self.image_selection=None;
         }
         Ok(())
     }
@@ -110,15 +110,22 @@ impl SyncState {
     /// RpcRequest case 10 ClipboardTextChangeRequest carrying the text, which the official Windows host applies
     /// (handle_text_change_request -> notifyReceiveText); it only acknowledges the rich offer. Each host
     /// ignores the other form.
-    fn local(&mut self,value:String)->Result<Option<Vec<Vec<u8>>>,&'static str>{
-        if self.last.as_ref()==Some(&value){return Ok(None)}
+    fn local(&mut self,value:String,selection:u64)->Result<Option<Vec<Vec<u8>>>,&'static str>{
+        // A mixed selection's text must not replace its PNG. A later selection,
+        // even with identical text, must replace the previously offered image.
+        if self.image_selection==Some(selection){return Ok(None)}
+        if self.image_selection.is_none() && self.last.as_ref()==Some(&value){return Ok(None)}
         let id=self.next();let payload=self.rich.offer_any_host(id,value.clone())?;
         let rich=wire::envelope(self.next(),21,&payload);
         let text=wire::envelope(self.next(),21,&crate::clipboard_protocol::text_request(self.next(),&value));
-        self.last=Some(value);
+        self.last=Some(value);self.image_selection=None;
         // Live-verified: the official Windows host writes case-10 text, then a rich format list replaces it with a
         // placeholder it never asks us to render (paste is empty). The Mac host only takes the rich offer.
         Ok(Some(match self.target_mac {Some(true)=>vec![rich],Some(false)=>vec![text],None=>vec![rich,text]}))
+    }
+    fn offer_png(&mut self,data:Vec<u8>,selection:u64)->Result<Vec<u8>,&'static str>{
+        let id=self.next();let body=self.rich.offer_png(id,data)?;
+        self.last=None;self.image_selection=Some(selection);Ok(body)
     }
     fn receive(&mut self,data:&[u8])->Result<(Vec<Vec<u8>>,Option<String>),&'static str>{
         if data.len()>MAX_TEXT*2+1024{return Err("clipboard message exceeds limit")}
@@ -153,9 +160,12 @@ impl SyncState {
     }
 }
 async fn send(channel:&RTCDataChannel,message:Vec<u8>)->Result<(),()>{
-    tokio::time::timeout(Duration::from_secs(2),channel.send(&bytes::Bytes::from(message))).await.map_err(|_|())?.map_err(|_|())?;Ok(())
+    tokio::time::timeout(Duration::from_secs(2),async {
+        while channel.buffered_amount().await>512*1024 {tokio::time::sleep(Duration::from_millis(10)).await;}
+        channel.send(&bytes::Bytes::from(message)).await.map_err(|_|())?;Ok(())
+    }).await.map_err(|_|())?
 }
-pub struct Bridge {backend:Option<Backend>,pub enabled:bool,tx:Option<mpsc::Sender<Vec<u8>>>,task:Option<tokio::task::JoinHandle<()>>,target_mac:Option<bool>}
+pub struct Bridge {selection:Arc<AtomicU64>,image_tx:Option<super::image_paste::Sender>,backend:Option<Backend>,pub enabled:bool,tx:Option<mpsc::Sender<Vec<u8>>>,task:Option<tokio::task::JoinHandle<()>>,target_mac:Option<bool>}
 #[cfg(feature="viewer-sdl")]
 fn sdl_backend(wayland:bool,niri:bool,tx:mpsc::Sender<ClipboardRequest>,find:impl Fn(&str)->Option<PathBuf>)->Option<Backend>{
     if wayland && niri {
@@ -169,27 +179,54 @@ fn sdl_backend(wayland:bool,niri:bool,tx:mpsc::Sender<ClipboardRequest>,find:imp
 impl Bridge {
     pub fn new(desktop:bool)->Self{
         let backend=if desktop{Backend::detect()}else{None};let enabled=backend.is_some();
-        Self{backend,enabled,tx:None,task:None,target_mac:None}
+        Self{selection:Arc::default(),image_tx:None,backend,enabled,tx:None,task:None,target_mac:None}
     }
     #[cfg(feature="viewer-sdl")]
-    pub fn sdl(tx:mpsc::Sender<ClipboardRequest>)->Self{
+    pub fn sdl(tx:mpsc::Sender<ClipboardRequest>,selection:Arc<AtomicU64>)->Self{
         let wayland=std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v|!v.is_empty());
         let backend=(std::env::var("UU_VIEWER_CLIPBOARD").as_deref()!=Ok("0"))
             .then(||sdl_backend(wayland,std::env::var_os("NIRI_SOCKET").is_some(),tx,executable)).flatten();
-        Self{enabled:backend.is_some(),backend,tx:None,task:None,target_mac:None}
+        Self{selection,image_tx:None,enabled:backend.is_some(),backend,tx:None,task:None,target_mac:None}
     }
     pub fn set_target_mac(&mut self,mac:Option<bool>){self.target_mac=mac;}
     pub fn start(&mut self,channel:&Arc<RTCDataChannel>,control:&Arc<RTCDataChannel>,observed:Arc<Observed>){
-        let Some(backend)=self.backend.take() else{return};let target_mac=self.target_mac;
-        let (tx,mut rx)=mpsc::channel::<Vec<u8>>(16);self.tx=Some(tx);
+        let Some(backend)=self.backend.take() else{return};let target_mac=self.target_mac;let selection=self.selection.clone();
+        let (tx,mut rx)=mpsc::channel::<Vec<u8>>(64);self.tx=Some(tx);
+        let(image_tx,mut image_rx)=mpsc::channel::<super::image_paste::Request>(1);
+        if target_mac==Some(true){self.image_tx=Some(image_tx);}
         let channel=Arc::downgrade(channel);let control=Arc::downgrade(control);
         self.task=Some(tokio::spawn(async move{
+            let(write_tx,mut write_rx)=mpsc::channel(2);
+            let writer_channel=channel.clone();
+            tokio::spawn(async move{while let Some(message)=write_rx.recv().await {
+                let Some(c)=writer_channel.upgrade() else{break};if send(&c,message).await.is_err(){break}
+            }});
+            let mut outgoing=std::collections::VecDeque::<Vec<u8>>::new();
+            let mut pending:Option<(tokio::sync::oneshot::Sender<Result<(),()>>,std::time::Instant)>=None;
             let mut state=SyncState{target_mac,..SyncState::default()};let mut tick=tokio::time::interval(POLL);
             let mut retries=0;let mut last_probe=std::time::Instant::now();
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 let Some(channel)=channel.upgrade() else{break};
                 tokio::select!{
+                    permit=write_tx.reserve(),if !outgoing.is_empty()=>{
+                        let Ok(permit)=permit else{break};permit.send(outgoing.pop_front().unwrap());
+                    },
+                    request=image_rx.recv(),if target_mac==Some(true)=>{
+                        let Some(request)=request else{break};
+                        if request.reply.is_closed(){continue}
+                        if let Some((reply,_))=pending.take(){let _=reply.send(Err(()));}
+                        if !observed.clipboard_supported.load(Ordering::Acquire) {let _=request.reply.send(Err(()));continue}
+                        // Consume the focused selection's text view before installing PNG.
+                        // Mixed text/image selections must not replace it at the next poll.
+                        let _=backend.read().await;
+                        if request.reply.is_closed(){continue}
+                        if selection.load(Ordering::Acquire)!=request.selection {let _=request.reply.send(Err(()));continue}
+                        match state.offer_png(request.data,request.selection){
+                            Ok(body)=>{outgoing.push_back(wire::envelope(state.next(),21,&body));pending=Some((request.reply,std::time::Instant::now()));},
+                            Err(_)=>{let _=request.reply.send(Err(()));},
+                        }
+                    },
                     data=rx.recv()=>{
                         let Some(data)=data else{break};
                         if !observed.clipboard_supported.load(Ordering::Acquire){continue}
@@ -199,13 +236,19 @@ impl Bridge {
                                     // Update only after the write succeeds; the next poll cannot echo it.
                                     if state.apply(&backend,value).await.is_err(){warn();break}
                                 }
-                                let mut failed=false;for reply in replies{if send(&channel,reply).await.is_err(){failed=true;break}}
-                                if failed{break}
+                                // A separate bounded writer lets block confirmations keep flowing
+                                // while a large image is sent; never drop ACKs behind the sender.
+                                if outgoing.iter().map(Vec::len).sum::<usize>()+replies.iter().map(Vec::len).sum::<usize>()>rich::MAX_IMAGE+2*1024*1024 {break}
+                                outgoing.extend(replies);
+                                if let Some(ok)=state.rich.image_status(){if let Some((reply,_))=pending.take(){let _=reply.send(if ok{Ok(())}else{Err(())});}}
                             },
                             Err(_)=>log::warn!("Viewer clipboard message rejected"),
                         }
                     },
                     _=tick.tick()=>{
+                        if pending.as_ref().is_some_and(|(reply,start)|reply.is_closed()||start.elapsed()>Duration::from_secs(18)) {
+                            if let Some((reply,_))=pending.take(){let _=reply.send(Err(()));}
+                        }
                         if observed.echo_received.load(Ordering::Acquire) && !observed.control_open.load(Ordering::Acquire){break}
                         if !observed.echo_received.load(Ordering::Acquire){continue}
                         if !observed.clipboard_supported.load(Ordering::Acquire){
@@ -218,8 +261,9 @@ impl Bridge {
                             continue
                         }
                         if channel.ready_state()!=webrtc::data_channel::data_channel_state::RTCDataChannelState::Open{continue}
+                        if pending.is_some() || !outgoing.is_empty(){continue}
                         match backend.read().await {
-                            Ok(Some(value))=>{let length=value.len();match state.local(value){
+                            Ok(Some(value))=>{let length=value.len();match state.local(value,selection.load(Ordering::Acquire)){
                                 Ok(Some(messages))=>{let mut failed=false;for m in messages{if send(&channel,m).await.is_err(){failed=true;break}}if failed{break}log::info!("Viewer local clipboard offered: bytes={length}");},
                                 Ok(None)=>{},Err(_)=>{},
                             }},
@@ -230,6 +274,7 @@ impl Bridge {
             }
         }));
     }
+    pub fn image_sender(&self)->Option<super::image_paste::Sender>{self.image_tx.clone()}
     pub fn sender(&self)->Option<mpsc::Sender<Vec<u8>>>{self.tx.clone()}
     pub fn stop(&self){if let Some(task)=&self.task{task.abort();}}
 }
@@ -237,6 +282,17 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn text_is_reoffered_after_png_only_when_the_selection_changes(){
+        let mut state=SyncState{target_mac:Some(true),..SyncState::default()};
+        assert!(state.local("same text".into(),0).unwrap().is_some());
+        state.offer_png(include_bytes!("../../tests/fixtures/clipboard-test.png").to_vec(),1).unwrap();
+        // Repeated reads of a mixed selection cannot replace its image.
+        for _ in 0..3 {assert!(state.local("same text".into(),1).unwrap().is_none());}
+        // Copying the same text again is a new selection and replaces the PNG.
+        assert!(state.local("same text".into(),2).unwrap().is_some());
+        assert!(state.local("same text".into(),2).unwrap().is_none());
+        assert!(state.local("same text".into(),3).unwrap().is_none());
+    }
     #[cfg(feature="viewer-sdl")]
     #[tokio::test] async fn sdl_backend_requests_and_invalid_text(){
         let(tx,mut rx)=mpsc::channel(8);let backend=Backend::Sdl(tx);
@@ -284,13 +340,13 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         assert!(include_str!("../clipboard.rs").contains("pub const MAX_TEXT: usize = 30 * 1024;"));
         assert!(POLL>=Duration::from_millis(500));
         let mut state=SyncState::default();
-        assert!(state.local("中文🙂\n".into()).unwrap().is_some());
-        assert!(state.local("中文🙂\n".into()).unwrap().is_none());
+        assert!(state.local("中文🙂\n".into(),0).unwrap().is_some());
+        assert!(state.local("中文🙂\n".into(),0).unwrap().is_none());
         state.last=Some("remote".into());
-        assert!(state.local("remote".into()).unwrap().is_none());
-        assert!(state.local(String::new()).unwrap().is_some());
-        assert!(state.local(String::new()).unwrap().is_none());
-        assert!(state.local("a".repeat(MAX_TEXT+1)).is_err());
+        assert!(state.local("remote".into(),0).unwrap().is_none());
+        assert!(state.local(String::new(),0).unwrap().is_some());
+        assert!(state.local(String::new(),0).unwrap().is_none());
+        assert!(state.local("a".repeat(MAX_TEXT+1),0).is_err());
     }
     #[test] fn message17_fragments_and_mobile_rpc_keep_unicode_and_request_id(){
         let mut state=SyncState::default();let value="中文🙂\n".repeat(2200);
@@ -323,7 +379,7 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
     fn native_host_exchange(outbound:usize,reverse:bool)->(Option<String>,bool){
         let mut viewer=SyncState::default();let mut host=[rich::State::default(),rich::State::default()];let mut id=1000;
         let value="clipboard-中文🙂\n".to_owned();
-        let offer=if reverse{wire::envelope(1,21,&host[1].offer(1,value.clone()).unwrap())}else{viewer.local(value.clone()).unwrap().unwrap().remove(0)};
+        let offer=if reverse{wire::envelope(1,21,&host[1].offer(1,value.clone()).unwrap())}else{viewer.local(value.clone(),0).unwrap().unwrap().remove(0)};
         let mut queue=std::collections::VecDeque::from([(reverse,if reverse{1}else{outbound},offer)]);
         let mut received=None;let mut unavailable=false;let mut steps=0;
         while let Some((to_viewer,channel,packet))=queue.pop_front(){
@@ -348,13 +404,13 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
                 }
             }
         }
-        if reverse && received.is_some(){viewer.last=Some(value.clone());assert!(viewer.local(value).unwrap().is_none());}
+        if reverse && received.is_some(){viewer.last=Some(value.clone());assert!(viewer.local(value,0).unwrap().is_none());}
         (received,unavailable)
     }
     #[test] fn local_change_follows_target_platform(){
         for (mac,kinds) in [(Some(true),vec![9]),(Some(false),vec![10]),(None,vec![9,10])]{
             let mut viewer=SyncState{target_mac:mac,..SyncState::default()};
-            let cases:Vec<u32>=viewer.local("text".into()).unwrap().unwrap().iter().map(|m|{
+            let cases:Vec<u32>=viewer.local("text".into(),0).unwrap().unwrap().iter().map(|m|{
                 let rpc=decode_wire(m).unwrap().into_iter().find_map(|f|match (f.number,f.value){(21,WireValue::Bytes(b))=>Some(b.to_vec()),_=>None}).unwrap();
                 decode_wire(&rpc).unwrap().iter().map(|f|f.number).find(|n|*n!=1).unwrap()
             }).collect();
@@ -363,7 +419,7 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
     }
     #[test] fn local_change_also_sends_windows_text_change_request(){
         let mut viewer=SyncState::default();
-        let messages=viewer.local("windows 中文".into()).unwrap().unwrap();assert_eq!(messages.len(),2);
+        let messages=viewer.local("windows 中文".into(),0).unwrap().unwrap();assert_eq!(messages.len(),2);
         let rpc=decode_wire(&messages[1]).unwrap().into_iter().find_map(|f|match (f.number,f.value){(21,WireValue::Bytes(b))=>Some(b.to_vec()),_=>None}).unwrap();
         let (_,text)=crate::clipboard_protocol::read_text_request(&rpc).unwrap().unwrap();assert_eq!(text,"windows 中文");
     }
@@ -405,7 +461,7 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         for value in ["中文🙂\n", "", "literal $(echo secret) `echo secret`"]{
             state.apply(&backend,value.into()).await.unwrap();
             let read=backend.read().await.unwrap().unwrap();assert_eq!(read,value);
-            assert!(state.local(read).unwrap().is_none());
+            assert!(state.local(read,0).unwrap().is_none());
         }
         let broken=Backend::Command(CommandBackend{write:root.join("missing"),..command});
         let previous=state.last.clone();assert!(state.apply(&broken,"failed".into()).await.is_err());assert_eq!(state.last,previous);

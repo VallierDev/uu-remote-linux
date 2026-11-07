@@ -16,6 +16,7 @@ pub mod desktop;
 #[cfg(uu_gtk)] pub mod ui;
 #[cfg(uu_gtk)] pub mod tools_ui;
 #[cfg(feature="viewer-sdl")] pub mod sdl;
+#[cfg(feature="viewer-sdl")] mod paste_input;
 #[cfg(feature="viewer-sdl")] pub mod hud;
 pub mod thumbs;
 #[cfg(uu_gtk)] pub mod host;
@@ -25,6 +26,7 @@ pub mod native_gamepad;
 pub mod native_rumble;
 
 pub mod clipboard;
+pub mod image_paste;
 pub mod cursor;
 pub mod power;
 pub mod secure_input;

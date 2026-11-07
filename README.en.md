@@ -625,6 +625,8 @@ text format are skipped; empty-text detection depends on the SDL2 backend. Build
 SDL2 reads selections synchronously, so a slow selection owner can temporarily block the window; the bridge timeout cannot interrupt it.
 GNOME-to-official-Mac bidirectional clipboard synchronization is still unverified; this change does not resolve host compatibility.
 
+Mac viewer sessions support **Ctrl+V / Command+V PNG screenshot paste** over the native clipboard channel, after all data is confirmed. No separate switch or remote file/terminal tools are needed. Repeated paste shortcuts during one transfer are coalesced into one paste. See [native image paste](docs/native-image-clipboard.md) for scope and platform limitations.
+
 **Use**:
 - `uuremote-viewer login`: QR login (reuses the sibling `uuremote-server` login window; `--no-gui` prints a terminal QR). The viewer
   shares `~/.config/uuremote/config.json` with the host (`UU_CONFIG` selects another), so it **cannot connect to a host on the same

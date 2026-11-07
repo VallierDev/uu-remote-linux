@@ -1,8 +1,8 @@
-//! Text-only desktop clipboard format negotiation. No file formats are offered.
+//! Desktop clipboard format negotiation. Files are never offered.
 use crate::clipboard::MAX_TEXT;
 use crate::clipboard_protocol::{nested,varint};
 use crate::protocol::{decode_wire,WireValue};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap,BTreeSet};
 
 const UNICODE_TEXT:u64=13;
 /// The official Mac host offers its pasteboard text as format id 0 named `public.utf8-plain-text` (observed live).
@@ -35,13 +35,35 @@ impl TextFormat {
     }
 }
 const WINDOWS_OFFER_NAME:&str="predefined_13";
+pub const MAX_IMAGE:usize=32*1024*1024;
+/// Bound the encoded bytes and advertised dimensions without decoding image pixels.
+pub fn valid_png(data:&[u8])->bool{
+    if data.len()>MAX_IMAGE || !data.starts_with(b"\x89PNG\r\n\x1a\n"){return false}
+    let mut at=8;let mut header=false;let mut pixels=false;
+    while at+12<=data.len(){
+        let n=u32::from_be_bytes(data[at..at+4].try_into().unwrap()) as usize;
+        let Some(end)=at.checked_add(n).and_then(|v|v.checked_add(12)).filter(|v|*v<=data.len()) else{return false};
+        match &data[at+4..at+8]{
+            b"IHDR"=>{if at!=8 || n!=13{return false}let w=u32::from_be_bytes(data[at+8..at+12].try_into().unwrap());let h=u32::from_be_bytes(data[at+12..at+16].try_into().unwrap());
+                if w==0 || h==0 || w>32768 || h>32768 || u64::from(w)*u64::from(h)>100_000_000{return false}header=true;},
+            b"IDAT"=>{if !header{return false}pixels=true;},
+            b"IEND"=>return header&&pixels&&n==0&&end==data.len(),
+            _=>if !header{return false},
+        }
+        at=end;
+    }
+    false
+}
+const PNG:&str="public.png";
+const IMAGE_BLOCK_BYTES:usize=32*1024;
 const BLOCK_BYTES:usize=0x20000;
 const MAX_BYTES:usize=MAX_TEXT*2+2;
 pub struct ResultMessages {pub messages:Vec<(u32,Vec<u8>)>,pub text:Option<String>}
 impl Default for ResultMessages {fn default()->Self{Self{messages:Vec::new(),text:None}}}
 struct Pending {key:String, format:TextFormat, count:Option<usize>, blocks:BTreeMap<usize,Vec<u8>>}
+struct ImageTransfer {key:String,count:usize,acked:BTreeSet<usize>,failed:bool}
 #[derive(Default)]
-pub struct State {local:Option<String>, pending:Option<Pending>}
+pub struct State {local:Option<String>, pending:Option<Pending>, image:Option<Vec<u8>>, image_offer:Option<u64>, image_accepted:bool, image_transfer:Option<ImageTransfer>}
 pub fn format_ids(rpc:&[u8])->Vec<u64>{
     let Ok(Some(clip))=bytes(rpc,9) else{return Vec::new();};
     let Ok(Some(list))=bytes(clip,1) else{return Vec::new();};
@@ -98,10 +120,21 @@ impl State{
     fn offer_formats(&mut self,id:u64,text:String,formats:&[TextFormat])->Result<Vec<u8>,&'static str>{
         if text.len()>MAX_TEXT{return Err("clipboard text exceeds limit");}
         if text.contains('\0')||encode_windows(&text).len()>MAX_BYTES{return Err("clipboard encoded text exceeds limit");}
-        self.local=Some(text);
+        self.local=Some(text);self.image=None;self.image_offer=None;self.image_accepted=false;self.image_transfer=None;
         let mut list=Vec::new();
         for kind in formats {let mut format=Vec::new();int(1,kind.id(),&mut format);string(2,kind.offer_name(),&mut format);nested(1,&format,&mut list);}
         Ok(request(id,1,&list))
+    }
+    /// Mac named formats use the same data-request/block exchange as UTF-8 text.
+    pub fn offer_png(&mut self,id:u64,data:Vec<u8>)->Result<Vec<u8>,&'static str>{
+        if !valid_png(&data) {return Err("invalid clipboard PNG");}
+        self.local=None;self.image=Some(data);self.image_offer=Some(id);self.image_accepted=false;self.image_transfer=None;
+        let mut format=Vec::new();int(1,0,&mut format);string(2,PNG,&mut format);
+        let mut list=Vec::new();nested(1,&format,&mut list);Ok(request(id,1,&list))
+    }
+    pub fn image_status(&self)->Option<bool>{
+        let t=self.image_transfer.as_ref()?;
+        if t.failed {Some(false)}else if self.image_accepted && t.acked.len()==t.count {Some(true)}else{None}
     }
     pub fn request(&mut self,rpc:&[u8],next:&mut impl FnMut()->u64)->Result<ResultMessages,&'static str>{
         if rpc.len()>MAX_BYTES+512{return Err("clipboard RPC exceeds limit");}
@@ -133,13 +166,17 @@ impl State{
             let key=text_field(ask,2)?;
             if key.len()>256||key.is_empty(){return Err("invalid clipboard block key");}
             let format=if number(ask,1)?==UNICODE_TEXT{Some(TextFormat::Windows)}else if text_field(ask,3).is_ok_and(|s|s==MAC_TEXT){Some(TextFormat::Mac)}else{None};
-            let data=format.zip(self.local.as_ref()).map(|(format,text)|format.encode(text));
+            let png=number(ask,1)?==0 && text_field(ask,3).is_ok_and(|s|s==PNG);
+            let data=if png {self.image.clone()}else{format.zip(self.local.as_ref()).map(|(format,text)|format.encode(text))};
+            let block_bytes=if png {IMAGE_BLOCK_BYTES}else{BLOCK_BYTES};
+            if png {log::info!("Viewer PNG data requested: available={} bytes={}",data.is_some(),data.as_ref().map_or(0,Vec::len));}
+            if png && data.is_some() {self.image_transfer=Some(ImageTransfer{key:key.into(),count:data.as_ref().unwrap().chunks(block_bytes).len(),acked:BTreeSet::new(),failed:false});}
             let mut confirm=Vec::new();int(1,if data.is_some(){1}else{2},&mut confirm);string(2,key,&mut confirm);
-            if let Some(data)=&data{int(3,data.chunks(BLOCK_BYTES).len() as u64,&mut confirm);}
+            if let Some(data)=&data{int(3,data.chunks(block_bytes).len() as u64,&mut confirm);}
             out.messages.push((22,response(h,2,&confirm)));
             if let Some(data)=data{
-                for (index,part) in data.chunks(BLOCK_BYTES).enumerate(){
-                    let mut block=Vec::new();string(1,key,&mut block);int(2,index as u64,&mut block);nested(3,part,&mut block);
+                for (index,part) in data.chunks(block_bytes).enumerate(){
+                    let mut block=Vec::new();string(1,key,&mut block);int(2,(index+usize::from(png)) as u64,&mut block);nested(3,part,&mut block);
                     out.messages.push((21,request(next(),3,&block)));
                 }
             }
@@ -165,6 +202,16 @@ impl State{
     }
     pub fn response(&mut self,rpc:&[u8])->Result<Option<String>,&'static str>{
         let Some(clip)=bytes(rpc,5)? else{return Ok(None);};
+        if bytes(clip,1)?.is_some() && self.image_offer.is_some_and(|id|header(rpc).and_then(|h|number(h,1))==Ok(id)) {
+            self.image_accepted=true;log::info!("Viewer PNG format offer acknowledged");
+        }
+        if let Some(ack)=bytes(clip,3)? {
+            if let Some(t)=self.image_transfer.as_mut().filter(|t|text_field(ack,1)==Ok(t.key.as_str())) {
+                let index=number(ack,2)? as usize;
+                if (1..=t.count).contains(&index) {if number(ack,3)?==1 {t.acked.insert(index);}else{t.failed=true;}}
+                if t.acked.len()==t.count {log::info!("Viewer PNG blocks acknowledged: count={}",t.count);}
+            }
+        }
         let Some(confirm)=bytes(clip,2)? else{return Ok(None);};
         let Some(pending)=self.pending.as_mut() else{return Ok(None);};
         if text_field(confirm,2)?!=pending.key{return Ok(None);}
@@ -192,6 +239,68 @@ impl State{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test] fn optional_format_names_do_not_abort_requests_or_change_text_paste(){
+        let mut source=State::default();let mut id=100;let mut next=||{id+=1;id};
+        let mut empty=Vec::new();string(3,"",&mut empty);
+        let mut invalid_utf8=Vec::new();nested(3,&[0xff],&mut invalid_utf8);
+        let mut wrong_type=Vec::new();int(3,1,&mut wrong_type);
+        let mut unknown=Vec::new();string(3,"unsupported",&mut unknown);
+        for name in [Vec::new(),empty,invalid_utf8,wrong_type,unknown]{
+            source.offer_png(1,include_bytes!("../tests/fixtures/clipboard-test.png").to_vec()).unwrap();
+            let mut ask=Vec::new();int(1,0,&mut ask);string(2,"format-key",&mut ask);ask.extend_from_slice(&name);
+            let out=source.request(&request(2,2,&ask),&mut next).unwrap();
+            assert_eq!(out.messages.len(),1);assert_eq!(out.messages[0].0,22);
+            let confirm=bytes(bytes(&out.messages[0].1,5).unwrap().unwrap(),2).unwrap().unwrap();
+            assert_eq!(number(confirm,1),Ok(2));assert!(source.image_transfer.is_none());
+            // Windows identifies text by numeric id even when the optional name is unusable.
+            source.offer_any_host(3,"text remains available".into()).unwrap();
+            let mut ask=Vec::new();int(1,UNICODE_TEXT,&mut ask);string(2,"text-key",&mut ask);ask.extend_from_slice(&name);
+            let out=source.request(&request(4,2,&ask),&mut next).unwrap();assert_eq!(out.messages.len(),2);
+            let block=bytes(bytes(&out.messages[1].1,9).unwrap().unwrap(),3).unwrap().unwrap();
+            assert_eq!(decode_windows(bytes(block,3).unwrap().unwrap()).unwrap(),"text remains available");
+        }
+    }
+    #[test] fn png_offer_and_acknowledgements_are_scoped_and_complete(){
+        let mut source=State::default();let mut id=100;let mut next=||{id+=1;id};
+        let png=include_bytes!("../tests/fixtures/clipboard-test.png").to_vec();
+        let offer=source.offer_png(7,png.clone()).unwrap();assert_eq!(format_ids(&offer),vec![0]);
+        let offer_header=header(&offer).unwrap();source.response(&response(offer_header,1,&[])).unwrap();
+        assert_eq!(source.image_status(),None);
+        let mut ask=Vec::new();string(2,"image-key",&mut ask);string(3,PNG,&mut ask);
+        let sent=source.request(&request(8,2,&ask),&mut next).unwrap();
+        let block=bytes(bytes(&sent.messages[1].1,9).unwrap().unwrap(),3).unwrap().unwrap();
+        assert_eq!(number(block,2),Ok(1));assert_eq!(bytes(block,3).unwrap().unwrap(),png);
+        for (key,index,expected) in [("stale",1,None),("image-key",0,None),("image-key",2,None),("image-key",1,Some(true)),("image-key",1,Some(true))]{
+            let mut ack=Vec::new();string(1,key,&mut ack);int(2,index,&mut ack);int(3,1,&mut ack);
+            source.response(&response(header(&sent.messages[1].1).unwrap(),3,&ack)).unwrap();assert_eq!(source.image_status(),expected);
+        }
+        source.offer_png(200,png).unwrap();source.response(&response(offer_header,1,&[])).unwrap();assert!(!source.image_accepted);
+        source.offer_any_host(201,"text after PNG".into()).unwrap();assert!(source.image.is_none());
+    }
+    #[test] fn png_multiple_blocks_are_bounded_and_wait_for_the_last_ack(){
+        let small=include_bytes!("../tests/fixtures/clipboard-test.png");let mut png=small[..33].to_vec();
+        png.extend_from_slice(&100000u32.to_be_bytes());png.extend_from_slice(b"ruST");png.extend(std::iter::repeat(0).take(100000));
+        png.extend_from_slice(&0xa0f16c3bu32.to_be_bytes());png.extend_from_slice(&small[33..]);assert!(valid_png(&png));
+        let mut source=State::default();let offer=source.offer_png(1,png.clone()).unwrap();
+        source.response(&response(header(&offer).unwrap(),1,&[])).unwrap();
+        let mut ask=Vec::new();string(2,"large-key",&mut ask);string(3,PNG,&mut ask);let mut id=10;
+        let sent=source.request(&request(2,2,&ask),&mut ||{id+=1;id}).unwrap();let mut joined=Vec::new();
+        for (i,(_,rpc)) in sent.messages.iter().skip(1).enumerate(){
+            assert_eq!(source.image_status(),None);
+            let block=bytes(bytes(rpc,9).unwrap().unwrap(),3).unwrap().unwrap();let data=bytes(block,3).unwrap().unwrap();
+            assert!(data.len()<=32*1024);assert_eq!(number(block,2),Ok(i as u64+1));joined.extend_from_slice(data);
+            let mut ack=Vec::new();string(1,"large-key",&mut ack);int(2,i as u64+1,&mut ack);int(3,1,&mut ack);
+            source.response(&response(header(rpc).unwrap(),3,&ack)).unwrap();
+        }
+        assert_eq!(joined,png);assert_eq!(source.image_status(),Some(true));
+    }
+    #[test] fn png_validation_rejects_truncation_excess_and_absurd_dimensions(){
+        let png=include_bytes!("../tests/fixtures/clipboard-test.png").to_vec();assert!(valid_png(&png));
+        for end in 0..png.len(){assert!(!valid_png(&png[..end]));}
+        let mut invalid=png.clone();invalid.extend_from_slice(b"trailing");assert!(!valid_png(&invalid));
+        let mut invalid=png.clone();invalid[16..20].copy_from_slice(&u32::MAX.to_be_bytes());assert!(!valid_png(&invalid));
+        let mut invalid=png;invalid[33..37].copy_from_slice(&u32::MAX.to_be_bytes());assert!(!valid_png(&invalid));
+    }
     #[test] fn mac_utf8_text_round_trips_both_directions(){
         // Mac host offer: format list {1 id 0, 2 "public.utf8-plain-text"} (observed live).
         let mut mac=Vec::new();int(1,0,&mut mac);string(2,MAC_TEXT,&mut mac);
