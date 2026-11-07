@@ -17,6 +17,29 @@ extern "C" {
 }
 fn toast(text: &str) { let t = c(text); unsafe { uu_viewer_ui_toast(t.as_ptr()) } }
 
+fn independent_helper(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    [Some(exe.with_file_name("uuremote-independent")), std::env::var_os("HOME").map(|h|std::path::PathBuf::from(h).join(".local/bin/uuremote-independent"))]
+        .into_iter().flatten().find(|p|p.metadata().is_ok_and(|m|m.is_file() && m.permissions().mode()&0o111!=0))
+}
+
+fn independent(exe: &std::path::Path, id: &str, name: &str, platform: i64, action: &str) -> Result<(), String> {
+    let helper=independent_helper(exe).ok_or_else(||crate::i18n::s("尚未安装独立会话组件", "The independent-session companion is not installed").to_owned())?;
+    let mut child=tokio::process::Command::new(helper)
+        .args([action,id,name,&platform.to_string()])
+        .env("UU_VIEWER_EXECUTABLE",exe).stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .kill_on_drop(false).spawn().map_err(|_|crate::i18n::s("无法打开独立会话组件", "Could not open the independent-session companion"))?;
+    // This short-lived companion launches a user service. It is deliberately not
+    // registered in `sessions`, whose children are stopped when the launcher closes.
+    tokio::spawn(async move {
+        if !child.wait().await.is_ok_and(|s|s.success()) {
+            toast(crate::i18n::s("独立会话操作失败，请检查组件配置", "Independent session failed; check the companion configuration"));
+        }
+    });
+    Ok(())
+}
+
 /// Runs one session child; on failure shows its last error line (log lines start with '[').
 fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::oneshot::Receiver<()>, success: Option<&'static str>) -> tokio::task::JoinHandle<()> {
     use tokio::io::AsyncBufReadExt;
@@ -96,6 +119,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
     let mut next_refresh = Instant::now();
     let mut sessions:std::collections::HashMap<String,Running>=Default::default();
     let mut names: std::collections::HashMap<String, String> = Default::default();
+    let mut platforms: std::collections::HashMap<String, i64> = Default::default();
     // Account token seen last; a new sign-in restarts a host the user turned on.
     let mut host_token: Option<String> = None;
     let mut just_logged_in = false;
@@ -136,6 +160,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                             let current = data.pointer("/current_device/device_id").and_then(Value::as_str);
                             names = list.iter().filter_map(|d| Some((d.get("device_id")?.as_str()?.to_owned(),
                                 d.get("alias").and_then(Value::as_str).unwrap_or_else(|| crate::i18n::s("远端设备","Remote device")).to_owned()))).collect();
+                            platforms = list.iter().filter_map(|d|Some((d.get("device_id")?.as_str()?.to_owned(),d.get("platform").and_then(Value::as_i64).unwrap_or(0)))).collect();
                             let rows = c(&device_rows(&list, current)); unsafe { uu_viewer_ui_set_devices(rows.as_ptr()) }
                         }
                         Err(super::api::Error::AuthenticationExpired) => set_login(false, "", crate::i18n::s("登录已过期，请重新登录","Sign-in expired, please sign in again"), ""),
@@ -163,6 +188,11 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                     unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
                 }
                 ["logout"] => {
+                    // Closing the main window preserves independent sessions; explicit sign-out does not.
+                    if let Some(helper)=independent_helper(&exe) {
+                        let _=tokio::time::timeout(Duration::from_secs(15),tokio::process::Command::new(helper).arg("--stop-all")
+                            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true).status()).await;
+                    }
                     // Sign out locally: drop the account token, keep the device identity.
                     let path = crate::config::path();
                     if let Ok(mut v) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).ok_or(()) {
@@ -181,6 +211,13 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
                         .kill_on_drop(true).spawn().ok();
                     if login.is_none() { set_login(false, "", crate::i18n::s("找不到配套的 uuremote-server","The matching uuremote-server was not found"), ""); }
+                }
+                ["connect", id, kind @ ("independent" | "independent-settings")] if std::env::var("UU_VIEWER_INDEPENDENT").as_deref()==Ok("1") => {
+                    if *kind=="independent" && !replace(&mut sessions,id).await {continue}
+                    if let Some(name)=names.get(*id) {
+                        let action=if *kind=="independent-settings" {"configure"} else {"open"};
+                        if let Err(error)=independent(&exe,id,name,platforms.get(*id).copied().unwrap_or(0),action) {toast(&error);}
+                    } else {toast(crate::i18n::s("设备已变化，请刷新列表", "The device changed; refresh the list"));}
                 }
                 ["connect", id, kind] if matches!(*kind, "desktop" | "watch") => {
                     if !replace(&mut sessions,id).await{continue}

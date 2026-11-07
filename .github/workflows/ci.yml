@@ -81,6 +81,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
       - run: cargo build --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
+      - name: Independent-session companion
+        run: |
+          python3 -m unittest discover -s contrib/independent-viewer -p 'test_*.py' -v
+          shellcheck contrib/independent-viewer/install.sh
 
   test-wayland:
     runs-on: ubuntu-24.04
