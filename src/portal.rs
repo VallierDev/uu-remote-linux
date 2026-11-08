@@ -181,6 +181,13 @@ mod native {
             drop(previous_handle);
             Ok(size)
         }
+        /// Point the host and the engine at the cursor mode the installed session really has.
+        fn restore_installed_cursor_mode(&self, fallback: bool) {
+            let installed = self.handle.lock().ok().map(|handle| unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) }).unwrap_or(0);
+            let embedded = if installed > 0 { installed == 2 } else { fallback };
+            unsafe { uu_portal_set_cursor_mode(if embedded { 2 } else { 1 }); }
+            super::CURSOR_MODE.store(if embedded { 2 } else { 1 }, std::sync::atomic::Ordering::Release);
+        }
         pub fn is_alive(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 })
         }
@@ -452,16 +459,14 @@ mod native {
                     Ok(true)
                 }
                 Ok(None) => {
-                    // Deferred (input went down during the open): keep the engine on the old mode.
-                    unsafe { uu_portal_set_cursor_mode(if previous { 2 } else { 1 }); }
+                    // Deferred (input went down during the open): open_inner published the
+                    // replacement's mode, but that session is never installed.
+                    self.restore_installed_cursor_mode(previous);
                     Ok(false)
                 }
                 Err(error) => {
                     // Leave the engine on the mode the installed session actually has.
-                    let installed = self.handle.lock().ok().map(|handle| unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) }).unwrap_or(0);
-                    let mode = if installed > 0 { installed == 2 } else { previous };
-                    unsafe { uu_portal_set_cursor_mode(if mode { 2 } else { 1 }); }
-                    super::CURSOR_MODE.store(if mode { 2 } else { 1 }, Ordering::Release);
+                    self.restore_installed_cursor_mode(previous);
                     Err(error)
                 }
             }

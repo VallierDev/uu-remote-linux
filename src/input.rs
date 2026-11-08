@@ -511,8 +511,9 @@ impl InputInjector {
             let mut pending=self.portal_held.lock().unwrap();
             (std::mem::take(&mut pending.buttons), std::mem::take(&mut pending.keys))
         };
-        for button in portal_buttons { let _=self.inject_button(button,false); }
-        for key in portal_keys { let _=self.inject_key(key,false); }
+        // Stop on the first failure like the sweep above: each call can wait out the portal timeout.
+        let buttons_ok = portal_buttons.into_iter().all(|button| self.inject_button(button,false)==0);
+        if buttons_ok { for key in portal_keys { if self.inject_key(key,false)!=0 { break; } } }
         PORTAL_INPUT_HELD.store(false,std::sync::atomic::Ordering::Relaxed);
         *self.shortcuts.lock().unwrap()=Shortcuts::default();
         *self.cmd.lock().unwrap()=CmdState::default();
