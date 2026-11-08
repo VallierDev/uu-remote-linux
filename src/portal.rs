@@ -120,7 +120,7 @@ mod native {
             was_locked.store(false, std::sync::atomic::Ordering::Release);
         }
     }
-    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool }
+    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, clipboard_write: Mutex<()> }
     impl Session {
         fn take_lock_observation(&self) -> Result<bool, String> {
             // A recovery in progress must see the lock even if another capture
@@ -268,7 +268,7 @@ mod native {
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
             // before new damage can leave a static desktop permanently blank (#2).
-            Ok(Self { handle: Mutex::new(Arc::new(Handle(handle))), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into() })
+            Ok(Self { handle: Mutex::new(Arc::new(Handle(handle))), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()) })
         }
         /// Frame pixels of the monitor the stream currently follows.
         pub fn size(&self) -> (u32, u32) {
@@ -374,6 +374,9 @@ mod native {
                 }
                 let size = replacement.size();
                 let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned".to_string())?;
+                // Hold clipboard writers off from before the swap until the text is carried over,
+                // so a viewer update cannot land on the new session and then be overwritten.
+                let clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned".to_string())?;
                 let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
                 self.size.store(pack(size.0, size.1), Ordering::Release);
                 let previous_handle = std::mem::replace(&mut *handle, next);
@@ -383,6 +386,7 @@ mod native {
                 if unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) } < 0 {
                     log::warn!("Portal clipboard ownership could not be carried over");
                 }
+                drop(clipboard);
                 drop(previous_handle);
                 Ok(size)
             })();
@@ -626,6 +630,9 @@ mod native {
         }
         pub fn clipboard_set(&self, text: &str) -> Result<(), String> {
             if text.len()>crate::clipboard::MAX_TEXT || *self.locked.borrow()!=Some(false) { return Err("Portal clipboard unavailable".into()); }
+            // Serialize with the cursor-session swap: it carries the old text over before
+            // releasing this lock, so a update that arrives during the swap wins afterwards.
+            let _write=self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned")?;
             let handle=self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
             if unsafe { uu_portal_clipboard_set(handle.0.as_ptr(),text.as_ptr(),text.len()) }==0 {Ok(())} else {Err("Portal clipboard ownership failed".into())}
         }
@@ -704,6 +711,7 @@ mod native {
                     recovery: Mutex::new(Recovery::default()),
                     size: pack(physical.0, physical.1).into(),
                     monitor: Mutex::new(None), virtual_output: false.into(),
+                    clipboard_write: Mutex::new(()),
                 }))
             }
 
