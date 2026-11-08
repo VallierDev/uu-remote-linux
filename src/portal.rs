@@ -165,12 +165,15 @@ mod native {
         }
         /// Swap `replacement` in, carrying the viewer's clipboard text before the old session
         /// closes. `expected` rejects a desktop end that raced the open.
-        fn install_replacement(&self, replacement: Self, expected: Option<u64>) -> Result<(u32, u32), String> {
+        fn install_replacement(&self, replacement: Self, expected: Option<u64>, defer_held: bool) -> Result<(u32, u32), String> {
             let size = replacement.size();
             let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned".to_string())?;
             let clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned".to_string())?;
             // Records made against the new handle must postdate the reset below.
             let serial = crate::input::lock_portal_held();
+            // Checked under the serial lock: an input recorded after an earlier check would
+            // otherwise be destroyed with the session it was sent to.
+            if defer_held && crate::input::portal_input_held() { return Err("input held during the swap".into()); }
             let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
             if expected.is_some_and(|generation| self.end_generation.load(std::sync::atomic::Ordering::Acquire) != generation) {
                 return Err("desktop session ended during the rebuild".into());
@@ -362,7 +365,7 @@ mod native {
             if replacement.monitor().as_deref() != Some(connector) {
                 return Err("Another monitor was shared; choose this monitor in the host dialog".into());
             }
-            self.install_replacement(replacement, None)?;
+            self.install_replacement(replacement, None, false)?;
             if let Ok(mut monitor) = self.monitor.lock() { *monitor = Some(connector.to_owned()); }
             Ok(())
         }
@@ -378,7 +381,7 @@ mod native {
             // exists (seen live: 3968x1280 = panel + virtual), so end the virtual share first.
             if !on { self.end(); }
             let replacement = Self::open_inner(None, monitor.as_deref(), false, on).map_err(|error| error.to_string())?;
-            let size = self.install_replacement(replacement, None)?;
+            let size = self.install_replacement(replacement, None, false)?;
             self.virtual_output.store(on, std::sync::atomic::Ordering::Release);
             log::info!("Portal capture source: virtual={on} size={}x{}", size.0, size.1);
             Ok(())
@@ -450,7 +453,11 @@ mod native {
                 self.check_geometry(&replacement).map_err(|error| error.to_string())?;
                 // A key or button can go down while the open waits for consent.
                 if crate::input::portal_input_held() { return Ok(None); }
-                let size = self.install_replacement(replacement, Some(generation))?;
+                let size = match self.install_replacement(replacement, Some(generation), true) {
+                    Ok(size) => size,
+                    Err(error) if error == "input held during the swap" => return Ok(None),
+                    Err(error) => return Err(error),
+                };
                 let applied = self.handle.lock().ok().map(|handle| unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) }).unwrap_or(0);
                 Ok(Some((size, applied)))
             })();
@@ -507,7 +514,7 @@ mod native {
             if replacement.monitor() != monitor { return Err("another monitor was shared".into()); }
             if !replacement.touch_supported() { return Err("the touchscreen was not granted".into()); }
             self.check_geometry(&replacement).map_err(|error| error.to_string())?;
-            self.install_replacement(replacement, None)?;
+            self.install_replacement(replacement, None, false)?;
             Ok(true)
         }
         pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, super::PortalError> {
