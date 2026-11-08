@@ -46,13 +46,24 @@ struct HeldInput { buttons: std::collections::BTreeSet<i32>, keys: std::collecti
 /// Inputs held through the portal session are dropped when that session is replaced; the
 /// cursor-mode rebuild waits until they are released. uinput devices survive the swap.
 static PORTAL_INPUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn portal_input_held() -> bool { PORTAL_INPUT_HELD.load(std::sync::atomic::Ordering::Relaxed) }
+/// An active contact on the portal touchscreen is also lost when the session is replaced.
+static PORTAL_TOUCH_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn portal_input_held() -> bool {
+    PORTAL_INPUT_HELD.load(std::sync::atomic::Ordering::Relaxed) || PORTAL_TOUCH_HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Inputs currently bound to the portal session; a replacement tears those devices down.
 static PORTAL_HELD: std::sync::Mutex<HeldInput> = std::sync::Mutex::new(HeldInput { buttons: std::collections::BTreeSet::new(), keys: std::collections::BTreeSet::new() });
+/// Serializes recording an input with retiring the records of a replaced handle.
+static PORTAL_HELD_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub fn lock_portal_held() -> std::sync::MutexGuard<'static, ()> {
+    PORTAL_HELD_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 /// The portal replaced its native devices: records of held portal inputs no longer apply.
+/// The caller holds `lock_portal_held()`, so an input recorded against the new handle stays.
 pub fn portal_session_replaced() {
     if let Ok(mut held)=PORTAL_HELD.lock() { *held=HeldInput::default(); }
     PORTAL_INPUT_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
+    PORTAL_TOUCH_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 /// Held modifier VKs (bit 0 Ctrl, 1 Shift, 2 Alt, 3 Win) and keys that got a synthetic Shift.
 #[derive(Default)]
@@ -398,7 +409,15 @@ impl InputInjector {
     }
     fn inject_touch(&self, phase: i32, x: i32, y: i32) -> i32 {
         let Some(portal) = self.portal.lock().unwrap().clone() else { return -1 };
-        self.portal_result("touch", portal.touch(phase, f64::from(x), f64::from(y)))
+        let result = self.portal_result("touch", portal.touch(phase, f64::from(x), f64::from(y)));
+        if result == 0 {
+            match phase {
+                0 => PORTAL_TOUCH_HELD.store(true, std::sync::atomic::Ordering::Relaxed),
+                2 => PORTAL_TOUCH_HELD.store(false, std::sync::atomic::Ordering::Relaxed),
+                _ => {}
+            }
+        }
+        result
     }
 
     fn terminal_focused(&self) -> bool {
@@ -515,6 +534,7 @@ impl InputInjector {
         *held=HeldInput::default();
         // Inputs bound to the portal session are not covered by the uinput release above.
         let (portal_buttons, portal_keys) = {
+            let _serial=lock_portal_held();
             let mut pending=PORTAL_HELD.lock().unwrap();
             (std::mem::take(&mut pending.buttons), std::mem::take(&mut pending.keys))
         };
@@ -557,11 +577,13 @@ impl InputInjector {
     }
     /// Inputs bound to the portal session are dropped when that session is replaced.
     fn record_portal_button(&self, button: i32, pressed: bool) {
+        let _serial = lock_portal_held();
         let mut held = PORTAL_HELD.lock().unwrap();
         if pressed { held.buttons.insert(button); } else { held.buttons.remove(&button); }
         PORTAL_INPUT_HELD.store(!held.buttons.is_empty() || !held.keys.is_empty(), std::sync::atomic::Ordering::Relaxed);
     }
     fn record_portal_key(&self, symbol: u64, pressed: bool) {
+        let _serial = lock_portal_held();
         let mut held = PORTAL_HELD.lock().unwrap();
         if pressed { held.keys.insert(symbol); } else { held.keys.remove(&symbol); }
         PORTAL_INPUT_HELD.store(!held.buttons.is_empty() || !held.keys.is_empty(), std::sync::atomic::Ordering::Relaxed);

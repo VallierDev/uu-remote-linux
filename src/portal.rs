@@ -105,6 +105,7 @@ mod native {
         drop(locked);
         let Some(replacement) = prepare()? else { return Ok(false); };
         let _clipboard = clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned")?;
+        let _serial = crate::input::lock_portal_held();
         let (old, installed) = {
             let mut handle = current.lock().map_err(|_| "Portal session lock poisoned")?;
             let old = std::mem::replace(&mut *handle, replacement);
@@ -168,6 +169,8 @@ mod native {
             let size = replacement.size();
             let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned".to_string())?;
             let clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned".to_string())?;
+            // Records made against the new handle must postdate the reset below.
+            let serial = crate::input::lock_portal_held();
             let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
             if expected.is_some_and(|generation| self.end_generation.load(std::sync::atomic::Ordering::Acquire) != generation) {
                 return Err("desktop session ended during the rebuild".into());
@@ -183,6 +186,7 @@ mod native {
             drop(previous_handle);
             // The replaced devices took any held portal input with them.
             crate::input::portal_session_replaced();
+            drop(serial);
             Ok(size)
         }
         /// Point the host and the engine at the cursor mode the installed session really has.
@@ -342,6 +346,7 @@ mod native {
             self.end_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if let Ok(handle) = self.handle.lock() { unsafe { uu_portal_end(handle.0.as_ptr()) }; }
             // The ended session's native devices are gone; forget the inputs bound to them.
+            let _serial = crate::input::lock_portal_held();
             crate::input::portal_session_replaced();
         }
         /// Mutter connector of the monitor this session captures, when several are advertised.
@@ -538,6 +543,7 @@ mod native {
                 self.check_geometry(&replacement)?;
                 let replacement_handle = replacement.handle.into_inner().map_err(|_| super::PortalError { code: 3 })?;
                 let clipboard = self.clipboard_write.lock().map_err(|_| super::PortalError { code: 3 })?;
+                let serial = crate::input::lock_portal_held();
                 let mut handle = self.handle.lock().map_err(|_| super::PortalError { code: 3 })?;
                 if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
                 let previous_handle = std::mem::replace(&mut *handle, replacement_handle);
@@ -548,6 +554,7 @@ mod native {
                 drop(previous_handle);
                 // The replaced devices took any held portal input with them.
                 crate::input::portal_session_replaced();
+                drop(serial);
                 clear_pause_for_unlocked_replacement(&self.was_locked, *self.locked.borrow());
                 log::info!("Portal capture session restored after closure");
                 Ok(())
