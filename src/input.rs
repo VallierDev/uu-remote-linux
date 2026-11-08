@@ -81,7 +81,7 @@ fn finger_held(finger: Finger, now: std::time::Instant) -> Option<(i32,i32)> {
 /// Viewer platform from the connect header `controller_platform` (website enum: 1 windows, 2 android,
 /// 3 ios, 4 macos, 5 tv).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Controller { #[default] Other, Mac, Mobile, Ios }
+pub enum Controller { #[default] Other, Windows, Mac, Mobile, Ios }
 impl Controller {
     /// Touch semantics cover both mobile platforms; the iOS RPC 7 screen-off encoding is its own quirk.
     pub fn is_mobile(self) -> bool { matches!(self, Self::Mobile | Self::Ios) }
@@ -92,9 +92,11 @@ impl Controller {
             Some(4) => Self::Mac,
             Some(3) => Self::Ios,
             Some(2) => Self::Mobile,
+            Some(1) => Self::Windows,
             _ if text.as_deref().is_some_and(|s| s.contains("mac") || s.contains("darwin")) => Self::Mac,
             _ if text.as_deref().is_some_and(|s| s.contains("ios") || s.contains("iphone") || s.contains("ipad")) => Self::Ios,
             _ if text.as_deref().is_some_and(|s| s.contains("android")) => Self::Mobile,
+            _ if text.as_deref().is_some_and(|s| s.contains("windows")) => Self::Windows,
             _ => Self::Other,
         }
     }
@@ -1310,7 +1312,8 @@ mod touch_tests {
         assert!(!Controller::Mac.is_mobile());
         assert_eq!(Controller::from_platform(Some(&json!(4))), Controller::Mac);
         assert_eq!(Controller::from_platform(Some(&json!("MacOS"))), Controller::Mac);
-        assert_eq!(Controller::from_platform(Some(&json!(1))), Controller::Other);
+        assert_eq!(Controller::from_platform(Some(&json!(1))), Controller::Windows);
+        assert_eq!(Controller::from_platform(Some(&json!("Windows"))), Controller::Windows);
         assert_eq!(Controller::from_platform(None), Controller::Other);
     }
     #[test]
