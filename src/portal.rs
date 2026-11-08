@@ -285,6 +285,9 @@ mod native {
         /// time GNOME asks on the host) and swap it in, so every holder of this Arc follows.
         pub fn switch_to(&self, connector: &str) -> Result<(), String> {
             if self.monitor().as_deref() == Some(connector) { return Ok(()); }
+            // Both this and the cursor-mode rebuild replace the handle: serialize them so the
+            // later open cannot install a stale source over the other.
+            let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
             let replacement = Self::open_inner(None, Some(connector), false, false).map_err(|error| error.to_string())?;
             if replacement.monitor().as_deref() != Some(connector) {
                 return Err("Another monitor was shared; choose this monitor in the host dialog".into());
@@ -327,18 +330,43 @@ mod native {
         /// Ask the compositor to draw the pointer into the stream (embedded) or keep it out
         /// (hidden). The portal only reads this when the session is created, so swap in a fresh
         /// session with the saved consent; every holder of this Arc follows the new handle.
-        pub fn set_cursor_embedded(&self, embedded: bool) -> Result<(), String> {
-            use std::sync::atomic::Ordering;
-            if super::cursor_embedded() == embedded { return Ok(()); }
+        /// Ok(true): the mode changed. Ok(false): nothing to do, or the desktop is locked and the
+        /// next unlocked motion retries.
+        pub fn set_cursor_embedded(&self, embedded: bool) -> Result<bool, String> {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            if super::cursor_embedded() == embedded { return Ok(false); }
+            // GNOME closes the portal session on lock; a rebuild then waits for consent that
+            // cannot be answered and holds `recovery` against the post-unlock recovery.
+            if *self.locked.borrow() != Some(false) { return Ok(false); }
             let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
-            if super::cursor_embedded() == embedded { return Ok(()); }
+            if super::cursor_embedded() == embedded { return Ok(false); }
+            if *self.locked.borrow() != Some(false) { return Ok(false); }
             let previous = super::cursor_embedded();
             let virtual_output = self.is_virtual();
             let monitor = self.monitor();
+            // A lock during the open must cancel the consent request, not wait out its timeout.
+            let cancel = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let watcher = {
+                let locked = self.locked.clone();
+                let cancel = cancel.clone();
+                let stop = stop.clone();
+                std::thread::Builder::new().name("portal-cursor-lock".into()).spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        if *locked.borrow() != Some(false) { cancel.store(true, Ordering::Release); return; }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }).ok()
+            };
             unsafe { uu_portal_set_cursor_mode(if embedded { 2 } else { 1 }); }
             let result = (|| -> Result<(u32, u32), String> {
-                let replacement = Self::open_inner(None, monitor.as_deref(), false, virtual_output)
+                let replacement = Self::open_inner(Some(&cancel), monitor.as_deref(), false, virtual_output)
                     .map_err(|error| error.to_string())?;
+                if *self.locked.borrow() != Some(false) { return Err("desktop locked during the rebuild".into()); }
+                // A source change that finished meanwhile must not be undone by this swap.
+                if self.is_virtual() != virtual_output || (!virtual_output && self.monitor() != monitor) {
+                    return Err("capture source changed during the rebuild".into());
+                }
                 // A restored consent must not silently move the share to another monitor.
                 if !virtual_output && monitor.is_some() && replacement.monitor() != monitor {
                     return Err("another monitor was shared; choose this monitor in the host dialog".into());
@@ -352,11 +380,13 @@ mod native {
                 drop(previous_handle);
                 Ok(size)
             })();
+            stop.store(true, Ordering::Release);
+            drop(watcher);
             match result {
                 Ok((width, height)) => {
                     super::CURSOR_MODE.store(if embedded { 2 } else { 1 }, Ordering::Release);
                     log::info!("Portal cursor mode: embedded={embedded} size={width}x{height}");
-                    Ok(())
+                    Ok(true)
                 }
                 Err(error) => {
                     // Leave the engine on the mode the swapped-in session did not get.
@@ -962,7 +992,7 @@ impl PortalSession {
     pub fn end(&self) {}
     pub fn switch_to(&self, _: &str) -> Result<(), String> { Err(error(15)) }
     pub fn set_virtual(&self, _: bool) -> Result<(), String> { Err(error(15)) }
-    pub fn set_cursor_embedded(&self, _: bool) -> Result<(), String> { Err(error(15)) }
+    pub fn set_cursor_embedded(&self, _: bool) -> Result<bool, String> { Err(error(15)) }
     pub fn is_virtual(&self) -> bool { false }
 }
 #[cfg(not(all(target_os = "linux", feature = "portal")))]
@@ -1038,7 +1068,7 @@ fn cursor_embedded() -> bool {
     }
 }
 /// Ask the running session for a stream with (or without) the compositor cursor.
-pub fn set_cursor_embedded(embedded: bool) -> Result<(), String> {
+pub fn set_cursor_embedded(embedded: bool) -> Result<bool, String> {
     let session = ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(std::sync::Weak::upgrade)
         .ok_or("Portal desktop unavailable")?;
     session.set_cursor_embedded(embedded)
@@ -1098,6 +1128,8 @@ fn pointer_decision(state: &mut PointerMode, current: bool, relative: bool, now:
 }
 pub fn note_pointer_motion(relative: bool) {
     if !cursor_switch_available() { return; }
+    // A swap closes the portal input devices; do not drop keys or buttons the viewer holds.
+    if crate::input::portal_input_held() { return; }
     let decision = {
         let Ok(mut state) = POINTER_MODE.lock() else { return; };
         let decision = pointer_decision(&mut state, cursor_embedded(), relative, std::time::Instant::now());
@@ -1118,10 +1150,15 @@ pub fn note_pointer_motion(relative: bool) {
         state.streak = 0;
         state.first = None;
         match result {
-            Ok(()) => {
+            Ok(true) => {
                 state.blocked_until = None;
                 drop(state);
                 log::info!("Cursor mode follows the pointer: embedded={target}");
+            }
+            Ok(false) => {
+                // Locked, or something else changed the mode first; the next motion retries.
+                state.blocked_until = None;
+                drop(state);
             }
             Err(error) => {
                 state.blocked_until = Some(std::time::Instant::now() + POINTER_COOLDOWN);

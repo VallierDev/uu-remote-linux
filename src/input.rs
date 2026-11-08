@@ -43,6 +43,10 @@ struct PendingPointer {
 unsafe fn x11_pointer_state(_: *mut libc::c_int,_:*mut libc::c_int,_:*mut libc::c_uint)->libc::c_int {-1}
 #[derive(Default)]
 struct HeldInput { buttons: std::collections::BTreeSet<i32>, keys: std::collections::BTreeSet<u64> }
+/// Inputs held through the portal session are dropped when that session is replaced; the
+/// cursor-mode rebuild waits until they are released. uinput devices survive the swap.
+static PORTAL_INPUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn portal_input_held() -> bool { PORTAL_INPUT_HELD.load(std::sync::atomic::Ordering::Relaxed) }
 /// Held modifier VKs (bit 0 Ctrl, 1 Shift, 2 Alt, 3 Win) and keys that got a synthetic Shift.
 #[derive(Default)]
 struct Shortcuts { modifiers: u8, shifted: std::collections::BTreeSet<i32> }
@@ -267,6 +271,7 @@ impl InputInjector {
         if result == 0 {
             let mut held = self.held.lock().unwrap();
             if is_press { held.buttons.insert(button); } else { held.buttons.remove(&button); }
+            self.publish_held(&held);
         } else if self.backend != crate::desktop_backend::DesktopBackend::Portal { log::warn!("Desktop mouse injection failed: {}",result); }
         static BUTTON_AUDIT:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
         if self.backend==crate::desktop_backend::DesktopBackend::X11 && BUTTON_AUDIT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
@@ -472,6 +477,7 @@ impl InputInjector {
             if result == 0 {
                 let mut held=self.held.lock().unwrap();
                 if is_press {held.keys.insert(symbol);} else {held.keys.remove(&symbol);}
+                self.publish_held(&held);
             }
         }
     }
@@ -502,6 +508,7 @@ impl InputInjector {
             if !keys_ok {log::warn!("Desktop input reset incomplete: backend unavailable");}
         }
         *held=HeldInput::default();
+        self.publish_held(&held);
         *self.shortcuts.lock().unwrap()=Shortcuts::default();
         *self.cmd.lock().unwrap()=CmdState::default();
     }
@@ -534,6 +541,11 @@ impl InputInjector {
                 -1
             }
         }
+    }
+    /// A portal-session rebuild drops keys and buttons bound to it; uinput devices survive.
+    fn publish_held(&self, held: &HeldInput) {
+        let busy = self.uinput.is_none() && (!held.buttons.is_empty() || !held.keys.is_empty());
+        PORTAL_INPUT_HELD.store(busy, std::sync::atomic::Ordering::Relaxed);
     }
     fn inject_move(&self,x:i32,y:i32,relative:bool)->i32 {
         // The viewer's mouse mode decides whether the stream must carry the pointer (see
