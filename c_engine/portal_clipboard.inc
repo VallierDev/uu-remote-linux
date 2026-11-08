@@ -101,18 +101,28 @@ int uu_portal_clipboard_set(struct uu_portal *p,const uint8_t *text,size_t lengt
     if (!uu_portal_clipboard_ready(p) || length>CLIP_LIMIT || !g_utf8_validate((const char *)text,(gssize)length,NULL)) return -1;
     char *copy=g_malloc(length+1); memcpy(copy,text,length); copy[length]=0;
     pthread_mutex_lock(&p->lock);
-    g_free(p->clipboard_text); p->clipboard_text=copy; p->clipboard_length=length;
-    p->clipboard_changed=0;
+    /* Serve the new text while the portal announces it, and restore the old one on failure. */
+    char *old_text=p->clipboard_text; size_t old_length=p->clipboard_length;
+    uint64_t revision=p->clipboard_revision;
+    p->clipboard_text=copy; p->clipboard_length=length; p->clipboard_changed=0;
     pthread_mutex_unlock(&p->lock);
     const char *types[]={"text/plain;charset=utf-8","text/plain",NULL};
     GVariantBuilder options; g_variant_builder_init(&options,G_VARIANT_TYPE_VARDICT);
     g_variant_builder_add(&options,"{sv}","mime_types",g_variant_new_strv(types,-1));
     GVariant *reply=g_dbus_connection_call_sync(p->bus,DEST,PATH,CLIPBOARD,"SetSelection",
         g_variant_new("(o@a{sv})",p->session,g_variant_builder_end(&options)),NULL,G_DBUS_CALL_FLAGS_NONE,2000,NULL,NULL);
-    if (!reply) return -1;
+    if (!reply) {
+        pthread_mutex_lock(&p->lock);
+        g_free(p->clipboard_text);
+        p->clipboard_text=old_text; p->clipboard_length=old_length;
+        pthread_mutex_unlock(&p->lock);
+        return -1;
+    }
     g_variant_unref(reply);
+    g_free(old_text);
     pthread_mutex_lock(&p->lock);
-    p->clipboard_owns=1;
+    /* Another owner may have been reported meanwhile; its newer state must win. */
+    if (p->clipboard_revision==revision) p->clipboard_owns=1;
     pthread_mutex_unlock(&p->lock);
     return 0;
 }

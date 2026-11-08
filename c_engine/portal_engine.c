@@ -39,6 +39,7 @@ struct uu_portal {
     char *restore_token;
     guint closed_subscription, clipboard_owner_subscription, clipboard_transfer_subscription, display_subscription;
     int clipboard_enabled, clipboard_changed, clipboard_owns;
+    int cursor_available, cursor_applied;
     char *clipboard_text, *clipboard_mime;
     size_t clipboard_length;
     uint64_t clipboard_revision;
@@ -85,6 +86,10 @@ static atomic_uint token_sequence = 1;
 /* Cursor preference for sessions opened from now on; -1 defers to UU_PORTAL_CURSOR_MODE. */
 static atomic_int cursor_mode_override = -1;
 void uu_portal_set_cursor_mode(int mode) { atomic_store(&cursor_mode_override, mode); }
+/* Cursor mode the last session actually requested: 1 hidden, 2 embedded, 0 when unavailable. */
+int uu_portal_cursor_mode(struct uu_portal *p) { return p ? p->cursor_applied : 0; }
+/* Cursor modes the backend advertised for the last session; 0 when the property was unreadable. */
+int uu_portal_cursor_modes(struct uu_portal *p) { return p ? p->cursor_available : 0; }
 static void initialize_pipewire(void) { pw_init(NULL, NULL); }
 static GVariant *empty_options(void) { return g_variant_new_array(G_VARIANT_TYPE("{sv}"), NULL, 0); }
 static int open_cancelled(struct uu_portal *p) {
@@ -675,8 +680,13 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
         const char *wanted = g_getenv("UU_PORTAL_CURSOR_MODE");
         cursor_mode = (wanted && !g_ascii_strcasecmp(wanted, "embedded")) ? 2 : 1;
     }
-    if (cursor_mode == 2 && (interface_property(p, SCREEN, "AvailableCursorModes") & 2))
+    /* The host reads these back so its belief matches what the session actually requested. */
+    p->cursor_available = (int)interface_property(p, SCREEN, "AvailableCursorModes");
+    p->cursor_applied = 1;
+    if (cursor_mode == 2 && (p->cursor_available & 2)) {
         g_variant_builder_add(&options, "{sv}", "cursor_mode", g_variant_new_uint32(2));
+        p->cursor_applied = 2;
+    }
     results = request(p, SCREEN, "SelectSources", &options, 1, error);
     if (!results) goto done;
     g_variant_unref(results);

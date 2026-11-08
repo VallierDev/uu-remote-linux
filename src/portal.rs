@@ -43,6 +43,8 @@ mod native {
         fn uu_portal_open_persist_capture(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), save_data: *mut c_void, cancelled: Option<extern "C" fn(*mut c_void) -> i32>, cancel_data: *mut c_void, prefer_dmabuf: i32, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_open_detailed(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void, i32, i32, i32), save_data: *mut c_void, cancelled: Option<extern "C" fn(*mut c_void) -> i32>, cancel_data: *mut c_void, prefer_dmabuf: i32, source_types: u32, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_set_cursor_mode(mode: i32);
+        fn uu_portal_cursor_mode(portal: *mut c_void) -> i32;
+        fn uu_portal_cursor_modes(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_supported(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_ready(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_set(portal: *mut c_void, text: *const u8, length: usize) -> i32;
@@ -85,6 +87,8 @@ mod native {
     }
     // Portal preparation and native teardown can wait for consent or D-Bus.
     // Only the swap may hold the mutex shared with input and clipboard.
+    // Only the unit tests swap a test handle now; production swaps carry the clipboard.
+    #[cfg(test)]
     fn replace_handle<T>(current: &Mutex<T>, locked: MutexGuard<'_, T>, prepare: impl FnOnce() -> Result<Option<T>, String>) -> Result<bool, String> {
         drop(locked);
         let Some(replacement) = prepare()? else { return Ok(false); };
@@ -92,6 +96,21 @@ mod native {
             let mut handle = current.lock().map_err(|_| "Portal session lock poisoned")?;
             std::mem::replace(&mut *handle, replacement)
         };
+        drop(old);
+        Ok(true)
+    }
+    /// Like `replace_handle`, but carries the viewer's clipboard text before the old session
+    /// closes. Clipboard writers wait from before the swap until the carry-over finishes.
+    fn replace_handle_carrying(current: &Mutex<Arc<Handle>>, clipboard_write: &Mutex<()>, locked: MutexGuard<'_, Arc<Handle>>, prepare: impl FnOnce() -> Result<Option<Arc<Handle>>, String>) -> Result<bool, String> {
+        drop(locked);
+        let Some(replacement) = prepare()? else { return Ok(false); };
+        let _clipboard = clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned")?;
+        let (old, installed) = {
+            let mut handle = current.lock().map_err(|_| "Portal session lock poisoned")?;
+            let old = std::mem::replace(&mut *handle, replacement);
+            (old, Arc::clone(&*handle))
+        };
+        unsafe { uu_portal_clipboard_copy(old.0.as_ptr(), installed.0.as_ptr()) };
         drop(old);
         Ok(true)
     }
@@ -140,6 +159,27 @@ mod native {
             } else {
                 Ok(())
             }
+        }
+        /// Swap `replacement` in, carrying the viewer's clipboard text before the old session
+        /// closes. `expected` rejects a desktop end that raced the open.
+        fn install_replacement(&self, replacement: Self, expected: Option<u64>) -> Result<(u32, u32), String> {
+            let size = replacement.size();
+            let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned".to_string())?;
+            let clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned".to_string())?;
+            let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
+            if expected.is_some_and(|generation| self.end_generation.load(std::sync::atomic::Ordering::Acquire) != generation) {
+                return Err("desktop session ended during the rebuild".into());
+            }
+            self.size.store(pack(size.0, size.1), std::sync::atomic::Ordering::Release);
+            let previous_handle = std::mem::replace(&mut *handle, next);
+            let installed = Arc::clone(&*handle);
+            drop(handle);
+            if unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) } < 0 {
+                log::warn!("Portal clipboard ownership could not be carried over");
+            }
+            drop(clipboard);
+            drop(previous_handle);
+            Ok(size)
         }
         pub fn is_alive(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 })
@@ -220,7 +260,8 @@ mod native {
                 prefer_dmabuf = true;
             }
             let pointer = if detailed {
-                let cancel = cancelled.filter(|_| !virtual_output);
+                // Virtual shares can wait for consent too; cancel them like monitor opens.
+                let cancel = cancelled;
                 let callback = cancel.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
                 let cancel_data = cancel.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
                 unsafe { uu_portal_open_detailed(
@@ -268,7 +309,14 @@ mod native {
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
             // before new damage can leave a static desktop permanently blank (#2).
-            Ok(Self { handle: Mutex::new(Arc::new(Handle(handle))), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()), end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
+            let handle = Arc::new(Handle(handle));
+            // The engine records what it actually requested; a backend can refuse the mode the
+            // environment or a runtime switch asked for.
+            let available = unsafe { uu_portal_cursor_modes(handle.0.as_ptr()) };
+            let applied = unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) };
+            if applied > 0 { super::CURSOR_MODE.store(if applied == 2 { 2 } else { 1 }, std::sync::atomic::Ordering::Release); }
+            if available > 0 { super::CURSOR_EMBED.store(if available & 2 != 0 { 2 } else { 1 }, std::sync::atomic::Ordering::Release); }
+            Ok(Self { handle: Mutex::new(handle), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()), end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
         }
         /// Frame pixels of the monitor the stream currently follows.
         pub fn size(&self) -> (u32, u32) {
@@ -296,15 +344,8 @@ mod native {
             if replacement.monitor().as_deref() != Some(connector) {
                 return Err("Another monitor was shared; choose this monitor in the host dialog".into());
             }
-            let size = replacement.size();
-            let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?;
-            let previous = {
-                let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
-                self.size.store(pack(size.0, size.1), std::sync::atomic::Ordering::Release);
-                std::mem::replace(&mut *handle, next)
-            };
+            self.install_replacement(replacement, None)?;
             if let Ok(mut monitor) = self.monitor.lock() { *monitor = Some(connector.to_owned()); }
-            drop(previous);
             Ok(())
         }
         pub fn is_virtual(&self) -> bool { self.virtual_output.load(std::sync::atomic::Ordering::Acquire) }
@@ -319,15 +360,8 @@ mod native {
             // exists (seen live: 3968x1280 = panel + virtual), so end the virtual share first.
             if !on { self.end(); }
             let replacement = Self::open_inner(None, monitor.as_deref(), false, on).map_err(|error| error.to_string())?;
-            let size = replacement.size();
-            let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?;
-            let previous = {
-                let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
-                self.size.store(pack(size.0, size.1), std::sync::atomic::Ordering::Release);
-                self.virtual_output.store(on, std::sync::atomic::Ordering::Release);
-                std::mem::replace(&mut *handle, next)
-            };
-            drop(previous);
+            let size = self.install_replacement(replacement, None)?;
+            self.virtual_output.store(on, std::sync::atomic::Ordering::Release);
             log::info!("Portal capture source: virtual={on} size={}x{}", size.0, size.1);
             Ok(())
         }
@@ -339,18 +373,27 @@ mod native {
         pub fn set_cursor_embedded(&self, embedded: bool) -> Result<bool, String> {
             use std::sync::atomic::{AtomicBool, Ordering};
             if super::cursor_embedded() == embedded { return Ok(false); }
-            // GNOME closes the portal session on lock; a rebuild then waits for consent that
-            // cannot be answered and holds `recovery` against the post-unlock recovery.
+            // Sample before waiting for `recovery`: an end that happens while this worker is
+            // queued must invalidate the rebuild below.
+            let generation = self.end_generation.load(Ordering::Acquire);
             if *self.locked.borrow() != Some(false) { return Ok(false); }
+            // A backend without the embedded cursor mode never applies the request; remember it
+            // so motion does not spawn a rebuild every few events.
+            let modes = self.handle.lock().map(|handle| unsafe { uu_portal_cursor_modes(handle.0.as_ptr()) }).unwrap_or(0);
+            if modes > 0 && modes & 2 == 0 { super::CURSOR_EMBED.store(1, Ordering::Release); return Ok(false); }
+            if modes & 2 != 0 { super::CURSOR_EMBED.store(2, Ordering::Release); }
             let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
             if super::cursor_embedded() == embedded { return Ok(false); }
             if *self.locked.borrow() != Some(false) { return Ok(false); }
+            // The session this rebuild replaces must still be running: a viewer that left or an
+            // idle shutdown ends it, and a replacement opened afterwards would share with nobody.
+            if !self.is_alive() { return Ok(false); }
+            if crate::input::portal_input_held() { return Ok(false); }
             let previous = super::cursor_embedded();
             let virtual_output = self.is_virtual();
             let monitor = self.monitor();
             // A lock or desktop end during the open must cancel the consent request, not wait
             // out its timeout.
-            let generation = self.end_generation.load(Ordering::Acquire);
             let cancel = Arc::new(AtomicBool::new(false));
             let stop = Arc::new(AtomicBool::new(false));
             let watcher = {
@@ -369,7 +412,7 @@ mod native {
                 }).ok()
             };
             unsafe { uu_portal_set_cursor_mode(if embedded { 2 } else { 1 }); }
-            let result = (|| -> Result<(u32, u32), String> {
+            let result = (|| -> Result<Option<((u32, u32), i32)>, String> {
                 let replacement = Self::open_inner(Some(&cancel), monitor.as_deref(), false, virtual_output)
                     .map_err(|error| error.to_string())?;
                 if *self.locked.borrow() != Some(false) { return Err("desktop locked during the rebuild".into()); }
@@ -384,40 +427,41 @@ mod native {
                 if !virtual_output && monitor.is_some() && replacement.monitor() != monitor {
                     return Err("another monitor was shared; choose this monitor in the host dialog".into());
                 }
-                let size = replacement.size();
-                let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned".to_string())?;
-                // Hold clipboard writers off from before the swap until the text is carried over,
-                // so a viewer update cannot land on the new session and then be overwritten.
-                let clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned".to_string())?;
-                let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
-                // Checked again under the handle lock: end() bumps the generation before it
-                // takes this lock, so either its bump is visible here or it ends the new handle.
-                if self.end_generation.load(Ordering::Acquire) != generation {
-                    return Err("desktop session ended during the rebuild".into());
-                }
-                self.size.store(pack(size.0, size.1), Ordering::Release);
-                let previous_handle = std::mem::replace(&mut *handle, next);
-                let installed = Arc::clone(&*handle);
-                drop(handle);
-                // Keep providing the viewer's text from the replacement before the old session closes.
-                if unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) } < 0 {
-                    log::warn!("Portal clipboard ownership could not be carried over");
-                }
-                drop(clipboard);
-                drop(previous_handle);
-                Ok(size)
+                // KDE does not report the connector, so a size change is the signal that the
+                // replacement follows another output.
+                self.check_geometry(&replacement).map_err(|error| error.to_string())?;
+                // A key or button can go down while the open waits for consent.
+                if crate::input::portal_input_held() { return Ok(None); }
+                let size = self.install_replacement(replacement, Some(generation))?;
+                let applied = self.handle.lock().ok().map(|handle| unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) }).unwrap_or(0);
+                Ok(Some((size, applied)))
             })();
             stop.store(true, Ordering::Release);
             drop(watcher);
             match result {
-                Ok((width, height)) => {
-                    super::CURSOR_MODE.store(if embedded { 2 } else { 1 }, Ordering::Release);
+                Ok(Some(((width, height), applied))) => {
+                    let applied_embedded = applied == 2;
+                    super::CURSOR_MODE.store(if applied_embedded { 2 } else { 1 }, Ordering::Release);
+                    if applied_embedded != embedded {
+                        // The backend refused the mode; keep later opens on what it does support.
+                        unsafe { uu_portal_set_cursor_mode(applied) };
+                        log::info!("Portal backend did not apply the embedded cursor");
+                        return Ok(false);
+                    }
                     log::info!("Portal cursor mode: embedded={embedded} size={width}x{height}");
                     Ok(true)
                 }
-                Err(error) => {
-                    // Leave the engine on the mode the swapped-in session did not get.
+                Ok(None) => {
+                    // Deferred (input went down during the open): keep the engine on the old mode.
                     unsafe { uu_portal_set_cursor_mode(if previous { 2 } else { 1 }); }
+                    Ok(false)
+                }
+                Err(error) => {
+                    // Leave the engine on the mode the installed session actually has.
+                    let installed = self.handle.lock().ok().map(|handle| unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) }).unwrap_or(0);
+                    let mode = if installed > 0 { installed == 2 } else { previous };
+                    unsafe { uu_portal_set_cursor_mode(if mode { 2 } else { 1 }); }
+                    super::CURSOR_MODE.store(if mode { 2 } else { 1 }, Ordering::Release);
                     Err(error)
                 }
             }
@@ -445,9 +489,7 @@ mod native {
             if replacement.monitor() != monitor { return Err("another monitor was shared".into()); }
             if !replacement.touch_supported() { return Err("the touchscreen was not granted".into()); }
             self.check_geometry(&replacement).map_err(|error| error.to_string())?;
-            let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?;
-            let previous = std::mem::replace(&mut *self.handle.lock().map_err(|_| "Portal session lock poisoned")?, next);
-            drop(previous);
+            self.install_replacement(replacement, None)?;
             Ok(true)
         }
         pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, super::PortalError> {
@@ -482,9 +524,15 @@ mod native {
             let result = super::open_then_install(cancelled, || Self::open_inner(Some(cancelled), monitor.as_deref(), false, virtual_output), |replacement| {
                 self.check_geometry(&replacement)?;
                 let replacement_handle = replacement.handle.into_inner().map_err(|_| super::PortalError { code: 3 })?;
+                let clipboard = self.clipboard_write.lock().map_err(|_| super::PortalError { code: 3 })?;
                 let mut handle = self.handle.lock().map_err(|_| super::PortalError { code: 3 })?;
                 if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
-                *handle = replacement_handle;
+                let previous_handle = std::mem::replace(&mut *handle, replacement_handle);
+                let installed = Arc::clone(&*handle);
+                drop(handle);
+                unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) };
+                drop(clipboard);
+                drop(previous_handle);
                 clear_pause_for_unlocked_replacement(&self.was_locked, *self.locked.borrow());
                 log::info!("Portal capture session restored after closure");
                 Ok(())
@@ -575,7 +623,7 @@ mod native {
                     Err(TryLockError::WouldBlock) => return Ok(blank_changed(frame, version)),
                     Err(TryLockError::Poisoned(_)) => return Err("Portal recovery lock poisoned".into()),
                 };
-                if replace_handle(&self.handle, handle, || {
+                if replace_handle_carrying(&self.handle, &self.clipboard_write, handle, || {
                     {
                         let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
                         if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } != 0 {
@@ -1090,6 +1138,8 @@ pub fn switch_active(connector: &str) -> Result<(), String> {
 /// Whether the capture stream carries the compositor's pointer. 0 is "not asked yet"; the
 /// startup answer has to match what the engine reads from UU_PORTAL_CURSOR_MODE.
 static CURSOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Embedded cursor support reported by a session: 0 unknown, 1 unavailable, 2 available.
+static CURSOR_EMBED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 fn cursor_embedded() -> bool {
     use std::sync::atomic::Ordering;
     match CURSOR_MODE.load(Ordering::Acquire) {
@@ -1162,6 +1212,8 @@ fn pointer_decision(state: &mut PointerMode, current: bool, relative: bool, now:
 }
 pub fn note_pointer_motion(relative: bool) {
     if !cursor_switch_available() { return; }
+    // The backend does not advertise an embedded cursor: nothing to switch to.
+    if CURSOR_EMBED.load(std::sync::atomic::Ordering::Acquire) == 1 { return; }
     // A swap closes the portal input devices; do not drop keys or buttons the viewer holds.
     if crate::input::portal_input_held() { return; }
     let decision = {

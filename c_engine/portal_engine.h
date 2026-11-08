@@ -22,6 +22,9 @@ struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32
  * into the stream). -1 restores the UU_PORTAL_CURSOR_MODE default. The host switches this at
  * runtime because the viewer cannot draw a pointer of its own during relative motion. */
 void uu_portal_set_cursor_mode(int mode);
+/* What the last session requested and what the backend offered, for host bookkeeping. */
+int uu_portal_cursor_mode(struct uu_portal *portal);
+int uu_portal_cursor_modes(struct uu_portal *portal);
 const char *uu_portal_restore_token(struct uu_portal *portal);
 void uu_portal_close(struct uu_portal *portal);
 int uu_portal_clipboard_ready(struct uu_portal *portal);
