@@ -30,6 +30,13 @@ is aimed at the virtual output's region. Needs GTK3.
   `portal-permissions/kde-virtual`）。窗口会被 KWin 移到虚拟屏，恢复后位置可能变化。
   The virtual size is KDE's (1920x1080 by default; the first share may ask on the host, later ones
   reuse `portal-permissions/kde-virtual`). KWin moves windows to it; positions may change on restore.
+- 壁纸模式下新出现的窗口也会被送到虚拟输出：KWin 按它认为"当前活动"的屏幕放置新窗口，而那块
+  屏幕可能是遮罩下的物理屏，远端就看不到。主机在防窥期间保持加载一个 KWin 脚本，新窗口和换了
+  屏幕的窗口都会被送回虚拟输出，恢复时卸载。
+  In wallpaper mode, windows that appear later are also sent to the virtual output: KWin places a
+  new window on the screen it considers active, which may be one under the cover, where the viewer
+  cannot see it. The host keeps a KWin script loaded for the privacy session that sends new windows
+  and windows that changed screen back to the virtual output, and unloads it on restore.
 - KDE 不处理虚拟输出共享上的 portal 输入，防窥期间指针、按键和文字改走 uinput（需要 `/dev/uinput`
   权限，见 README）；手机拖动手势在此期间按普通鼠标拖动处理。
   KDE ignores portal input on a virtual-output share, so pointer, keys and text use uinput while the

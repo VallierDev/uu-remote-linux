@@ -5,7 +5,8 @@
 //! physical outputs before the virtual one exists (KWin applies stored configs on creation),
 //! re-enable them before the virtual output goes away, and never disable the virtual output
 //! itself (KWin bug 527747 persists that and breaks later virtual shares).
-//! Picture mode then turns the physical outputs back on as secondary ones and covers them.
+//! Picture mode then turns the physical outputs back on as secondary ones and covers them, and a
+//! second KWin script keeps windows that appear later on the virtual output too.
 mod input;
 mod kwin;
 mod outputs;
@@ -39,6 +40,12 @@ fn wallpaper() -> Option<std::path::PathBuf> {
 /// secondary outputs, keep the windows on the virtual one, and cover the physical ones.
 fn cover(data: &Data) -> Result<[f64; 4], String> {
     let virtual_name = outputs::layout()?.into_iter().map(|o| o.name).find(|n| !data.outputs.contains(n)).ok_or("virtual output not found")?;
+    // Loaded before the physical outputs come back: from then on KWin places a new window on the
+    // screen it considers active, which may be one that is about to be covered.
+    match kwin::keep_windows_on(&virtual_name) {
+        Ok(()) => log::info!("Privacy new-window keeper: loaded"),
+        Err(e) => log::warn!("Privacy new-window keeper: {e}"),
+    }
     outputs::set(&data.outputs, true).map_err(|e| format!("enable outputs: {e}"))?;
     if let Err(e) = outputs::set_primary(&virtual_name) { log::warn!("Privacy virtual output priority: {e}"); }
     kwin::move_windows_to(&virtual_name).map_err(|e| format!("move windows: {e}"))?;
@@ -87,6 +94,8 @@ impl Backend for Kde {
         // controller keeps the recovery record and the guard for the next attempt. A device that
         // no longer exists is skipped, so a record replayed after a reboot cannot wedge recovery.
         let devices = input::restore(&data.devices).map_err(|e| format!("enable input devices: {e}"));
+        // Stop following new windows before the virtual output goes away.
+        if let Err(e) = kwin::unload_keep_windows() { log::warn!("Privacy new-window keeper: {e}"); }
         // Physical outputs first: switching back opens a monitor share, which needs them enabled.
         // The wait also matters: a share opened before KWin applies the mode got the virtual
         // output's geometry (seen live: 1920x1080 instead of the panel's 3072x1920).
