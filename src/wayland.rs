@@ -260,10 +260,13 @@ fn portal_outputs()->Vec<Output> {
     let fps=crate::video::display_fps() as i32;
     let mut outputs:Vec<Output>=monitors.iter().map(|m|Output {name:m.connector.clone(),width:m.width,height:m.height,fps,x:m.x,y:m.y}).collect();
     // Screen 0 is the one opened first: the monitor whose consent is already saved, else the primary.
+    // Shadowed monitors (whose identity is shared with an earlier monitor) cannot be restored via tokens,
+    // so they are never preferred as Screen 0.
     let dir=crate::portal::permissions_directory();
-    let granted=|name:&str|dir.as_deref().is_some_and(|d|crate::portal::permission_exists(d,&crate::portal::monitor_key(name)));
+    let lead=|name:&str|crate::portal::lead_connector(&monitors, name).is_some();
+    let granted=|name:&str|!lead(name) && dir.as_deref().is_some_and(|d|crate::portal::permission_exists(d,&crate::portal::monitor_key(name)));
     let primary=monitors.iter().find(|m|m.primary).map(|m|m.connector.clone()).unwrap_or_default();
-    outputs.sort_by_key(|o|(!granted(&o.name),o.name!=primary,o.x,o.y));
+    outputs.sort_by_key(|o|(!granted(&o.name),lead(&o.name),o.name!=primary,o.x,o.y));
     outputs.truncate(16);
     log::info!("Portal multi-screen: {} monitors",outputs.len());
     outputs
@@ -399,11 +402,22 @@ pub fn failed(id:usize,generation:u64) {
     let mut state=SELECTION.lock().unwrap();
     if (state.id,state.generation)==(id,generation) {state.failed=true;}
 }
+pub fn sync_portal_monitor(connector: &str) {
+    if !inventory().portal { return; }
+    if let Some((id, _)) = outputs().iter().enumerate().find(|(_, o)| o.name == connector) {
+        let mut state = SELECTION.lock().unwrap();
+        if state.id != id {
+            state.begin(id);
+            log::info!("Portal monitor selection synced: id={} connector={connector}", id);
+        }
+    }
+}
+
 pub fn select(id:usize)->Result<(),String> {
     let output=source(id).ok_or("Unknown screen")?;
     if inventory().portal {
-        let mut state=SELECTION.lock().unwrap();
         crate::portal::switch_active(&output.name)?;
+        let mut state=SELECTION.lock().unwrap();
         state.begin(id);
         log::info!("Portal screen selected: id={} source={}x{}",id,output.width,output.height);
         return Ok(());

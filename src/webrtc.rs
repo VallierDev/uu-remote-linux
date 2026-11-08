@@ -682,19 +682,24 @@ impl WebRtcSession {
                                 if let Some(id)=crate::wayland::requested_output(&request) {
                                     if crate::wayland::source(id).is_none() {reject("Unknown screen");continue;}
                                     if id!=source_before {
-                                        let mut changed=false;
-                                        if let Some(owner)=&switch_owner {owner.with_current(|| {
-                                            owner.release_input();
-                                            match crate::wayland::select(id) {
-                                                Ok(())=>{
-                                                    let (source_id,source_generation)=crate::wayland::selection();
-                                                    settings.send_modify(|s|{s.source_id=source_id;s.source_generation=source_generation;s.output=None;});
-                                                    changed=true;
-                                                },
-                                                Err(error)=>{log::warn!("Screen switch rejected: {}",error);reject(&error);},
+                                        if let Some(owner)=&switch_owner { owner.release_input(); }
+                                        let switch_res = tokio::task::spawn_blocking(move || crate::wayland::select(id)).await;
+                                        match switch_res {
+                                            Ok(Ok(())) => {
+                                                let (source_id,source_generation)=crate::wayland::selection();
+                                                settings.send_modify(|s|{s.source_id=source_id;s.source_generation=source_generation;s.output=None;});
                                             }
-                                        });}
-                                        if !changed {continue;}
+                                            Ok(Err(error)) => {
+                                                log::warn!("Screen switch rejected: {}",error);
+                                                reject(&error);
+                                                continue;
+                                            }
+                                            Err(_) => {
+                                                log::warn!("Screen switch worker panicked");
+                                                reject("Screen switch worker failed");
+                                                continue;
+                                            }
+                                        }
                                     }
                                 }
                             }
