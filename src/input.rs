@@ -47,6 +47,13 @@ struct HeldInput { buttons: std::collections::BTreeSet<i32>, keys: std::collecti
 /// cursor-mode rebuild waits until they are released. uinput devices survive the swap.
 static PORTAL_INPUT_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn portal_input_held() -> bool { PORTAL_INPUT_HELD.load(std::sync::atomic::Ordering::Relaxed) }
+/// Inputs currently bound to the portal session; a replacement tears those devices down.
+static PORTAL_HELD: std::sync::Mutex<HeldInput> = std::sync::Mutex::new(HeldInput { buttons: std::collections::BTreeSet::new(), keys: std::collections::BTreeSet::new() });
+/// The portal replaced its native devices: records of held portal inputs no longer apply.
+pub fn portal_session_replaced() {
+    if let Ok(mut held)=PORTAL_HELD.lock() { *held=HeldInput::default(); }
+    PORTAL_INPUT_HELD.store(false, std::sync::atomic::Ordering::Relaxed);
+}
 /// Held modifier VKs (bit 0 Ctrl, 1 Shift, 2 Alt, 3 Win) and keys that got a synthetic Shift.
 #[derive(Default)]
 struct Shortcuts { modifiers: u8, shifted: std::collections::BTreeSet<i32> }
@@ -108,7 +115,7 @@ impl Controller {
 #[derive(Default)]
 struct CmdState { held: bool, pending: bool, passthrough: bool, combos: std::collections::BTreeMap<i32, bool> }
 
-pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, portal_held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag>, pointer_wake: tokio::sync::Notify }
+pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag>, pointer_wake: tokio::sync::Notify }
 
 fn active_output_count(json: &[u8]) -> Option<usize> {
     let data: serde_json::Value = serde_json::from_slice(json).ok()?;
@@ -144,7 +151,7 @@ impl InputInjector {
             || (backend == crate::desktop_backend::DesktopBackend::Portal && single_portal_output()));
         if uinput_pointer { log::info!("Input pointer backend: uinput (motion, buttons and wheel)"); }
         else if backend == crate::desktop_backend::DesktopBackend::Portal { log::info!("Input pointer backend: portal (monitor-local coordinates)"); }
-        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), portal_held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
+        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
     }
 
     pub fn bind_portal(&self,session:Option<std::sync::Arc<crate::portal::PortalSession>>) {
@@ -508,7 +515,7 @@ impl InputInjector {
         *held=HeldInput::default();
         // Inputs bound to the portal session are not covered by the uinput release above.
         let (portal_buttons, portal_keys) = {
-            let mut pending=self.portal_held.lock().unwrap();
+            let mut pending=PORTAL_HELD.lock().unwrap();
             (std::mem::take(&mut pending.buttons), std::mem::take(&mut pending.keys))
         };
         // Stop on the first failure like the sweep above: each call can wait out the portal timeout.
@@ -550,12 +557,12 @@ impl InputInjector {
     }
     /// Inputs bound to the portal session are dropped when that session is replaced.
     fn record_portal_button(&self, button: i32, pressed: bool) {
-        let mut held = self.portal_held.lock().unwrap();
+        let mut held = PORTAL_HELD.lock().unwrap();
         if pressed { held.buttons.insert(button); } else { held.buttons.remove(&button); }
         PORTAL_INPUT_HELD.store(!held.buttons.is_empty() || !held.keys.is_empty(), std::sync::atomic::Ordering::Relaxed);
     }
     fn record_portal_key(&self, symbol: u64, pressed: bool) {
-        let mut held = self.portal_held.lock().unwrap();
+        let mut held = PORTAL_HELD.lock().unwrap();
         if pressed { held.keys.insert(symbol); } else { held.keys.remove(&symbol); }
         PORTAL_INPUT_HELD.store(!held.buttons.is_empty() || !held.keys.is_empty(), std::sync::atomic::Ordering::Relaxed);
     }
@@ -1258,7 +1265,6 @@ impl InputInjector {
             portal_outcomes:std::array::from_fn(|_|std::sync::atomic::AtomicUsize::new(0)),
             portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::DesktopBackend::Portal,
             pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()),
-            portal_held:std::sync::Mutex::new(HeldInput::default()),
             touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
     }
 }

@@ -112,6 +112,8 @@ mod native {
         };
         unsafe { uu_portal_clipboard_copy(old.0.as_ptr(), installed.0.as_ptr()) };
         drop(old);
+        // The replaced devices took any held portal input with them.
+        crate::input::portal_session_replaced();
         Ok(true)
     }
     #[derive(Default)]
@@ -179,6 +181,8 @@ mod native {
             }
             drop(clipboard);
             drop(previous_handle);
+            // The replaced devices took any held portal input with them.
+            crate::input::portal_session_replaced();
             Ok(size)
         }
         /// Point the host and the engine at the cursor mode the installed session really has.
@@ -337,6 +341,8 @@ mod native {
             // after the desktop was ended (viewer disconnect, idle shutdown, capture teardown).
             self.end_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if let Ok(handle) = self.handle.lock() { unsafe { uu_portal_end(handle.0.as_ptr()) }; }
+            // The ended session's native devices are gone; forget the inputs bound to them.
+            crate::input::portal_session_replaced();
         }
         /// Mutter connector of the monitor this session captures, when several are advertised.
         pub fn monitor(&self) -> Option<String> { self.monitor.lock().ok().and_then(|m| m.clone()) }
@@ -540,6 +546,8 @@ mod native {
                 unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) };
                 drop(clipboard);
                 drop(previous_handle);
+                // The replaced devices took any held portal input with them.
+                crate::input::portal_session_replaced();
                 clear_pause_for_unlocked_replacement(&self.was_locked, *self.locked.borrow());
                 log::info!("Portal capture session restored after closure");
                 Ok(())
