@@ -25,14 +25,17 @@ static POINTER: Mutex<Option<[f64; 4]>> = Mutex::new(None);
 /// ends. An auto-enable never overrides it, including an RPC that arrives after the connection
 /// opens but before `session_started` bumps the counter.
 static VIEWER_OVERRIDE: AtomicBool = AtomicBool::new(false);
-/// iOS viewers encode "screen off" as `enable=0, type=3`; see
-/// `protocol::Request::normalize_ios_screen_off`.
+/// iOS viewers encode "screen off" as `enable=0, type=3`, and Windows viewers carry every request
+/// in `type` with `enable=0`; see `protocol::Request::normalize_ios_screen_off` and
+/// `protocol::Request::normalize_windows`.
 static VIEWER_IOS: AtomicBool = AtomicBool::new(false);
+static VIEWER_WINDOWS: AtomicBool = AtomicBool::new(false);
 
 pub fn supported() -> bool { backend::detect().is_some() }
-/// Record the desktop controller's platform for the iOS RPC 7 encoder quirk.
+/// Record the desktop controller's platform for the RPC 7 encoder quirks.
 pub fn set_viewer_controller(controller: crate::input::Controller) {
     VIEWER_IOS.store(controller == crate::input::Controller::Ios, Ordering::Relaxed);
+    VIEWER_WINDOWS.store(controller == crate::input::Controller::Windows, Ordering::Relaxed);
 }
 pub fn active() -> bool { ACTIVE.load(Ordering::Relaxed) }
 /// The viewer's privacy_type now in effect.
@@ -125,6 +128,9 @@ pub fn rpc_accept(rpc: &[crate::protocol::WireField]) -> Option<(Vec<u8>, Option
         // as an accepted request would.
         VIEWER_OVERRIDE.store(true, Ordering::Relaxed);
         log::info!("Privacy request: iOS screen-off encoding normalized (enable=0 type=3)");
+    } else if request.normalize_windows(VIEWER_WINDOWS.load(Ordering::Relaxed)) {
+        VIEWER_OVERRIDE.store(true, Ordering::Relaxed);
+        log::info!("Privacy request: Windows encoding normalized (enable=0 mode={:?})", request.mode);
     }
     if let Some(e) = refuse(request.enable, request.mode) {
         log::warn!("Privacy request refused: enable={} mode={:?}: {e}", request.enable, request.mode);

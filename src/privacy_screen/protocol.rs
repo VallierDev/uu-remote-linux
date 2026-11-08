@@ -17,6 +17,16 @@ impl Request {
         }
         false
     }
+    /// Windows viewers send every privacy request with `enable=0` and carry the intent in
+    /// `privacy_type`: `0/0` is off, `0/2` picture and `0/3` screen-off (verified live on the
+    /// Windows client). Android 4.43.0 and macOS keep field 1 as the master switch.
+    pub fn normalize_windows(&mut self, windows: bool) -> bool {
+        if windows && !self.enable && self.mode.is_some() {
+            self.enable = true;
+            return true;
+        }
+        false
+    }
 }
 
 pub fn parse(rpc: &[crate::protocol::WireField]) -> Option<(Vec<u8>, Request)> {
@@ -104,6 +114,33 @@ mod tests {
         let mac = crate::protocol::decode_wire(&[10, 2, 8, 42, 58, 4, 8, 1, 16, 3]).unwrap();
         let (_, mut request) = parse(&mac).unwrap();
         assert!(!request.normalize_ios_screen_off(true));
+        assert!(request.enable);
+    }
+    #[test]
+    fn normalizes_windows_encoding_only() {
+        // Windows: enable is always 0, the type carries the intent.
+        for (wire, mode) in [(2u8, Mode::Picture), (3u8, Mode::ScreenOff)] {
+            let bytes = [10, 2, 8, 42, 58, 4, 8, 0, 16, wire];
+            let (_, mut request) = parse(&crate::protocol::decode_wire(&bytes).unwrap()).unwrap();
+            assert!(request.normalize_windows(true));
+            assert!(request.enable);
+            assert_eq!(request.mode, Some(mode));
+        }
+        // Off stays off: type 0 (seen when the Windows switch is turned off) and type 1.
+        for wire in [0u8, 1] {
+            let bytes = [10, 2, 8, 42, 58, 4, 8, 0, 16, wire];
+            let (_, mut request) = parse(&crate::protocol::decode_wire(&bytes).unwrap()).unwrap();
+            assert!(!request.normalize_windows(true));
+            assert!(!request.enable);
+        }
+        // Other platforms and explicit enables are untouched.
+        let picture = crate::protocol::decode_wire(&[10, 2, 8, 42, 58, 4, 8, 0, 16, 2]).unwrap();
+        let (_, mut request) = parse(&picture).unwrap();
+        assert!(!request.normalize_windows(false));
+        assert!(!request.enable);
+        let explicit = crate::protocol::decode_wire(&[10, 2, 8, 42, 58, 4, 8, 1, 16, 2]).unwrap();
+        let (_, mut request) = parse(&explicit).unwrap();
+        assert!(!request.normalize_windows(true));
         assert!(request.enable);
     }
 }
