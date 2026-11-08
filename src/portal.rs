@@ -42,6 +42,7 @@ mod native {
         fn uu_portal_open_persist_cancellable(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), save_data: *mut c_void, cancelled: extern "C" fn(*mut c_void) -> i32, cancel_data: *mut c_void, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_open_persist_capture(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void), save_data: *mut c_void, cancelled: Option<extern "C" fn(*mut c_void) -> i32>, cancel_data: *mut c_void, prefer_dmabuf: i32, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
         fn uu_portal_open_detailed(restore: *const libc::c_char, save: extern "C" fn(*const libc::c_char, *mut c_void, i32, i32, i32), save_data: *mut c_void, cancelled: Option<extern "C" fn(*mut c_void) -> i32>, cancel_data: *mut c_void, prefer_dmabuf: i32, source_types: u32, error: *mut i32, width: *mut u32, height: *mut u32) -> *mut c_void;
+        fn uu_portal_set_cursor_mode(mode: i32);
         fn uu_portal_clipboard_supported(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_ready(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_set(portal: *mut c_void, text: *const u8, length: usize) -> i32;
@@ -322,6 +323,47 @@ mod native {
             drop(previous);
             log::info!("Portal capture source: virtual={on} size={}x{}", size.0, size.1);
             Ok(())
+        }
+        /// Ask the compositor to draw the pointer into the stream (embedded) or keep it out
+        /// (hidden). The portal only reads this when the session is created, so swap in a fresh
+        /// session with the saved consent; every holder of this Arc follows the new handle.
+        pub fn set_cursor_embedded(&self, embedded: bool) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            if super::cursor_embedded() == embedded { return Ok(()); }
+            let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
+            if super::cursor_embedded() == embedded { return Ok(()); }
+            let previous = super::cursor_embedded();
+            let virtual_output = self.is_virtual();
+            let monitor = self.monitor();
+            unsafe { uu_portal_set_cursor_mode(if embedded { 2 } else { 1 }); }
+            let result = (|| -> Result<(u32, u32), String> {
+                let replacement = Self::open_inner(None, monitor.as_deref(), false, virtual_output)
+                    .map_err(|error| error.to_string())?;
+                // A restored consent must not silently move the share to another monitor.
+                if !virtual_output && monitor.is_some() && replacement.monitor() != monitor {
+                    return Err("another monitor was shared; choose this monitor in the host dialog".into());
+                }
+                let size = replacement.size();
+                let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned".to_string())?;
+                let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
+                self.size.store(pack(size.0, size.1), Ordering::Release);
+                let previous_handle = std::mem::replace(&mut *handle, next);
+                drop(handle);
+                drop(previous_handle);
+                Ok(size)
+            })();
+            match result {
+                Ok((width, height)) => {
+                    super::CURSOR_MODE.store(if embedded { 2 } else { 1 }, Ordering::Release);
+                    log::info!("Portal cursor mode: embedded={embedded} size={width}x{height}");
+                    Ok(())
+                }
+                Err(error) => {
+                    // Leave the engine on the mode the swapped-in session did not get.
+                    unsafe { uu_portal_set_cursor_mode(if previous { 2 } else { 1 }); }
+                    Err(error)
+                }
+            }
         }
         pub fn open() -> Result<Self, String> {
             Self::open_inner(None, None, false, false).map_err(|error| error.to_string())
@@ -920,6 +962,7 @@ impl PortalSession {
     pub fn end(&self) {}
     pub fn switch_to(&self, _: &str) -> Result<(), String> { Err(error(15)) }
     pub fn set_virtual(&self, _: bool) -> Result<(), String> { Err(error(15)) }
+    pub fn set_cursor_embedded(&self, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn is_virtual(&self) -> bool { false }
 }
 #[cfg(not(all(target_os = "linux", feature = "portal")))]
@@ -979,6 +1022,117 @@ pub fn switch_active(connector: &str) -> Result<(), String> {
     let session = ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(std::sync::Weak::upgrade)
         .ok_or("Portal desktop unavailable")?;
     session.switch_to(connector)
+}
+/// Whether the capture stream carries the compositor's pointer. 0 is "not asked yet"; the
+/// startup answer has to match what the engine reads from UU_PORTAL_CURSOR_MODE.
+static CURSOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+fn cursor_embedded() -> bool {
+    use std::sync::atomic::Ordering;
+    match CURSOR_MODE.load(Ordering::Acquire) {
+        0 => {
+            let embedded = std::env::var("UU_PORTAL_CURSOR_MODE").is_ok_and(|value| value.eq_ignore_ascii_case("embedded"));
+            CURSOR_MODE.store(if embedded { 2 } else { 1 }, Ordering::Release);
+            embedded
+        }
+        mode => mode == 2,
+    }
+}
+/// Ask the running session for a stream with (or without) the compositor cursor.
+pub fn set_cursor_embedded(embedded: bool) -> Result<(), String> {
+    let session = ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(std::sync::Weak::upgrade)
+        .ok_or("Portal desktop unavailable")?;
+    session.set_cursor_embedded(embedded)
+}
+/// A release package can carry an older libuu-portal.so without the runtime cursor switch;
+/// rebuilding the session would be wasted work there.
+fn cursor_switch_available() -> bool {
+    #[cfg(all(target_os = "linux", feature = "portal", feature = "engine-plugins"))]
+    {
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| crate::engine_plugin::symbol(crate::engine_plugin::Engine::Portal, "uu_portal_set_cursor_mode\0") != 0)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "portal", feature = "engine-plugins")))]
+    { cfg!(all(target_os = "linux", feature = "portal")) }
+}
+/// Relative motion has no position the viewer could draw a cursor at, so the stream has to carry
+/// one. Absolute motion means the viewer draws its own and an embedded copy would trail it. Both
+/// need a fresh portal session, so wait for a run of the same kind before rebuilding it.
+struct PointerMode {
+    candidate: Option<bool>,
+    streak: u32,
+    first: Option<std::time::Instant>,
+    switching: bool,
+    blocked_until: Option<std::time::Instant>,
+}
+static POINTER_MODE: std::sync::Mutex<PointerMode> = std::sync::Mutex::new(PointerMode {
+    candidate: None, streak: 0, first: None, switching: false, blocked_until: None,
+});
+const POINTER_STREAK: u32 = 5;
+/// A burst at connect must not rebuild the session, so the run has to span time as well.
+const POINTER_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+/// After a failed rebuild the consent may be gone; do not retry on the next few events.
+const POINTER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+fn pointer_decision(state: &mut PointerMode, current: bool, relative: bool, now: std::time::Instant) -> Option<bool> {
+    if current == relative {
+        state.candidate = None;
+        state.streak = 0;
+        state.first = None;
+        return None;
+    }
+    if state.switching || state.blocked_until.is_some_and(|until| now < until) { return None; }
+    match state.candidate {
+        Some(candidate) if candidate == relative => {
+            state.streak += 1;
+            if state.streak >= POINTER_STREAK
+                && state.first.is_some_and(|first| now.duration_since(first) >= POINTER_WINDOW) {
+                return Some(relative);
+            }
+        }
+        _ => {
+            state.candidate = Some(relative);
+            state.streak = 1;
+            state.first = Some(now);
+        }
+    }
+    None
+}
+pub fn note_pointer_motion(relative: bool) {
+    if !cursor_switch_available() { return; }
+    let decision = {
+        let Ok(mut state) = POINTER_MODE.lock() else { return; };
+        let decision = pointer_decision(&mut state, cursor_embedded(), relative, std::time::Instant::now());
+        if decision.is_some() {
+            state.switching = true;
+            state.candidate = None;
+            state.streak = 0;
+            state.first = None;
+        }
+        decision
+    };
+    let Some(target) = decision else { return; };
+    let spawned = std::thread::Builder::new().name("portal-cursor".into()).spawn(move || {
+        let result = set_cursor_embedded(target);
+        let mut state = POINTER_MODE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.switching = false;
+        state.candidate = None;
+        state.streak = 0;
+        state.first = None;
+        match result {
+            Ok(()) => {
+                state.blocked_until = None;
+                drop(state);
+                log::info!("Cursor mode follows the pointer: embedded={target}");
+            }
+            Err(error) => {
+                state.blocked_until = Some(std::time::Instant::now() + POINTER_COOLDOWN);
+                drop(state);
+                log::warn!("Portal cursor switch failed: {error}");
+            }
+        }
+    });
+    if spawned.is_err() {
+        if let Ok(mut state) = POINTER_MODE.lock() { state.switching = false; }
+    }
 }
 pub struct Monitor { pub connector: String, pub width: u32, pub height: u32, pub x: i32, pub y: i32, pub primary: bool }
 #[cfg(all(target_os = "linux", feature = "portal"))]
@@ -1063,5 +1217,78 @@ mod tests {
             Ok(())
         }).unwrap();
         assert_eq!(*handle.lock().unwrap(), 11);
+    }
+}
+
+#[cfg(test)]
+mod pointer_mode_tests {
+    use super::{pointer_decision, PointerMode, POINTER_COOLDOWN, POINTER_WINDOW};
+    use std::time::{Duration, Instant};
+
+    fn state() -> PointerMode {
+        PointerMode { candidate: None, streak: 0, first: None, switching: false, blocked_until: None }
+    }
+
+    #[test]
+    fn a_connect_burst_does_not_rebuild_the_session() {
+        let mut state = state();
+        let start = Instant::now();
+        for step in 0..20 {
+            assert_eq!(pointer_decision(&mut state, true, false, start + Duration::from_millis(step)), None);
+        }
+    }
+
+    #[test]
+    fn a_sustained_change_decides_once_the_run_spans_the_window() {
+        let mut state = state();
+        let start = Instant::now();
+        let mut decided = None;
+        for step in 0..40 {
+            let now = start + Duration::from_millis(step * 10);
+            if let Some(value) = pointer_decision(&mut state, true, false, now) {
+                assert!(now.duration_since(start) >= POINTER_WINDOW);
+                decided = Some(value);
+                break;
+            }
+        }
+        assert_eq!(decided, Some(false));
+    }
+
+    #[test]
+    fn an_opposite_event_restarts_the_run() {
+        let mut state = state();
+        let start = Instant::now();
+        for step in 0..10 { pointer_decision(&mut state, true, false, start + Duration::from_millis(step)); }
+        pointer_decision(&mut state, true, true, start + Duration::from_millis(10));
+        for step in 11..19 {
+            assert_eq!(pointer_decision(&mut state, true, false, start + Duration::from_millis(step)), None);
+        }
+    }
+
+    #[test]
+    fn a_failed_switch_waits_out_the_cooldown() {
+        let mut state = state();
+        let start = Instant::now();
+        state.blocked_until = Some(start + POINTER_COOLDOWN);
+        for step in 0..40 {
+            assert_eq!(pointer_decision(&mut state, true, false, start + Duration::from_millis(step * 10)), None);
+        }
+        let after = start + POINTER_COOLDOWN + Duration::from_millis(1);
+        let mut decided = None;
+        for step in 0..30 {
+            let now = after + Duration::from_millis(step * 10);
+            if let Some(value) = pointer_decision(&mut state, true, false, now) { decided = Some(value); break; }
+        }
+        assert_eq!(decided, Some(false));
+    }
+
+    #[test]
+    fn a_switch_in_flight_ignores_more_events() {
+        let mut state = state();
+        let start = Instant::now();
+        state.switching = true;
+        for step in 0..40 {
+            assert_eq!(pointer_decision(&mut state, true, false, start + Duration::from_millis(step * 10)), None);
+        }
     }
 }

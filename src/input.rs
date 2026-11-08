@@ -536,6 +536,9 @@ impl InputInjector {
         }
     }
     fn inject_move(&self,x:i32,y:i32,relative:bool)->i32 {
+        // The viewer's mouse mode decides whether the stream must carry the pointer (see
+        // portal::note_pointer_motion); only the portal backend can change that.
+        if self.backend==crate::desktop_backend::DesktopBackend::Portal { crate::portal::note_pointer_motion(relative); }
         if self.uinput_pointer && self.backend != crate::desktop_backend::DesktopBackend::X11 {
             if let Some(uinput) = &self.uinput {
                 if relative { return Self::uinput_result(uinput.move_relative(x,y)); }

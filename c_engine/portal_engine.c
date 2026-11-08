@@ -82,6 +82,9 @@ struct uu_portal {
 
 static pthread_once_t pw_once = PTHREAD_ONCE_INIT;
 static atomic_uint token_sequence = 1;
+/* Cursor preference for sessions opened from now on; -1 defers to UU_PORTAL_CURSOR_MODE. */
+static atomic_int cursor_mode_override = -1;
+void uu_portal_set_cursor_mode(int mode) { atomic_store(&cursor_mode_override, mode); }
 static void initialize_pipewire(void) { pw_init(NULL, NULL); }
 static GVariant *empty_options(void) { return g_variant_new_array(G_VARIANT_TYPE("{sv}"), NULL, 0); }
 static int open_cancelled(struct uu_portal *p) {
@@ -89,10 +92,10 @@ static int open_cancelled(struct uu_portal *p) {
 }
 static int wait_for_first_frame(struct uu_portal *p);
 #include "portal_eis.inc"
-/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes); 0 when unreadable. */
-static guint remote_property(struct uu_portal *p, const char *name) {
+/* A uint32 portal property; 0 when unreadable. */
+static guint interface_property(struct uu_portal *p, const char *interface, const char *name) {
     GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH,
-        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", REMOTE, name),
+        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", interface, name),
         G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
     guint result = 0;
     if (reply) {
@@ -101,6 +104,10 @@ static guint remote_property(struct uu_portal *p, const char *name) {
         g_variant_unref(value); g_variant_unref(reply);
     }
     return result;
+}
+/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes). */
+static guint remote_property(struct uu_portal *p, const char *name) {
+    return interface_property(p, REMOTE, name);
 }
 static void fail(struct uu_portal *p, int error) {
     pthread_mutex_lock(&p->lock);
@@ -658,7 +665,18 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     /* 1 monitor; 4 virtual (KDE creates a KWin virtual output for the stream). */
     g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(source_types));
     g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(FALSE));
-    /* Hidden cursor avoids duplicate pointer; supported since ScreenCast v1. */
+    /* Hidden cursor avoids a duplicate pointer in absolute mode: the viewer draws its own where
+     * it last sent motion. Relative mode has no such position, so the game's cursor has to come
+     * from the compositor. The host flips this at runtime through uu_portal_set_cursor_mode();
+     * UU_PORTAL_CURSOR_MODE=embedded is the startup default. Only sent when the backend
+     * advertises embedded, since an unsupported value closes the session. */
+    int cursor_mode = atomic_load(&cursor_mode_override);
+    if (cursor_mode < 0) {
+        const char *wanted = g_getenv("UU_PORTAL_CURSOR_MODE");
+        cursor_mode = (wanted && !g_ascii_strcasecmp(wanted, "embedded")) ? 2 : 1;
+    }
+    if (cursor_mode == 2 && (interface_property(p, SCREEN, "AvailableCursorModes") & 2))
+        g_variant_builder_add(&options, "{sv}", "cursor_mode", g_variant_new_uint32(2));
     results = request(p, SCREEN, "SelectSources", &options, 1, error);
     if (!results) goto done;
     g_variant_unref(results);
