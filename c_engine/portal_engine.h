@@ -26,6 +26,8 @@ const char *uu_portal_restore_token(struct uu_portal *portal);
 void uu_portal_close(struct uu_portal *portal);
 int uu_portal_clipboard_ready(struct uu_portal *portal);
 int uu_portal_clipboard_set(struct uu_portal *portal, const uint8_t *text, size_t length);
+/* Offers the text `from` still owns to `to`; 0 transferred, 1 nothing to transfer. */
+int uu_portal_clipboard_copy(struct uu_portal *from, struct uu_portal *to);
 int uu_portal_clipboard_poll(struct uu_portal *portal, uint8_t *text, size_t capacity);
 int uu_portal_alive(struct uu_portal *portal);
 int uu_portal_capture_alive(struct uu_portal *portal);

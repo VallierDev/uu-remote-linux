@@ -38,7 +38,7 @@ struct uu_portal {
     char *session;
     char *restore_token;
     guint closed_subscription, clipboard_owner_subscription, clipboard_transfer_subscription, display_subscription;
-    int clipboard_enabled, clipboard_changed;
+    int clipboard_enabled, clipboard_changed, clipboard_owns;
     char *clipboard_text, *clipboard_mime;
     size_t clipboard_length;
     uint64_t clipboard_revision;

@@ -46,6 +46,7 @@ mod native {
         fn uu_portal_clipboard_supported(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_ready(portal: *mut c_void) -> i32;
         fn uu_portal_clipboard_set(portal: *mut c_void, text: *const u8, length: usize) -> i32;
+        fn uu_portal_clipboard_copy(from: *mut c_void, to: *mut c_void) -> i32;
         fn uu_portal_clipboard_poll(portal: *mut c_void, text: *mut u8, capacity: usize) -> i32;
         fn uu_portal_close(portal: *mut c_void);
         fn uu_portal_alive(portal: *mut c_void) -> i32;
@@ -376,7 +377,12 @@ mod native {
                 let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
                 self.size.store(pack(size.0, size.1), Ordering::Release);
                 let previous_handle = std::mem::replace(&mut *handle, next);
+                let installed = Arc::clone(&*handle);
                 drop(handle);
+                // Keep providing the viewer's text from the replacement before the old session closes.
+                if unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) } < 0 {
+                    log::warn!("Portal clipboard ownership could not be carried over");
+                }
                 drop(previous_handle);
                 Ok(size)
             })();
@@ -409,6 +415,8 @@ mod native {
         pub fn upgrade_touch(&self) -> Result<bool, String> {
             let available = self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_touch_available(handle.0.as_ptr()) } != 0);
             if !available || self.touch_supported() { return Ok(false); }
+            // Serialize with recovery and the cursor-mode rebuild: all replace the handle.
+            let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
             log::info!("Portal touch consent: asking the host again for the touchscreen");
             let monitor = self.monitor();
             let replacement = Self::open_inner(None, monitor.as_deref(), true, self.is_virtual()).map_err(|error| error.to_string())?;
