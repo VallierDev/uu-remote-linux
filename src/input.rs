@@ -408,7 +408,11 @@ impl InputInjector {
         });
     }
     fn inject_touch(&self, phase: i32, x: i32, y: i32) -> i32 {
+        // Serialize the contact with handle replacement: a contact sent to the new devices
         let Some(portal) = self.portal.lock().unwrap().clone() else { return -1 };
+        // Serialize with handle replacement while the contact is sent; portal then recording
+        // lock, the same order the button and key recorders use.
+        let _serial = lock_portal_held();
         let result = self.portal_result("touch", portal.touch(phase, f64::from(x), f64::from(y)));
         if result == 0 {
             match phase {
