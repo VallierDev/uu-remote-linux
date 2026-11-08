@@ -581,13 +581,12 @@ impl InputInjector {
     }
     /// Inputs bound to the portal session are dropped when that session is replaced.
     fn record_portal_button(&self, button: i32, pressed: bool) {
-        let _serial = lock_portal_held();
+        // Callers hold the serial lock across the injection they are recording.
         let mut held = PORTAL_HELD.lock().unwrap();
         if pressed { held.buttons.insert(button); } else { held.buttons.remove(&button); }
         PORTAL_INPUT_HELD.store(!held.buttons.is_empty() || !held.keys.is_empty(), std::sync::atomic::Ordering::Relaxed);
     }
     fn record_portal_key(&self, symbol: u64, pressed: bool) {
-        let _serial = lock_portal_held();
         let mut held = PORTAL_HELD.lock().unwrap();
         if pressed { held.keys.insert(symbol); } else { held.keys.remove(&symbol); }
         PORTAL_INPUT_HELD.store(!held.buttons.is_empty() || !held.keys.is_empty(), std::sync::atomic::Ordering::Relaxed);
@@ -666,6 +665,8 @@ impl InputInjector {
         // before the compositor has moved the pointer there (uinput is a separate queue).
         if !self.uinput_pointer && self.backend==crate::desktop_backend::DesktopBackend::Portal && !self.virtual_uinput() {
             if let Some(portal)=self.portal.lock().unwrap().as_ref() {
+                // The injection and its record must both predate or both postdate a swap.
+                let _serial=lock_portal_held();
                 let result=self.portal_result("button", portal.button(button,pressed));
                 if result==0 { self.record_portal_button(button,pressed); }
                 return result;
@@ -677,6 +678,7 @@ impl InputInjector {
         }
         if self.backend==crate::desktop_backend::DesktopBackend::Kms { return -1; }
         if let Some(portal)=self.portal.lock().unwrap().as_ref() {
+            let _serial=lock_portal_held();
             let result=self.portal_result("button", portal.button(button,pressed));
             if result==0 { self.record_portal_button(button,pressed); }
             return result;
@@ -691,6 +693,7 @@ impl InputInjector {
         }
         if self.backend==crate::desktop_backend::DesktopBackend::Kms { return -1; }
         if let Some(portal)=self.portal.lock().unwrap().as_ref() {
+            let _serial=lock_portal_held();
             let result=self.portal_result("keyboard", portal.key(symbol,pressed));
             if result==0 { self.record_portal_key(symbol,pressed); }
             return result;

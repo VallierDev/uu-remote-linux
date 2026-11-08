@@ -20,6 +20,9 @@ pub trait Backend: Send + Sync {
     fn enter(&self, mode: Mode, journal: &mut Journal) -> Result<Entered, String>;
     /// Undo `data` from `enter`. Also used for crash recovery, where no desktop stream exists.
     fn leave(&self, data: &serde_json::Value) -> Result<(), String>;
+    /// Recompute `Entered::pointer_region` after the virtual output was recreated. None keeps
+    /// the stored region (backends without a virtual output, or a layout not settled yet).
+    fn refresh_pointer_region(&self) -> Option<[f64; 4]> { None }
 }
 
 /// The backend for this session, if the desktop has one.
