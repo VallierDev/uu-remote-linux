@@ -16,6 +16,28 @@ impl std::error::Error for PortalError {}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FrameVersion(usize, u64);
 
+/// Retains the exact capture source for queued packet cancellation checks.
+/// A check is an observation, not an atomic guarantee across network sends.
+#[derive(Clone)]
+pub(crate) struct FrameValidity(Arc<dyn Fn() -> bool + Send + Sync>);
+impl FrameValidity {
+    pub(crate) fn new(cancelled: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(cancelled))
+    }
+    pub(crate) fn cancelled(&self) -> bool { (self.0)() }
+}
+impl std::fmt::Debug for FrameValidity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrameValidity")
+    }
+}
+
+/// Producer contract selected only after independent synchronization/lifetime validation.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExplicitProtocol { UnscheduledRelease = 0, ReleasePoint = 1 }
+
+
 #[repr(C)]
 #[derive(Default)]
 pub struct DmaFrame {
@@ -56,6 +78,14 @@ mod native {
         fn uu_portal_dmabuf_acquire(portal: *mut c_void, frame: *mut super::DmaFrame, revision: *mut u64) -> i32;
         fn uu_portal_dmabuf_release(portal: *mut c_void);
         fn uu_portal_dmabuf_disable(portal: *mut c_void);
+        fn uu_portal_request_explicit(portal: *mut c_void, modifier: u64) -> i32;
+        fn uu_portal_request_explicit_protocol(portal: *mut c_void, modifier: u64, protocol: i32) -> i32;
+        fn uu_portal_async_acquire(portal: *mut c_void, lease: *mut *mut c_void, frame: *mut AsyncFrame) -> i32;
+        fn uu_portal_async_cancelled(lease: *const c_void) -> i32;
+        fn uu_portal_capture_cancelled(portal: *mut c_void, epoch: u64) -> i32;
+        fn uu_portal_recovery_status(portal: *mut c_void) -> i32;
+        fn uu_portal_async_finish(lease: *mut *mut c_void, complete: i32, release: Release, data: *mut c_void) -> i32;
+        fn uu_portal_async_abandon(lease: *mut *mut c_void, complete: i32) -> i32;
         fn uu_portal_move(portal: *mut c_void, x: f64, y: f64, relative: i32) -> i32;
         fn uu_portal_button(portal: *mut c_void, button: i32, pressed: i32) -> i32;
         fn uu_portal_key(portal: *mut c_void, keysym: u32, keycode: i32, pressed: i32) -> i32;
@@ -66,22 +96,61 @@ mod native {
         fn uu_portal_stream_position(portal: *mut c_void, x: *mut i32, y: *mut i32) -> i32;
         fn uu_portal_monitors(out: *mut libc::c_char, length: usize) -> i32;
         fn uu_portal_end(portal: *mut c_void);
+        fn uu_portal_end_checked(portal: *mut c_void) -> i32;
+        fn uu_portal_disconnect_capture(portal: *mut c_void) -> i32;
     }
-    struct Handle(NonNull<c_void>);
+    fn open_cpu_transport<T>(detailed: bool, opener: impl FnOnce(bool, i32) -> T) -> T {
+        opener(detailed, 0)
+    }
+    // A lease retains the exact native object even if Session installs a replacement.
+    pub(crate) struct NativeHandle(NonNull<c_void>);
+    impl NativeHandle { fn as_ptr(&self) -> *mut c_void { self.0.as_ptr() } }
+    unsafe impl Send for NativeHandle {}
+    // Ordinary calls still require Session.handle. Lease calls use the C engine's
+    // loop/frame locks; cancellation only reads atomic state.
+    unsafe impl Sync for NativeHandle {}
+    impl Drop for NativeHandle { fn drop(&mut self) { unsafe { uu_portal_close(self.as_ptr()) } } }
+    struct Handle(std::sync::Arc<NativeHandle>);
+    impl Handle { fn new(pointer: NonNull<c_void>) -> Self { Self(std::sync::Arc::new(NativeHandle(pointer))) } }
+    include!("portal_async.rs");
     fn pack(width: u32, height: u32) -> u64 { (u64::from(width) << 32) | u64::from(height) }
     // Calls are serialized by Session's mutex except wait_frame, whose C-side
     // condition wait synchronizes with callbacks and input through the engine lock.
     unsafe impl Send for Handle {}
-    unsafe impl Sync for Handle {}
-    impl Drop for Handle { fn drop(&mut self) { unsafe { uu_portal_close(self.0.as_ptr()) } } }
-    fn lease_handle<T>(current: &Mutex<Arc<T>>) -> Result<Arc<T>, String> {
-        current.lock().map(|handle| Arc::clone(&handle)).map_err(|_| "Portal session lock poisoned".into())
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // Replacing a retained session cancels its worker before final destruction.
+            if std::sync::Arc::strong_count(&self.0) > 1 { unsafe { uu_portal_end(self.0.as_ptr()) }; }
+        }
+    }
+    fn lease_handle<T, O>(current: &Mutex<T>, retain: impl FnOnce(&T) -> Arc<O>) -> Result<Arc<O>, String> {
+        current.lock().map(|handle| retain(&handle)).map_err(|_| "Portal session lock poisoned".into())
     }
     fn blank_changed(frame: &mut [u8], version: &mut Option<super::FrameVersion>) -> bool {
         if *version == Some(super::FrameVersion(0, 0)) { return false; }
         super::blank(frame); *version = Some(super::FrameVersion(0, 0)); true
     }
     // Portal preparation and native teardown can wait for consent or D-Bus.
+    fn lock_opening<'a>(opening: &'a Mutex<()>, cancelled: Option<&std::sync::atomic::AtomicBool>) -> Result<MutexGuard<'a, ()>, super::PortalError> {
+        use std::sync::atomic::Ordering;
+        let Some(cancelled) = cancelled else {
+            return Ok(opening.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        };
+        loop {
+            if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+            let guard = match opening.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+            };
+            if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+            return Ok(guard);
+        }
+    }
+
     // Only the swap may hold the mutex shared with input and clipboard.
     fn replace_handle<T>(current: &Mutex<T>, locked: MutexGuard<'_, T>, prepare: impl FnOnce() -> Result<Option<T>, String>) -> Result<bool, String> {
         drop(locked);
@@ -92,6 +161,17 @@ mod native {
         };
         drop(old);
         Ok(true)
+    }
+    fn install_recovered_handle<T>(current: &Mutex<T>, replacement: T, cancelled: &std::sync::atomic::AtomicBool) -> Result<(), super::PortalError> {
+        let mut handle = current.lock().map_err(|_| super::PortalError { code: 3 })?;
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            drop(handle);
+            return Err(super::PortalError { code: 13 });
+        }
+        let old = std::mem::replace(&mut *handle, replacement);
+        drop(handle);
+        drop(old);
+        Ok(())
     }
     #[derive(Default)]
     struct Recovery { retry_at: Option<std::time::Instant>, failed_until: Option<std::time::Instant>, denied: bool }
@@ -118,7 +198,7 @@ mod native {
             was_locked.store(false, std::sync::atomic::Ordering::Release);
         }
     }
-    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool }
+    pub struct Session { capture_access: std::sync::Arc<tokio::sync::RwLock<()>>, handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool }
     impl Session {
         fn take_lock_observation(&self) -> Result<bool, String> {
             // A recovery in progress must see the lock even if another capture
@@ -166,7 +246,7 @@ mod native {
             // (privacy virtual-output switch and closure recovery after a quick reconnect) each
             // consumed one and both failed, leaving no saved consent (seen live, KDE).
             static OPENING: Mutex<()> = Mutex::new(());
-            let _opening = OPENING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _opening = lock_opening(&OPENING, cancelled)?;
             // Each monitor has its own consent; the desktop-wide key is the single-monitor one.
             let taken = directory.as_deref().filter(|_| !fresh).and_then(|dir| {
                 let take = |k: String| super::permissions::take(dir, &k).map(|v| (k, v));
@@ -210,37 +290,18 @@ mod native {
             let detailed = crate::engine_plugin::symbol(crate::engine_plugin::Engine::Portal, "uu_portal_open_detailed\0") != 0;
             #[cfg(not(feature = "engine-plugins"))]
             let detailed = true;
-            #[allow(unused_mut)]
-            let mut prefer_dmabuf = false;
-            #[cfg(feature = "inproc-av")]
-            if !virtual_output && crate::video::native_engine_eligible(crate::video_select::selection().encoder, crate::video::NativeDisplayKind::Portal)
-                && !std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v| v == "0") {
-                prefer_dmabuf = true;
-            }
-            let pointer = if detailed {
+            // Every opening and recovery requests SHM; VAAPI errors cannot prove DMA completion.
+            let pointer = open_cpu_transport(detailed, |detailed, prefer_dmabuf| if detailed {
                 let cancel = cancelled.filter(|_| !virtual_output);
                 let callback = cancel.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
                 let cancel_data = cancel.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
                 unsafe { uu_portal_open_detailed(
                     restore, save_detailed, &mut cache as *mut _ as *mut c_void, callback, cancel_data,
-                    i32::from(prefer_dmabuf), if virtual_output { 4 } else { 1 },
+                    prefer_dmabuf, if virtual_output { 4 } else { 1 },
                     &mut error, &mut width, &mut height,
                 ) }
             } else {
-                #[allow(unused_mut)]
-                let mut pointer: *mut c_void = std::ptr::null_mut();
-                #[cfg(feature = "inproc-av")]
-                if prefer_dmabuf {
-                    let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
-                    let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
-                    pointer = unsafe { uu_portal_open_persist_capture(
-                        restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
-                        &mut error, &mut width, &mut height,
-                    ) };
-                    if pointer.is_null() && error != 0 { return Err(failed(error, &cache)); }
-                    if pointer.is_null() { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
-                }
-                if !pointer.is_null() { pointer } else { unsafe {
+                unsafe {
                     if virtual_output {
                         uu_portal_open_virtual(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
                     } else if let Some(cancelled) = cancelled {
@@ -249,8 +310,8 @@ mod native {
                     } else {
                         uu_portal_open_persist(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
                     }
-                } }
-            };
+                }
+            });
             let Some(handle) = NonNull::new(pointer) else { return Err(failed(if error == 0 { 15 } else { error }, &cache)) };
             let (mut x, mut y) = (0, 0);
             let granted = (!virtual_output && unsafe { uu_portal_stream_position(handle.as_ptr(), &mut x, &mut y) } == 0)
@@ -266,7 +327,7 @@ mod native {
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
             // before new damage can leave a static desktop permanently blank (#2).
-            Ok(Self { handle: Mutex::new(Arc::new(Handle(handle))), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into() })
+            Ok(Self { capture_access:std::sync::Arc::new(tokio::sync::RwLock::new(())), handle: Mutex::new(Handle::new(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into() })
         }
         /// Frame pixels of the monitor the stream currently follows.
         pub fn size(&self) -> (u32, u32) {
@@ -381,9 +442,7 @@ mod native {
             let result = super::open_then_install(cancelled, || Self::open_inner(Some(cancelled), monitor.as_deref(), false, virtual_output), |replacement| {
                 self.check_geometry(&replacement)?;
                 let replacement_handle = replacement.handle.into_inner().map_err(|_| super::PortalError { code: 3 })?;
-                let mut handle = self.handle.lock().map_err(|_| super::PortalError { code: 3 })?;
-                if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
-                *handle = replacement_handle;
+                install_recovered_handle(&self.handle, replacement_handle, cancelled)?;
                 clear_pause_for_unlocked_replacement(&self.was_locked, *self.locked.borrow());
                 log::info!("Portal capture session restored after closure");
                 Ok(())
@@ -417,11 +476,14 @@ mod native {
             }
         }
         pub fn disable_dmabuf(&self) {
+            let Ok(_access)=self.capture_access.try_read() else {return;};
             if let Ok(handle) = self.handle.lock() { unsafe { uu_portal_dmabuf_disable(handle.0.as_ptr()) }; }
         }
+        #[cfg(test)]
         pub fn with_dmabuf<T>(&self, version: &mut Option<super::FrameVersion>,
             encode: impl FnOnce(&super::DmaFrame, bool) -> Result<T, String>,
         ) -> Result<super::DmaCapture<T>, String> {
+            let _access=self.capture_access.try_read().map_err(|_| "Portal capture reserved by explicit worker")?;
             let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
             unsafe { uu_portal_input_dispatch(handle.0.as_ptr()) };
             // Hold the handle guard through GPU completion, so monitor swaps cannot invalidate a lease.
@@ -448,6 +510,7 @@ mod native {
             }
         }
         pub fn capture_changed(&self, frame: &mut [u8], version: &mut Option<super::FrameVersion>) -> Result<bool, String> {
+            let _access=self.capture_access.try_read().map_err(|_| "Portal capture reserved by explicit worker")?;
             let (width, height) = self.size();
             // A buffer sized for the previous monitor belongs to an encoder that a switch is replacing.
             if frame.len() != width as usize * height as usize * 4 { return Ok(blank_changed(frame, version)); }
@@ -531,10 +594,10 @@ mod native {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_clipboard_supported(handle.0.as_ptr()) != 0 })
         }
         pub fn wait_frame(&self, timeout: std::time::Duration) -> Result<bool, String> {
-            let handle = lease_handle(&self.handle)?;
+            let handle = lease_handle(&self.handle, |handle| Arc::clone(&handle.0))?;
             // Retain sub-millisecond precision across the FFI boundary and clamp to 5s.
             let us = (timeout.as_micros().min(5_000_000) as i64).max(1);
-            let ret = unsafe { uu_portal_wait_frame(handle.0.as_ptr(), us) };
+            let ret = unsafe { uu_portal_wait_frame(handle.as_ptr(), us) };
             if ret < 0 {
                 Err("Portal stream closed or failed during frame wait".into())
             } else {
@@ -613,12 +676,458 @@ mod native {
         use super::*;
         use std::{mem::ManuallyDrop, sync::Arc};
 
+        /// Uses the production opener/copy/close APIs, without saved credentials,
+        /// input injection, pixel logging or an outstanding GPU lease.
+        #[test]
+        #[ignore = "visible RemoteDesktop consent and changing desktop required"]
+        fn fresh_shm_real_portal() {
+            use std::time::{Duration, Instant};
+            extern "C" fn discard_token(_: *const libc::c_char, _: *mut c_void) {}
+            extern "C" fn expired(data: *mut c_void) -> i32 {
+                // The opener borrows this stack deadline only until it returns.
+                (Instant::now() >= unsafe { *(data as *const Instant) }) as i32
+            }
+            let mut deadline = Instant::now() + Duration::from_secs(120);
+            let (mut error, mut width, mut height) = (0, 0, 0);
+            let pointer = unsafe {
+                uu_portal_open_persist_capture(std::ptr::null(), discard_token,
+                    std::ptr::null_mut(), Some(expired),
+                    (&mut deadline as *mut Instant).cast(), 0,
+                    &mut error, &mut width, &mut height)
+            };
+            let handle = NativeHandle(NonNull::new(pointer)
+                .unwrap_or_else(|| panic!("fresh SHM open failed: code={error}")));
+            assert_eq!(error, 0);
+            assert!(width > 0 && height > 0 && width <= 8192 && height <= 8192);
+            let length = (width as usize).checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(4)).expect("frame size overflow");
+            let mut frame = vec![0; length];
+            let mut revision = 0;
+            let mut frames = 0;
+            let until = Instant::now() + Duration::from_secs(30);
+            while frames < 8 && Instant::now() < until {
+                let before = revision;
+                let code = unsafe { uu_portal_capture_since(handle.as_ptr(),
+                    frame.as_mut_ptr(), frame.len(), &mut revision) };
+                match code {
+                    0 => { assert_ne!(revision, before); frames += 1; }
+                    10 | 12 => {}
+                    _ => panic!("fresh SHM capture failed: code={code}"),
+                }
+                std::thread::sleep(Duration::from_millis(33));
+            }
+            // No GPU imports/work exist in this CPU-only test. Close acknowledgment
+            // tests the API, not a general producer-termination proof.
+            let closed = unsafe { uu_portal_end_checked(handle.as_ptr()) };
+            let after_close = unsafe { uu_portal_capture_since(handle.as_ptr(),
+                frame.as_mut_ptr(), frame.len(), &mut revision) };
+            drop(handle);
+            assert_eq!(closed, 0, "fresh SHM close failed");
+            assert_eq!(after_close, 9, "closed session must reject capture");
+            assert_eq!(frames, 8, "not enough changing desktop frames");
+            eprintln!("PASS fresh SHM production API: width={width} height={height} frames={frames} closed=1 capture_after_close=9");
+        }
+
+        #[test]
+        #[ignore = "visible Portal consent; requires UU_TEST_DMABUF_MODIFIER; metadata only, no GPU access"]
+        fn real_portal_native_async_lease() {
+            use std::time::{Duration, Instant};
+            let modifier=std::env::var("UU_TEST_DMABUF_MODIFIER").expect("explicit tested modifier required");
+            let modifier=u64::from_str_radix(modifier.trim_start_matches("0x"),16).unwrap();
+            extern "C" fn discard(_: *const libc::c_char, _: *mut c_void) {}
+            extern "C" fn expired(p: *mut c_void) -> i32 {
+                (Instant::now() >= unsafe { *p.cast::<Instant>() }) as i32
+            }
+            let mut deadline=Instant::now()+Duration::from_secs(120);
+            let (mut error,mut width,mut height)=(0,0,0);
+            let raw=unsafe { uu_portal_open_persist_capture(std::ptr::null(),discard,
+                std::ptr::null_mut(),Some(expired),(&mut deadline as *mut Instant).cast(),
+                0,&mut error,&mut width,&mut height) };
+            let owner=Arc::new(NativeHandle(NonNull::new(raw)
+                .unwrap_or_else(|| panic!("native open failed: code={error}"))));
+            // Select flagless metadata for this controlled diagnostic. No pixel
+            // access, timeline signal, GPU import or buffer return is authorized.
+            assert_eq!(unsafe { uu_portal_request_explicit_protocol(owner.as_ptr(),modifier,1) },0);
+            let until=Instant::now()+Duration::from_secs(10);
+            let mut lease=loop {
+                match unsafe { acquire_native_lease(owner.clone()) } {
+                    Ok(lease)=>break lease,
+                    Err(code) if code == -libc::EAGAIN && Instant::now()<until =>
+                        std::thread::sleep(Duration::from_millis(10)),
+                    Err(code)=>panic!("native async acquisition failed: code={code}"),
+                }
+            };
+            let guard=lease.publication_guard();
+            assert!(!guard.cancelled());
+            assert_eq!(lease.frame().pixels.modifier,modifier);
+            assert!(lease.frame().acquire_point>0 && lease.frame().release_point>lease.frame().acquire_point);
+            assert_eq!(unsafe { uu_portal_end_checked(owner.as_ptr()) },0);
+            assert!(guard.cancelled() && lease.cancelled());
+            // No timeline context or GPU access was created. Discard only this
+            // closed consumer's lease/fd references, without signal or requeue.
+            unsafe { lease.abandon_completed().unwrap(); }
+            drop(lease); drop(owner);
+            assert!(guard.cancelled()); // retained native owner is still valid
+            drop(guard);
+            eprintln!("PASS native async lease: width={width} height={height} closed_guard=1 gpu_access=0 release_signal=0");
+        }
+
+        #[test]
+        #[cfg(feature = "inproc-av")]
+        #[ignore = "visible Portal consent; reviewed Mutter release-point producer and NVIDIA required; desktop pixels decoded only in memory"]
+        fn real_portal_mutter_worker_encode() {
+            use std::time::{Duration,Instant};
+            let frames=std::env::var("UU_TEST_WORKER_FRAMES").map(|v| v.parse::<usize>().unwrap()).unwrap_or(32);
+            let cache_only=std::env::var("UU_TEST_WORKER_CACHE_ONLY").is_ok_and(|v| v=="1");
+            assert!((1..=120).contains(&frames));
+            assert!(!cache_only || frames>=3);
+            let modifier=std::env::var("UU_TEST_DMABUF_MODIFIER").expect("explicit tested modifier required");
+            let modifier=u64::from_str_radix(modifier.trim_start_matches("0x"),16).unwrap();
+            extern "C" fn discard(_: *const libc::c_char,_: *mut c_void) {}
+            extern "C" fn expired(p:*mut c_void)->i32 { (Instant::now()>=unsafe{*p.cast::<Instant>()}) as i32 }
+            let mut deadline=Instant::now()+Duration::from_secs(120);
+            let (mut error,mut width,mut height)=(0,0,0);
+            let raw=unsafe { uu_portal_open_persist_capture(std::ptr::null(),discard,std::ptr::null_mut(),
+                Some(expired),(&mut deadline as *mut Instant).cast(),0,&mut error,&mut width,&mut height) };
+            let owner=Arc::new(NativeHandle(NonNull::new(raw)
+                .unwrap_or_else(|| panic!("native open failed: code={error}"))));
+            // Controlled acceptance of the reviewed normal Mutter path: one
+            // consumer, one retained lease, no external timeline signalers.
+            // A matching modifier/flag alone would not establish this contract.
+            assert_eq!(unsafe{uu_portal_request_explicit_protocol(owner.as_ptr(),modifier,1)},0);
+            let source=ExplicitSession(owner.clone(),super::super::ExplicitProtocol::ReleasePoint,None);
+            let budget=Arc::new(tokio::sync::Semaphore::new(1));
+            let until=Instant::now()+Duration::from_secs(30);
+            let mut buffers=std::collections::HashMap::new();
+            let mut reused=0;
+            let mut original_guard=None;
+            let guards=if cache_only {
+                unsafe {crate::inproc_encoder::test_portal_worker_stream(&source,(width,height),frames,&budget,None,|| {
+                    let lease=acquire_native_lease(owner.clone())?;
+                    assert_eq!(lease.frame().pixels.modifier,modifier);
+                    original_guard=Some(lease.publication_guard());
+                    Ok(lease)
+                })}
+            } else {unsafe{crate::inproc_encoder::test_portal_worker_encode(&source,frames,|| {
+                assert_eq!(budget.available_permits(),1);
+                let permit=budget.clone().try_acquire_owned().unwrap();
+                let lease=loop {
+                    assert!(Instant::now()<until,"native frame collection deadline exceeded");
+                    match acquire_native_lease(owner.clone()) {
+                        Ok(lease)=>break lease,
+                        Err(code) if code == -libc::EAGAIN=>std::thread::sleep(Duration::from_millis(10)),
+                        Err(code)=>panic!("native encode acquisition failed: code={code}"),
+                    }
+                };
+                let frame=lease.frame();
+                assert_eq!(frame.pixels.modifier,modifier);
+                let mut stat=std::mem::MaybeUninit::<libc::stat>::uninit();
+                assert_eq!(libc::fstat(frame.pixels.fd,stat.as_mut_ptr()),0);
+                let stat=stat.assume_init();
+                if let Some(previous)=buffers.insert((stat.st_dev,stat.st_ino),frame.acquire_point) {
+                    assert!(frame.acquire_point>previous,"reused DMA-BUF acquire point must advance");
+                    reused+=1;
+                }
+                (lease,permit)
+            })}};
+            if !cache_only && frames>=32 { assert!(reused>0,"multi-frame acceptance must exercise producer buffer reuse"); }
+            assert_eq!(budget.available_permits(),1);
+            assert_eq!(guards.len(),frames);
+            assert!(guards.iter().all(|guard| guard.cancelled()==cache_only));
+            if let Some(guard)=original_guard.as_ref() {assert!(!guard.cancelled());}
+            assert_eq!(unsafe{uu_portal_end_checked(owner.as_ptr())},0);
+            assert!(guards.iter().all(|guard| guard.cancelled()));
+            if let Some(guard)=original_guard.as_ref() {assert!(guard.cancelled());}
+            assert_eq!(unsafe{uu_portal_disconnect_capture(owner.as_ptr())},0);
+            drop(source); drop(owner);
+            assert!(guards.iter().all(|guard| guard.cancelled())); drop(guards);
+            if cache_only {
+                eprintln!("PASS real cached worker loop: source_frames=1 cached_frames={} queued={frames} decoded={frames} task_stop=1 source_live_before_close=1 budget_returned=1 closed_guards=1",frames-1);
+            } else {
+                eprintln!("PASS real native worker: frames={frames} queued={frames} decoded={frames} encoder_instances=1 distinct_buffers={} reused_deliveries={reused} budget_returned=1 closed_guards=1",buffers.len());
+            }
+        }
+
+        #[cfg(feature = "inproc-av")]
+        pub(super) fn open_worker_test_session(locked: tokio::sync::watch::Receiver<Option<bool>>) -> Result<Session,super::super::PortalError> {
+            use std::time::{Duration,Instant};
+            extern "C" fn discard(_: *const libc::c_char,_: *mut c_void) {}
+            extern "C" fn expired(p:*mut c_void)->i32 { (Instant::now()>=unsafe{*p.cast::<Instant>()}) as i32 }
+            let mut deadline=Instant::now()+Duration::from_secs(120);
+            let (mut error,mut width,mut height)=(0,0,0);
+            let raw=unsafe { uu_portal_open_persist_capture(std::ptr::null(),discard,std::ptr::null_mut(),
+                Some(expired),(&mut deadline as *mut Instant).cast(),0,&mut error,&mut width,&mut height) };
+            let pointer=NonNull::new(raw).ok_or(super::super::PortalError{code:error})?;
+            let mut x=0; let mut y=0;
+            let monitor=(unsafe{uu_portal_stream_position(pointer.as_ptr(),&mut x,&mut y)}==0)
+                .then(|| crate::wayland::portal_monitor_at(x,y)).flatten();
+            Ok(Session {capture_access:std::sync::Arc::new(tokio::sync::RwLock::new(())),handle:Mutex::new(Handle::new(pointer)),locked,was_locked:false.into(),
+                recovery:Mutex::new(Recovery::default()),size:pack(width,height).into(),
+                monitor:Mutex::new(monitor),virtual_output:false.into()})
+        }
+
+        #[test]
+        #[cfg(feature = "inproc-av")]
+        #[ignore = "visible Portal consent; explicit production admission; NVIDIA; memory-only decode"]
+        fn real_portal_nvenc_production_entry() {
+            assert_eq!(std::env::var("UU_TEST_PORTAL_EPHEMERAL_RECOVERY").as_deref(),Ok("1"));
+            assert!(crate::video::native_engine_eligible(crate::video::Encoder::Nvenc,crate::video::NativeDisplayKind::Portal));
+            let (_lock_tx,locked)=tokio::sync::watch::channel(Some(false));
+            let session=Arc::new(open_worker_test_session(locked).unwrap());
+            crate::inproc_encoder::test_portal_production_run(session.clone(),32);
+            assert!(session.capture_access.clone().try_write_owned().is_ok());
+            let handle=session.handle.lock().unwrap();
+            assert_eq!(unsafe{uu_portal_recovery_status(handle.0.as_ptr())},0);
+            assert_eq!(unsafe{uu_portal_end_checked(handle.0.as_ptr())},0);
+            assert_eq!(unsafe{uu_portal_disconnect_capture(handle.0.as_ptr())},0);
+            eprintln!("PASS real production entry: selected=1 queued=32 decoded=32 stopped=1 budget_returned=1 reservation_released=1");
+        }
+
+        #[test]
+        #[cfg(feature = "inproc-av")]
+        #[ignore = "visible Portal consent; explicit production admission; full video reader; memory-only decode"]
+        fn real_portal_nvenc_video_reader() {
+            assert_eq!(std::env::var("UU_TEST_PORTAL_EPHEMERAL_RECOVERY").as_deref(),Ok("1"));
+            assert!(crate::video::native_engine_eligible(crate::video::Encoder::Nvenc,crate::video::NativeDisplayKind::Portal));
+            let (_lock_tx,locked)=tokio::sync::watch::channel(Some(false));
+            let session=Arc::new(open_worker_test_session(locked).unwrap());
+            crate::video::test_portal_production_reader(session.clone(),32,false);
+            assert!(session.capture_access.clone().try_write_owned().is_ok());
+            let handle=session.handle.lock().unwrap();
+            assert_eq!(unsafe{uu_portal_recovery_status(handle.0.as_ptr())},0);
+            assert_eq!(unsafe{uu_portal_end_checked(handle.0.as_ptr())},0);
+            assert_eq!(unsafe{uu_portal_disconnect_capture(handle.0.as_ptr())},0);
+            eprintln!("PASS real video reader: delivered=32 decoded=32 first_idr=1 source_identity=1 abort_joined=1 stale_frame_rejected=1 budget_returned=1 reservation_released=1");
+        }
+
+        #[test]
+        #[cfg(feature = "inproc-av")]
+        #[ignore = "visible Portal consent; explicit production admission; same-session reader restart"]
+        fn real_portal_nvenc_reader_restart() {
+            assert_eq!(std::env::var("UU_TEST_PORTAL_EPHEMERAL_RECOVERY").as_deref(),Ok("1"));
+            assert!(crate::video::native_engine_eligible(crate::video::Encoder::Nvenc,crate::video::NativeDisplayKind::Portal));
+            let (_lock_tx,locked)=tokio::sync::watch::channel(Some(false));
+            let session=Arc::new(open_worker_test_session(locked).unwrap());
+            let original=session.handle.lock().unwrap().0.clone();
+            crate::video::test_portal_production_reader(session.clone(),32,true);
+            assert!(session.capture_access.clone().try_write_owned().is_ok());
+            let handle=session.handle.lock().unwrap();
+            assert!(Arc::ptr_eq(&original,&handle.0),"restart must not replace the Portal session");
+            assert_eq!(unsafe{uu_portal_recovery_status(handle.0.as_ptr())},0);
+            assert_eq!(unsafe{uu_portal_end_checked(handle.0.as_ptr())},0);
+            assert_eq!(unsafe{uu_portal_disconnect_capture(handle.0.as_ptr())},0);
+            eprintln!("PASS real reader restart: phases=2 delivered=64 decoded=64 same_session=1 fps_change=30_to_60 first_idr_each=1 continuous_sequence=1 stale_frame_rejected=1 budget_returned=1 reservation_released=1");
+        }
+
+        #[test]
+        #[cfg(feature = "inproc-av")]
+        #[ignore = "visible Portal consent; reviewed Mutter producer; real continuous NVIDIA worker; memory-only decode"]
+        fn real_portal_worker_live_stream() {
+            let modifier=std::env::var("UU_TEST_DMABUF_MODIFIER").expect("explicit tested modifier required");
+            let modifier=u64::from_str_radix(modifier.trim_start_matches("0x"),16).unwrap();
+            // Inject only unlocked observation; acquisition and transport are real.
+            let (_lock_tx,locked)=tokio::sync::watch::channel(Some(false));
+            let session=open_worker_test_session(locked).unwrap();
+            let (source,status)=unsafe {session.request_explicit_protocol(modifier,super::super::ExplicitProtocol::ReleasePoint)}.unwrap();
+            assert_eq!(status,0);
+            let budget=Arc::new(tokio::sync::Semaphore::new(1));
+            let frames=32;
+            let guards=unsafe {crate::inproc_encoder::test_portal_worker_stream(
+                &source,session.size(),frames,&budget,Some(&session),|| unreachable!("live adapter owns acquisition"))};
+            assert_eq!(guards.len(),frames);
+            assert!(guards.iter().all(|g| g.cancelled()));
+            assert_eq!(budget.available_permits(),1);
+            let handle=session.handle.lock().unwrap();
+            assert_eq!(unsafe{uu_portal_recovery_status(handle.0.as_ptr())},0);
+            assert_eq!(unsafe{uu_portal_end_checked(handle.0.as_ptr())},0);
+            assert_eq!(unsafe{uu_portal_disconnect_capture(handle.0.as_ptr())},0);
+            drop(handle);
+            assert!(matches!(unsafe{session.acquire_explicit(&source)},Err(code) if code == -libc::ECANCELED));
+            eprintln!("PASS real live worker adapter: queued=32 decoded=32 task_stop=1 budget_returned=1 closed_source_rejected=1");
+        }
+
+        #[test]
+        #[cfg(feature = "inproc-av")]
+        #[ignore = "two visible Portal consents; real continuous NVIDIA worker; controlled failure after GPU completion"]
+        fn real_portal_stream_shm_recovery() {
+            let modifier=std::env::var("UU_TEST_DMABUF_MODIFIER").expect("explicit tested modifier required");
+            let modifier=u64::from_str_radix(modifier.trim_start_matches("0x"),16).unwrap();
+            let (_lock_tx,locked)=tokio::sync::watch::channel(Some(false));
+            let session=open_worker_test_session(locked.clone()).unwrap();
+            let (source,status)=unsafe {session.request_explicit_protocol(modifier,super::super::ExplicitProtocol::ReleasePoint)}.unwrap();
+            assert_eq!(status,0);
+            let installed=unsafe {crate::inproc_encoder::test_portal_stream_recovery(&session,&source,|stop| {
+                eprintln!("Stream recovery diagnostic: opening fresh SHM session; confirm second consent");
+                session.fallback_explicit_to_shm_using(&source,stop,|_,virtual_output| {
+                    assert!(!virtual_output); open_worker_test_session(locked.clone())
+                })
+            })}.unwrap();
+            assert!(installed);
+            assert!(matches!(unsafe{session.acquire_explicit(&source)},Err(code) if code == -libc::ECANCELED));
+            drop(source);
+            let (width,height)=session.size();
+            let mut frame=vec![0; width as usize*height as usize*4];
+            let handle=session.handle.lock().unwrap();
+            let mut revision=0;
+            assert_eq!(unsafe{uu_portal_capture_since(handle.0.as_ptr(),frame.as_mut_ptr(),frame.len(),&mut revision)},0);
+            assert!(revision>0);
+            assert_eq!(unsafe{uu_portal_end_checked(handle.0.as_ptr())},0);
+            eprintln!("PASS real stream SHM recovery: completed_gpu=1 budget_returned=1 failed_packet_suppressed=1 replaced=1 old_source_rejected=1 cpu_frame=1");
+        }
+
+        #[test]
+        #[cfg(feature = "inproc-av")]
+        #[ignore = "two visible Portal consents; NVIDIA worker; UU_TEST_DMABUF_MODIFIER; no source GPU work or saved tokens"]
+        fn real_portal_pre_submit_shm_recovery() {
+            real_portal_worker_shm_recovery(false);
+        }
+
+        #[test]
+        #[cfg(feature = "inproc-av")]
+        #[ignore = "two visible Portal consents; reviewed Mutter producer; actual GPU encode then injected error before release"]
+        fn real_portal_completed_shm_recovery() {
+            real_portal_worker_shm_recovery(true);
+        }
+
+        #[cfg(feature = "inproc-av")]
+        fn real_portal_worker_shm_recovery(completed:bool) {
+            use std::time::{Duration,Instant};
+            let modifier=std::env::var("UU_TEST_DMABUF_MODIFIER").expect("explicit tested modifier required");
+            let modifier=u64::from_str_radix(modifier.trim_start_matches("0x"),16).unwrap();
+            // Only the lock observation is injected; both transport sessions and
+            // recovery installation are real. No lock/unlock acceptance is claimed.
+            let (_lock_tx,locked)=tokio::sync::watch::channel(Some(false));
+            let session=open_worker_test_session(locked.clone()).unwrap();
+            let (source,status)=unsafe {session.request_explicit_protocol(modifier,super::super::ExplicitProtocol::ReleasePoint)}.unwrap();
+            assert_eq!(status,0);
+            let budget=Arc::new(tokio::sync::Semaphore::new(1));
+            let permit=budget.clone().try_acquire_owned().unwrap();
+            let until=Instant::now()+Duration::from_secs(10);
+            let lease=loop {
+                match unsafe {session.acquire_explicit(&source)} {
+                    Ok(lease)=>break lease,
+                    Err(code) if code == -libc::EAGAIN && Instant::now()<until => std::thread::sleep(Duration::from_millis(10)),
+                    Err(code)=>panic!("recovery lease failed: code={code}"),
+                }
+            };
+            let guard=lease.publication_guard();
+            assert!(lease.belongs_to(&source));
+            let cancelled=std::sync::atomic::AtomicBool::new(false);
+            let installed=unsafe {crate::inproc_encoder::test_portal_worker_recovery(
+                lease,&source,permit,completed,|| {
+                    assert_eq!(budget.available_permits(),1);
+                    assert!(guard.cancelled());
+                    eprintln!("Recovery diagnostic: opening fresh SHM session; confirm second consent");
+                    session.fallback_explicit_to_shm_using(&source,&cancelled,|_,virtual_output| {
+                        assert!(!virtual_output); open_worker_test_session(locked.clone())
+                    })
+                })}.unwrap();
+            assert!(installed && guard.cancelled());
+            assert!(matches!(unsafe{session.acquire_explicit(&source)},Err(code) if code == -libc::ECANCELED));
+            drop(source);
+            let (width,height)=session.size();
+            let mut frame=vec![0; width as usize*height as usize*4];
+            let handle=session.handle.lock().unwrap();
+            let mut revision=0;
+            assert_eq!(unsafe{uu_portal_capture_since(handle.0.as_ptr(),frame.as_mut_ptr(),frame.len(),&mut revision)},0);
+            assert!(revision>0);
+            assert_eq!(unsafe{uu_portal_end_checked(handle.0.as_ptr())},0);
+            drop(handle); drop(session);
+            eprintln!("PASS real worker fresh SHM recovery: completed_gpu={} budget_returned=1 replaced=1 old_source_rejected=1 cpu_frame=1 release_signal=0",u8::from(completed));
+        }
+
+        #[test]
+        fn cpu_transport_passes_zero_to_injected_opener() {
+            for detailed in [false, true] {
+                assert_eq!(open_cpu_transport(detailed, |selected, prefer| {
+                    assert_eq!(selected, detailed);
+                    assert_eq!(prefer, 0);
+                    42
+                }), 42);
+            }
+        }
+
+        #[test]
+        fn cpu_transport_with_replacement_helpers_and_failures() {
+            use std::{cell::RefCell, sync::atomic::AtomicBool};
+            // Synthetic labels exercise helper composition, not Session entry points or a Portal.
+            for detailed in [false, true] {
+                let calls = RefCell::new(Vec::new());
+                let open = |source: &str, fail: bool| {
+                    open_cpu_transport(detailed, |selected, prefer| {
+                        calls.borrow_mut().push((source.to_owned(), selected, prefer));
+                        if fail { Err(super::super::PortalError { code: 3 }) } else { Ok(source.to_owned()) }
+                    })
+                };
+                let current = Mutex::new(open("first", false).unwrap());
+                let cancelled = AtomicBool::new(false);
+                // open_then_install propagates an opener failure and installs a success.
+                assert!(super::super::open_then_install(&cancelled, || open("open-fail", true), |next| {
+                    install_recovered_handle(&current, next, &cancelled)
+                }).is_err());
+                assert_eq!(*current.lock().unwrap(), "first");
+                super::super::open_then_install(&cancelled, || open("replacement", false), |next| {
+                    install_recovered_handle(&current, next, &cancelled)
+                }).unwrap();
+                // Separately exercise replace_handle with successful and failed opens.
+                let guard = current.lock().unwrap();
+                assert!(replace_handle(&current, guard, || Ok(Some(open("next", false).unwrap()))).unwrap());
+                for source in ["a", "b", "c", "d"] {
+                    let guard = current.lock().unwrap();
+                    assert!(replace_handle(&current, guard, || Ok(Some(open(source, false).unwrap()))).unwrap());
+                }
+                let guard = current.lock().unwrap();
+                assert!(replace_handle(&current, guard, || { open("replace-fail", true).map(Some).map_err(|_| "failed".into()) }).is_err());
+                assert_eq!(*current.lock().unwrap(), "d");
+                assert_eq!(calls.borrow().len(), 9);
+                assert!(calls.borrow().iter().all(|(_, selected, prefer)| *selected == detailed && *prefer == 0));
+            }
+        }
+
+        #[test]
+        fn opening_lock_cancellation_and_contention() {
+            use std::{sync::{atomic::{AtomicBool, Ordering}, mpsc}, time::Duration};
+            let opening = Arc::new(Mutex::new(()));
+            let held = opening.lock().unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let (started, waiting) = mpsc::channel();
+            let (done, result) = mpsc::channel();
+            let worker = {
+                let opening = opening.clone();
+                let cancelled = cancelled.clone();
+                std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    done.send(lock_opening(&opening, Some(&cancelled)).err().map(|e| e.code)).unwrap();
+                })
+            };
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(result.recv_timeout(Duration::from_millis(50)).is_err());
+            cancelled.store(true, Ordering::Release);
+            let outcome = result.recv_timeout(Duration::from_secs(2));
+            drop(held);
+            worker.join().unwrap();
+            assert_eq!(outcome.unwrap(), Some(13));
+            assert_eq!(lock_opening(&opening, Some(&cancelled)).err().unwrap().code, 13);
+            assert!(lock_opening(&opening, None).is_ok());
+        }
+
+        #[test]
+        fn opening_lock_recovers_poison() {
+            use std::sync::atomic::AtomicBool;
+            let opening = Arc::new(Mutex::new(()));
+            let other = opening.clone();
+            assert!(std::thread::spawn(move || { let _guard = other.lock().unwrap(); panic!("poison"); }).join().is_err());
+            assert!(lock_opening(&opening, Some(&AtomicBool::new(false))).is_ok());
+            assert!(lock_opening(&opening, None).is_ok());
+        }
+
         struct Fixture(ManuallyDrop<Session>);
         impl Fixture {
             fn new(physical: (u32, u32)) -> Self {
                 let (_, locked) = tokio::sync::watch::channel(None);
                 Self(ManuallyDrop::new(Session {
-                    handle: Mutex::new(Arc::new(Handle(NonNull::dangling()))),
+                    capture_access:std::sync::Arc::new(tokio::sync::RwLock::new(())),
+                    handle: Mutex::new(Handle::new(NonNull::dangling())),
                     locked,
                     was_locked: std::sync::atomic::AtomicBool::new(false),
                     recovery: Mutex::new(Recovery::default()),
@@ -637,6 +1146,24 @@ mod native {
                 std::mem::forget(handle);
                 drop((locked, was_locked, recovery));
             }
+        }
+
+        #[test]
+        fn explicit_reservation_excludes_cpu_and_other_negotiators() {
+            let fixture=Fixture::new((2,2));
+            let session=fixture.session();
+            let access=session.capture_access.clone().try_write_owned().unwrap();
+            let mut pixels=[0;16]; let mut version=None;
+            assert!(session.capture_changed(&mut pixels,&mut version).is_err());
+            assert!(matches!(unsafe{session.request_explicit_protocol(0,super::super::ExplicitProtocol::ReleasePoint)},
+                Err(code) if code == -libc::EBUSY));
+            assert!(session.with_dmabuf(&mut version,|_,_| Ok(())).is_err());
+            drop(access);
+            let cpu=session.capture_access.try_read().unwrap();
+            assert!(matches!(unsafe{session.request_explicit_protocol(0,super::super::ExplicitProtocol::ReleasePoint)},
+                Err(code) if code == -libc::EBUSY));
+            drop(cpu);
+            assert!(session.capture_access.clone().try_write_owned().is_ok());
         }
 
         #[test]
@@ -669,7 +1196,7 @@ mod native {
             let worker = {
                 let current = current.clone();
                 std::thread::spawn(move || {
-                    let lease = lease_handle(&current).unwrap();
+                    let lease = lease_handle(&current, Arc::clone).unwrap();
                     waiting.send(()).unwrap();
                     resumed.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
                     assert!(!lease.0.load(Ordering::SeqCst));
@@ -761,6 +1288,28 @@ mod native {
             assert_eq!(second_result.unwrap(), (2, false, false));
             assert!(contention_result.unwrap());
             assert!(recovered.unwrap());
+        }
+
+        #[test]
+        fn closure_recovery_drops_handles_outside_the_mutex() {
+            use std::sync::{atomic::{AtomicBool, Ordering}, Weak};
+            struct CheckedDrop { current: Weak<Mutex<CheckedDrop>>, dropped: Arc<AtomicBool> }
+            impl Drop for CheckedDrop {
+                fn drop(&mut self) {
+                    if let Some(current) = self.current.upgrade() {
+                        assert!(current.try_lock().is_ok(), "handle dropped while locked");
+                        self.dropped.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+            for cancelled in [false, true] {
+                let dropped = Arc::new(AtomicBool::new(false));
+                let current = Arc::new_cyclic(|weak| Mutex::new(CheckedDrop { current: weak.clone(), dropped: dropped.clone() }));
+                let replacement = CheckedDrop { current: Arc::downgrade(&current), dropped: dropped.clone() };
+                let result = install_recovered_handle(&current, replacement, &AtomicBool::new(cancelled));
+                assert_eq!(result.is_err(), cancelled);
+                assert!(dropped.load(Ordering::SeqCst));
+            }
         }
 
         #[test]
@@ -911,6 +1460,10 @@ pub const NOT_BUILT: &str = "this build has no GNOME/KDE Wayland (portal) suppor
     (\"GNOME on Xorg\" / \"Plasma (X11)\") at the login screen, or build with --features wayland,portal";
 #[cfg(all(target_os = "linux", feature = "portal"))]
 pub use native::Session as PortalSession;
+#[cfg(all(target_os = "linux", feature = "portal"))]
+pub(crate) use native::{GpuFrameResult, AsyncFrame, AsyncLease, WorkerFrame, run_explicit_frame, run_explicit_frame_cancelable, NativeHandle, ExplicitSession};
+#[cfg(all(test, target_os = "linux", feature = "portal"))]
+pub(crate) use native::{synthetic_lease,synthetic_lease_cancellable,SyntheticCancellation};
 #[cfg(not(all(target_os = "linux", feature = "portal")))]
 pub struct PortalSession { pub width: u32, pub height: u32 }
 #[cfg(not(all(target_os = "linux", feature = "portal")))]

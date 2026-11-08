@@ -2,13 +2,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <ffnvcodec/dynlink_cuda.h>
 #include <ffnvcodec/nvEncodeAPI.h>
 
 // Struct revisions come from the vendored nvEncodeAPI.h (*_VER macros), so the session must be
 // opened with that header's NVENCAPI_VERSION; older drivers are rejected in nvenc_create.
 #define CU_MEMHOSTREGISTER_DEVICEMAP 0x02
+
+typedef CUresult CUDAAPI tcuCtxSynchronize(void);
 
 typedef CUresult CUDAAPI (*tcuMemHostRegister)(void *p, size_t bytesize, unsigned int Flags);
 typedef CUresult CUDAAPI (*tcuMemHostGetDevicePointer)(CUdeviceptr *pdptr, void *p, unsigned int Flags);
@@ -31,6 +35,9 @@ struct NvencEngine {
     tcuMemAlloc_v2 *cuMemAlloc;
     tcuMemFree_v2 *cuMemFree;
     tcuMemcpyHtoD_v2 *cuMemcpyHtoD;
+    tcuCtxSynchronize *cuCtxSynchronize;
+    int gpu_busy, gpu_quarantined;
+    CUgraphicsResource egl_resource;
     tcuMemHostRegister cuMemHostRegister;
     tcuMemHostGetDevicePointer cuMemHostGetDevicePointer;
     tcuMemHostUnregister cuMemHostUnregister;
@@ -103,6 +110,7 @@ NvencEngine* nvenc_create(const NvencConfig* config) {
     engine->cuCtxPopCurrent = (tcuCtxPopCurrent_v2*)dlsym(engine->cuda_lib, "cuCtxPopCurrent_v2");
     engine->cuMemAlloc = (tcuMemAlloc_v2*)dlsym(engine->cuda_lib, "cuMemAlloc_v2");
     engine->cuMemFree = (tcuMemFree_v2*)dlsym(engine->cuda_lib, "cuMemFree_v2");
+    engine->cuCtxSynchronize = (tcuCtxSynchronize*)dlsym(engine->cuda_lib, "cuCtxSynchronize");
     engine->cuMemcpyHtoD = (tcuMemcpyHtoD_v2*)dlsym(engine->cuda_lib, "cuMemcpyHtoD_v2");
     engine->cuMemHostRegister = (tcuMemHostRegister)dlsym(engine->cuda_lib, "cuMemHostRegister_v2");
     engine->cuMemHostGetDevicePointer = (tcuMemHostGetDevicePointer)dlsym(engine->cuda_lib, "cuMemHostGetDevicePointer_v2");
@@ -346,6 +354,7 @@ fail:
 }
 
 int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size) {
+    if (engine && (engine->gpu_busy || engine->gpu_quarantined)) return -1;
     if (!engine || !host_ptr || size < engine->frame_bytes) {
         return -1;
     }
@@ -411,6 +420,7 @@ int nvenc_register_host_buffer(NvencEngine* engine, void* host_ptr, size_t size)
 
 // Caller has the context current.
 void nvenc_unregister_host_buffer(NvencEngine* engine) {
+    if (engine && (engine->gpu_busy || engine->gpu_quarantined)) return;
     if (!engine || !engine->is_zero_copy) return;
 
     if (engine->reg_res.registeredResource && engine->encoder) {
@@ -432,7 +442,7 @@ int nvenc_encode_frame(
     const uint8_t** out_data,
     uint32_t* out_len
 ) {
-    if (!engine || !out_data || !out_len || !engine->reg_res.registeredResource) {
+    if (!engine || engine->gpu_busy || engine->gpu_quarantined || !out_data || !out_len || !engine->reg_res.registeredResource) {
         return -1;
     }
     *out_data = NULL;
@@ -539,8 +549,11 @@ int nvenc_encode_frame(
     return rc;
 }
 
+#include "nvenc_gpu.inc"
+#include "nvenc_egl.inc"
+
 void nvenc_destroy(NvencEngine* engine) {
-    if (!engine) return;
+    if (!engine || engine->gpu_busy || engine->gpu_quarantined) return;
 
     int pushed = ctx_push(engine);
     // Without a current context the NVENC/CUDA objects cannot be released safely; leak them.

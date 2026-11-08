@@ -336,6 +336,12 @@ static int cancel_after_polls(void *data) {
 }
 static void cancellable_waits(void) {
     int cancelled = 1, error = 0;
+    uint32_t width = 99, height = 99;
+    /* Pre-cancellation must win even when connecting to the session bus fails. */
+    assert(!uu_portal_open_persist_cancellable(NULL, NULL, NULL, cancel_immediately,
+        &cancelled, &error, &width, &height));
+    assert(error == 13 && width == 0 && height == 0);
+    error = 0;
     struct uu_portal p = {.cancelled=cancel_immediately, .cancel_data=&cancelled};
     pthread_mutex_init(&p.lock, NULL);
     pthread_cond_init(&p.changed, NULL);
@@ -345,9 +351,9 @@ static void cancellable_waits(void) {
 
     GVariantBuilder options;
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(3));
     assert(!request(&p, REMOTE, "Start", &options, 2, &error));
-    assert(error == 13);
-    g_variant_builder_clear(&options);
+    assert(error == 13); /* request consumes options even on early cancellation. */
 
     /* A cancel arriving during the consent wait must stop it without the full timeout. */
     int waiting_cancelled = 0;
@@ -498,9 +504,24 @@ int main(void) {
     for (unsigned pixel=0; pixel<4; pixel++) {
         assert(p->frame[pixel*4]==0 && p->frame[pixel*4+1]==0 && p->frame[pixel*4+2]==0 && p->frame[pixel*4+3]==255);
     }
+    uint64_t first=0, second=0;
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &first)==0);
+    copy_video_buffer(p, &buffer);
+    assert(p->sequence==3 && uu_portal_capture_since(p, pixels, sizeof(pixels), &first)==12);
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &second)==0 && second==first);
+    uu_portal_reset_frame(p);
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &first)==10);
+    copy_video_buffer(p, &buffer);
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &first)==0);
+    for (unsigned pixel=0; pixel<4; pixel++) assert(pixels[pixel*4+3]==255);
     /* A valid buffer after corruption remains usable; no permanent failure. */
     chunk.size=20; chunk.flags=0; copy_video_buffer(p, &buffer);
-    assert(p->sequence==4 && !memcmp(p->frame, expected, 16));
+    assert(p->sequence==2 && !memcmp(p->frame, expected, 16));
+    chunk.flags=SPA_CHUNK_FLAG_EMPTY; chunk.size=0;
+    copy_video_buffer(p, &buffer);
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &first)==0);
+    for (unsigned pixel=0; pixel<4; pixel++) assert(pixels[pixel*4]==0 && pixels[pixel*4+3]==255);
+    chunk.flags=0; chunk.size=20;
     uu_portal_reset_frame(p);
     assert(uu_portal_capture(p, pixels, sizeof(pixels)) == 10);
     copy_video_buffer(p, &buffer);

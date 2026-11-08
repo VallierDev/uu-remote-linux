@@ -217,6 +217,8 @@ sudo apt install build-essential pkg-config \
 sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # optional: GNOME/KDE portal backend
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
+# Combined portal and inproc-av: development headers for EGLImage import helpers
+sudo apt install libegl-dev libdrm-dev
 # optional: headers for the inproc-av VAAPI/DRI3 engines (libva itself is loaded at runtime)
 sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
 # In-process audio capture and Opus encoding for inproc-av
@@ -240,7 +242,7 @@ The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config -
 The host's optional `--features inproc-av` encodes with hardware inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
 
 On GNOME/KDE Wayland, enable in-process encoding with `cargo build --release --features wayland,portal,inproc-av` and `set-encoder vaapi`; support is limited to Portal + VAAPI.
-`UU_PORTAL_DMABUF=0` disables DMA-BUF in favor of in-process host upload; `UU_VIDEO_PIPELINE=process` restores external FFmpeg pipelines.
+Portal VAAPI DMA-BUF import is disabled, with no environment-variable override, because the GPU may still access a returned frame after a VAAPI error. CPU capture and in-process upload are used instead; the extra copies may increase CPU use and reduce frame rate (not yet benchmarked). `UU_VIDEO_PIPELINE=process` restores external FFmpeg pipelines.
 
 ### 3. Log in
 
@@ -688,3 +690,7 @@ Default OFF: set `UU_VIEWER_NATIVE_GAMEPAD=1` to enable input; `UU_VIEWER_NATIVE
 Guide forwarding, multiple controllers and adaptive triggers are unsupported; suspend, forced exit and network recovery are not comprehensively verified.
 One reporting user tested input, phone-hotspot WAN, reconnect and rumble on one Windows/Steam Deck pair.
 See [protocol evidence, design and limits](docs/deckpad-native-gamepad.md).
+
+### Experimental Portal → NVIDIA low-copy capture
+
+An explicit, disabled-by-default entry is wired into video tasks; deployed client picture/control passed on one tested host with H.264; other configurations remain unverified. See [configuration, synchronization contract and recovery limits](docs/portal-nvidia-experimental.md).
