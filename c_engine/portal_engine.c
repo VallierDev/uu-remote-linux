@@ -191,6 +191,8 @@ static void session_closed(GDBusConnection *bus, const gchar *sender, const gcha
     const gchar *interface, const gchar *signal, GVariant *parameters, gpointer data) {
     (void)bus; (void)sender; (void)path; (void)interface; (void)signal; (void)parameters;
     struct uu_portal *p = data;
+    /* A closed session no longer tracks owner changes, so its cached claim is stale. */
+    pthread_mutex_lock(&p->lock); p->clipboard_owns=0; pthread_mutex_unlock(&p->lock);
     atomic_store(&p->closed, 1); fail(p, 9);
 }
 static void *run_dbus(void *data) {
@@ -1060,6 +1062,8 @@ int uu_portal_monitors(char *out, size_t length) {
  * captures then report a closed stream until the handle is replaced. */
 void uu_portal_end(struct uu_portal *p) {
     if (!p || atomic_exchange(&p->closed, 1)) return;
+    /* A closed session no longer tracks owner changes, so its cached claim is stale. */
+    pthread_mutex_lock(&p->lock); p->clipboard_owns=0; pthread_mutex_unlock(&p->lock);
     if (p->bus && p->session) {
         GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
             NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);

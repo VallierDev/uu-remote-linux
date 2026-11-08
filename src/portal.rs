@@ -450,7 +450,9 @@ mod native {
                     let applied_embedded = applied == 2;
                     super::CURSOR_MODE.store(if applied_embedded { 2 } else { 1 }, Ordering::Release);
                     if applied_embedded != embedded {
-                        // The backend refused the mode; keep later opens on what it does support.
+                        // The backend refused the mode (or cannot report support); retrying would
+                        // rebuild the session every motion run without changing anything.
+                        super::CURSOR_EMBED.store(1, Ordering::Release);
                         unsafe { uu_portal_set_cursor_mode(applied) };
                         log::info!("Portal backend did not apply the embedded cursor");
                         return Ok(false);

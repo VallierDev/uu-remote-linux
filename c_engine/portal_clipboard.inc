@@ -131,6 +131,8 @@ int uu_portal_clipboard_set(struct uu_portal *p,const uint8_t *text,size_t lengt
  * while this session still owns the selection. Returns 0 transferred, 1 nothing to transfer. */
 int uu_portal_clipboard_copy(struct uu_portal *from, struct uu_portal *to) {
     if (!from || !to) return -1;
+    /* A session that ended cannot know whether a newer owner took the selection since. */
+    if (!uu_portal_alive(from)) return 1;
     pthread_mutex_lock(&from->lock);
     char *copy=(from->clipboard_owns && from->clipboard_text)?g_memdup2(from->clipboard_text,from->clipboard_length+1):NULL;
     size_t length=from->clipboard_length;
