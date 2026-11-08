@@ -120,7 +120,7 @@ mod native {
             was_locked.store(false, std::sync::atomic::Ordering::Release);
         }
     }
-    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, clipboard_write: Mutex<()> }
+    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, clipboard_write: Mutex<()>, end_generation: Arc<std::sync::atomic::AtomicU64> }
     impl Session {
         fn take_lock_observation(&self) -> Result<bool, String> {
             // A recovery in progress must see the lock even if another capture
@@ -268,7 +268,7 @@ mod native {
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
             // before new damage can leave a static desktop permanently blank (#2).
-            Ok(Self { handle: Mutex::new(Arc::new(Handle(handle))), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()) })
+            Ok(Self { handle: Mutex::new(Arc::new(Handle(handle))), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()), end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
         }
         /// Frame pixels of the monitor the stream currently follows.
         pub fn size(&self) -> (u32, u32) {
@@ -278,6 +278,9 @@ mod native {
         /// End the compositor session (screen-share indicator off); the next desktop
         /// connection reopens it with the saved consent.
         pub fn end(&self) {
+            // Invalidate an open that is still waiting for consent: it must not install a share
+            // after the desktop was ended (viewer disconnect, idle shutdown, capture teardown).
+            self.end_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             if let Ok(handle) = self.handle.lock() { unsafe { uu_portal_end(handle.0.as_ptr()) }; }
         }
         /// Mutter connector of the monitor this session captures, when several are advertised.
@@ -345,16 +348,22 @@ mod native {
             let previous = super::cursor_embedded();
             let virtual_output = self.is_virtual();
             let monitor = self.monitor();
-            // A lock during the open must cancel the consent request, not wait out its timeout.
+            // A lock or desktop end during the open must cancel the consent request, not wait
+            // out its timeout.
+            let generation = self.end_generation.load(Ordering::Acquire);
             let cancel = Arc::new(AtomicBool::new(false));
             let stop = Arc::new(AtomicBool::new(false));
             let watcher = {
                 let locked = self.locked.clone();
+                let end_generation = self.end_generation.clone();
                 let cancel = cancel.clone();
                 let stop = stop.clone();
                 std::thread::Builder::new().name("portal-cursor-lock".into()).spawn(move || {
                     while !stop.load(Ordering::Acquire) {
-                        if *locked.borrow() != Some(false) { cancel.store(true, Ordering::Release); return; }
+                        if *locked.borrow() != Some(false) || end_generation.load(Ordering::Acquire) != generation {
+                            cancel.store(true, Ordering::Release);
+                            return;
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                 }).ok()
@@ -364,6 +373,9 @@ mod native {
                 let replacement = Self::open_inner(Some(&cancel), monitor.as_deref(), false, virtual_output)
                     .map_err(|error| error.to_string())?;
                 if *self.locked.borrow() != Some(false) { return Err("desktop locked during the rebuild".into()); }
+                if self.end_generation.load(Ordering::Acquire) != generation {
+                    return Err("desktop session ended during the rebuild".into());
+                }
                 // A source change that finished meanwhile must not be undone by this swap.
                 if self.is_virtual() != virtual_output || (!virtual_output && self.monitor() != monitor) {
                     return Err("capture source changed during the rebuild".into());
@@ -378,6 +390,11 @@ mod native {
                 // so a viewer update cannot land on the new session and then be overwritten.
                 let clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned".to_string())?;
                 let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
+                // Checked again under the handle lock: end() bumps the generation before it
+                // takes this lock, so either its bump is visible here or it ends the new handle.
+                if self.end_generation.load(Ordering::Acquire) != generation {
+                    return Err("desktop session ended during the rebuild".into());
+                }
                 self.size.store(pack(size.0, size.1), Ordering::Release);
                 let previous_handle = std::mem::replace(&mut *handle, next);
                 let installed = Arc::clone(&*handle);
@@ -712,6 +729,7 @@ mod native {
                     size: pack(physical.0, physical.1).into(),
                     monitor: Mutex::new(None), virtual_output: false.into(),
                     clipboard_write: Mutex::new(()),
+                    end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 }))
             }
 
