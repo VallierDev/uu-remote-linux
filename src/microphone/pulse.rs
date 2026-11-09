@@ -83,7 +83,8 @@ impl Stream {
     fn connect(api: &'static Api, sink: &CStr, stopped: &watch::Receiver<bool>) -> Result<Self, String> { unsafe {
         let mut output = Self { api, mainloop: (api.mainloop_new)(), context: std::ptr::null_mut(), stream: std::ptr::null_mut() };
         if output.mainloop.is_null() { return Err("Microphone audio loop unavailable".into()); }
-        output.context = (api.context_new)((api.mainloop_get_api)(output.mainloop), c"UU Remote microphone".as_ptr());
+        let client = CString::new(crate::i18n::s("UU 远程麦克风", "UU Remote microphone")).unwrap();
+        output.context = (api.context_new)((api.mainloop_get_api)(output.mainloop), client.as_ptr());
         // PA_CONTEXT_NOAUTOSPAWN: connecting to the configured server must not start another one.
         if output.context.is_null() || (api.context_connect)(output.context, std::ptr::null(), 1, std::ptr::null_mut()) < 0 {
             return Err("Microphone audio server unavailable".into());
@@ -91,7 +92,8 @@ impl Stream {
         let context = output.context;
         output.wait(stopped, || (api.context_get_state)(context) == 4)?; // PA_CONTEXT_READY
         let spec = SampleSpec { format: 3, rate: 48000, channels: 2 }; // PA_SAMPLE_S16LE
-        output.stream = (api.stream_new)(context, c"Remote-Microphone".as_ptr(), &spec, std::ptr::null_mut());
+        let name = CString::new(crate::i18n::s("远程麦克风", "Remote-Microphone")).unwrap();
+        output.stream = (api.stream_new)(context, name.as_ptr(), &spec, std::ptr::null_mut());
         let attr = BufferAttr { maxlength: u32::MAX, tlength: 5760, prebuf: u32::MAX, minreq: 1920, fragsize: u32::MAX };
         // pulse/def.h: PA_STREAM_DONT_MOVE | PA_STREAM_ADJUST_LATENCY. A disappearing target
         // must fail closed; PipeWire-only node properties cannot enforce this on PulseAudio.

@@ -3,6 +3,48 @@ use super::*;
 use tokio::io::AsyncReadExt;
 use webrtc::track::track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocalWriter};
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
+use webrtc::interceptor::{mock::{mock_builder::MockBuilder, mock_interceptor::MockInterceptor},
+    registry::Registry, Attributes, RTPReader};
+
+fn have_opus() -> bool {
+    match opus() {
+        Ok(_) => true,
+        Err(error) => { eprintln!("Skipping Opus-dependent microphone test: {error}"); false }
+    }
+}
+
+#[derive(Default)]
+struct ReadPause {
+    requested: AtomicBool, entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify, completed: tokio::sync::Notify,
+}
+struct PausedReader { reader: Arc<dyn RTPReader + Send + Sync>, pause: Arc<ReadPause> }
+#[async_trait::async_trait]
+impl RTPReader for PausedReader {
+    async fn read(&self, buffer: &mut [u8], attributes: &Attributes) -> Result<(Packet, Attributes), webrtc::interceptor::Error> {
+        let result = self.reader.read(buffer, attributes).await?;
+        if self.pause.requested.swap(false, Ordering::AcqRel) {
+            // The packet has already been consumed; cancelling here would lose it.
+            self.pause.entered.notify_one();
+            self.pause.resume.notified().await;
+            self.pause.completed.notify_one();
+        }
+        Ok(result)
+    }
+}
+fn pause_registry(pause: Arc<ReadPause>) -> Registry {
+    let mut registry = Registry::new();
+    registry.add(Box::new(MockBuilder::new(move |_| {
+        let pause = pause.clone();
+        Ok(Arc::new(MockInterceptor { bind_remote_stream_fn: Some(Box::new(move |_, reader| {
+            let pause = pause.clone();
+            Box::pin(async move {
+                Arc::new(PausedReader { reader, pause }) as Arc<dyn RTPReader + Send + Sync>
+            })
+        })), ..Default::default() }))
+    })));
+    registry
+}
 
 fn tone() -> Vec<u8> {
     tone_samples(960)
@@ -48,6 +90,7 @@ fn rms(bytes: &[u8]) -> f64 {
 
 #[test]
 fn opus_decodes_generated_tone_and_conceals_loss() {
+    if !have_opus() { return; }
     assert!(!valid_packet(&[]));
     assert!(!valid_packet(&vec![0; 8193]));
     let data = tone();
@@ -63,6 +106,7 @@ fn opus_decodes_generated_tone_and_conceals_loss() {
 
 #[test]
 fn reorder_handles_wrap_loss_duplicates_and_bounded_backlog() {
+    if !have_opus() { return; }
     let data = tone();
     let mut jitter = Jitter::default();
     for seq in [65535, 1, 0, 0] { jitter.push(packet(seq, &data)); }
@@ -79,6 +123,7 @@ fn reorder_handles_wrap_loss_duplicates_and_bounded_backlog() {
 
 #[test]
 fn loss_duration_follows_rtp_clock_across_wrap_and_packet_sizes() {
+    if !have_opus() { return; }
     for samples in [480, 960, 1920, 2880] {
         let data = tone_samples(samples);
         let mut decoder = Decoder::new().unwrap();
@@ -97,6 +142,7 @@ fn loss_duration_follows_rtp_clock_across_wrap_and_packet_sizes() {
 
 #[test]
 fn variable_losses_preserve_total_time_and_bound_discontinuities() {
+    if !have_opus() { return; }
     let data = tone();
     let mut jitter = Jitter::default();
     let mut decoder = Decoder::new().unwrap();
@@ -250,16 +296,18 @@ async fn shutdown_waits_for_receivers_before_removing_endpoints() {
 
 #[tokio::test]
 async fn webrtc_microphone_obeys_mute_desktop_role_and_disconnect() {
+    if !have_opus() { return; }
     tokio::time::timeout(Duration::from_secs(15), async {
         let (left, right, router) = crate::test_network::virtual_network().await;
-        async fn peer(settings: webrtc::api::setting_engine::SettingEngine) -> Arc<RTCPeerConnection> {
+        async fn peer(settings: webrtc::api::setting_engine::SettingEngine, registry: Registry) -> Arc<RTCPeerConnection> {
             let mut m = webrtc::api::media_engine::MediaEngine::default();
             m.register_default_codecs().unwrap();
-            Arc::new(webrtc::api::APIBuilder::new().with_media_engine(m).with_setting_engine(settings)
+            Arc::new(webrtc::api::APIBuilder::new().with_media_engine(m).with_setting_engine(settings).with_interceptor_registry(registry)
                 .build().new_peer_connection(Default::default()).await.unwrap())
         }
-        let sender = peer(left).await;
-        let host = peer(right).await;
+        let pause = Arc::new(ReadPause::default());
+        let sender = peer(left, Registry::new()).await;
+        let host = peer(right, pause_registry(pause.clone())).await;
         // Match the real host: its existing desktop sound track negotiates a bidirectional m-line.
         host.add_track(Arc::new(TrackLocalStaticRTP::new(RTCRtpCodecCapability {
             mime_type: "audio/opus".into(), clock_rate: 48000, channels: 2, ..Default::default()
@@ -309,6 +357,13 @@ async fn webrtc_microphone_obeys_mute_desktop_role_and_disconnect() {
             loop { pcm.read_exact(&mut frame).await.unwrap(); played_frames += 1; }
         }).await;
         assert!((25..=35).contains(&played_frames), "wrong real-time playout rate: {played_frames} frames / 600 ms");
+        pause.requested.store(true, Ordering::Release);
+        pause.entered.notified().await;
+        // Span several playout ticks and at least two health ticks with a consumed RTP packet.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        pause.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), pause.completed.notified()).await
+            .expect("timer ticks cancelled a pending RTP read and lost its packet");
         let data = tone();
         let replacing = tokio::spawn(async move {
             for seq in 0..500 { let _ = replacement.write_rtp(&packet(seq, &data)).await; tokio::time::sleep(Duration::from_millis(20)).await; }
@@ -364,6 +419,8 @@ async fn pipewire_virtual_microphone_receives_generated_tone() {
         let mut frame = vec![0; 3840];
         loop { capture.read_exact(&mut frame).await?; if rms(&frame) > 1000. { return Ok::<_, std::io::Error>(()); } }
     }).await;
+    let inputs = pactl(&["--format=json", "list", "sink-inputs"]);
+    let devices = [pactl(&["--format=json", "list", "sinks"]), pactl(&["--format=json", "list", "sources"])];
     let stopped = recorder.kill().await;
     stop.send_replace(true);
     let generated = generating.await;
@@ -374,6 +431,22 @@ async fn pipewire_virtual_microphone_receives_generated_tone() {
     stopped.unwrap();
     assert!(!generated.is_err_and(|e| e.is_panic()), "tone generator panicked");
     received.expect("generated tone did not reach the virtual microphone").unwrap();
+    let inputs: serde_json::Value = serde_json::from_str(&inputs.unwrap()).unwrap();
+    let pid = std::process::id().to_string();
+    let properties = inputs.as_array().unwrap().iter().find_map(|input| {
+        let properties = input.get("properties")?;
+        (properties.get("application.process.id")?.as_str()? == pid
+            && properties.get("media.name")?.as_str()? == crate::i18n::s("远程麦克风", "Remote-Microphone")).then_some(properties)
+    }).expect("localized microphone stream missing");
+    assert_eq!(properties["application.name"], crate::i18n::s("UU 远程麦克风", "UU Remote microphone"));
+    for (data, name, description) in [
+        (&devices[0], &sink, crate::i18n::s("UU-远程麦克风输入", "UU-Remote-Microphone-Input")),
+        (&devices[1], &source, crate::i18n::s("UU-远程麦克风", "UU-Remote-Microphone")),
+    ] {
+        let devices: serde_json::Value = serde_json::from_str(data.as_ref().unwrap()).unwrap();
+        let device = devices.as_array().unwrap().iter().find(|device| device["name"] == name.as_str()).unwrap();
+        assert_eq!(device["description"], description);
+    }
 }
 
 /// Run through contrib/check-microphone-pulse.py, never against the desktop's audio server.

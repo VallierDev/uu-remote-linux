@@ -111,7 +111,8 @@ fn native_pulse(info: &str) -> Result<bool, String> {
     Ok(true)
 }
 fn sink_args(name: &str) -> Result<Vec<String>, String> {
-    let mut args = vec![format!("sink_name={name}"), "sink_properties=device.description=UU-Remote-Microphone-Input".into(),
+    let description = crate::i18n::s("UU-远程麦克风输入", "UU-Remote-Microphone-Input");
+    let mut args = vec![format!("sink_name={name}"), format!("sink_properties=device.description={description}"),
         "rate=48000".into(), "channels=2".into()];
     // PulseAudio 13+: norewinds starts the null sink with a 50 ms block instead of 2 s of
     // idle silence. PipeWire's compatible module does not accept this Pulse-only argument.
@@ -122,8 +123,9 @@ impl Route {
     fn new(sink_name: &str, source_name: &str) -> Result<Self, String> {
         let lock = route_lock(source_name)?;
         let sink = Module::open("module-null-sink", sink_args(sink_name)?)?;
+        let description = crate::i18n::s("UU-远程麦克风", "UU-Remote-Microphone");
         let source = Module::open("module-remap-source", vec![format!("source_name={source_name}"),
-            format!("master={sink_name}.monitor"), "source_properties=device.description=UU-Remote-Microphone".into(),
+            format!("master={sink_name}.monitor"), format!("source_properties=device.description={description}"),
             "rate=48000".into(), "channels=2".into()]);
         match source {
             Ok(source) => Ok(Route { source, sink, _lock: lock }),
@@ -375,6 +377,8 @@ impl Session {
         let mut health = tokio::time::interval(Duration::from_millis(100));
         let mut played = 0u64;
         let mut lost = 0u64;
+        // TrackRemote reads are not cancel safe. Keep the same future across timer and gate ticks.
+        let mut pending = Box::pin(track.read_rtp());
         loop {
             // A worker can first run after its replacement has already subscribed. Check the id,
             // not only changed(): both receivers may otherwise have marked the latest id as seen.
@@ -412,8 +416,9 @@ impl Session {
                         next = tokio::time::Instant::now() + Duration::from_millis(10);
                     }
                 },
-                received = track.read_rtp() => {
+                received = &mut pending => {
                     let Ok((packet, _)) = received else { break; };
+                    pending.set(track.read_rtp());
                     if !allowed || !valid_packet(&packet.payload) { continue; }
                     if player.is_none() {
                         match (self.factory)() {

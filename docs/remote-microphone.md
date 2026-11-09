@@ -23,7 +23,9 @@ systemctl --user restart uuremote-native.service
 
 The host creates the input device **UU-Remote-Microphone** (`uu-remote-microphone`) and a private backing sink (`uu-remote-mic-input`). In the application that should receive your voice, select UU-Remote-Microphone as its input. This patch does not change the system default input or output device. The backing sink is an audio destination for the decoder; it is not the device to select as an application microphone.
 
-被控端会出现 **UU-Remote-Microphone** 输入设备。在需要使用麦克风的应用中选择这个输入。补丁不修改系统默认输入、输出；底层的 `uu-remote-mic-input` 是解码器内部输出目标，不是应用应选择的麦克风。
+被控端会出现 **UU-远程麦克风** 输入设备（英文界面显示 **UU-Remote-Microphone**）。在需要使用麦克风的应用中选择这个输入。设备与音频流的显示名称跟随被控端语言，技术名称 `uu-remote-microphone`、`uu-remote-mic-input` 不变。补丁不修改系统默认输入、输出；底层的 `uu-remote-mic-input` 是解码器内部输出目标，不是应用应选择的麦克风。
+
+Device and stream display labels follow the host language; the technical sink/source identifiers stay unchanged.
 
 Enable the controller's microphone in the official UU client. The host completes VirtualAudioDriverPolicyRequest (RpcRequest field 21) using RpcResponse field 17 with a correctly encoded two-byte tag. It commits the reception gate and queues its reply/notification as one ordered transition before any network send can block. CONTROL and TEXT callbacks share the same transition lock, so a stalled open reply cannot overwrite a later close. Reception starts closed; connecting alone does not request capture. Opus is decoded at 48 kHz stereo and written through libpulse with PA_STREAM_DONT_MOVE, preventing rescue to a physical output on either supported audio server. A disconnected or superseded desktop drops queued audio and closes playback. Tool-only peers cannot inject microphone audio. A new incoming track replaces the previous track of the same peer.
 
@@ -46,6 +48,10 @@ Native PulseAudio uses its `norewinds` null-sink option to avoid the default two
 原生 PulseAudio 使用空设备的 `norewinds` 选项，避免首次播放时的默认两秒空闲缓冲；不向 PipeWire 传递这个专用参数。较旧、不受支持的 PulseAudio 不会启用麦克风。
 
 ## Validation / 验证
+
+Opus-dependent unit tests print a skip diagnostic when `libopus.so.0` is unavailable, so default tests still pass without this optional runtime. CI's `inproc-av` jobs install libopus and exercise these tests. The explicitly requested audio-server smoke tests require the runtime and fail if it is missing.
+
+缺少可选的 `libopus.so.0` 时，依赖 Opus 的单元测试会输出跳过说明，默认测试仍能通过。CI 的 `inproc-av` 任务安装 libopus 并实际运行这些测试；显式启用的音频服务真机测试需要该运行库，缺少时会失败。
 
 ```sh
 cargo test --locked --bin uuremote-server --features wayland,portal,engine-plugins microphone::tests
