@@ -142,7 +142,7 @@ niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
 | 被控端防窥模式 | 实验性，仅 KDE Plasma Wayland（portal）；Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显；`UU_PRIVACY_AUTO=picture` / `screen-off` 可在桌面连接时自动开启，见 [docs/privacy-screen.md](docs/privacy-screen.md) |
-| 麦克风（控制端声音传到被控端） | 未实现（需要虚拟声卡） |
+| 麦克风（控制端声音传到被控端） | 实验性：Opus → 虚拟麦克风，需 `UU_MICROPHONE=1`；支持 PulseAudio / PipeWire-pulse，见 [说明](docs/remote-microphone.md) |
 | 魔兽世界排队提醒等插件 | 不支持，会明确告诉客户端「无插件」 |
 | Linux 系统登录界面 | 还不支持控制开机后的系统登录界面（还没有人登录 Linux 桌面时）；这种情况可以用无头模式或虚拟桌面（见下文）。注意：这里说的是 Linux 系统登录，**不登录 UU 账号**现在可以通过「远程协助」使用 |
 | 跨运营商 / 受限网络的中继连接 | 已接入官方下发的 ICE 服务器，但复杂网络环境未充分测试 |

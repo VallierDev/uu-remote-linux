@@ -127,6 +127,11 @@ pub async fn run() -> Result<(), String> {
     line("render node", writable(&std::env::var("UU_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".into())));
 
     println!("-- audio");
+    line(crate::i18n::s("麦克风输入", "microphone input"),
+        crate::i18n::s("控制端 Opus 到固定虚拟输入（可选）", "controller Opus to pinned virtual input (opt-in)"));
+    line("UU_MICROPHONE", if crate::microphone::requested() { crate::i18n::s("已启用", "enabled") } else { crate::i18n::s("已禁用", "disabled") });
+    line(crate::i18n::s("虚拟麦克风", "virtual microphone"), command_output("pactl", &["list", "short", "sources"]).await
+        .is_some_and(|sources| sources.lines().any(|line| line.split('\t').nth(1) == Some(crate::microphone::SOURCE))));
     for tool in ["pactl", "pw-cli"] {
         line(tool, command_output("sh", &["-c", &format!("command -v {tool} >/dev/null && echo found || echo missing")]).await.unwrap_or_else(|| "unknown".into()));
     }

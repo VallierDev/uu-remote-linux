@@ -161,7 +161,7 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
 | Privacy screen on the host | Experimental, KDE Plasma Wayland (portal) only; off, picture and screen-off status labels verified with Mac 4.43.0; `UU_PRIVACY_AUTO=picture` / `screen-off` enables it automatically on desktop connect; see [docs/privacy-screen.md](docs/privacy-screen.md) |
-| Microphone (viewer audio played on the host) | Not implemented (needs a virtual sound card) |
+| Microphone (viewer audio played on the host) | Experimental: Opus to a virtual input with `UU_MICROPHONE=1`; supports PulseAudio / PipeWire-pulse, see [notes](docs/remote-microphone.md) |
 | Plugins such as the WoW queue notifier | Not supported; the client is told that no plugins exist |
 | Linux login screen | The system login screen (before anyone logs in to the Linux desktop) cannot be controlled yet; use headless mode or a virtual desktop (see below). This is about the Linux login: **without a UU account** the host can now be used through remote assistance |
 | Relay connections on restrictive networks | Uses the ICE servers provided by the UU cloud; complex network setups are not thoroughly tested |
