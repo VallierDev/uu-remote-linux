@@ -38,6 +38,7 @@ mod native {
 /// Set GNOME's display power-save mode to on. This does not unlock the session or change
 /// lock-screen policy. Session-bus setup and each method call are bounded to three seconds.
 pub fn wake() -> Result<(), String> {
+    if crate::privacy_screen::active() { return Ok(()); }
     if !gnome_portal_active() {
         return Ok(());
     }

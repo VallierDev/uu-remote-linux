@@ -5,6 +5,7 @@ mod ws_transport;
 mod engine_plugin;
 mod doctor;
 mod wol;
+mod wallpaper;
 mod desktop_backend;
 mod desktop_mode;
 mod desktop_session;
@@ -45,7 +46,9 @@ mod inproc_encoder;
 mod capture_setting;
 mod audio;
 mod virtual_audio;
+mod privacy_screen;
 mod system_actions;
+mod annotation;
 mod capability;
 mod protocol;
 mod control_protocol;
@@ -208,7 +211,7 @@ pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
     }
 }
 
-const SUBCOMMANDS: [&str; 17] = ["doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+const SUBCOMMANDS: [&str; 20] = ["privacy-guard", "privacy-wallpaper", "privacy-screen-probe", "doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
     "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
 
 /// Unknown arguments and illegal set-encoder / set-codec values exit 2 (never start a second host).
@@ -630,6 +633,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if login::run(gui).await.is_err() { std::process::exit(1); } // error already shown
         return Ok(());
     }
+    if std::env::args().nth(1).as_deref() == Some("privacy-guard") { std::process::exit(privacy_screen::guard_main()); }
+    if std::env::args().nth(1).as_deref() == Some("privacy-wallpaper") {
+        std::process::exit(privacy_screen::cover_main(&std::env::args().skip(2).collect::<Vec<_>>()));
+    }
+    if std::env::args().nth(1).as_deref() == Some("privacy-screen-probe") {
+        let screen = ScreenCapture::new()?;
+        if screen.portal.is_none() { return Err(std::io::Error::other("privacy screen needs the portal backend").into()); }
+        let _input = input::InputInjector::new(); // the privacy screen requires its uinput devices
+        let mode = if std::env::var("UU_PRIVACY_PROBE_WALLPAPER").as_deref() == Ok("1") { privacy_screen::Mode::Picture } else { privacy_screen::Mode::ScreenOff };
+        tokio::task::spawn_blocking(move || privacy_screen::probe(mode)).await?.map_err(std::io::Error::other)?;
+        drop(screen);
+        return Ok(());
+    }
+    privacy_screen::recover();
     virtual_audio::init();
     let _audio_cleanup=virtual_audio::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
@@ -668,7 +685,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(target_os="linux"))]
         let _ = tokio::signal::ctrl_c().await;
-        if !assist_enabled { shutdown_input.shutdown(); virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
+        if !assist_enabled { privacy_screen::shutdown(); shutdown_input.shutdown(); virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
         let _ = signal_tx.send(true);
     });
     let mut assist = if assist_enabled { Some(assist::Assist::start(&mut shutdown, unified).await?) } else { None };
@@ -699,7 +716,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One exit path for commands, signals, transport failures and UI failures.
     if let Some(session) = assist.as_mut() { session.allowed = false; }
     for (_, old) in webrtc_sessions.lock().await.drain() { close_peer(&old.pc).await; }
-    virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
+    privacy_screen::shutdown(); virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
     // Switching identity (signed in / out) restarts at once and the new identity republishes the same
     // device share: logout already withdrew it, and after a QR login the cloud moved it to the account
     // (a guest cancel then fails). Only a real stop withdraws here.
@@ -760,6 +777,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
         client
     };
 
+    let mut wallpaper_task = AbortOnDrop(wallpaper::start(auth.clone()));
     // One peer per viewer connection (desktop, file transfer, terminal...), keyed by ice_id.
     let mut next_capture_type: Option<(u64,crate::session_ice::SessionIce)> = None;
     let mut capture_types: HashMap<String, (u64,crate::session_ice::SessionIce)> = HashMap::new();
@@ -797,6 +815,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                 log::error!("UU login is invalid or expired; a new QR login is required");
                 let stale = config::read_fresh().ok().flatten().and_then(|f| f.get("token").and_then(|t| t.as_str()).map(str::to_owned));
                 auth = Arc::new(UUAuthClient::new(login::wait_for_credentials(stale).await));
+                wallpaper_task.0.abort();
+                wallpaper_task = AbortOnDrop(wallpaper::start(auth.clone()));
                 continue;
             }
             Err(e) => {
@@ -836,8 +856,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                 Arc::new(cli)
             }
             Err(e) => {
-                let _ = e;
-                log::error!("Failed to connect signaling; retrying in 5s (details omitted)");
+                // ws_transport errors carry only a category or HTTP status, never the token or URL.
+                log::error!("Failed to connect signaling; retrying in 5s: {e}");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -1018,6 +1038,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                             if desktop { portal_desktop.clone() } else { None }).await {
                             Ok(mut sess) => {
                                 sess.controller = controller;
+                                if desktop { crate::privacy_screen::set_viewer_controller(controller); }
                                 if !desktop {
                                     let (requests, peer) = (desktop_requests.clone(), ice.clone());
                                     sess.on_desktop_request(move || { let _ = requests.send(peer.clone()); });
@@ -1099,6 +1120,7 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                     } else { None };
                     video::warm_auto_probe(); video::check_ffmpeg_usable();
                     input.set_controller(controller);
+                    crate::privacy_screen::set_viewer_controller(controller);
                     input.bind_portal(screen.as_ref().map_or_else(|| sessions[&ice].capture.portal.clone(), |screen| screen.portal.clone()));
                     // One desktop at a time, as for a new desktop offer. Peers offered as desktops
                     // close; a promoted tool peer only stops its desktop and keeps its tools.

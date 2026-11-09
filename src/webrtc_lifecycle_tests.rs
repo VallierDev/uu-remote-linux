@@ -18,6 +18,11 @@ struct Viewer {
 
 async fn connect(desktop: bool, portal: Option<Arc<crate::desktop_session::PortalDesktop>>)
     -> (WebRtcSession, Viewer) {
+    connect_channels(desktop, portal, &["CONTROL_DATA_CHANNEL"]).await
+}
+
+async fn connect_channels(desktop: bool, portal: Option<Arc<crate::desktop_session::PortalDesktop>>, labels: &[&str])
+    -> (WebRtcSession, Viewer) {
     let input = Arc::new(InputInjector::without_desktop());
     let (host_setting, viewer_setting, router) = crate::test_network::virtual_network().await;
     let screen = Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into()));
@@ -26,7 +31,7 @@ async fn connect(desktop: bool, portal: Option<Arc<crate::desktop_session::Porta
     let pc = Arc::new(APIBuilder::new().with_setting_engine(viewer_setting).build().new_peer_connection(RTCConfiguration::default()).await.unwrap());
     let (tx, messages) = mpsc::unbounded_channel();
     let mut channels = HashMap::new();
-    for label in ["CONTROL_DATA_CHANNEL"] {
+    for &label in labels {
         let channel = pc.create_data_channel(label, None).await.unwrap();
         let (tx, name) = (tx.clone(), label.to_string());
         channel.on_message(Box::new(move |message| {
@@ -226,4 +231,58 @@ async fn tool_peer_applies_capture_settings_without_a_desktop() {
         host.pc.close().await.unwrap();
         viewer.router.lock().await.stop().await.unwrap();
     }).await.expect("tool capture-setting regression exceeded deadline");
+}
+
+/// Exercise the locally patched notifications and close handler through real SCTP,
+/// alongside the upstream CONTROL drain. No cloud or live host session is used.
+#[tokio::test]
+async fn terminal_notifications_and_disconnect_preserve_control_channel() {
+    use crate::terminal::{self, TerminalConn};
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let id = u32::MAX - 100;
+        struct Cleanup(u32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let (tx, _rx) = mpsc::unbounded_channel();
+                TerminalConn::new(tx).handle(&terminal::encode(terminal::KILL_REQ, 999,
+                    serde_json::json!({"session_id": self.0}).to_string().as_bytes()));
+            }
+        }
+        let _cleanup = Cleanup(id);
+        let (host, mut viewer) = connect_channels(false, None,
+            &["CONTROL_DATA_CHANNEL", "BINARY_DATA_CHANNEL"]).await;
+        viewer.channels["BINARY_DATA_CHANNEL"].send(&terminal::encode(terminal::OPEN, id,
+            br#"{"cols":80,"rows":24,"shell":"/bin/sh"}"#).into()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (mut opened, mut notified) = (false, false);
+            while !(opened && notified) {
+                let (label, bytes) = viewer.messages.recv().await.expect("terminal channel closed");
+                if label != "BINARY_DATA_CHANNEL" { continue; }
+                if let Some(frame) = terminal::decode(&bytes) {
+                    if frame.kind == terminal::OPEN_RESP && frame.session == id {
+                        assert_eq!(serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()["code"], 0);
+                        opened = true;
+                    }
+                } else if body(&bytes, 28) == Some(&[][..]) { notified = true; }
+            }
+        }).await.expect("open response and list notification must both reach the viewer");
+        let state = || {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            TerminalConn::new(tx).handle(&terminal::encode(terminal::LIST_REQ, 998, &[]));
+            let frame = terminal::decode(&rx.try_recv().unwrap()).unwrap();
+            serde_json::from_slice::<Vec<serde_json::Value>>(&frame.payload).unwrap().into_iter()
+                .find(|s| s["session_id"] == id).unwrap()["state"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(state(), "running");
+        viewer.channels["BINARY_DATA_CHANNEL"].close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state() != "detached" { tokio::time::sleep(Duration::from_millis(20)).await; }
+        }).await.expect("channel closure must detach its terminal session");
+        viewer.channels["CONTROL_DATA_CHANNEL"].send(&echo_request(123).into()).await.unwrap();
+        assert!(receive(&mut viewer.messages, 3, Duration::from_secs(3)).await.is_some(),
+            "terminal closure must leave CONTROL responsive");
+        viewer.pc.close().await.unwrap();
+        host.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("terminal lifecycle regression exceeded deadline");
 }

@@ -1,6 +1,6 @@
 [package]
 name = "uu-remote-linux"
-version = "0.2.41"
+version = "0.2.55"
 edition = "2021"
 default-run = "uuremote-server"
 authors = ["uu-remote-linux contributors"]
@@ -23,7 +23,7 @@ required-features = ["native-viewer"]
 default = []
 native-viewer = []
 viewer-ffmpeg = ["native-viewer", "dep:ffmpeg-next"]
-viewer-sdl = ["native-viewer", "dep:sdl2", "dep:ab_glyph"]
+viewer-sdl = ["native-viewer", "dep:sdl2", "dep:ab_glyph", "dep:png"]
 wayland = []
 # Experimental direct linear framebuffer capture; never enabled in release builds.
 kms = []
@@ -60,8 +60,10 @@ x11rb = { version = "0.13", features = ["damage", "shm", "allow-unsafe-code"], o
 
 sdl2 = { version = "0.37", optional = true, features = ["use-pkgconfig"] }
 ab_glyph = { version = "0.2", optional = true }
+png = { version = "0.18", optional = true }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 # Synthetic loopback WSS certificates only; both crates already occur in Cargo.lock.
 rcgen = "0.11.3"
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }

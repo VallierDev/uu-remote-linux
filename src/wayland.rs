@@ -261,7 +261,7 @@ fn portal_outputs()->Vec<Output> {
     let mut outputs:Vec<Output>=monitors.iter().map(|m|Output {name:m.connector.clone(),width:m.width,height:m.height,fps,x:m.x,y:m.y}).collect();
     // Screen 0 is the one opened first: the monitor whose consent is already saved, else the primary.
     let dir=crate::portal::permissions_directory();
-    let granted=|name:&str|dir.as_deref().is_some_and(|d|d.join(crate::portal::monitor_key(name)).exists());
+    let granted=|name:&str|dir.as_deref().is_some_and(|d|crate::portal::permission_exists(d,&crate::portal::monitor_key(name)));
     let primary=monitors.iter().find(|m|m.primary).map(|m|m.connector.clone()).unwrap_or_default();
     outputs.sort_by_key(|o|(!granted(&o.name),o.name!=primary,o.x,o.y));
     outputs.truncate(16);

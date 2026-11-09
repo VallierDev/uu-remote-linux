@@ -67,6 +67,7 @@ static void selection_owner(GDBusConnection *bus,const gchar *sender,const gchar
         pthread_mutex_lock(&p->lock);
         g_free(p->clipboard_mime); p->clipboard_mime=selected;
         p->clipboard_changed=!owner && selected!=NULL; p->clipboard_revision++;
+        p->clipboard_owns=owner?1:0;
         pthread_mutex_unlock(&p->lock);
         if (types) g_variant_unref(types);
     }
@@ -100,16 +101,46 @@ int uu_portal_clipboard_set(struct uu_portal *p,const uint8_t *text,size_t lengt
     if (!uu_portal_clipboard_ready(p) || length>CLIP_LIMIT || !g_utf8_validate((const char *)text,(gssize)length,NULL)) return -1;
     char *copy=g_malloc(length+1); memcpy(copy,text,length); copy[length]=0;
     pthread_mutex_lock(&p->lock);
-    g_free(p->clipboard_text); p->clipboard_text=copy; p->clipboard_length=length;
-    p->clipboard_changed=0;
+    /* Serve the new text while the portal announces it, and restore the old one on failure. */
+    char *old_text=p->clipboard_text; size_t old_length=p->clipboard_length;
+    uint64_t revision=p->clipboard_revision;
+    p->clipboard_text=copy; p->clipboard_length=length; p->clipboard_changed=0;
     pthread_mutex_unlock(&p->lock);
     const char *types[]={"text/plain;charset=utf-8","text/plain",NULL};
     GVariantBuilder options; g_variant_builder_init(&options,G_VARIANT_TYPE_VARDICT);
     g_variant_builder_add(&options,"{sv}","mime_types",g_variant_new_strv(types,-1));
     GVariant *reply=g_dbus_connection_call_sync(p->bus,DEST,PATH,CLIPBOARD,"SetSelection",
         g_variant_new("(o@a{sv})",p->session,g_variant_builder_end(&options)),NULL,G_DBUS_CALL_FLAGS_NONE,2000,NULL,NULL);
-    if (!reply) return -1;
-    g_variant_unref(reply); return 0;
+    if (!reply) {
+        pthread_mutex_lock(&p->lock);
+        g_free(p->clipboard_text);
+        p->clipboard_text=old_text; p->clipboard_length=old_length;
+        pthread_mutex_unlock(&p->lock);
+        return -1;
+    }
+    g_variant_unref(reply);
+    g_free(old_text);
+    pthread_mutex_lock(&p->lock);
+    /* Another owner may have been reported meanwhile; its newer state must win. */
+    if (p->clipboard_revision==revision) p->clipboard_owns=1;
+    pthread_mutex_unlock(&p->lock);
+    return 0;
+}
+/* Hand the text this session is providing to a replacement session, so a session swap (cursor
+ * mode, privacy screen, monitor switch) does not drop the viewer's clipboard. Transfers only
+ * while this session still owns the selection. Returns 0 transferred, 1 nothing to transfer. */
+int uu_portal_clipboard_copy(struct uu_portal *from, struct uu_portal *to) {
+    if (!from || !to) return -1;
+    /* A session that ended cannot know whether a newer owner took the selection since. */
+    if (!uu_portal_alive(from)) return 1;
+    pthread_mutex_lock(&from->lock);
+    char *copy=(from->clipboard_owns && from->clipboard_text)?g_memdup2(from->clipboard_text,from->clipboard_length+1):NULL;
+    size_t length=from->clipboard_length;
+    pthread_mutex_unlock(&from->lock);
+    if (!copy) return 1;
+    int result=uu_portal_clipboard_set(to,(const uint8_t *)copy,length);
+    g_free(copy);
+    return result==0?0:-1;
 }
 int uu_portal_clipboard_poll(struct uu_portal *p,uint8_t *out,size_t capacity) {
     if (!out || !uu_portal_clipboard_ready(p) || capacity<CLIP_LIMIT) return -1;

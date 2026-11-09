@@ -25,6 +25,14 @@
 
 ## Appearance / 外观
 
+Launcher icons use the system icon theme instead of emoji glyphs, so they do not depend on emoji font coverage.
+
+Signed-in graphical hosts report the system wallpaper for disconnected device cards in official clients
+(no desktop-window screenshot). GNOME/Cinnamon, KDE, Xfce and Omarchy on Hyprland are supported (following the current wallpaper); checks run every 60 seconds
+and unchanged content is not uploaded again. Other desktops can set `UU_WALLPAPER=/absolute/path/image.png`
+(PNG/JPEG/WebP). Set `UU_WALLPAPER_UPLOAD=0` to disable; guest and headless hosts skip reporting.
+See [protocol evidence and limitations](docs/wallpaper-protocol.md).
+
 Choose **System / Light / Dark** (default: System) in the viewer's **Settings → General → Appearance**, or via the gear settings button in host / tool windows.
 The choice is saved to `$XDG_CONFIG_HOME/uuremote/theme` (default `~/.config/uuremote/theme`).
 
@@ -69,10 +77,11 @@ Protocol strings and messages that come from the UU servers are shown as the ser
 | Mac shortcuts | **Recommended**: turn off 「使用 macOS 快捷键」 (use macOS shortcuts) in the Mac viewer's remote-window menu; then Cmd+C/V/A/F/X/Z work as on a Mac (Cmd+C/V become Ctrl+Shift+C/V in terminals) and Ctrl+C always interrupts. With the option on, the viewer sends Cmd as Ctrl: in a terminal Ctrl+V / Cmd+V paste, Ctrl+C interrupts, copy is Cmd+Shift+C (X11) |
 | Pointer shape | Remote cursor shape is mirrored to the viewer (X11) |
 | Clipboard | Two-way text sync; Wayland mobile IME text inputs use clipboard paste fallback (see below) |
+| Viewer annotation | Strokes drawn with 「批注」 (annotate) in the viewer's watch mode appear on the Linux screen and stream back to the viewer (X11, needs a compositing manager; the overlay lets clicks through); cleared when annotation is turned off or the viewer disconnects. Verified with the Mac viewer 4.42.0; mobile viewers untested |
 | Quality / frame rate / resolution | Auto, Original 20M, Ultra 8M, HD 2M, custom; 30/60/90/144 fps; on X11 a resolution choice changes the desktop resolution itself like the official Windows host (xrandr, adding the mode when missing; restored for "original" or on disconnect), `UU_DESKTOP_RESIZE=0` scales in the encoder instead; Wayland scales in the encoder |
 | Sound | System audio captured from PulseAudio / PipeWire and sent as Opus |
-| File transfer | Upload, download (including folders), create folder, rename, delete |
-| Terminal | The official "Terminal" tool, PTY sessions, multiple sessions, rename |
+| File transfer | Upload, download (including folders), create folder, rename, delete; iOS quick uploads use the default receive directory (the current user’s home) |
+| Terminal | The official "Terminal" tool, PTY sessions, multiple sessions, rename, termination and automatic list refresh; input and detach messages from an old connection cannot affect a reattached session |
 | Lock state and auto unlock | Lock state is reported to the viewer; with "auto unlock" enabled in the client, the password is verified with PAM and the session is unlocked |
 | Lock after remote session | Stored on the host, so it still applies after reconnecting |
 | Mute host while controlled | Host speakers are muted while the viewer still hears the sound; the previous mute state is restored afterwards |
@@ -151,7 +160,7 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
-| Privacy screen on the host | Not implemented |
+| Privacy screen on the host | Experimental, KDE Plasma Wayland (portal) only; off, picture and screen-off status labels verified with Mac 4.43.0; `UU_PRIVACY_AUTO=picture` / `screen-off` enables it automatically on desktop connect; see [docs/privacy-screen.md](docs/privacy-screen.md) |
 | Microphone (viewer audio played on the host) | Not implemented (needs a virtual sound card) |
 | Plugins such as the WoW queue notifier | Not supported; the client is told that no plugins exist |
 | Linux login screen | The system login screen (before anyone logs in to the Linux desktop) cannot be controlled yet; use headless mode or a virtual desktop (see below). This is about the Linux login: **without a UU account** the host can now be used through remote assistance |
@@ -387,10 +396,11 @@ Common environment variables:
 | `UU_X11_OUTPUT` | Initial X11 monitor name (`xrandr --listmonitors`); default: the primary |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | Native Wayland skips the virtual keyboard (e.g. Denial reserves it for its input method); keys go through uinput. Without wlr-virtual-pointer the pointer also uses uinput (#72) |
 | `UU_INPUT_BACKEND` | `auto` (default: uinput on Wayland when accessible) / `uinput` / `native` |
+| `UU_PORTAL_CURSOR_MODE` | Startup cursor mode: `embedded` draws the compositor pointer into the stream; hidden by default. The host switches at runtime as the viewer sends relative or absolute motion. A switch rebuilds the portal session and interrupts picture and input for a moment |
 | `UU_TERMINAL_SHORTCUTS=0` | Disable the Ctrl+V paste rewrite in terminal windows |
 | `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: opt-in Intel/AMD; `nvenc`: force NVENC; unset or `auto`: a background probe (one synthetic IDR per candidate, 3 s each). With an NVIDIA driver the order is NVENC then CPU; without one the only candidate is CPU and the probe is skipped. A session that starts before the probe finishes uses the previous rule (NVENC if NVIDIA is present, else CPU). On a self-built `--features inproc-av` binary, a process-only failure of NVENC when the in-process engine would try it first on X11 is logged `native_unprobed` and keeps the previous NVENC choice (Wayland, portal, and KMS fall back to CPU). The skipped CPU-only probe is logged `not probed (only candidate)`. A successful probe and that CPU-only skip stay cached while NVIDIA presence matches the report. A later desktop connection whose presence differs starts one background re-probe and still uses the cached encoder until the new result is stored. A hardware-candidate failure (NVENC failed, CPU chosen) is kept for 10 minutes; the next desktop connection after that starts the same re-probe and still uses the cached encoder until the new result is stored. Explicit `cpu` / `vaapi` / `nvenc` does not start the probe. Another failure restarts the 10 minutes. `native_unprobed` is not a temporary failure. A non-`auto` `video_encoder` in `host_settings.json` wins. VAAPI stays out of auto until #33 |
 | `UU_VAAPI_BUFFER_MS` | VAAPI VBV buffer in ms (10-1000, VAAPI only); raise it when keyframes are squeezed into a blur at high resolution |
-| `UU_NVENC_BUFFER_MS` | NVENC VBV buffer in ms (10-1000, NVENC only, including the in-process engine); the default is 100-500 kbit, set `1000` when high-resolution keyframes blur and flicker once per GOP (#103) |
+| `UU_NVENC_BUFFER_MS` | NVENC VBV buffer in ms (10-1000, NVENC only, including the in-process engine); the default matches libx264, one second of the bitrate cap within 500-8000 kbit, so high-resolution keyframes no longer blur and flicker once per GOP (#103). Set a small value (e.g. `50`) for a smaller low-latency buffer on a weak link |
 | `UU_FFMPEG_ROOT` | Use FFmpeg from this prefix |
 | `UU_AUDIO=0` | Disable sound; `UU_AUDIO_SOURCE` picks the PulseAudio source |
 | `UU_REMOTE_ASSIST=0` | Disable remote assistance (no guest assistance before sign-in either) |
@@ -460,6 +470,7 @@ flowchart LR
 
 ## Security and privacy
 
+- By default, signed-in graphical hosts upload the current wallpaper image to UU's file service for device-card backgrounds. Set `UU_WALLPAPER_UPLOAD=0` to disable this upload.
 - Logs never contain keystrokes, terminal text, clipboard contents, file contents, passwords or tokens.
 - For auto unlock the password is stored in the **viewer** (the official client). The host only checks it
   once with PAM; it is never written to disk or logs.
@@ -606,6 +617,10 @@ separate from the host `uuremote-server`; the default host build and behaviour a
 terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsdl2-dev`, then
 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`.
 
+Key combinations use the left/right modifier state attached to each SDL key event. Focus loss releases remote keys; after focus returns, the next non-modifier key restores any still-held Shift/Ctrl/Alt/Win (Command on Mac). This is built in, with no adapter or setting required.
+
+The viewer mirrors remote PNG pointer shapes (including text and window-resize cursors) with their hotspots. Leaving the remote picture or opening local controls restores the local arrow.
+
 SDL clipboard access reuses the desktop window to avoid temporary-window Dock churn on GNOME Wayland (#37).
 On niri, data-control-capable `wl-clipboard` is used instead, so synchronization does not require window focus.
 Other SDL backends synchronize only while that window is focused. The 30 KiB text limit applies. Selections without a supported
@@ -641,6 +656,8 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
   4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
 - Frames are decoded at the host's native resolution and scaled to the window with linear filtering; a host resolution
   change restarts the decoder. `UU_VIEWER_SIZE=WxH` forces a fixed letterboxed canvas instead.
+
+The SDL remote desktop window disables local IME text composition and forwards physical keys; use the remote host’s input method and its language toggle (for example, Shift) to enter Chinese.
 
 Mac targets use native macOS keycodes; Windows / Linux targets retain Windows VK. Keys follow physical positions, without
 automatically translating Ctrl to Command; on a Mac target the PC Super / Windows key acts as Command. Only verified target

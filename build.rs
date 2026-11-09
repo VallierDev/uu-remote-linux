@@ -3,6 +3,7 @@ fn main() {
     println!("cargo:rerun-if-changed=c_engine/wayland_transform.h");
     println!("cargo:rerun-if-changed=c_engine/portal_clipboard.inc");
     println!("cargo:rerun-if-changed=c_engine/x11_engine.c");
+    println!("cargo:rerun-if-changed=c_engine/annotation_overlay.c");
     println!("cargo:rerun-if-changed=c_engine/uinput_keymap.c");
     println!("cargo:rerun-if-changed=c_engine/uinput_keymap.h");
     println!("cargo:rerun-if-changed=c_engine/nvenc_engine.c");
@@ -11,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/ffnvcodec/ffnvcodec/nvEncodeAPI.h");
     println!("cargo:rerun-if-changed=c_engine/clipboard.c");
     println!("cargo:rerun-if-changed=c_engine/assist_window.c");
+    println!("cargo:rerun-if-changed=c_engine/privacy_wallpaper.c");
     println!("cargo:rerun-if-changed=c_engine/viewer_window.c");
     println!("cargo:rerun-if-changed=c_engine/viewer_tools.c");
     println!("cargo:rerun-if-changed=c_engine/ui_theme.c");
@@ -33,6 +35,7 @@ fn main() {
         }
         let mut x11_build = cc::Build::new();
         x11_build.file("c_engine/x11_engine.c")
+            .file("c_engine/annotation_overlay.c")
             .file("c_engine/uinput_keymap.c")
             .file("c_engine/clipboard.c")
             .file("c_engine/pam_check.c");
@@ -79,7 +82,7 @@ fn main() {
         match (std::env::var_os("UU_NO_GTK").is_none()).then(|| gtk("--cflags").zip(gtk("--libs"))).flatten() {
             Some((cflags, libs)) => {
                 let mut build = cc::Build::new();
-                build.file("c_engine/assist_window.c").file("c_engine/viewer_window.c").file("c_engine/viewer_tools.c").file("c_engine/ui_theme.c").flag_if_supported("-Wno-deprecated-declarations");
+                build.file("c_engine/assist_window.c").file("c_engine/privacy_wallpaper.c").file("c_engine/viewer_window.c").file("c_engine/viewer_tools.c").file("c_engine/ui_theme.c").flag_if_supported("-Wno-deprecated-declarations");
                 for flag in cflags.split_whitespace() { build.flag(flag); }
                 build.compile("uu_login_window");
                 for flag in libs.split_whitespace() {

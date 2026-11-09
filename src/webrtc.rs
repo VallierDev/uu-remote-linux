@@ -4,6 +4,9 @@ use crate::capture::ScreenCapture;
 use crate::input::InputInjector;
 use crate::signaling::SoacMessage;
 
+#[path = "text_outbox.rs"]
+mod text_outbox;
+
 use base64::Engine;
 use flate2::read::GzDecoder;
 use std::io::Read;
@@ -137,6 +140,8 @@ fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_acti
             let closed = matches!(end_pc.connection_state(), State::Closed | State::Failed);
             let ending = actions.clone();
             let _ = tokio::task::spawn_blocking(move || ending.session_ended()).await;
+            // Strokes belong to the viewer that drew them: never leave them on the host screen.
+            crate::annotation::reset(crate::annotation::owner(&actions));
             if closed { return; }
         }
     });
@@ -489,6 +494,11 @@ impl WebRtcSession {
         let file_channel: Arc<std::sync::Mutex<Option<Arc<RTCDataChannel>>>> = Arc::new(std::sync::Mutex::new(None));
         let (file_tx, mut file_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let peer_files = crate::file_trans::FileSession::new(file_tx, control_sequence.clone());
+        // Mac 4.43: streamerDidReceiveTextData (0x1001f56b4, arm64) reaches
+        // the metrics/RPC dispatcher at 0x1003a8560; CONTROL does not.
+        // Keep CONTROL metrics for other viewers; privacy replies use TEXT.
+        let (text_tx, text_rx) = text_outbox::channel();
+        let text_rx = Arc::new(tokio::sync::Mutex::new(Some(OutboundReceiver::Text(text_rx))));
         // 端口映射 frames (Message 27) also travel on FILE_DATA_CHANNEL; one session per peer.
         let port_mapping = crate::port_mapping::Session::new(file_channel.clone(), control_sequence.clone());
         {
@@ -537,6 +547,8 @@ impl WebRtcSession {
             let echo_seen = echo_seen.clone();
             let channel_lock_state = channel_lock_state.clone();
             let peer_files = peer_files.clone();
+            let text_out = text_tx.clone();
+            let text_rx = text_rx.clone();
             let peer_port_mapping = port_mapping.clone();
             let peer_video_settings = video_settings.clone();
             let peer_video_track = control_video_track.clone();
@@ -565,12 +577,16 @@ impl WebRtcSession {
                 }
                 // Ordered outbound queue for protocol replies produced outside this callback.
                 // webrtc-rs announces the channel before handle_open (ready_state Connecting);
-                // send() returns ErrClosedPipe until Open. Draining CONTROL here would drop
-                // Message 25 and every later reply. Start CONTROL from the on_open below
+                // send() returns ErrClosedPipe until Open. Draining CONTROL/TEXT here would
+                // drop initial state and replies. Start them from the on_open below
                 // (one handler; a second on_open replaces it). Receiver taken once.
-                let mut control_drain: Option<Box<dyn (FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) + Send + Sync>> = None;
-                let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-                let outbound_rx = Arc::new(tokio::sync::Mutex::new(Some(outbound_rx)));
+                let mut open_drain: Option<Box<dyn (FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) + Send + Sync>> = None;
+                let (outbound, outbound_rx) = if label == "TEXT_DATA_CHANNEL" {
+                    (Outbound::Text(text_out.clone()), text_rx)
+                } else {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                    (Outbound::Other(tx), Arc::new(tokio::sync::Mutex::new(Some(OutboundReceiver::Other(rx)))))
+                };
                 if label == "CONTROL_DATA_CHANNEL" {
                     if let Some(mut chroma_sync_rx) = chroma_sync_rx.lock().unwrap().take() {
                         let sync_out = outbound.clone();
@@ -588,14 +604,33 @@ impl WebRtcSession {
                     let out_channel = d.clone();
                     let out_label = label.clone();
                     let outbound_rx = outbound_rx.clone();
+                    let change_sequence = out_sequence.clone();
+                    let terminal_changes = crate::terminal::subscribe_changes();
                     let start_drain = move || {
                         let out_channel = out_channel.clone();
                         let out_label = out_label.clone();
                         let outbound_rx = outbound_rx.clone();
+                        let change_sequence = change_sequence.clone();
+                        let mut terminal_changes = terminal_changes.clone();
                         Box::pin(async move {
                             let Some(mut outbound_rx) = take_outbound_once(&outbound_rx).await else { return; };
                             tokio::spawn(async move {
-                                while let Some(message) = outbound_rx.recv().await {
+                                let mut health = tokio::time::interval(std::time::Duration::from_millis(200));
+                                loop {
+                                    let message = tokio::select! {
+                                        message = outbound_rx.recv() => match message { Some(message) => message, None => break },
+                                        changed = terminal_changes.changed(), if out_label == "BINARY_DATA_CHANNEL" => {
+                                            if changed.is_err() { break; }
+                                            if out_channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { continue; }
+                                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                            crate::terminal::changed_message(change_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts)
+                                        },
+                                        _ = health.tick(), if out_label == "BINARY_DATA_CHANNEL" => {
+                                            use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+                                            if matches!(out_channel.ready_state(), RTCDataChannelState::Closing | RTCDataChannelState::Closed) { break; }
+                                            continue;
+                                        },
+                                    };
                                     if let Err(e) = out_channel.send(&bytes::Bytes::from(message)).await {
                                         log::warn!("{} send failed: {}", out_label, e); break;
                                     }
@@ -603,8 +638,8 @@ impl WebRtcSession {
                             });
                         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
                     };
-                    if label != "CONTROL_DATA_CHANNEL" { tokio::spawn(start_drain()); }
-                    else { control_drain = Some(Box::new(start_drain)); }
+                    if !matches!(label.as_str(), "CONTROL_DATA_CHANNEL" | "TEXT_DATA_CHANNEL") { tokio::spawn(start_drain()); }
+                    else { open_drain = Some(Box::new(start_drain)); }
                 }
                 let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
                 if matches!(label.as_str(),"CONTROL_DATA_CHANNEL"|"TEXT_DATA_CHANNEL") {
@@ -686,7 +721,7 @@ impl WebRtcSession {
                             };
                             let Some(active_screen) = active_screen else { continue; };
                             let input_size = if active_screen.init_error.is_none() {
-                                (active_screen.width, active_screen.height)
+                                active_screen.portal.as_ref().map_or((active_screen.width, active_screen.height), |p| p.size())
                             } else { (1920, 1080) };
                             let input_size=crate::wayland::input_size(input_size);
                             let source_changed=source_before!=crate::wayland::selected();
@@ -776,9 +811,17 @@ impl WebRtcSession {
                     Some(peer_files.clone())
                 } else { None };
                 // CT_TERMINAL: TERM frames and terminal RPCs (check_env/rename) on BINARY.
-                let terminal_conn = if label == "BINARY_DATA_CHANNEL" {
-                    Some(Arc::new(crate::terminal::TerminalConn::new(outbound.clone())))
-                } else { None };
+                let terminal_conn = match (&outbound, label.as_str()) {
+                    (Outbound::Other(tx), "BINARY_DATA_CHANNEL") => Some(Arc::new(crate::terminal::TerminalConn::new(tx.clone()))),
+                    _ => None,
+                };
+                if let Some(terminal) = &terminal_conn {
+                    let closing = terminal.clone();
+                    d.on_close(Box::new(move || {
+                        let closing = closing.clone();
+                        Box::pin(async move { closing.disconnect(); })
+                    }));
+                }
                 if label == "CONTROL_DATA_CHANNEL" || label == "TEXT_DATA_CHANNEL" {
                     let channel = d.clone();
                     let initial_sequence = out_sequence.clone();
@@ -795,8 +838,9 @@ impl WebRtcSession {
                     let open_role = channel_role.clone();
                     let open_screen = screen.clone();
                     let open_selection = peer_selection;
+                    let open_text_out = text_out.clone();
                     d.on_open(Box::new(move || {
-                        if let Some(start_drain) = control_drain { tokio::spawn(start_drain()); }
+                        if let Some(start_drain) = open_drain { tokio::spawn(start_drain()); }
                         let init_actions = open_actions.clone();
                         let init_video = open_video.clone();
                         let init_track = open_track.clone();
@@ -810,6 +854,7 @@ impl WebRtcSession {
                         let owner = open_owner.clone();
                         let role = open_role.clone();
                         let pc = desktop_pc.upgrade();
+                        let text_out = open_text_out.clone();
                         Box::pin(async move {
                           // Permission dialogs and first-frame waits must not occupy the
                           // channel-open callback or delay CONTROL message dispatch.
@@ -962,6 +1007,7 @@ impl WebRtcSession {
                                     let message = crate::initialization::envelope(
                                         sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
                                         &init_actions.metrics_payload(desktop_sound, snapshot.permission(true)));
+                                    text_out.metrics(message.clone());
                                     if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
                                     let mut updates = portal.subscribe();
                                     match crate::desktop_session::wait_ready(&mut updates, &channel).await {
@@ -972,6 +1018,7 @@ impl WebRtcSession {
                                                 let message = crate::initialization::envelope(
                                                     sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13,
                                                     &init_actions.metrics_payload(desktop_sound, crate::system_metrics::Permission::Reject));
+                                                text_out.metrics(message.clone());
                                                 let _ = channel.send(&bytes::Bytes::from(message)).await;
                                             }
                                             return;
@@ -983,6 +1030,7 @@ impl WebRtcSession {
                             // Default file-transfer folder: the desktop user's home directory.
                             let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
                             let (mut desktop, mut promoted, mut lock_reported) = (desktop, false, desktop);
+                            let mut privacy_reported = false;
                             let mut screen = screen;
                             loop {
                             loop {
@@ -1019,6 +1067,7 @@ impl WebRtcSession {
                                         Ok(message) => message,
                                         Err(e) => { log::error!("CONTROL initialization encode failed: {}", e); return; }
                                     };
+                                    if field == 13 { text_out.metrics(message.clone()); }
                                     if let Err(e) = channel.send(&bytes::Bytes::from(message)).await {
                                         log::error!("CONTROL initialization field {} failed: {}", field, e);
                                         return;
@@ -1036,6 +1085,41 @@ impl WebRtcSession {
                             if !lock_reported {
                                 lock_reported = true;
                                 tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), crate::session_lock::watch_locked()));
+                            }
+                            // The viewer's menu only learns about a mode it did not ask for (an
+                            // auto-enable) from this push, so desktop peers need it too, not only a
+                            // tool peer promoted to desktop.
+                            if !privacy_reported && crate::privacy_screen::supported() {
+                                privacy_reported = true;
+                                let (channel, sequence, actions) = (channel.clone(), sequence.clone(), init_actions.clone());
+                                let portal = portal_desktop.clone();
+                                let text_out = text_out.clone();
+                                tokio::spawn(async move {
+                                    // 0 is not a wire type: the first tick must push the effective state.
+                                    // An auto-enable can land before this task starts, and the viewer
+                                    // never sent an RPC to learn the mode from a response.
+                                    let mut previous = 0u8;
+                                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                                    loop {
+                                        tick.tick().await;
+                                        if channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { return; }
+                                        let current = crate::privacy_screen::current_type();
+                                        if current == previous { continue; }
+                                        previous = current;
+                                        log::info!("Privacy state change pushed: type={current}");
+                                        let permission = portal.as_ref().map_or(crate::system_metrics::Permission::Allow, |p| p.snapshot().permission(true));
+                                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                        let payload = actions.metrics_payload(desktop_sound, permission);
+                                        let message = crate::initialization::envelope(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &payload);
+                                        text_out.metrics(message.clone());
+                                        if channel.send(&bytes::Bytes::from(message)).await.is_err() { return; }
+                                        let state = crate::privacy_screen::state_message(sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts);
+                                        // Android 4.43.0 handles privacy replies on TEXT; CONTROL stays for
+                                        // viewers that only read the desktop channel.
+                                        let _ = text_out.send(state.clone());
+                                        if channel.send(&bytes::Bytes::from(state)).await.is_err() { return; }
+                                    }
+                                });
                             }
                             // Mirror the Linux pointer shape; the video itself carries no pointer.
                             let mut shapes = crate::cursor::monitor(&screen.display);
@@ -1087,6 +1171,7 @@ impl WebRtcSession {
                     let message_role=channel_role.clone();
                     let terminal_worker = terminal_conn.clone();
                     let rpc_out = outbound.clone();
+                    let text_out = text_out.clone();
                     let reply_chan = d_reply.clone();
                     let out_sequence = reply_sequence.clone();
                     let clipboard_sink = clipboard_input.clone();
@@ -1103,7 +1188,8 @@ impl WebRtcSession {
                     let capture_requests = capture_tx.clone();
 
                     Box::pin(async move {
-                        let input_size = crate::wayland::input_size((screen.width, screen.height));
+                        // The privacy screen can swap the portal stream to a virtual output of another size.
+                        let input_size = crate::wayland::input_size(screen.portal.as_ref().map_or((screen.width, screen.height), |p| p.size()));
                         // After a RandR resize the stream restarts capture at the new size; map the pointer to it.
                         let live_x11 = screen.init_error.is_none() && screen.portal.is_none() && screen.backend == crate::desktop_backend::DesktopBackend::X11;
                         if let Some(term) = &terminal_worker {
@@ -1117,27 +1203,64 @@ impl WebRtcSession {
                             }
                             return;
                         }
-                        if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
+                        let proto_fields = crate::protocol::decode_wire(&msg.data).ok();
+                        if let Some(fields) = proto_fields.as_deref() {
                             use crate::protocol::WireValue;
                             let rpc = fields.iter().find_map(|f| match (f.number, &f.value) { (21, WireValue::Bytes(b)) => Some(*b), _ => None });
                             let rpc_fields = rpc.and_then(|r| crate::protocol::decode_wire(r).ok());
+                            if let Some(request) = rpc.filter(|_| rpc_fields.as_ref().is_some_and(|r| r.iter().any(|f| f.number == 7))) {
+                                let Some((response, accepted)) = rpc_fields.as_deref().and_then(crate::privacy_screen::rpc_accept) else { return };
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                let Some(accepted) = accepted else { return };
+                                let failed = tokio::task::spawn_blocking(move || accepted.apply().is_err()).await.unwrap_or(true);
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let next = || out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if failed {
+                                    let report = crate::initialization::encode_report_error(next(), ts, crate::privacy_screen::REPORT_ERROR, "privacy screen failed");
+                                    let _ = reply_chan.send(&bytes::Bytes::from(report)).await;
+                                }
+                                let permission = portal_for_message.as_ref().map_or(crate::system_metrics::Permission::Allow, |p| p.snapshot().permission(desktop));
+                                let metrics = actions.metrics_payload(desktop_sound, permission);
+                                text_out.metrics(crate::initialization::envelope(next(), ts, 13, &metrics));
+                                let _ = reply_chan.send(&bytes::Bytes::from(crate::initialization::envelope(next(), ts, 13, &metrics))).await;
+                                let state = crate::privacy_screen::state_message(next(), ts);
+                                let _ = reply_chan.send(&bytes::Bytes::from(state)).await;
+                                log::info!("Privacy switch done: failed={failed} type={}", crate::privacy_screen::current_type());
+                                return;
+                            }
+                            if let Some(response) = rpc_fields.as_deref().and_then(crate::privacy_screen::screensaver_response) {
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                return;
+                            }
+                            if let Some((header, body)) = rpc_fields.as_deref().and_then(crate::annotation::draw_request) {
+                                // A toggle waits for the X overlay to open: keep it off the async workers.
+                                let owner = crate::annotation::owner(&actions);
+                                let Ok(response) = tokio::task::spawn_blocking(move || crate::annotation::respond(owner, &header, &body)).await else { return };
+                                // draw_req arrives on CONTROL, but a CONTROL reply timed out (9998) on Mac 4.42.0:
+                                // answer on TEXT like the privacy RPCs above.
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                return;
+                            }
                             if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
                                 return;
                             }
-                            if let Some(response) = rpc.and_then(|r| crate::protocol::decode_wire(r).ok()).and_then(|r| crate::terminal::rpc_response(&r)) {
+                            if let Some(response) = rpc_fields.as_deref().and_then(crate::terminal::rpc_response) {
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = rpc_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
                                 return;
                             }
                         }
-                        if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
-                            if mapping.handle(&fields, &channel_name) { return; }
+                        if let Some(fields) = proto_fields.as_deref() {
+                            if mapping.handle(fields, &channel_name) { return; }
                         }
                         if let Some(files) = &file_worker {
-                            if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
-                                if files.handle(&fields) {
+                            if let Some(fields) = proto_fields.as_deref() {
+                                if files.handle(fields) {
                                     static ROUTE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                                     if ROUTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
                                         log::info!("File transfer RPC received on {}", channel_name);
@@ -1163,16 +1286,16 @@ impl WebRtcSession {
                                         }
                                     }
                                     shape(&value,0).to_string()
-                                } else if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
+                                } else if let Some(fields) = proto_fields.as_deref() {
                                     format!("protobuf fields={:?}",fields.iter().map(|f|f.number).collect::<Vec<_>>())
                                 } else { "opaque".to_string() };
                                 log::info!("Clipboard channel schema: channel={} bytes={} schema={}",channel_name,msg.data.len(),shape);
                             }
                         }
                         if channel_name == "CONTROL_DATA_CHANNEL" || channel_name == "TEXT_DATA_CHANNEL" {
-                            if let Ok(fields) = crate::protocol::decode_wire(&msg.data) {
+                            if let Some(fields) = proto_fields.as_deref() {
                                 use crate::protocol::WireValue;
-                                for field in &fields {
+                                for field in fields {
                                     if let (22,WireValue::Bytes(payload))=(field.number,&field.value) {
                                         let update=rich_incoming.lock().unwrap().response(payload);
                                         match update {
@@ -1189,8 +1312,6 @@ impl WebRtcSession {
                                             }
                                         }
                                     }
-                                }
-                                for field in &fields {
                                     if let (21, WireValue::Bytes(payload)) = (field.number,&field.value) {
                                         let ids=crate::clipboard_rich::format_ids(payload);
                                         if !ids.is_empty(){log::info!("Clipboard offered format IDs: {:?}",ids);}
@@ -1228,8 +1349,6 @@ impl WebRtcSession {
                                             Err(reason)=>log::warn!("Clipboard RPC rejected: {}",reason),
                                         }
                                     }
-                                }
-                                for field in &fields {
                                     if let (17, WireValue::Bytes(payload)) = (field.number, &field.value) {
                                         match clipboard_assembly.lock().unwrap().accept(payload) {
                                             Ok(Some(text)) => {
@@ -1302,6 +1421,7 @@ impl WebRtcSession {
                                                 crate::control_protocol::simple_action_name(action).unwrap_or("?"), value, sa::args_shape(&args));
                                             let (actions, input, chan, seq_out) = (actions.clone(), input_worker.clone(), reply_chan.clone(), out_sequence.clone());
                                             let settings_portal = portal_for_message.clone();
+                                            let text_out = text_out.clone();
                                             tokio::spawn(async move {
                                                 let worker = actions.clone();
                                                 let report = tokio::task::spawn_blocking(move || worker.handle(action, value, &args, || {
@@ -1315,6 +1435,7 @@ impl WebRtcSession {
                                                         crate::system_metrics::Permission::Allow,
                                                         |manager| manager.snapshot().permission(desktop));
                                                     let message = crate::initialization::envelope(seq_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 13, &actions.metrics_payload(desktop_sound, permission));
+                                                    text_out.metrics(message.clone());
                                                     if let Err(e) = chan.send(&bytes::Bytes::from(message)).await { log::warn!("Settings report failed: {}", e); }
                                                 }
                                             });
@@ -1354,69 +1475,87 @@ impl WebRtcSession {
                         }
                         if let Ok(txt) = std::str::from_utf8(&msg.data) {
                             log::debug!("DataChannel [{}] received UTF-8 data: {} bytes", channel_name, txt.len());
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt) {
-                                if !channel_name.contains("CONTROL") {
-                                    // Input JSON on another channel (mobile input-method text was missing from CONTROL, #13/#46):
-                                    // record action names only, once per name, and accept text_input wherever it arrives.
-                                    if let Some(action) = val.get("action").and_then(serde_json::Value::as_str) {
-                                        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-                                        let mut seen = SEEN.lock().unwrap();
-                                        if seen.len() < 32 && action.len() <= 40 && action.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !seen.iter().any(|s| s == action) {
-                                            seen.push(action.to_owned());
-                                            log::info!("JSON action on {} channel: action={}", if channel_name.contains("STREAMER") {"STREAMER"} else if channel_name.contains("TEXT") {"TEXT"} else {"other"}, action);
+                            if channel_name.contains("CONTROL") {
+                                match crate::control_protocol::decode_control(&msg.data) {
+                                    Ok(crate::control_protocol::ControlMessage::Input(event)) => {
+                                        // A ready compositor source remains controllable on its lock screen.
+                                        if screen.backend == crate::desktop_backend::DesktopBackend::Portal
+                                            && (screen.init_error.is_some() || !desktop_ready) { return; }
+                                        if !crate::wayland::input_ready() {return;}
+                                        use crate::control_protocol::ControlInput;
+                                        // Separate receipt budgets keep motion floods from hiding clicks.
+                                        static RECEIPTS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+                                        let (slot, kind) = match &event {
+                                            ControlInput::MouseButton {..} | ControlInput::MouseClick {..} => (0, "button"),
+                                            ControlInput::Keyboard {..} | ControlInput::KeyboardClick {..} | ControlInput::TextInput {..} => (1, "keyboard"),
+                                            _ => (2, "motion"),
+                                        };
+                                        if RECEIPTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                                            log::info!("CONTROL input received: kind={}", kind);
                                         }
-                                    }
-                                    if let Ok(crate::control_protocol::ControlMessage::Input(crate::control_protocol::ControlInput::TextInput {text})) = crate::control_protocol::decode_control(&msg.data) {
-                                        if let Some(session)=message_input_session.as_ref() { session.with_input(|| {if crate::wayland::input_ready() {input_worker.text_input(&text);}}); }
+                                        if let Some(session)=message_input_session.as_ref() {
+                                            if matches!(&event, ControlInput::TextInput {..}) {
+                                                let (session, input, text) = match &event {
+                                                    ControlInput::TextInput {text} => (session.clone(), input_worker.clone(), text.clone()),
+                                                    _ => unreachable!(),
+                                                };
+                                                let _ = tokio::task::spawn_blocking(move || {
+                                                    session.with_input(|| {
+                                                        if crate::wayland::input_ready() { input.text_input(&text); }
+                                                    });
+                                                }).await;
+                                            } else {
+                                                session.with_input(|| {
+                                                    if !crate::wayland::input_ready() {return;}
+                                                    match &event {
+                                                        ControlInput::MouseAbsolute {x,y} => input_worker.mouse_absolute_normalized(*x,*y,crate::wayland::input_size(if live_x11 {crate::capture::x11_last_size().unwrap_or(input_size)} else {input_size})),
+                                                        ControlInput::MouseRelative {dx,dy} => input_worker.mouse_relative(*dx,*dy),
+                                                        ControlInput::MouseScroll {dx,dy} => input_worker.mouse_scroll(*dx,*dy),
+                                                        ControlInput::Keyboard {key, pressed} => input_worker.windows_key_event(*key, *pressed),
+                                                        ControlInput::KeyboardClick {key} => {input_worker.windows_key_event(*key, true);input_worker.windows_key_event(*key, false);},
+                                                        ControlInput::MouseButton {button,pressed} => input_worker.wire_mouse_button(*button,*pressed),
+                                                        ControlInput::MouseClick {button} => {input_worker.wire_mouse_button(*button,true);input_worker.wire_mouse_button(*button,false);},
+                                                        _ => {}
+                                                    }
+                                                });
+                                            }
+                                        }
+
+                                    },
+                                    Ok(crate::control_protocol::ControlMessage::Unsupported(v)) => {
+                                        // Action name and key names only, never values (an IME text event would carry typed text).
+                                        static UNSUPPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                                        if UNSUPPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                                            let action = v.get("action").and_then(serde_json::Value::as_str)
+                                                .filter(|a| a.len() <= 40 && a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')).unwrap_or("?");
+                                            let keys: Vec<&str> = v.as_object().map(|o| o.keys().map(String::as_str).take(12).collect()).unwrap_or_default();
+                                            log::info!("Unsupported CONTROL input: action={action} keys={keys:?}");
+                                        }
+                                    },
+                                    _ => {}
+                                }
+                            } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(txt) {
+                                // Input JSON on another channel (mobile input-method text was missing from CONTROL, #13/#46):
+                                // record action names only, once per name, and accept text_input wherever it arrives.
+                                if let Some(action) = val.get("action").and_then(serde_json::Value::as_str) {
+                                    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                                    let mut seen = SEEN.lock().unwrap();
+                                    if seen.len() < 32 && action.len() <= 40 && action.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !seen.iter().any(|s| s == action) {
+                                        seen.push(action.to_owned());
+                                        log::info!("JSON action on {} channel: action={}", if channel_name.contains("STREAMER") {"STREAMER"} else if channel_name.contains("TEXT") {"TEXT"} else {"other"}, action);
                                     }
                                 }
-                                if channel_name.contains("CONTROL") {
-                                    match crate::control_protocol::decode_control(&msg.data) {
-                                        Ok(crate::control_protocol::ControlMessage::Input(event)) => {
-                                            // A ready compositor source remains controllable on its lock screen.
-                                            if screen.backend == crate::desktop_backend::DesktopBackend::Portal
-                                                && (screen.init_error.is_some() || !desktop_ready) { return; }
-                                            if !crate::wayland::input_ready() {return;}
-                                            use crate::control_protocol::ControlInput;
-                                            // Separate receipt budgets keep motion floods from hiding clicks.
-                                            static RECEIPTS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
-                                            let (slot, kind) = match &event {
-                                                ControlInput::MouseButton {..} | ControlInput::MouseClick {..} => (0, "button"),
-                                                ControlInput::Keyboard {..} | ControlInput::KeyboardClick {..} | ControlInput::TextInput {..} => (1, "keyboard"),
-                                                _ => (2, "motion"),
-                                            };
-                                            if RECEIPTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
-                                                log::info!("CONTROL input received: kind={}", kind);
-                                            }
-                                            if let Some(session)=message_input_session.as_ref() {session.with_input(|| {
-                                            if !crate::wayland::input_ready() {return;}
-                                            match &event {
-                                                ControlInput::MouseAbsolute {x,y} => input_worker.mouse_absolute_normalized(*x,*y,crate::wayland::input_size(if live_x11 {crate::capture::x11_last_size().unwrap_or(input_size)} else {input_size})),
-                                                ControlInput::MouseRelative {dx,dy} => input_worker.mouse_relative(*dx,*dy),
-                                                ControlInput::MouseScroll {dx,dy} => input_worker.mouse_scroll(*dx,*dy),
-                                                ControlInput::Keyboard {key, pressed} => input_worker.windows_key_event(*key, *pressed),
-                                                ControlInput::TextInput {text} => input_worker.text_input(text),
-                                                ControlInput::KeyboardClick {key} => {input_worker.windows_key_event(*key, true);input_worker.windows_key_event(*key, false);},
-                                                ControlInput::MouseButton {button,pressed} => input_worker.wire_mouse_button(*button,*pressed),
-                                                ControlInput::MouseClick {button} => {input_worker.wire_mouse_button(*button,true);input_worker.wire_mouse_button(*button,false);},
-                                                _ => {}
-                                            }
-                                            });}
-
-                                        },
-                                        Ok(crate::control_protocol::ControlMessage::Unsupported(v)) => {
-                                            // Action name and key names only, never values (an IME text event would carry typed text).
-                                            static UNSUPPORTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-                                            if UNSUPPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
-                                                let action = v.get("action").and_then(serde_json::Value::as_str)
-                                                    .filter(|a| a.len() <= 40 && a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')).unwrap_or("?");
-                                                let keys: Vec<&str> = v.as_object().map(|o| o.keys().map(String::as_str).take(12).collect()).unwrap_or_default();
-                                                log::info!("Unsupported CONTROL input: action={action} keys={keys:?}");
-                                            }
-                                        },
-                                        _ => {}
+                                if let Ok(crate::control_protocol::ControlMessage::Input(crate::control_protocol::ControlInput::TextInput {text})) = crate::control_protocol::decode_control(&msg.data) {
+                                    if let Some(session)=message_input_session.as_ref() {
+                                        let (session, input) = (session.clone(), input_worker.clone());
+                                        let _ = tokio::task::spawn_blocking(move || {
+                                            session.with_input(|| {
+                                                if crate::wayland::input_ready() { input.text_input(&text); }
+                                            });
+                                        }).await;
                                     }
-                                } else if channel_name.contains("STREAMER") {
+                                }
+                                if channel_name.contains("STREAMER") {
                                     log::debug!("STREAMER channel JSON received");
                                     if let Some(event)=val.get("connection_period_stats_event") {
                                         let nums=crate::viewer_metrics::collect(event);
@@ -1669,8 +1808,28 @@ fn negotiated_bundle_media(sdp: &str) -> Option<(String, u16)> {
     None
 }
 
+#[derive(Clone)]
+enum Outbound {
+    Text(text_outbox::Sender),
+    Other(tokio::sync::mpsc::UnboundedSender<Vec<u8>>),
+}
+impl Outbound {
+    fn send(&self, message: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        match self { Self::Text(tx) => tx.send(message), Self::Other(tx) => tx.send(message) }
+    }
+}
+enum OutboundReceiver {
+    Text(text_outbox::Receiver),
+    Other(tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>),
+}
+impl OutboundReceiver {
+    async fn recv(&mut self) -> Option<Vec<u8>> {
+        match self { Self::Text(rx) => rx.recv().await, Self::Other(rx) => rx.recv().await }
+    }
+}
+
 /// First drain owns the outbound receiver; a later open must not start another.
-async fn take_outbound_once<T>(slot: &tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<T>>>) -> Option<tokio::sync::mpsc::UnboundedReceiver<T>> {
+async fn take_outbound_once<T>(slot: &tokio::sync::Mutex<Option<T>>) -> Option<T> {
     slot.lock().await.take()
 }
 

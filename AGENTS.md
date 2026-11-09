@@ -129,6 +129,7 @@ viewer does not reconnect them automatically.
 | `UU_NVENC_RGB=0` / `=1` | NVENC 4:2:0 without scaling takes packed BGRA/BGR0 directly (no CPU swscale). Default: on, except when a connected DRM connector belongs to an nvidia-bound card (desktop composited on the encoding GPU; #16 measured 82.6 vs 98 fps at 4K). `0` forces CPU conversion, `1` forces the direct path |
 | `UU_TOUCH_INPUT` | Android/iOS controllers (connect header `controller_platform` 2/3) send a finger as a left-button drag at absolute positions. Default on the portal backend (gesture): per press, moving past 12 px within 450 ms scrolls (`NotifyPointerAxis` / EIS scroll, content follows the finger, `finish` on release), holding still selects with button 1 down, a short press clicks; needs no touchscreen consent. `touch`: replay as one finger on the portal touchscreen (`NotifyTouch*` / EIS touch; requested where `AvailableDeviceTypes` offers it; consents saved before touch support restore keyboard+pointer only, so the first mobile drag asks once per run in the background via `PortalSession::upgrade_touch`, swapped in only with the touchscreen granted for the same monitor; the saved consent is never removed first). `0`: plain mouse drags |
 | `UU_INPUT_BACKEND` | `auto` (uinput on Wayland/portal when `/dev/uinput` is accessible, udev `uaccess` rule in README) / `uinput` / `native`. X11 keeps XTest (held-key autorepeat handling) |
+| `UU_PORTAL_CURSOR_MODE` | portal capture startup cursor mode: `embedded` draws the compositor pointer into the stream, default hidden. `input::inject_move` reports relative/absolute motion; `portal::note_pointer_motion` flips the mode after a 200 ms run of one kind and rebuilds the session via `Session::set_cursor_embedded`, because the portal only reads `cursor_mode` in `SelectSources`. Relative motion gives the viewer no position to draw its own pointer at, so the stream must carry one; absolute motion means the viewer draws its own and an embedded copy would trail it |
 | Mac viewer Cmd | With 「使用 macOS 快捷键」 off the Mac viewer sends Cmd=VK_LWIN 0x5B, Option=0xA4, Ctrl=0xA2; connect header `controller_platform`=4 is macOS. For Mac controllers Cmd is held back: Cmd+C/V/A/F/X/Z → Ctrl+key (terminal: Cmd+C/V → Ctrl+Shift+C/V), other combos/alone → Super |
 | `UU_TERMINAL_SHORTCUTS=0` | disable Ctrl+V → Ctrl+Shift+V in focused X11 terminals (Mac Cmd and Ctrl both arrive as VK_LCONTROL) |
 | `contrib/virtual-desktop/` | Xvfb + session (`UU_VIRTUAL_SESSION`, `UU_VIRTUAL_BUS=user|private`) for monitorless hosts; serve it with `DISPLAY=:99` |
@@ -162,8 +163,10 @@ for a new QR login.
 | `src/clipboard*.rs` | text clipboard bridge and protocol |
 | `src/file_trans.rs` | FileTransferFtp RPC |
 | `src/terminal.rs` | TERM frames + PTY sessions |
+| `src/privacy_screen/`, `c_engine/privacy_wallpaper.c` | host privacy screen (RPC 7): desktop-independent controller, recovery record, guard and cover processes; `Backend` per desktop (`kde/`: KWin virtual output, kscreen-doctor, KWin input devices). See docs/privacy-screen.md |
 | `src/session_lock.rs`, `c_engine/pam_check.c` | lock state reporting, auto unlock via PAM + logind |
 | `src/system_actions.rs`, `src/system_metrics.rs` | SimpleAction system commands, mute, auto-lock, SystemMetrics |
+| `src/annotation.rs`, `c_engine/annotation_overlay.c` | viewer annotation (RPC 27 `draw_req` → RpcResponse 23): click-through X11 ARGB overlay, needs a compositing manager |
 | `src/initialization.rs`, `src/control_protocol.rs`, `src/protocol.rs` | protobuf encoders/decoders for CONTROL |
 | `src/session_ice.rs`, `src/network_diagnostics.rs` | cloud ICE servers, address-free path diagnostics |
 | `src/desktop_backend.rs`, `src/wayland.rs`, `src/portal*.rs` | backend selection, Hyprland, GNOME/KDE portal |
@@ -195,7 +198,7 @@ started a second full host server instead, so check that a subcommand exists in 
 - RPC = Message 21 `RpcRequest {1 header{1 request_id}, <case>}`, answered with Message 22
   `RpcResponse {1 header (same id), <case>}`. Cases used: 2 capture_setting, 3 fps, 4 video_quality,
   6 resolution, 8 file transfer, 9 clipboard, 15 send_video_track, 16–20 plugins, 21 virtual audio policy,
-  28/29 terminal.
+  27 draw (annotation; answered on TEXT, a CONTROL reply times out with 9998), 28/29 terminal.
 - CaptureSettingRequest: field 1 is an **fps option index** (1=30, 2=60, 3=90); the real frame rate is
   field 18 `fpsCount`. Field 2 quality: 1 Fast, 2 General (高清 2M), 3 HD (超清 8M), 4 Bluray (原画 20M),
   5 Auto, 6 Custom. Resolution: 16/17 pixel size or 5/6, 10 resolution_type (3 = follow remote).

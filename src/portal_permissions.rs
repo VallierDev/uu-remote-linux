@@ -26,6 +26,58 @@ pub fn desktop_key() -> &'static str {
 /// Consent for one monitor (Mutter connector); connectors are checked to be file-name safe.
 pub fn monitor_key(connector: &str) -> String { format!("{}@{}", desktop_key(), connector) }
 
+/// An unclassified grant is kept separately until its monitor is known.
+pub fn pending_key(key: &str) -> String { format!("{key}.pending") }
+
+pub fn exists(dir: &Path, key: &str) -> bool {
+    dir.join(key).exists() || dir.join(pending_key(key)).exists()
+}
+
+pub struct Rotation {
+    directory: Option<PathBuf>,
+    pending: String,
+    saved: Option<String>,
+    token: Option<String>,
+}
+
+impl Rotation {
+    pub fn new(directory: Option<PathBuf>, requested_key: &str) -> Self {
+        Self { directory, pending: pending_key(requested_key), saved: None, token: None }
+    }
+
+    pub fn received(&self) -> bool { self.token.is_some() }
+
+    /// A fresh request has not consumed the old grant; keep it until the new session opens.
+    pub fn remember(&mut self, token: &str) { self.token = Some(token.to_owned()); }
+
+    /// Persist before PipeWire starts; `known_key` comes from the actual granted source.
+    pub fn record(&mut self, token: &str, known_key: Option<&str>) -> std::io::Result<()> {
+        self.remember(token);
+        let Some(dir) = self.directory.as_deref() else { return Ok(()); };
+        let destination = known_key.unwrap_or(&self.pending);
+        save(dir, destination, token)?;
+        self.saved = Some(destination.to_owned());
+        if let Some(key) = known_key { let _ = fs::remove_file(dir.join(pending_key(key))); }
+        Ok(())
+    }
+
+    /// Move, rather than copy, so a single-use token never has two cache entries.
+    pub fn finish(&mut self, destination: &str, replace: bool) -> std::io::Result<()> {
+        let (Some(dir), Some(token)) = (self.directory.as_deref(), self.token.as_deref()) else { return Ok(()); };
+        if self.saved.as_deref() == Some(destination) { return Ok(()); }
+        if !replace && dir.join(destination).exists() { return Ok(()); }
+        if let Some(source) = self.saved.as_deref() {
+            fs::rename(dir.join(source), dir.join(destination))?;
+            fs::File::open(dir)?.sync_all()?;
+        } else {
+            save(dir, destination, token)?;
+        }
+        self.saved = Some(destination.to_owned());
+        let _ = fs::remove_file(dir.join(pending_key(destination)));
+        Ok(())
+    }
+}
+
 pub fn take(dir: &Path, key: &str) -> Option<String> {
     let path = dir.join(key);
     let mut file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path).ok()?;
@@ -69,6 +121,63 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("gnome"), dir.join("kde")).unwrap();
         assert!(take(&dir, "kde").is_none());
         assert!(save(&dir, "gnome", &"x".repeat(4097)).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotated_grant_survives_failure_and_is_moved_after_success() {
+        let dir = std::env::temp_dir().join(format!("uu-rotation-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        save(&dir, "gnome@other", "other-grant").unwrap();
+        let mut rotation = Rotation::new(Some(dir.clone()), "gnome@wanted");
+        rotation.record("new-grant", None).unwrap();
+        // Simulate capture failure: no finish callback runs.
+        assert!(exists(&dir, "gnome@wanted"));
+        assert_eq!(take(&dir, &pending_key("gnome@wanted")).as_deref(), Some("new-grant"));
+        assert!(!exists(&dir, "gnome@wanted"));
+        assert_eq!(take(&dir, "gnome@other").as_deref(), Some("other-grant"));
+
+        let mut rotation = Rotation::new(Some(dir.clone()), "gnome@wanted");
+        rotation.record("newer-grant", None).unwrap();
+        rotation.finish("gnome@actual", true).unwrap();
+        assert!(!dir.join(pending_key("gnome@wanted")).exists());
+        assert_eq!(take(&dir, "gnome@actual").as_deref(), Some("newer-grant"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn known_grants_replace_only_their_monitor_and_unknown_grants_do_not_overwrite() {
+        let dir = std::env::temp_dir().join(format!("uu-rotation-known-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        save(&dir, "gnome", "existing-grant").unwrap();
+        save(&dir, "gnome@other", "other-grant").unwrap();
+        let mut unknown = Rotation::new(Some(dir.clone()), "gnome@wanted");
+        unknown.record("unknown-grant", None).unwrap();
+        unknown.finish("gnome", false).unwrap();
+        assert_eq!(take(&dir, "gnome").as_deref(), Some("existing-grant"));
+        assert_eq!(take(&dir, &pending_key("gnome@wanted")).as_deref(), Some("unknown-grant"));
+        let mut known = Rotation::new(Some(dir.clone()), "gnome@wanted");
+        known.record("known-grant", Some("gnome@actual")).unwrap();
+        assert_eq!(take(&dir, "gnome@actual").as_deref(), Some("known-grant"));
+        assert_eq!(take(&dir, "gnome@other").as_deref(), Some("other-grant"));
+        let mut no_token = Rotation::new(Some(dir.clone()), "gnome");
+        no_token.finish("gnome", true).unwrap();
+        assert!(!no_token.received());
+        assert!(!dir.join("gnome").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fresh_request_keeps_existing_grant_until_open_succeeds() {
+        let dir = std::env::temp_dir().join(format!("uu-rotation-fresh-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        save(&dir, "gnome", "existing-grant").unwrap();
+        let mut fresh = Rotation::new(Some(dir.clone()), "gnome");
+        fresh.remember("fresh-grant");
+        assert_eq!(fs::read_to_string(dir.join("gnome")).unwrap(), "existing-grant");
+        assert!(!dir.join(pending_key("gnome")).exists());
+        fresh.finish("gnome", true).unwrap();
+        assert_eq!(take(&dir, "gnome").as_deref(), Some("fresh-grant"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

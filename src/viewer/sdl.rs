@@ -1,7 +1,7 @@
 use super::{desktop::{Frame,FrameSink},input::{Input,Viewport},session::Session};
 use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum,rect::Rect};
 #[derive(Debug)] enum Command { Files, Type }
-pub struct Window { canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
+pub struct Window {cursor:super::cursor::Display,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest>,
     pub last_frame:Option<Frame>, chrome:Chrome }
 /// In-window chrome state (src/viewer/hud.rs): menu, network panel, loading screen.
@@ -19,6 +19,9 @@ impl Window {
         let name=super::device_label(std::env::var("UU_VIEWER_DEVICE_NAME").ok().as_deref()).to_owned();
         let window=video.window(&format!("{name} · {}",crate::i18n::s("UU 远程 Linux 控制端","UU Remote Linux viewer")),1280,720).position_centered().resizable().build().map_err(|_|"Window creation failed")?;
         let mut canvas=window.into_canvas().build().map_err(|_|"Renderer creation failed")?;
+        // This window forwards scancodes, not SDL_TEXTINPUT. SDL enables text input by
+        // default; its X11 IME path can consume keys before KeyDown/KeyUp (#149).
+        video.text_input().stop();
         // Wayland maps a toplevel only after its first buffer; without this the window stays
         // invisible until the first decoded frame, which a stalled stream never delivers.
         canvas.set_draw_color(LOADING_BG);canvas.clear();canvas.present();
@@ -29,10 +32,18 @@ impl Window {
             title:crate::tr!("正在连接 {name}","Connecting to {name}"),stage:crate::i18n::s("正在连接远端设备…","Contacting the remote device…").into(),labels:Default::default(),menu_cache:None};
         let events=sdl.event_pump()?;let clipboard=video.clipboard();
         let(clipboard_tx,clipboard_requests)=tokio::sync::mpsc::channel(16);
-        Ok(Self{canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
+        Ok(Self{cursor:super::cursor::Display::new(),canvas,events,_sdl:sdl,frame:(1920,1080),focused:true,files:false,mac:false,clipboard,clipboard_dirty:true,clipboard_tx,clipboard_requests,last_frame:None,chrome})
     }
     pub fn clipboard_bridge(&self)->super::clipboard::Bridge{super::clipboard::Bridge::sdl(self.clipboard_tx.clone())}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
+    fn sync_cursor(&mut self,state:&super::cursor::State){
+        let mouse=self.events.mouse_state();let(x,y)=(mouse.x() as f64,mouse.y() as f64);let v=self.viewport();
+        let tab=hud::tab_rect(self.chrome.font.as_ref(),self.canvas.window().size(),self.chrome.scale);
+        let active=self.focused&&self.canvas.window().has_mouse_focus()&&!self.chrome.menu.open
+            &&x>=v.x&&y>=v.y&&x<v.x+v.width&&y<v.y+v.height
+            &&!(self.tab_visible()&&tab.contains(x as f32,y as f32));
+        self.cursor.update(state.take(),active);
+    }
     fn viewport(&self)->Viewport {
         let window=self.canvas.window().size();
         if !self.chrome.state.one_to_one {return Viewport::fit(window,self.frame)}
@@ -342,7 +353,13 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
                             if !repeat{*files=true;messages.extend(input.release_all());}None
                         },
                 _ if !*focused || !input.enabled()=>None,
-                Event::KeyDown{scancode:Some(s),repeat:false,..}=>input.key(s as i32,true),
+                Event::KeyDown{scancode:Some(s),keymod,repeat:false,..}=>{
+                    // FocusLost releases remote keys, while a modifier may remain physically held.
+                    // SDL_Keysym.mod is the event-time snapshot: restore it before the next key,
+                    // without querying the final state of a whole polled batch or typing text.
+                    if !(224..=231).contains(&(s as i32)){messages.extend(sync_modifiers(input,keymod));}
+                    input.key(s as i32,true)
+                },
                 Event::KeyUp{scancode:Some(s),..}=>input.key(s as i32,false),
                 Event::MouseMotion{x,y,..}=>viewport.motion(x as f64,y as f64),
                 Event::MouseButtonDown{mouse_btn,..}=>button(mouse_btn).and_then(|b|input.button(b,true)),
@@ -361,6 +378,18 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
                 messages.push(m);
             }
         } (quit,messages)
+}
+
+fn sync_modifiers(input:&mut Input,keymod:sdl2::keyboard::Mod)->Vec<serde_json::Value>{
+    use sdl2::keyboard::Mod as M;
+    let modifiers=[(224,M::LCTRLMOD),(225,M::LSHIFTMOD),(226,M::LALTMOD),(227,M::LGUIMOD),
+        (228,M::RCTRLMOD),(229,M::RSHIFTMOD),(230,M::RALTMOD),(231,M::RGUIMOD)];
+    let mut out=Vec::new();
+    // Release stale modifiers before pressing new ones. Input deduplicates transitions.
+    // Caps/Num/Scroll Lock and MODE are not physical held modifiers.
+    for down in [false,true]{for (scan,flag) in modifiers{
+        if keymod.contains(flag)==down{out.extend(input.key(scan,down));}
+    }}out
 }
 
 fn needs_redraw(event:&Event)->bool{
@@ -475,6 +504,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
             _=tick.tick()=>{
                 if let Some(playback)=audio.as_mut(){if playback.pump().is_err(){log::warn!("Viewer audio playback stopped");audio=None;}}
                 let (quit,mut messages)=window.poll(&mut input);
+                window.sync_cursor(&session.peer.cursor);
                 if !window.has_picture() {window.loading_frame(false);}
                 if !restored && session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false) {restored=true;window.restore_remote_settings();}
                 for command in window.take_commands() {
@@ -706,8 +736,101 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
     }
 }
 
+#[cfg(test)] mod modifier_tests {
+    use super::*;
+    use sdl2::keyboard::{Scancode as S,Mod as M};
+    fn key(scan:S,down:bool,mods:M)->Event{
+        if down{Event::KeyDown{timestamp:0,window_id:1,keycode:None,scancode:Some(scan),keymod:mods,repeat:false}}
+        else{Event::KeyUp{timestamp:0,window_id:1,keycode:None,scancode:Some(scan),keymod:mods,repeat:false}}
+    }
+    fn focus(event:WindowEvent)->Event{Event::Window{timestamp:0,window_id:1,win_event:event}}
+    fn send(input:&mut Input,focused:&mut bool,events:impl IntoIterator<Item=Event>)->Vec<serde_json::Value>{
+        translate(events,input,Viewport::fit((800,600),(1920,1080)),focused).1
+    }
+    fn codes(messages:&[serde_json::Value])->Vec<(&str,i64)>{
+        messages.iter().map(|m|(m["action"].as_str().unwrap(),m["key"].as_i64().unwrap())).collect()
+    }
+    #[test] fn held_left_and_right_modifiers_recover_after_focus_return(){
+        for mac in [false,true]{for (scan,flag) in [(S::LCtrl,M::LCTRLMOD),(S::LShift,M::LSHIFTMOD),
+            (S::LAlt,M::LALTMOD),(S::LGui,M::LGUIMOD),(S::RCtrl,M::RCTRLMOD),(S::RShift,M::RSHIFTMOD),
+            (S::RAlt,M::RALTMOD),(S::RGui,M::RGUIMOD)]{
+            let code=|scan:S|i64::from(if mac{super::super::input::mac_keycode(scan as i32)}else{super::super::input::windows_vk(scan as i32)}.unwrap());
+            let mut input=Input::default();input.set_mac(mac);let mut focused=true;
+            let out=send(&mut input,&mut focused,[key(scan,true,flag),focus(WindowEvent::FocusLost)]);
+            assert_eq!(codes(&out),vec![("kbd_press",code(scan)),("kbd_release",code(scan))]);
+            assert!(!focused);
+            let out=send(&mut input,&mut focused,[focus(WindowEvent::FocusGained),key(S::Num2,true,flag),
+                key(S::Num2,false,flag),key(scan,false,M::NOMOD)]);
+            assert_eq!(codes(&out),vec![("kbd_press",code(scan)),("kbd_press",code(S::Num2)),
+                ("kbd_release",code(S::Num2)),("kbd_release",code(scan))]);
+            assert!(input.release_all().is_empty());
+        }}
+    }
+    #[test] fn combined_snapshot_releases_stale_modifiers_before_new_chord(){
+        let mut input=Input::default();input.set_mac(true);let mut focused=true;
+        send(&mut input,&mut focused,[key(S::LShift,true,M::LSHIFTMOD),key(S::RGui,true,M::LSHIFTMOD|M::RGUIMOD)]);
+        let mods=M::RSHIFTMOD|M::LCTRLMOD|M::LALTMOD;
+        let out=send(&mut input,&mut focused,[key(S::A,true,mods),key(S::A,false,mods),
+            key(S::B,true,M::NOMOD),key(S::B,false,M::NOMOD)]);
+        assert_eq!(codes(&out),vec![("kbd_release",56),("kbd_release",54),
+            ("kbd_press",59),("kbd_press",58),("kbd_press",60),("kbd_press",0),("kbd_release",0),
+            ("kbd_release",59),("kbd_release",58),("kbd_release",60),("kbd_press",11),("kbd_release",11)]);
+        assert!(input.release_all().is_empty());
+    }
+    #[test] fn complete_chords_and_overlapping_letters_are_not_duplicated(){
+        let mut input=Input::default();input.set_mac(true);let mut focused=true;
+        let mods=M::LSHIFTMOD|M::RSHIFTMOD;
+        let out=send(&mut input,&mut focused,[key(S::LShift,true,M::LSHIFTMOD),key(S::RShift,true,mods),
+            key(S::A,true,mods),key(S::B,true,mods),key(S::A,false,mods),key(S::LShift,false,M::RSHIFTMOD),
+            key(S::B,false,M::RSHIFTMOD),key(S::RShift,false,M::NOMOD)]);
+        assert_eq!(codes(&out),vec![("kbd_press",56),("kbd_press",60),("kbd_press",0),("kbd_press",11),
+            ("kbd_release",0),("kbd_release",56),("kbd_release",11),("kbd_release",60)]);
+        assert!(input.release_all().is_empty());
+    }
+    #[test] fn snapshot_is_event_time_and_does_not_create_lock_or_view_only_keys(){
+        let mut input=Input::default();let mut focused=true;
+        let out=send(&mut input,&mut focused,[key(S::Num2,true,M::LSHIFTMOD|M::CAPSMOD|M::NUMMOD|M::MODEMOD),
+            key(S::Num2,false,M::LSHIFTMOD),key(S::A,true,M::NOMOD),key(S::A,false,M::NOMOD)]);
+        assert_eq!(codes(&out),vec![("kbd_press",0xa0),("kbd_press",0x32),("kbd_release",0x32),
+            ("kbd_release",0xa0),("kbd_press",0x41),("kbd_release",0x41)]);
+        for watch in [false,true]{
+            let mut input=Input::new(watch);let mut focused=false;
+            assert!(send(&mut input,&mut focused,[key(S::A,true,M::LSHIFTMOD)]).is_empty());
+            if watch{assert!(send(&mut input,&mut focused,[focus(WindowEvent::FocusGained),key(S::A,true,M::LSHIFTMOD)]).is_empty());}
+            assert!(input.release_all().is_empty());
+        }
+    }
+}
+
 #[cfg(test)] mod tests {
     use super::*;
+    #[cfg_attr(target_os="macos",ignore)]
+    #[test] fn remote_window_disables_local_text_input_and_forwards_shift(){
+        if std::env::var_os("UU_VIEWER_IME_TEST_CHILD").is_none(){
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","viewer::sdl::tests::remote_window_disables_local_text_input_and_forwards_shift","--test-threads=1"])
+                .env("SDL_VIDEODRIVER","dummy").env("UU_VIEWER_IME_TEST_CHILD","1").output().unwrap();
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return
+        }
+        let mut window=Window::new().unwrap();
+        assert!(!window.canvas.window().subsystem().text_input().is_active());
+        let id=window.canvas.window().id();
+        let key=|down,scan|if down {
+            Event::KeyDown{timestamp:0,window_id:id,keycode:None,scancode:Some(scan),keymod:sdl2::keyboard::Mod::NOMOD,repeat:false}
+        }else{
+            Event::KeyUp{timestamp:0,window_id:id,keycode:None,scancode:Some(scan),keymod:sdl2::keyboard::Mod::NOMOD,repeat:false}
+        };
+        let push=|event|window._sdl.event().unwrap().push_event(event).unwrap();
+        use sdl2::keyboard::Scancode as S;
+        for event in [key(true,S::LShift),key(false,S::LShift),key(true,S::A),key(false,S::A),
+            key(true,S::RShift),Event::Window{timestamp:0,window_id:id,win_event:WindowEvent::FocusLost},
+            Event::Window{timestamp:0,window_id:id,win_event:WindowEvent::FocusGained}] {push(event);}
+        let (_,messages)=window.poll(&mut Input::new(false));
+        let keys:Vec<_>=messages.iter().filter_map(|m|Some((m.get("action")?.as_str()?,m.get("key")?.as_i64()?))).collect();
+        assert_eq!(keys,vec![("kbd_press",0xa0),("kbd_release",0xa0),("kbd_press",0x41),("kbd_release",0x41),
+            ("kbd_press",0xa1),("kbd_release",0xa1)]);
+        assert!(!window.canvas.window().subsystem().text_input().is_active());
+    }
     // macOS: SDL video must start on the main thread, which the test harness does not use; CI runs it on Linux.
     #[cfg_attr(target_os="macos",ignore)]
     #[tokio::test] async fn clipboard_requests_use_existing_window(){

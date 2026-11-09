@@ -36,6 +36,8 @@ pub(crate) struct Settings {
     /// video field cannot drop auto_lock / mute when the document is loaded.
     #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_encoder: Option<String>,
     #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_codec: Option<String>,
+    /// Last privacy_type the viewer enabled (2 picture, 3 screen off), not the current live state.
+    #[serde(default)] pub(crate) privacy_type: Option<u8>,
 }
 
 fn lenient_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
@@ -260,6 +262,7 @@ impl PeerActions {
         if self.started.swap(true, Ordering::Relaxed) { return; }
         let mut state = state().lock().unwrap();
         state.desktop_sessions += 1;
+        crate::privacy_screen::session_started();
         if state.desktop_sessions == 1 && state.settings.keep_mute {
             mute_for_session(&mut state);
             log::info!("Host muted for remote session (静音运行)");
@@ -272,6 +275,7 @@ impl PeerActions {
         if !self.started.swap(false, Ordering::Relaxed) { return; }
         let mut state = state().lock().unwrap();
         state.desktop_sessions = state.desktop_sessions.saturating_sub(1);
+        crate::privacy_screen::session_ended();
         if state.desktop_sessions > 0 { return; }
         crate::virtual_audio::disable();
         if !state.settings.mute_permanent { restore_mute(&mut state); }
@@ -287,6 +291,7 @@ impl PeerActions {
         let current = state().lock().unwrap().settings.clone();
         payload_with_settings(desktop, desktop, desktop, &home, &crate::system_metrics::Settings {
             sound, keep_mute: current.keep_mute, mute_permanent: current.mute_permanent, auto_lock: current.auto_lock,
+            private_screen: crate::privacy_screen::supported().then(crate::privacy_screen::current_type),
         })
     }
 }

@@ -21,6 +21,10 @@
 
 ## 外观 / Appearance
 
+启动器图标使用系统主题的符号图标，避免缺少 emoji 字体时显示方框。
+
+已登录的图形主机会上报系统壁纸，供官方客户端的设备卡片在未连接时显示背景图（不是桌面窗口截图）。支持 GNOME/Cinnamon、KDE、Xfce 和 Hyprland 下的 Omarchy（自动跟随当前壁纸）；每 60 秒检查一次，内容不变则不重复上传。其他桌面可用 `UU_WALLPAPER=/绝对路径/图片.png` 指定 PNG/JPEG/WebP；`UU_WALLPAPER_UPLOAD=0` 关闭。访客和无桌面模式跳过上报。协议依据与限制见 [设备壁纸上报](docs/wallpaper-protocol.md)。
+
 在控制端的 **设置 → 常规 → 外观**，或主机 / 工具窗口的齿轮设置按钮中选择 **跟随系统 / 浅色 / 深色**（默认跟随系统）。
 选择保存在 `$XDG_CONFIG_HOME/uuremote/theme`（默认 `~/.config/uuremote/theme`）。
 
@@ -62,10 +66,11 @@ UU_LANG=en uuremote-server
 | Mac 快捷键 | **推荐**：在 Mac 远控窗口菜单里关闭「使用 macOS 快捷键」，之后和在 Mac 上一样：Cmd+C/V/A/F/X/Z 是复制、粘贴、全选、查找、剪切、撤销（终端里 Cmd+C/V 自动变成 Ctrl+Shift+C/V），Ctrl+C 在终端里始终是中断。保持开启时，客户端会把 Cmd 和 Ctrl 都当成 Ctrl 发送：终端里 Ctrl+V / Cmd+V 自动转成粘贴，Ctrl+C 是中断，复制用 Cmd+Shift+C（X11） |
 | 鼠标指针样式 | 远端指针形状实时同步（X11） |
 | 剪贴板 | 双向文本同步；Wayland 手机输入法输入通过剪贴板兜底粘贴，见下文 |
+| 观看模式批注 | 控制端观看模式下开启「批注」后画的笔迹显示在 Linux 屏幕上，并随画面传回控制端（X11，需要合成器；覆盖层不拦截鼠标）；关闭批注或断开连接时清除。已用 Mac 控制端 4.42.0 实测，手机控制端未测 |
 | 画质 / 帧率 / 分辨率 | 自动、原画 20M、超清 8M、高清 2M、自定义；30/60/90/144 帧；X11 下切换分辨率会像官方 Windows 被控端一样真正修改桌面分辨率（xrandr，缺少该模式时自动添加；选「原始」或断开后恢复），`UU_DESKTOP_RESIZE=0` 改为仅由编码器缩放；Wayland 仍由编码器缩放 |
 | 声音 | 采集系统声音（PulseAudio / PipeWire），Opus 编码传到控制端 |
-| 文件传输 | 上传、下载（含文件夹）、新建文件夹、重命名、删除 |
-| 终端 | 官方「终端」工具，PTY 会话，支持多会话和重命名 |
+| 文件传输 | 上传、下载（含文件夹）、新建文件夹、重命名、删除；iOS 直接上传使用默认接收目录（当前用户的主目录） |
+| 终端 | 官方「终端」工具，PTY 会话，支持多会话、重命名、结束会话和列表自动刷新；重连后旧连接的输入和断开消息不会影响当前会话 |
 | 锁屏与自动解锁 | 向控制端上报锁屏状态；开启「自动解锁被控端」后，通过 PAM 校验密码并解锁当前会话 |
 | 远程结束后自动锁屏 | 设置保存在本机，重连后依然生效 |
 | 被控端静音运行 | 主机扬声器静音，控制端照常能听到声音；结束后恢复原来的音量设置 |
@@ -136,7 +141,7 @@ niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通
 | 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；`inproc-av` 原生 NVENC 输出 H.264 High 4:4:4 / HEVC FRExt；VAAPI 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
-| 被控端防窥模式 | 未实现 |
+| 被控端防窥模式 | 实验性，仅 KDE Plasma Wayland（portal）；Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显；`UU_PRIVACY_AUTO=picture` / `screen-off` 可在桌面连接时自动开启，见 [docs/privacy-screen.md](docs/privacy-screen.md) |
 | 麦克风（控制端声音传到被控端） | 未实现（需要虚拟声卡） |
 | 魔兽世界排队提醒等插件 | 不支持，会明确告诉客户端「无插件」 |
 | Linux 系统登录界面 | 还不支持控制开机后的系统登录界面（还没有人登录 Linux 桌面时）；这种情况可以用无头模式或虚拟桌面（见下文）。注意：这里说的是 Linux 系统登录，**不登录 UU 账号**现在可以通过「远程协助」使用 |
@@ -354,10 +359,11 @@ systemctl --user restart uuremote-native.service
 | `UU_X11_OUTPUT` | X11 默认采集的显示器名称（`xrandr --listmonitors`），默认主显示器 |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
 | `UU_INPUT_BACKEND` | `auto`（默认，Wayland 下可用时用 uinput）/ `uinput` / `native` |
+| `UU_PORTAL_CURSOR_MODE` | 启动时的光标模式：`embedded` 让合成器把指针画进抓屏流，默认隐藏。运行中按客户端发来的相对/绝对位移自动切换；每次切换重建一次 portal 会话，画面和输入短暂中断 |
 | `UU_TERMINAL_SHORTCUTS=0` | 关闭终端窗口里的 Ctrl+V 粘贴转换 |
 | `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置或 `auto` 时后台探测（每个候选编码一帧，限时 3 秒）。有 NVIDIA 驱动时顺序是 NVENC → CPU；没有 NVIDIA 时只有 CPU，不探测。探测未完成就建流则沿用旧规则（有 NVIDIA 用 NVENC，否则 CPU）。自行编译的 `--features inproc-av` 上，仅 X11 会先走进程内引擎：外部 FFmpeg 探测失败时记为 `native_unprobed`，沿用旧规则（NVENC）；Wayland、portal、KMS 回退 CPU。只有 CPU 时跳过探测，记为 `not probed (only candidate)`。探测成功和这种只含 CPU 的跳过会缓存到 NVIDIA 是否存在发生变化为止（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）。之后的桌面连接在后台再探测一次（不挡住这一路，仍用缓存的编码器）。NVENC 探测失败、选用 CPU 时只缓存 10 分钟；到期后下一次桌面连接同样在后台再探测一次，再次失败则重新计 10 分钟。显式 `cpu` / `vaapi` / `nvenc` 不启动探测。`native_unprobed` 不算失败缓存。优先级低于 `host_settings.json` 里非 `auto` 的 `video_encoder`。VAAPI 要等 #33 解决后才会进入 auto |
 | `UU_VAAPI_BUFFER_MS` | VAAPI 的 VBV 缓冲（10–1000 ms，仅 `UU_VIDEO_ENCODER=vaapi` 时生效）；高分辨率下关键帧被压糊时用它换稳定画质 |
-| `UU_NVENC_BUFFER_MS` | NVENC 的 VBV 缓冲（10–1000 ms，仅 NVENC 生效，含进程内引擎）；默认 100–500 kbit，1440p 等高分辨率下关键帧被压糊、按 GOP 周期闪烁时设 `1000`（#103） |
+| `UU_NVENC_BUFFER_MS` | NVENC 的 VBV 缓冲（10–1000 ms，仅 NVENC 生效，含进程内引擎）；默认与 libx264 相同，取 1 秒码率上限并限制在 500–8000 kbit，高分辨率关键帧不再被压糊、按 GOP 周期闪烁（#103）。弱网下想要更小的低延迟缓冲可设小值（如 `50`） |
 | `UU_FFMPEG_ROOT` | 使用指定目录下的 FFmpeg |
 | `UU_AUDIO=0` | 关闭声音转发；`UU_AUDIO_SOURCE` 指定 PulseAudio 采集源 |
 | `UU_LOGIN_WINDOW=0` | 凭证缺失时不自动弹出登录窗口 |
@@ -404,6 +410,7 @@ flowchart LR
 
 ## 安全与隐私
 
+- 已登录的图形主机默认会将当前壁纸图片上传到 UU 的文件服务，供设备卡片显示背景；可用 `UU_WALLPAPER_UPLOAD=0` 关闭上传。
 - 日志不记录键盘输入、终端内容、剪贴板内容、文件内容、密码和令牌。
 - 自动解锁的密码保存在**控制端**（官方客户端）里，被控端只拿来做一次 PAM 校验，不落盘、不写日志。
 - 能连上这台机器的，只有登录了同一个 UU 账号的设备。请保管好你的 UU 账号。
@@ -532,6 +539,10 @@ xfce4-session xfce4-panel xfdesktop xfwm4 gnome-terminal`。
 `ffmpeg` 命令；SDL 桌面窗口直接同步文本剪贴板（Wayland/X11），无需额外剪贴板工具；终端功能需要本机终端程序（可用 `TERMINAL` 指定）。
 从源码构建：`sudo apt install libsdl2-dev`，然后 `cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer`。
 
+组合键使用 SDL 按键事件携带的左右修饰键状态；窗口失焦时释放远端按键，重新聚焦后的下一次普通按键会恢复仍按住的 Shift/Ctrl/Alt/Win（Mac 为 Command）。此行为内置，无需适配库或开关。
+
+控制端会同步远端以 PNG 发送的指针形状（如文本光标和窗口缩放箭头），并保留正确热点。离开远控画面或打开本地菜单时恢复本机箭头。
+
 SDL 剪贴板复用桌面窗口，避免 GNOME Wayland 上临时窗口引起的 Dock 跳动（#37）。niri 改用支持 data-control 的
 `wl-clipboard`，不需要桌面窗口保持焦点；其他 SDL 后端仅在桌面窗口获得焦点时同步。
 保留 30 KiB 文本上限；跳过不含支持的文本格式的本地选择，空文本的识别取决于 SDL2 后端。不带 SDL 的构建保留命令后端。
@@ -564,6 +575,8 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
 - 按被控端原始分辨率解码，窗口缩放使用线性过滤；被控端分辨率变化时自动重启解码器。`UU_VIEWER_SIZE=WxH` 可改为固定的留黑边画布。
+
+SDL 远程画面窗口关闭本地输入法的文本组合，按物理键转发；输入中文时请使用被控端的输入法及其中英切换键（例如 Shift）。
 
 Mac 目标使用 macOS 原生键码，Windows / Linux 目标保留 Windows VK。键盘按物理键位置转发，不自动把 Ctrl 改成 Command；
 控制 Mac 时，PC 键盘的 Super / Win 键对应 Command。仅接受已验证的目标平台值 1（Windows / 本项目 Linux 主机）和 4（Mac），

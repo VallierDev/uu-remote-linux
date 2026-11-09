@@ -157,8 +157,25 @@ fn is_independent_frame_for(bytes: &[u8], codec: VideoCodec) -> bool {
     match codec {
         VideoCodec::H264 => !nal_offsets_for(bytes, 5, codec).is_empty() && nal_offsets_for(bytes, 1, codec).is_empty(),
         // BLA/IDR/CRA are IRAP (RFC 7798 §4.1); no leading pictures with our no-B-frame encoder.
-        VideoCodec::H265 => (16..=21).any(|kind| !nal_offsets_for(bytes, kind, codec).is_empty())
-            && !(0..16).any(|kind| !nal_offsets_for(bytes, kind, codec).is_empty()),
+        VideoCodec::H265 => {
+            let mut has_irap = false;
+            let mut has_non_irap_vcl = false;
+            let mut i = 0;
+            while i + 3 < bytes.len() {
+                let prefix = if bytes[i..].starts_with(&[0, 0, 0, 1]) { 4 }
+                    else if bytes[i..].starts_with(&[0, 0, 1]) { 3 } else { i += 1; continue };
+                let header = i + prefix;
+                if let Some(kind) = hevc_nal_kind(bytes, header) {
+                    if (16..=21).contains(&kind) {
+                        has_irap = true;
+                    } else if kind < 16 {
+                        has_non_irap_vcl = true;
+                    }
+                }
+                i += prefix;
+            }
+            has_irap && !has_non_irap_vcl
+        }
     }
 }
 #[cfg(test)]
@@ -172,7 +189,7 @@ struct CompleteFrame {
     codec: VideoCodec,
     sequence: u64,
     completed_at: Instant,
-    data: Vec<u8>,
+    data: bytes::Bytes,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -816,7 +833,7 @@ async fn read_inprocess(
     let mut gate = DependencyGate::default();
     while let Some(unit) = units.recv().await {
         let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        gate.submit(&latest, Arc::new(CompleteFrame { source_generation: source.1, source_id: source.0, codec, sequence, completed_at: unit.completed_at, data: unit.data, _permit: Some(unit.permit) }));
+        gate.submit(&latest, Arc::new(CompleteFrame { source_generation: source.1, source_id: source.0, codec, sequence, completed_at: unit.completed_at, data: unit.data.into(), _permit: Some(unit.permit) }));
         if latest.is_closed() { break; }
     }
     // Dropping the receiver also unblocks the encoder if it is waiting to send.
@@ -825,11 +842,11 @@ async fn read_inprocess(
     job.await.map_err(|e| format!("Encoder task: {e}"))?
 }
 
-/// Rate-control arguments: constant quality capped at 30M (自动), or capped at the viewer's
-/// chosen bitrate. The VBV buffer stays at most 500k so a cap never adds queueing latency.
-/// VBV buffer in kbit. NVENC ull and VAAPI keep the small low-latency buffer; libx264 needs room for a
-/// whole IDR frame, otherwise large desktops get near-grey keyframes that sharpen over the GOP (#8).
-/// Half a second of bitrate still starved repeated 0.5 s-GOP keyframes at 3296x2036/2M; one second did not.
+/// VBV buffer in kbit. libx264 and NVENC need room for a whole IDR frame, otherwise large desktops get
+/// keyframes quantized into a blur that sharpens over the GOP (#8 libx264, #103 NVENC). Half a second of
+/// bitrate still starved repeated 0.5 s-GOP keyframes at 3296x2036/2M; one second did not. The 8000 kbit
+/// cap bounds the keyframe burst: 4K hevc_nvenc CQ18 IDRs measured 0.45 MB (desktop) to 0.76 MB (photo).
+/// VAAPI keeps the small low-latency buffer unless UU_VAAPI_BUFFER_MS asks for more.
 fn buffer_kbits(max_kbps: u32, encoder: Encoder) -> u32 {
     let env = match encoder {
         Encoder::Cpu => return max_kbps.clamp(500, 8000),
@@ -837,13 +854,14 @@ fn buffer_kbits(max_kbps: u32, encoder: Encoder) -> u32 {
         Encoder::Nvenc => "UU_NVENC_BUFFER_MS",
     };
     let requested = std::env::var(env).ok();
-    buffer_ms_kbits(max_kbps, requested.as_deref()).unwrap_or((max_kbps / 8).clamp(100, 500))
+    let default = if encoder == Encoder::Nvenc { max_kbps.clamp(500, 8000) } else { (max_kbps / 8).clamp(100, 500) };
+    buffer_ms_kbits(max_kbps, requested.as_deref()).unwrap_or(default)
 }
 
-/// Opt-in hardware VBV buffer: `码率上限 × 毫秒 / 1000` for `UU_VAAPI_BUFFER_MS` /
-/// `UU_NVENC_BUFFER_MS` in 10-1000 ms. With the 100-500 kbit default the encoder quantizes a
-/// whole desktop keyframe, which reads as a blur that sharpens over each GOP (#42 VAAPI, #103 NVENC).
-/// Unset, out of range or unparsable values keep the default buffer.
+/// Hardware VBV buffer override: `码率上限 × 毫秒 / 1000` for `UU_VAAPI_BUFFER_MS` /
+/// `UU_NVENC_BUFFER_MS` in 10-1000 ms. With VAAPI's 100-500 kbit default the encoder quantizes a
+/// whole desktop keyframe, which reads as a blur that sharpens over each GOP (#42); a small NVENC value
+/// brings back the old low-latency buffer. Unset, out of range or unparsable values keep the default buffer.
 fn buffer_ms_kbits(max_kbps: u32, value: Option<&str>) -> Option<u32> {
     let ms = value?.trim().parse::<u32>().ok().filter(|ms| (10..=1000).contains(ms))?;
     Some((max_kbps.saturating_mul(ms) / 1000).max(1))
@@ -872,6 +890,8 @@ fn inproc_rate_control(settings: &VideoSettings, encoder: Encoder) -> InprocRate
     }
 }
 
+/// Rate-control arguments: constant quality capped at 30M (自动), or capped at the viewer's
+/// chosen bitrate.
 fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
     let max_kbps = settings.max_kbps().unwrap_or(30_000);
     (format!("{max_kbps}k"), format!("{}k", buffer_for(settings, encoder)))
@@ -1052,7 +1072,7 @@ async fn read_encoder_with(
             if aud.len() < 2 { break; }
             let next = aud[1];
             if next > MAX_ACCESS_UNIT { return Err("Encoder access unit exceeds limit".into()); }
-            let frame: Vec<u8> = pending.drain(..next).collect();
+            let frame: bytes::Bytes = pending.drain(..next).collect::<Vec<u8>>().into();
             let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let permit=if wayland {Some(permits_rx.recv().await.ok_or("Capture producer stopped")?)} else {None};
             gate.submit(&latest, Arc::new(CompleteFrame { source_generation: settings.source_generation, source_id: settings.source_id,
@@ -1265,6 +1285,8 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         }
     };
     let mut reader = EncoderTask(tokio::spawn(open(size, live_selection, current)));
+    // The privacy screen swaps the portal stream to a virtual output that can have another size.
+    let mut portal_size = portal.as_ref().map(|p| p.size());
     let mut previous = None;
     let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
     let mut settings_open = true;
@@ -1366,7 +1388,19 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 }
                 return result;
             },
-            _ = health.tick() => { if transport_closed(&pc) { return Ok(()); } },
+            _ = health.tick() => {
+                if transport_closed(&pc) { return Ok(()); }
+                let now = portal.as_ref().map(|p| p.size());
+                if now != portal_size {
+                    log::info!("Portal stream size changed; restarting capture");
+                    portal_size = now;
+                    reader.0.abort();
+                    let _ = (&mut reader.0).await;
+                    while receiver.try_recv().is_ok() {}
+                    idr.store(true, std::sync::atomic::Ordering::Relaxed);
+                    reader.0 = tokio::spawn(open(size, live_selection, current));
+                }
+            },
             changed = settings.changed(), if settings_open => {
                 if changed.is_err() { settings_open = false; }
                 continue;
@@ -1380,7 +1414,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
                 max_age_ms = max_age_ms.max(frame.completed_at.elapsed().as_millis());
                 // Continue monitoring close even if the network send stalls.
                 let sample = Sample {
-                    data: frame.data.clone().into(), duration, ..Default::default()
+                    data: frame.data.clone(), duration, ..Default::default()
                 };
                 let extensions = [crate::rtp_metadata::capture_index(0), crate::rtp_metadata::new_frame()];
                 let sent_before=track.revision();
@@ -1548,7 +1582,7 @@ mod tests {
         for sequence in 1..=2 {
             let permit=budget.clone().acquire_owned().await.unwrap();
             gate.submit(&tx,Arc::new(CompleteFrame { source_generation: 0, source_id: 0,codec:VideoCodec::H264,sequence,completed_at:Instant::now(),
-                data:vec![0,0,1,5,42],_permit:Some(permit)}));
+                data:vec![0,0,1,5,42].into(),_permit:Some(permit)}));
         }
         let sending=rx.recv().await.unwrap();
         assert_eq!(budget.available_permits(),0);
@@ -1664,7 +1698,10 @@ mod tests {
 
     #[test]
     fn x264_buffer_fits_keyframes() {
-        assert_eq!(buffer_kbits(2000, Encoder::Nvenc), 250);
+        // NVENC follows libx264 (#103): one second of the cap within 500-8000 kbit.
+        assert_eq!(buffer_kbits(2000, Encoder::Nvenc), 2000);
+        assert_eq!(buffer_kbits(300, Encoder::Nvenc), 500);
+        assert_eq!(buffer_kbits(30_000, Encoder::Nvenc), 8000);
         assert_eq!(buffer_kbits(2000, Encoder::Vaapi), 250);
         assert_eq!(buffer_kbits(2000, Encoder::Cpu), 2000);
         assert_eq!(buffer_kbits(300, Encoder::Cpu), 500);
@@ -1710,7 +1747,7 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let frame = |sequence, idr| Arc::new(CompleteFrame { source_generation: 0, source_id: 0, _permit: None,
             sequence, codec: VideoCodec::H264, completed_at: Instant::now(),
-            data: vec![0, 0, 1, 9, 240, 0, 0, 1, if idr { 5 } else { 1 }, 42],
+            data: vec![0, 0, 1, 9, 240, 0, 0, 1, if idr { 5 } else { 1 }, 42].into(),
         });
         let mut reader = EncoderTask(tokio::spawn(async move {
             let _stopped = MarkStopped(old_stopped);
@@ -1803,7 +1840,7 @@ mod tests {
     async fn bounded_queue_never_sends_broken_prediction_chain_after_overload(){
         let(tx,mut rx)=mpsc::channel(1);
         let mut gate=DependencyGate::default();
-        let frame=|sequence,idr|Arc::new(CompleteFrame{source_generation:0,source_id:0,_permit:None,sequence,codec:VideoCodec::H264,completed_at:Instant::now(),data:vec![0,0,1,9,240,0,0,1,if idr{5}else{1},42]});
+        let frame=|sequence,idr|Arc::new(CompleteFrame{source_generation:0,source_id:0,_permit:None,sequence,codec:VideoCodec::H264,completed_at:Instant::now(),data:vec![0,0,1,9,240,0,0,1,if idr{5}else{1},42].into()});
         gate.submit(&tx,frame(1,false));assert!(rx.try_recv().is_err()); // no IDR yet
         gate.submit(&tx,frame(2,true));
         gate.submit(&tx,frame(3,false)); // queue full: P3 lost
@@ -1876,7 +1913,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut gate = DependencyGate::default();
         let frame = |sequence, irap| Arc::new(CompleteFrame { source_generation: 0, source_id: 0, _permit: None, codec: VideoCodec::H265,
-            sequence, completed_at: Instant::now(), data: vec![0,0,1,if irap { 38 } else { 2 },1,42] });
+            sequence, completed_at: Instant::now(), data: vec![0,0,1,if irap { 38 } else { 2 },1,42].into() });
         gate.submit(&tx, frame(1, false));
         assert!(rx.try_recv().is_err());
         gate.submit(&tx, frame(2, true));
@@ -1948,7 +1985,7 @@ mod screen_frame_tests {
     use super::*;
     #[test]
     fn source_restart_rejects_queued_frames_even_with_same_screen_and_codec() {
-        let frame=CompleteFrame {source_id:0,source_generation:7,codec:VideoCodec::H264,sequence:1,completed_at:Instant::now(),data:vec![],_permit:None};
+        let frame=CompleteFrame {source_id:0,source_generation:7,codec:VideoCodec::H264,sequence:1,completed_at:Instant::now(),data:vec![].into(),_permit:None};
         let mut settings=VideoSettings {source_id:0,source_generation:7,..Default::default()};
         assert!(frame.matches(&settings));
         settings.source_generation=9;assert!(!frame.matches(&settings));

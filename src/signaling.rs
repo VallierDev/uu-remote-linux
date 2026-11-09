@@ -248,7 +248,7 @@ impl SignalingClient {
         let mut req = ws_url
             .clone()
             .into_client_request()
-            .map_err(|e| format!("Invalid WS request: {}", e))?;
+            .map_err(|_| "Invalid WS request".to_string())?;
 
         req.headers_mut().insert(
             "X-NRD-AUTH",

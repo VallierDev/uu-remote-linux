@@ -182,6 +182,10 @@ pub fn encode_echo_response_with_clipboard(seq: u64, timestamp: u64, request_seq
     // 6 ff_file_transfer_ftp = LIST_COMPRESS (zlib dir_data), 8 ff_clipboard = SUPPORT_TEXT_CHANGE.
     let mut flags = vec![8, crate::capture_setting::FEATURE_VERSION as u8,
         16, crate::system_actions::FF_SIMPLE_ACTION, 24, crate::system_actions::FF_SYSTEM_METRICS, 48, 2];
+    // Privacy screen (Mac UURemote name maps): 3 ff_system_metrics = FF_SYSTEM_METRICS_SETTING_PRIVATE_SCREEN
+    // (3, after AUTO_LOCK 2; the viewer then reads SettingMetric 4/7), 4 ff_private_screen =
+    // FF_PRIVATE_SCREEN_ENHANCED_PRIVACY (2): screen off besides the picture mode.
+    if crate::privacy_screen::supported() { flags[5] = 3; flags.extend([32, 2]); }
     if clipboard { flags.extend_from_slice(&[64, 3]); }
     action.push(34);
     action.push(flags.len() as u8);

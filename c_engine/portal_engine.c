@@ -38,7 +38,8 @@ struct uu_portal {
     char *session;
     char *restore_token;
     guint closed_subscription, clipboard_owner_subscription, clipboard_transfer_subscription, display_subscription;
-    int clipboard_enabled, clipboard_changed;
+    int clipboard_enabled, clipboard_changed, clipboard_owns;
+    int cursor_available, cursor_applied;
     char *clipboard_text, *clipboard_mime;
     size_t clipboard_length;
     uint64_t clipboard_revision;
@@ -82,6 +83,13 @@ struct uu_portal {
 
 static pthread_once_t pw_once = PTHREAD_ONCE_INIT;
 static atomic_uint token_sequence = 1;
+/* Cursor preference for sessions opened from now on; -1 defers to UU_PORTAL_CURSOR_MODE. */
+static atomic_int cursor_mode_override = -1;
+void uu_portal_set_cursor_mode(int mode) { atomic_store(&cursor_mode_override, mode); }
+/* Cursor mode the last session actually requested: 1 hidden, 2 embedded, 0 when unavailable. */
+int uu_portal_cursor_mode(struct uu_portal *p) { return p ? p->cursor_applied : 0; }
+/* Cursor modes the backend advertised for the last session; 0 when the property was unreadable. */
+int uu_portal_cursor_modes(struct uu_portal *p) { return p ? p->cursor_available : 0; }
 static void initialize_pipewire(void) { pw_init(NULL, NULL); }
 static GVariant *empty_options(void) { return g_variant_new_array(G_VARIANT_TYPE("{sv}"), NULL, 0); }
 static int open_cancelled(struct uu_portal *p) {
@@ -89,10 +97,10 @@ static int open_cancelled(struct uu_portal *p) {
 }
 static int wait_for_first_frame(struct uu_portal *p);
 #include "portal_eis.inc"
-/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes); 0 when unreadable. */
-static guint remote_property(struct uu_portal *p, const char *name) {
+/* A uint32 portal property; 0 when unreadable. */
+static guint interface_property(struct uu_portal *p, const char *interface, const char *name) {
     GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH,
-        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", REMOTE, name),
+        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", interface, name),
         G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
     guint result = 0;
     if (reply) {
@@ -101,6 +109,10 @@ static guint remote_property(struct uu_portal *p, const char *name) {
         g_variant_unref(value); g_variant_unref(reply);
     }
     return result;
+}
+/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes). */
+static guint remote_property(struct uu_portal *p, const char *name) {
+    return interface_property(p, REMOTE, name);
 }
 static void fail(struct uu_portal *p, int error) {
     pthread_mutex_lock(&p->lock);
@@ -179,6 +191,8 @@ static void session_closed(GDBusConnection *bus, const gchar *sender, const gcha
     const gchar *interface, const gchar *signal, GVariant *parameters, gpointer data) {
     (void)bus; (void)sender; (void)path; (void)interface; (void)signal; (void)parameters;
     struct uu_portal *p = data;
+    /* A closed session no longer tracks owner changes, so its cached claim is stale. */
+    pthread_mutex_lock(&p->lock); p->clipboard_owns=0; pthread_mutex_unlock(&p->lock);
     atomic_store(&p->closed, 1); fail(p, 9);
 }
 static void *run_dbus(void *data) {
@@ -558,7 +572,7 @@ static int wait_for_first_frame(struct uu_portal *p) {
     while (!p->sequence && !p->error && !open_cancelled(p) && !(p->dma_requested && p->dma_bad)) {
         gint64 remaining = deadline - g_get_monotonic_time();
         if (remaining <= 0) break;
-        clock_gettime(CLOCK_REALTIME, &until);
+        clock_gettime(CLOCK_MONOTONIC, &until);
         gint64 wait_us = MIN(100000, remaining);
         until.tv_nsec += wait_us * 1000;
         if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
@@ -594,9 +608,15 @@ static int read_stream_result(struct uu_portal *p, GVariant *results) {
     if (streams) g_variant_unref(streams);
     return error;
 }
+static void save_restore_token(struct uu_portal *p, void (*save_token)(const char *, void *),
+    uu_portal_save_detailed_fn save_detailed, void *save_data) {
+    if (!p->restore_token) return;
+    if (save_token) save_token(p->restore_token, save_data);
+    if (save_detailed) save_detailed(p->restore_token, save_data, p->has_position, p->position_x, p->position_y);
+}
 static struct uu_portal *open_persist(const char *restore, void (*save_token)(const char *, void *),
-    void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
-    int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height) {
+    uu_portal_save_detailed_fn save_detailed, void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
+    int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height, uint32_t source_types) {
     *error = 0; *width = *height = 0;
     struct uu_portal *p = calloc(1, sizeof(*p));
     if (!p) { *error = 8; return NULL; }
@@ -610,7 +630,12 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     for (gchar **desktop = desktops; *desktop; desktop++)
         if (!g_ascii_strcasecmp(*desktop, "GNOME")) p->absolute_stream_pixels = 1;
     g_strfreev(desktops);
-    pthread_mutex_init(&p->lock, NULL); pthread_cond_init(&p->changed, NULL);
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&p->changed, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
     p->context = g_main_context_new(); g_main_context_push_thread_default(p->context);
     p->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
     if (!p->bus) { *error = 1; goto done; }
@@ -644,9 +669,26 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     if (!results) goto done;
     g_variant_unref(results);
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(1));
+    /* 1 monitor; 4 virtual (KDE creates a KWin virtual output for the stream). */
+    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(source_types));
     g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(FALSE));
-    /* Hidden cursor avoids duplicate pointer; supported since ScreenCast v1. */
+    /* Hidden cursor avoids a duplicate pointer in absolute mode: the viewer draws its own where
+     * it last sent motion. Relative mode has no such position, so the game's cursor has to come
+     * from the compositor. The host flips this at runtime through uu_portal_set_cursor_mode();
+     * UU_PORTAL_CURSOR_MODE=embedded is the startup default. Only sent when the backend
+     * advertises embedded, since an unsupported value closes the session. */
+    int cursor_mode = atomic_load(&cursor_mode_override);
+    if (cursor_mode < 0) {
+        const char *wanted = g_getenv("UU_PORTAL_CURSOR_MODE");
+        cursor_mode = (wanted && !g_ascii_strcasecmp(wanted, "embedded")) ? 2 : 1;
+    }
+    /* The host reads these back so its belief matches what the session actually requested. */
+    p->cursor_available = (int)interface_property(p, SCREEN, "AvailableCursorModes");
+    p->cursor_applied = 1;
+    if (cursor_mode == 2 && (p->cursor_available & 2)) {
+        g_variant_builder_add(&options, "{sv}", "cursor_mode", g_variant_new_uint32(2));
+        p->cursor_applied = 2;
+    }
     results = request(p, SCREEN, "SelectSources", &options, 1, error);
     if (!results) goto done;
     g_variant_unref(results);
@@ -674,7 +716,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
         fprintf(stderr, "Portal persistence: requested=%d restore_attempted=%d token_returned=%d\n",
             version >= 2, restore && *restore, p->restore_token && *p->restore_token);
     }
-    if (!*error && p->restore_token && save_token) save_token(p->restore_token, save_data);
+    if (!*error) save_restore_token(p, save_token, save_detailed, save_data);
     g_variant_unref(results);
     if (*error) goto done;
     p->main_loop = g_main_loop_new(p->context, FALSE);
@@ -707,17 +749,27 @@ struct uu_portal *uu_portal_open_persist_cancellable(const char *restore,
     void (*save_token)(const char *, void *), void *save_data,
     uu_portal_cancelled_fn cancelled, void *cancel_data,
     int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, save_data, cancelled, cancel_data, 0, error, width, height);
+    return open_persist(restore, save_token, NULL, save_data, cancelled, cancel_data, 0, error, width, height, 1);
 }
 struct uu_portal *uu_portal_open_persist_capture(const char *restore,
     void (*save_token)(const char *, void *), void *save_data,
     uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf,
     int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height);
+    return open_persist(restore, save_token, NULL, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height, 1);
 }
 struct uu_portal *uu_portal_open_persist(const char *restore, void (*save_token)(const char *, void *),
     void *data, int *error, uint32_t *width, uint32_t *height) {
-    return open_persist(restore, save_token, data, NULL, NULL, 0, error, width, height);
+    return open_persist(restore, save_token, NULL, data, NULL, NULL, 0, error, width, height, 1);
+}
+struct uu_portal *uu_portal_open_virtual(const char *restore, void (*save_token)(const char *, void *),
+    void *data, int *error, uint32_t *width, uint32_t *height) {
+    return open_persist(restore, save_token, NULL, data, NULL, NULL, 0, error, width, height, 4);
+}
+struct uu_portal *uu_portal_open_detailed(const char *restore, uu_portal_save_detailed_fn save_token,
+    void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf,
+    uint32_t source_types, int *error, uint32_t *width, uint32_t *height) {
+    if (source_types != 1 && source_types != 4) { *error = 3; *width = *height = 0; return NULL; }
+    return open_persist(restore, NULL, save_token, save_data, cancelled, cancel_data, prefer_dmabuf, error, width, height, source_types);
 }
 struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32_t *width, uint32_t *height) {
     return uu_portal_open_persist(restore, NULL, NULL, error, width, height);
@@ -814,6 +866,36 @@ int uu_portal_capture_alive(struct uu_portal *p) {
     int alive = !stream_stalled(p);
     pthread_mutex_unlock(&p->lock);
     return alive;
+}
+int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
+    if (!p || atomic_load(&p->closed)) return -1;
+    pthread_mutex_lock(&p->lock);
+    if (p->error || atomic_load(&p->closed) || stream_stalled(p)) {
+        pthread_mutex_unlock(&p->lock);
+        return -1;
+    }
+    uint64_t prev_seq = p->sequence;
+    if (timeout_us <= 0) {
+        int ready = (p->sequence != prev_seq);
+        pthread_mutex_unlock(&p->lock);
+        return ready;
+    }
+    struct timespec until;
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    until.tv_sec += timeout_us / 1000000LL;
+    until.tv_nsec += (long)(timeout_us % 1000000LL) * 1000L;
+    if (until.tv_nsec >= 1000000000L) {
+        until.tv_sec += 1;
+        until.tv_nsec -= 1000000000L;
+    }
+    while (p->sequence == prev_seq && !p->error && !atomic_load(&p->closed) && !stream_stalled(p)) {
+        int rc = pthread_cond_timedwait(&p->changed, &p->lock, &until);
+        if (rc != 0) break; // timeout or error
+    }
+    int res = (p->error || atomic_load(&p->closed) || stream_stalled(p)) ? -1 :
+              (p->sequence != prev_seq) ? 1 : 0;
+    pthread_mutex_unlock(&p->lock);
+    return res;
 }
 void uu_portal_input_dispatch(struct uu_portal *p) {
     if (p->ei) portal_eis_dispatch(p);
@@ -980,6 +1062,8 @@ int uu_portal_monitors(char *out, size_t length) {
  * captures then report a closed stream until the handle is replaced. */
 void uu_portal_end(struct uu_portal *p) {
     if (!p || atomic_exchange(&p->closed, 1)) return;
+    /* A closed session no longer tracks owner changes, so its cached claim is stale. */
+    pthread_mutex_lock(&p->lock); p->clipboard_owns=0; pthread_mutex_unlock(&p->lock);
     if (p->bus && p->session) {
         GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
             NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
