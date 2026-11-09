@@ -274,6 +274,8 @@ impl WebRtcSession {
 
         let role = Arc::new(DesktopRole::new(desktop));
         if desktop { *role.input.lock().unwrap() = Some(input.desktop_session()); }
+        let microphone = crate::microphone::Session::new();
+        if crate::microphone::available() { microphone.attach(&pc, role.active.subscribe()); }
         let context = Arc::new(Mutex::new(SessionContext::default()));
         crate::network_diagnostics::start(Arc::downgrade(&pc));
 
@@ -530,6 +532,7 @@ impl WebRtcSession {
         // Settings arrive on CONTROL or TEXT; serialize both queues for this peer.
         let settings_serial=Arc::new(Mutex::new(()));
         let data_role = role.clone();
+        let data_microphone = microphone.clone();
         // 监听 DataChannel
         pc.on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
             let label = d.label().to_string();
@@ -538,6 +541,7 @@ impl WebRtcSession {
             let peer_settings_serial=settings_serial.clone();
             let input_inst = input_clone.clone();
             let channel_role=data_role.clone();
+            let channel_microphone = data_microphone.clone();
             let screen = control_capture.clone();
             let portal_desktop = portal_desktop.clone();
             let desktop_pc = desktop_pc.clone();
@@ -1169,6 +1173,7 @@ impl WebRtcSession {
                     let input_worker = inp.clone();
                     let message_input_session=channel_role.input();
                     let message_role=channel_role.clone();
+                    let message_microphone = channel_microphone.clone();
                     let terminal_worker = terminal_conn.clone();
                     let rpc_out = outbound.clone();
                     let text_out = text_out.clone();
@@ -1242,6 +1247,30 @@ impl WebRtcSession {
                                 // answer on TEXT like the privacy RPCs above.
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                return;
+                            }
+                            if let Some(policy) = rpc_fields.as_deref().and_then(crate::microphone::policy_request) {
+                                let supported = policy <= 1 && crate::microphone::available() && message_role.is_desktop();
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let next = || out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let response = crate::system_actions::session_rpc_response_with_error(rpc_fields.as_deref().unwrap(), u8::from(!supported)).unwrap();
+                                let response = crate::initialization::envelope(next(), ts, 22, &response);
+                                // Windows NevaudioHelper completes the request on TEXT; mirror CONTROL
+                                // for viewers that dispatch responses there, as for privacy RPCs.
+                                let enqueue = |message: Vec<u8>| {
+                                    let _ = text_out.send(message.clone());
+                                    if channel_name != "TEXT_DATA_CHANNEL" { let _ = rpc_out.send(message); }
+                                };
+                                if supported {
+                                    let action = if policy == 1 { 23 } else { 24 };
+                                    // Use the channel's ordered outbox: a stalled SCTP send must
+                                    // never delay this state transition past a later close on TEXT.
+                                    message_microphone.action_with(action, || {
+                                        enqueue(response);
+                                        enqueue(crate::initialization::envelope(next(), ts, 3, &[8, action as u8]));
+                                    });
+                                } else { enqueue(response); }
+                                log::info!("Remote microphone policy: value={policy} supported={supported}");
                                 return;
                             }
                             if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
@@ -1452,6 +1481,8 @@ impl WebRtcSession {
                                             } else {
                                                 log::info!("SimpleAction 4 (capture_desktop) not handled: tool connection without a desktop route");
                                             }
+                                        } else if matches!(action, 23 | 24) && crate::microphone::available() && message_role.is_desktop() {
+                                            message_microphone.action(action);
                                         } else if action > 1 && action != 15 {
                                             let args = action_fields.iter().find_map(|f| match (&f.value, f.number) { (WireValue::Bytes(v), 2) => Some(*v), _ => None }).unwrap_or(&[]);
                                             log::info!("SimpleAction {} ({}) not handled: args={}", action, crate::control_protocol::simple_action_name(action).unwrap_or("?"), sa::args_shape(args));

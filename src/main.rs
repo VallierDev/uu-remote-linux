@@ -45,6 +45,7 @@ mod damage_capture;
 mod inproc_encoder;
 mod capture_setting;
 mod audio;
+mod microphone;
 mod virtual_audio;
 mod privacy_screen;
 mod system_actions;
@@ -649,6 +650,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     privacy_screen::recover();
     virtual_audio::init();
     let _audio_cleanup=virtual_audio::Cleanup;
+    microphone::init();
+    let _microphone_cleanup = microphone::Cleanup;
     log::info!("Starting uu-remote-linux host v{}...", env!("CARGO_PKG_VERSION"));
     session_ice::configure_relay_transport();
     // Before host.pid, and before assist: a missing or failed assist session must still handle SIGUSR2.
@@ -685,7 +688,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(not(target_os="linux"))]
         let _ = tokio::signal::ctrl_c().await;
-        if !assist_enabled { privacy_screen::shutdown(); shutdown_input.shutdown(); virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
+        if !assist_enabled { privacy_screen::shutdown(); shutdown_input.shutdown(); microphone::shutdown().await; virtual_audio::disable(); terminal::shutdown_all(); std::process::exit(0); }
         let _ = signal_tx.send(true);
     });
     let mut assist = if assist_enabled { Some(assist::Assist::start(&mut shutdown, unified).await?) } else { None };
@@ -716,7 +719,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One exit path for commands, signals, transport failures and UI failures.
     if let Some(session) = assist.as_mut() { session.allowed = false; }
     for (_, old) in webrtc_sessions.lock().await.drain() { close_peer(&old.pc).await; }
-    privacy_screen::shutdown(); virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
+    privacy_screen::shutdown(); microphone::shutdown().await; virtual_audio::disable(); input.shutdown(); terminal::shutdown_all();
     // Switching identity (signed in / out) restarts at once and the new identity republishes the same
     // device share: logout already withdrew it, and after a QR login the cloud moved it to the account
     // (a guest cancel then fails). Only a real stop withdraws here.
