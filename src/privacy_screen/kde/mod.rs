@@ -88,6 +88,14 @@ impl Backend for Kde {
         log::info!("Privacy KDE: outputs={} input_devices={}", data.outputs.len(), data.devices.len());
         Ok(entered)
     }
+    fn refresh_pointer_region(&self) -> Option<[f64; 4]> {
+        // The old virtual output disappears with the replaced session; wait for the layout to
+        // settle on the new one before taking its share of the bounding box.
+        let layout = outputs::layout().ok()?;
+        let virtuals: Vec<_> = layout.iter().filter(|o| o.name.starts_with("Virtual")).collect();
+        let target = match virtuals.as_slice() { [only] => *only, _ => return None };
+        outputs::region(&layout, &target.name)
+    }
     fn leave(&self, data: &serde_json::Value) -> Result<(), String> {
         let data: Data = serde_json::from_value(data.clone()).map_err(|_| "invalid KDE recovery data")?;
         // KWin persists the device flag: a failure is returned (after restoring the outputs) so the

@@ -18,10 +18,19 @@ struct uu_portal *uu_portal_open_persist_cancellable(const char *restore, void (
 /* Select the capture transport before connecting, including on same-process recovery. */
 struct uu_portal *uu_portal_open_persist_capture(const char *restore, void (*save_token)(const char *, void *), void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data, int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height);
 struct uu_portal *uu_portal_open_restore(const char *restore, int *error, uint32_t *width, uint32_t *height);
+/* Cursor mode for subsequent sessions: 1 hidden, 2 embedded (the compositor draws the pointer
+ * into the stream). -1 restores the UU_PORTAL_CURSOR_MODE default. The host switches this at
+ * runtime because the viewer cannot draw a pointer of its own during relative motion. */
+void uu_portal_set_cursor_mode(int mode);
+/* What the last session requested and what the backend offered, for host bookkeeping. */
+int uu_portal_cursor_mode(struct uu_portal *portal);
+int uu_portal_cursor_modes(struct uu_portal *portal);
 const char *uu_portal_restore_token(struct uu_portal *portal);
 void uu_portal_close(struct uu_portal *portal);
 int uu_portal_clipboard_ready(struct uu_portal *portal);
 int uu_portal_clipboard_set(struct uu_portal *portal, const uint8_t *text, size_t length);
+/* Offers the text `from` still owns to `to`; 0 transferred, 1 nothing to transfer. */
+int uu_portal_clipboard_copy(struct uu_portal *from, struct uu_portal *to);
 int uu_portal_clipboard_poll(struct uu_portal *portal, uint8_t *text, size_t capacity);
 int uu_portal_alive(struct uu_portal *portal);
 int uu_portal_capture_alive(struct uu_portal *portal);

@@ -48,6 +48,18 @@ pub fn state_message(seq: u64, timestamp: u64) -> Vec<u8> {
 }
 /// See `backend::Entered::pointer_region`.
 pub fn pointer_region() -> Option<[f64; 4]> { *POINTER.lock().ok()? }
+/// A session rebuild replaced the virtual output: refresh the region absolute input maps into.
+pub fn refresh_pointer_region() {
+    if !active() { return; }
+    for _ in 0..10 {
+        if let Some(region) = backend::detect().and_then(backend::Backend::refresh_pointer_region) {
+            if let Ok(mut pointer) = POINTER.lock() { *pointer = Some(region); }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    log::warn!("Privacy pointer region not refreshed: virtual output layout did not settle");
+}
 
 fn publish(active: Option<&Active>) {
     ACTIVE.store(active.is_some(), Ordering::Relaxed);

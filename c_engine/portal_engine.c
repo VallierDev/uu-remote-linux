@@ -38,7 +38,8 @@ struct uu_portal {
     char *session;
     char *restore_token;
     guint closed_subscription, clipboard_owner_subscription, clipboard_transfer_subscription, display_subscription;
-    int clipboard_enabled, clipboard_changed;
+    int clipboard_enabled, clipboard_changed, clipboard_owns;
+    int cursor_available, cursor_applied;
     char *clipboard_text, *clipboard_mime;
     size_t clipboard_length;
     uint64_t clipboard_revision;
@@ -82,6 +83,13 @@ struct uu_portal {
 
 static pthread_once_t pw_once = PTHREAD_ONCE_INIT;
 static atomic_uint token_sequence = 1;
+/* Cursor preference for sessions opened from now on; -1 defers to UU_PORTAL_CURSOR_MODE. */
+static atomic_int cursor_mode_override = -1;
+void uu_portal_set_cursor_mode(int mode) { atomic_store(&cursor_mode_override, mode); }
+/* Cursor mode the last session actually requested: 1 hidden, 2 embedded, 0 when unavailable. */
+int uu_portal_cursor_mode(struct uu_portal *p) { return p ? p->cursor_applied : 0; }
+/* Cursor modes the backend advertised for the last session; 0 when the property was unreadable. */
+int uu_portal_cursor_modes(struct uu_portal *p) { return p ? p->cursor_available : 0; }
 static void initialize_pipewire(void) { pw_init(NULL, NULL); }
 static GVariant *empty_options(void) { return g_variant_new_array(G_VARIANT_TYPE("{sv}"), NULL, 0); }
 static int open_cancelled(struct uu_portal *p) {
@@ -89,10 +97,10 @@ static int open_cancelled(struct uu_portal *p) {
 }
 static int wait_for_first_frame(struct uu_portal *p);
 #include "portal_eis.inc"
-/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes); 0 when unreadable. */
-static guint remote_property(struct uu_portal *p, const char *name) {
+/* A uint32 portal property; 0 when unreadable. */
+static guint interface_property(struct uu_portal *p, const char *interface, const char *name) {
     GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH,
-        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", REMOTE, name),
+        "org.freedesktop.DBus.Properties", "Get", g_variant_new("(ss)", interface, name),
         G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
     guint result = 0;
     if (reply) {
@@ -101,6 +109,10 @@ static guint remote_property(struct uu_portal *p, const char *name) {
         g_variant_unref(value); g_variant_unref(reply);
     }
     return result;
+}
+/* A uint32 RemoteDesktop property (version, AvailableDeviceTypes). */
+static guint remote_property(struct uu_portal *p, const char *name) {
+    return interface_property(p, REMOTE, name);
 }
 static void fail(struct uu_portal *p, int error) {
     pthread_mutex_lock(&p->lock);
@@ -179,6 +191,8 @@ static void session_closed(GDBusConnection *bus, const gchar *sender, const gcha
     const gchar *interface, const gchar *signal, GVariant *parameters, gpointer data) {
     (void)bus; (void)sender; (void)path; (void)interface; (void)signal; (void)parameters;
     struct uu_portal *p = data;
+    /* A closed session no longer tracks owner changes, so its cached claim is stale. */
+    pthread_mutex_lock(&p->lock); p->clipboard_owns=0; pthread_mutex_unlock(&p->lock);
     atomic_store(&p->closed, 1); fail(p, 9);
 }
 static void *run_dbus(void *data) {
@@ -658,7 +672,23 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     /* 1 monitor; 4 virtual (KDE creates a KWin virtual output for the stream). */
     g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(source_types));
     g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(FALSE));
-    /* Hidden cursor avoids duplicate pointer; supported since ScreenCast v1. */
+    /* Hidden cursor avoids a duplicate pointer in absolute mode: the viewer draws its own where
+     * it last sent motion. Relative mode has no such position, so the game's cursor has to come
+     * from the compositor. The host flips this at runtime through uu_portal_set_cursor_mode();
+     * UU_PORTAL_CURSOR_MODE=embedded is the startup default. Only sent when the backend
+     * advertises embedded, since an unsupported value closes the session. */
+    int cursor_mode = atomic_load(&cursor_mode_override);
+    if (cursor_mode < 0) {
+        const char *wanted = g_getenv("UU_PORTAL_CURSOR_MODE");
+        cursor_mode = (wanted && !g_ascii_strcasecmp(wanted, "embedded")) ? 2 : 1;
+    }
+    /* The host reads these back so its belief matches what the session actually requested. */
+    p->cursor_available = (int)interface_property(p, SCREEN, "AvailableCursorModes");
+    p->cursor_applied = 1;
+    if (cursor_mode == 2 && (p->cursor_available & 2)) {
+        g_variant_builder_add(&options, "{sv}", "cursor_mode", g_variant_new_uint32(2));
+        p->cursor_applied = 2;
+    }
     results = request(p, SCREEN, "SelectSources", &options, 1, error);
     if (!results) goto done;
     g_variant_unref(results);
@@ -1032,6 +1062,8 @@ int uu_portal_monitors(char *out, size_t length) {
  * captures then report a closed stream until the handle is replaced. */
 void uu_portal_end(struct uu_portal *p) {
     if (!p || atomic_exchange(&p->closed, 1)) return;
+    /* A closed session no longer tracks owner changes, so its cached claim is stale. */
+    pthread_mutex_lock(&p->lock); p->clipboard_owns=0; pthread_mutex_unlock(&p->lock);
     if (p->bus && p->session) {
         GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, p->session, SESSION, "Close",
             NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
