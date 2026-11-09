@@ -795,11 +795,11 @@ async fn read_inprocess(
     job.await.map_err(|e| format!("Encoder task: {e}"))?
 }
 
-/// Rate-control arguments: constant quality capped at 30M (自动), or capped at the viewer's
-/// chosen bitrate. The VBV buffer stays at most 500k so a cap never adds queueing latency.
-/// VBV buffer in kbit. NVENC ull and VAAPI keep the small low-latency buffer; libx264 needs room for a
-/// whole IDR frame, otherwise large desktops get near-grey keyframes that sharpen over the GOP (#8).
-/// Half a second of bitrate still starved repeated 0.5 s-GOP keyframes at 3296x2036/2M; one second did not.
+/// VBV buffer in kbit. libx264 and NVENC need room for a whole IDR frame, otherwise large desktops get
+/// keyframes quantized into a blur that sharpens over the GOP (#8 libx264, #103 NVENC). Half a second of
+/// bitrate still starved repeated 0.5 s-GOP keyframes at 3296x2036/2M; one second did not. The 8000 kbit
+/// cap bounds the keyframe burst: 4K hevc_nvenc CQ18 IDRs measured 0.45 MB (desktop) to 0.76 MB (photo).
+/// VAAPI keeps the small low-latency buffer unless UU_VAAPI_BUFFER_MS asks for more.
 fn buffer_kbits(max_kbps: u32, encoder: Encoder) -> u32 {
     let env = match encoder {
         Encoder::Cpu => return max_kbps.clamp(500, 8000),
@@ -807,13 +807,14 @@ fn buffer_kbits(max_kbps: u32, encoder: Encoder) -> u32 {
         Encoder::Nvenc => "UU_NVENC_BUFFER_MS",
     };
     let requested = std::env::var(env).ok();
-    buffer_ms_kbits(max_kbps, requested.as_deref()).unwrap_or((max_kbps / 8).clamp(100, 500))
+    let default = if encoder == Encoder::Nvenc { max_kbps.clamp(500, 8000) } else { (max_kbps / 8).clamp(100, 500) };
+    buffer_ms_kbits(max_kbps, requested.as_deref()).unwrap_or(default)
 }
 
-/// Opt-in hardware VBV buffer: `码率上限 × 毫秒 / 1000` for `UU_VAAPI_BUFFER_MS` /
-/// `UU_NVENC_BUFFER_MS` in 10-1000 ms. With the 100-500 kbit default the encoder quantizes a
-/// whole desktop keyframe, which reads as a blur that sharpens over each GOP (#42 VAAPI, #103 NVENC).
-/// Unset, out of range or unparsable values keep the default buffer.
+/// Hardware VBV buffer override: `码率上限 × 毫秒 / 1000` for `UU_VAAPI_BUFFER_MS` /
+/// `UU_NVENC_BUFFER_MS` in 10-1000 ms. With VAAPI's 100-500 kbit default the encoder quantizes a
+/// whole desktop keyframe, which reads as a blur that sharpens over each GOP (#42); a small NVENC value
+/// brings back the old low-latency buffer. Unset, out of range or unparsable values keep the default buffer.
 fn buffer_ms_kbits(max_kbps: u32, value: Option<&str>) -> Option<u32> {
     let ms = value?.trim().parse::<u32>().ok().filter(|ms| (10..=1000).contains(ms))?;
     Some((max_kbps.saturating_mul(ms) / 1000).max(1))
@@ -825,6 +826,8 @@ fn buffer_for(settings: &VideoSettings, encoder: Encoder) -> u32 {
     } else { buffer_kbits(settings.max_kbps().unwrap_or(30_000), encoder) }
 }
 
+/// Rate-control arguments: constant quality capped at 30M (自动), or capped at the viewer's
+/// chosen bitrate.
 fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
     let max_kbps = settings.max_kbps().unwrap_or(30_000);
     (format!("{max_kbps}k"), format!("{}k", buffer_for(settings, encoder)))
@@ -1613,7 +1616,10 @@ mod tests {
 
     #[test]
     fn x264_buffer_fits_keyframes() {
-        assert_eq!(buffer_kbits(2000, Encoder::Nvenc), 250);
+        // NVENC follows libx264 (#103): one second of the cap within 500-8000 kbit.
+        assert_eq!(buffer_kbits(2000, Encoder::Nvenc), 2000);
+        assert_eq!(buffer_kbits(300, Encoder::Nvenc), 500);
+        assert_eq!(buffer_kbits(30_000, Encoder::Nvenc), 8000);
         assert_eq!(buffer_kbits(2000, Encoder::Vaapi), 250);
         assert_eq!(buffer_kbits(2000, Encoder::Cpu), 2000);
         assert_eq!(buffer_kbits(300, Encoder::Cpu), 500);
