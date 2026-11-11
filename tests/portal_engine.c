@@ -192,8 +192,12 @@ static void portal_suspended_stream_lifecycle(void) {
     assert(!stream_stalled(p));
     assert(uu_portal_capture_alive(p));
 
-    /* A capture call automatically resumes active state */
+    /* A stale capture or wait lease must not wake a parked session. */
     uint64_t revision = 0;
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &revision) == 10);
+    assert(uu_portal_wait_frame(p, 1000000) == 0);
+    assert(atomic_load(&p->suspended) == 1);
+    uu_portal_set_active(p, 1);
     test_format(p, 2, 2);
     stream_state(p, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
     test_frame(p);

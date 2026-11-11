@@ -104,6 +104,8 @@ Wayland 下的限制：默认采集单屏，Hyprland 可按上文启用切屏；
 
 **手机控制端触控（GNOME）**：Android/iOS 控制端在触控模式下把手指当作左键拖动发送，在桌面上会选中文字。Portal 后端下被控端按每次按下判断：0.45 秒内移动超过几个像素即平滑滚动（`NotifyPointerAxis`，内容跟随手指，终端里同样有效，最后一个事件让客户端可以惯性滑动）；按住不动则像鼠标拖动一样选中；短按为点击。此模式无需触摸屏授权。`UU_TOUCH_INPUT=touch` 改为把拖动按单指触控在 Portal 触摸屏上重放，门户提供触摸屏设备类型时被控端会一并申请；此前保存的授权只恢复键盘和指针，因此第一次拖动时会在后台再申请一次（GNOME 共享对话框，手机画面中也能看到，授权超时后自动关闭），同意同一显示器后无需重连即切换为触控。不会预先删除已保存的授权，每次运行最多申请一次。`UU_TOUCH_INPUT=0` 保持鼠标拖动。
 
+**GNOME PBP 多屏**：若同一面板的两个输入在 GNOME 中报告相同的显示器身份，切到无法单独恢复授权的半屏时，首次需在本机选中该半屏。只要 GNOME 保留授权，会话可挂起供切回或重连复用。锁屏使该会话关闭后，会恢复到可用已保存授权的同组屏幕；若帧尺寸不同，需重新连接。为避免自动弹出授权窗口，这个半屏保留获准时的光标模式。
+
 **Wayland 手机输入法打字与剪贴板**：Wayland 下手机端输入法提交的文字（`text_input`）优先通过虚拟键盘空闲键码上屏；GNOME（Portal）下，当前输入源为拉丁 xkb 布局时，可打印 ASCII 直接以 keysym 输入（由 Mutter 选择按键和 Shift 层级）；其他文字、KDE 以及键码耗尽的环境自动通过「写系统剪贴板 + 触发 `Shift+Insert`（或 `UU_WAYLAND_PASTE_KEY=ctrl_v`）」兜底粘贴。VTE 终端的 `Shift+Insert` 粘贴的是 PRIMARY 选区，因此 ASCII 改为直接输入。**注意**：此兜底过程会覆盖被控端原有的剪贴板内容，且会被双向同步回传到控制端剪贴板；设置 `UU_WAYLAND_TEXT=0` 可完全关闭 Wayland 文字输入及该粘贴兜底。
 
 GNOME 缩放桌面在使用 Portal 原生键鼠时，若支持 `ConnectToEIS` 和屏幕 `mapping_id`，通过同一授权会话的 EIS 接口注入输入，按匹配的区域与实际帧尺寸分别映射横纵坐标，没有固定分辨率或缩放倍率，可避免 `NotifyPointerMotionAbsolute` 在缩放时拒绝坐标。Portal 构建需要 libei ≥ 1.1。缺少 EIS 支持时保留旧输入路径及其既有缩放限制；其他初始化错误会明确报告并触发会话恢复。EIS 连接成功后全部输入统一使用 EIS。只采集画面或使用 uinput 时不会初始化 EIS；缺少可选的逻辑尺寸也不阻断采集。键盘沿用项目现有的 Windows VK → evdev 映射。恢复时保持编码器的采集帧尺寸不变，允许缩放后的逻辑尺寸变化。GNOME 显示配置变化后，已推流的 Portal 采集若持续「暂停且无有效格式」，会在关联通知后的 200 毫秒宽限结束后提前进入现有恢复流程；正常重协商恢复会取消提前判定，连续通知不会推迟同次异常的判定。未收到相关通知时保留五秒兜底；静态画面或有效格式下的暂停不会触发恢复。Ubuntu 26.04、GNOME Wayland 单屏 3840×2160 已实测保持连接切换 200%→166.67%→200%，恢复后画面持续更新且鼠标可控制全屏；切换期间会短暂停顿、黑屏后恢复，五秒是兜底判定阈值，并非总恢复时间。提前恢复的测量结果和验证范围见 [#35](../../pull/35)。此路径仍需实机验证锁屏恢复；多屏、连接中改变分辨率及旋转/镜像变换不属于本次修复范围。 捕获设置协议仍为版本 4：对客户端上报的分辨率统一使用像素坐标、DPR 为 1；Portal 逻辑尺寸仅用于本地输入映射。
@@ -142,7 +144,7 @@ niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
 | 被控端防窥模式 | 实验性，仅 KDE Plasma Wayland（portal）；Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显；`UU_PRIVACY_AUTO=picture` / `screen-off` 可在桌面连接时自动开启，见 [docs/privacy-screen.md](docs/privacy-screen.md) |
-| 麦克风（控制端声音传到被控端） | 未实现（需要虚拟声卡） |
+| 麦克风（控制端声音传到被控端） | 实验性：Opus → 虚拟麦克风，需 `UU_MICROPHONE=1`；支持 PulseAudio / PipeWire-pulse，见 [说明](docs/remote-microphone.md) |
 | 魔兽世界排队提醒等插件 | 不支持，会明确告诉客户端「无插件」 |
 | Linux 系统登录界面 | 还不支持控制开机后的系统登录界面（还没有人登录 Linux 桌面时）；这种情况可以用无头模式或虚拟桌面（见下文）。注意：这里说的是 Linux 系统登录，**不登录 UU 账号**现在可以通过「远程协助」使用 |
 | 跨运营商 / 受限网络的中继连接 | 已接入官方下发的 ICE 服务器，但复杂网络环境未充分测试 |
@@ -357,17 +359,18 @@ systemctl --user restart uuremote-native.service
 | `UU_X11_OUTPUT` | X11 默认采集的显示器名称（`xrandr --listmonitors`），默认主显示器 |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
 | `UU_INPUT_BACKEND` | `auto`（默认，Wayland 下可用时用 uinput）/ `uinput` / `native` |
+| `UU_PORTAL_CURSOR_MODE` | 启动时的光标模式：`embedded` 让合成器把指针画进抓屏流，默认隐藏。运行中按客户端发来的相对/绝对位移自动切换；每次切换重建一次 portal 会话，画面和输入短暂中断 |
 | `UU_TERMINAL_SHORTCUTS=0` | 关闭终端窗口里的 Ctrl+V 粘贴转换 |
 | `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置或 `auto` 时后台探测（每个候选编码一帧，限时 3 秒）。有 NVIDIA 驱动时顺序是 NVENC → CPU；没有 NVIDIA 时只有 CPU，不探测。探测未完成就建流则沿用旧规则（有 NVIDIA 用 NVENC，否则 CPU）。自行编译的 `--features inproc-av` 上，仅 X11 会先走进程内引擎：外部 FFmpeg 探测失败时记为 `native_unprobed`，沿用旧规则（NVENC）；Wayland、portal、KMS 回退 CPU。只有 CPU 时跳过探测，记为 `not probed (only candidate)`。探测成功和这种只含 CPU 的跳过会缓存到 NVIDIA 是否存在发生变化为止（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）。之后的桌面连接在后台再探测一次（不挡住这一路，仍用缓存的编码器）。NVENC 探测失败、选用 CPU 时只缓存 10 分钟；到期后下一次桌面连接同样在后台再探测一次，再次失败则重新计 10 分钟。显式 `cpu` / `vaapi` / `nvenc` 不启动探测。`native_unprobed` 不算失败缓存。优先级低于 `host_settings.json` 里非 `auto` 的 `video_encoder`。VAAPI 要等 #33 解决后才会进入 auto |
 | `UU_VAAPI_BUFFER_MS` | VAAPI 的 VBV 缓冲（10–1000 ms，仅 `UU_VIDEO_ENCODER=vaapi` 时生效）；高分辨率下关键帧被压糊时用它换稳定画质 |
-| `UU_NVENC_BUFFER_MS` | NVENC 的 VBV 缓冲（10–1000 ms，仅 NVENC 生效，含进程内引擎）；默认 100–500 kbit，1440p 等高分辨率下关键帧被压糊、按 GOP 周期闪烁时设 `1000`（#103） |
+| `UU_NVENC_BUFFER_MS` | NVENC 的 VBV 缓冲（10–1000 ms，仅 NVENC 生效，含进程内引擎）；默认与 libx264 相同，取 1 秒码率上限并限制在 500–8000 kbit，高分辨率关键帧不再被压糊、按 GOP 周期闪烁（#103）。弱网下想要更小的低延迟缓冲可设小值（如 `50`） |
 | `UU_FFMPEG_ROOT` | 使用指定目录下的 FFmpeg |
 | `UU_AUDIO=0` | 关闭声音转发；`UU_AUDIO_SOURCE` 指定 PulseAudio 采集源 |
 | `UU_LOGIN_WINDOW=0` | 凭证缺失时不自动弹出登录窗口 |
 | `UU_REMOTE_ASSIST=0` | 关闭远程协助（未登录时也不再以访客身份提供协助） |
 | `UU_ASSIST_ALLOW=1` | 启动时就允许他人远程协助（覆盖窗口里保存的开关状态） |
 | `UU_PORT_MAPPING=0` | 关闭端口映射（对应官方被控端的开关） |
-| `UU_WOL_HELPER=1` | 实验性：让这台主机像官方 Windows 被控端一样充当「远程开机」辅助设备——登录后向网易上报本机局域网信息，收到云端唤醒请求时向同一局域网发送唤醒包（未经端到端验证） |
+| `UU_WOL_HELPER=1` | 实验性：让这台主机像官方 Windows 被控端一样充当「远程开机」辅助设备——登录后向网易上报本机局域网信息，收到云端唤醒请求时向同一局域网发送唤醒包（已在 NAS 上的无头 Linux 主机配合官方 iOS 控制端实测可远程开机） |
 | `UU_USE_PROXY=1` | REST API 与 host/viewer WebSocket 信令共用环境 HTTP/HTTPS 代理策略；默认忽略代理、直连 |
 
 

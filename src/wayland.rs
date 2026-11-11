@@ -212,8 +212,9 @@ pub fn text_probe()->Result<(),String> {
 pub struct Output { pub name:String, pub width:u32, pub height:u32, pub fps:i32, pub x:i32, pub y:i32 }
 struct Inventory { outputs:Vec<Output>, x11:bool, portal:bool }
 static OUTPUTS: std::sync::OnceLock<Inventory> = std::sync::OnceLock::new();
+type SettingsSender = tokio::sync::watch::Sender<crate::capture_setting::VideoSettings>;
 #[derive(Default)]
-struct Selection { id:usize, generation:u64, presented:Option<u64>, failed:bool }
+struct Selection { id:usize, generation:u64, presented:Option<u64>, failed:bool, portal_settings:Option<std::sync::Weak<SettingsSender>> }
 impl Selection {
     fn begin(&mut self,id:usize) {
         self.id=id; self.generation+=1; self.presented=None; self.failed=false;
@@ -222,8 +223,23 @@ impl Selection {
         if (self.id,self.generation)==(id,generation) {self.presented=Some(generation);}
     }
     fn ready(&self)->bool {self.presented==Some(self.generation)}
+    fn sync_portal(&mut self,id:usize) {
+        if self.id != id {
+            self.begin(id);
+            self.publish_portal();
+        }
+    }
+    fn publish_portal(&self) {
+        if let Some(settings)=self.portal_settings.as_ref().and_then(std::sync::Weak::upgrade) {
+            settings.send_if_modified(|s| {
+                if (s.source_id,s.source_generation)==(self.id,self.generation) {return false;}
+                s.source_id=self.id;s.source_generation=self.generation;s.output=None;
+                true
+            });
+        }
+    }
 }
-static SELECTION:std::sync::Mutex<Selection>=std::sync::Mutex::new(Selection {id:0,generation:0,presented:None,failed:false});
+static SELECTION:std::sync::Mutex<Selection>=std::sync::Mutex::new(Selection {id:0,generation:0,presented:None,failed:false,portal_settings:None});
 fn inventory() -> &'static Inventory {
     OUTPUTS.get_or_init(|| {
         let backend=crate::desktop_backend::detect().ok();
@@ -263,10 +279,10 @@ fn portal_outputs()->Vec<Output> {
     // Shadowed monitors (whose identity is shared with an earlier monitor) cannot be restored via tokens,
     // so they are never preferred as Screen 0.
     let dir=crate::portal::permissions_directory();
-    let lead=|name:&str|crate::portal::lead_connector(&monitors, name).is_some();
-    let granted=|name:&str|!lead(name) && dir.as_deref().is_some_and(|d|crate::portal::permission_exists(d,&crate::portal::monitor_key(name)));
+    let shadowed=|name:&str|crate::portal::lead_connector(&monitors, name).is_some();
+    let granted=|name:&str|!shadowed(name) && dir.as_deref().is_some_and(|d|crate::portal::permission_exists(d,&crate::portal::monitor_key(name)));
     let primary=monitors.iter().find(|m|m.primary).map(|m|m.connector.clone()).unwrap_or_default();
-    outputs.sort_by_key(|o|(!granted(&o.name),lead(&o.name),o.name!=primary,o.x,o.y));
+    outputs.sort_by_key(|o|(!granted(&o.name),shadowed(&o.name),o.name!=primary,o.x,o.y));
     outputs.truncate(16);
     log::info!("Portal multi-screen: {} monitors",outputs.len());
     outputs
@@ -402,26 +418,38 @@ pub fn failed(id:usize,generation:u64) {
     let mut state=SELECTION.lock().unwrap();
     if (state.id,state.generation)==(id,generation) {state.failed=true;}
 }
+pub fn bind_portal_settings(settings:&std::sync::Arc<SettingsSender>) {
+    let mut state=SELECTION.lock().unwrap();
+    state.portal_settings=Some(std::sync::Arc::downgrade(settings));
+    state.publish_portal();
+}
+
 pub fn sync_portal_monitor(connector: &str) {
     if !inventory().portal { return; }
-    if let Some((id, _)) = outputs().iter().enumerate().find(|(_, o)| o.name == connector) {
-        let mut state = SELECTION.lock().unwrap();
-        if state.id != id {
-            state.begin(id);
-            log::info!("Portal monitor selection synced: id={} connector={connector}", id);
-        }
+    if let Some(id) = outputs().iter().position(|o| o.name == connector) {
+        SELECTION.lock().unwrap().sync_portal(id);
     }
+}
+
+/// Portal consent may block; only installation and publication run under the owner lock.
+pub fn select_for(id:usize, expected:(usize,u64), owner:&crate::input::DesktopInputSession,
+    publish:impl FnOnce()) -> Result<(),String> {
+    let output=source(id).ok_or("Unknown screen")?;
+    if inventory().portal {
+        return crate::portal::switch_active(&output.name, owner, expected, publish);
+    }
+    let mut result=Err(crate::i18n::s("切屏时桌面来源已变更", "Desktop source changed during the switch").into());
+    owner.with_current(|| {
+        if selection()!=expected {return;}
+        owner.release_input();
+        result=select(id);
+        if result.is_ok() {publish();}
+    });
+    result
 }
 
 pub fn select(id:usize)->Result<(),String> {
     let output=source(id).ok_or("Unknown screen")?;
-    if inventory().portal {
-        crate::portal::switch_active(&output.name)?;
-        let mut state=SELECTION.lock().unwrap();
-        state.begin(id);
-        log::info!("Portal screen selected: id={} source={}x{}",id,output.width,output.height);
-        return Ok(());
-    }
     if x11_multiscreen() {
         SELECTION.lock().unwrap().begin(id);
         log::info!("X11 screen selected: id={} source={}x{}+{}+{}",id,output.width,output.height,output.x,output.y);
@@ -496,6 +524,27 @@ mod selection_regressions {
         s.sent(0,old);assert!(!s.ready());
         s.sent(1,current);assert!(!s.ready());
         s.sent(0,current);assert!(s.ready());
+    }
+    #[test]
+    fn portal_recovery_publishes_the_new_source_before_input_resumes() {
+        let mut state=Selection::default();
+        state.begin(1);
+        let old=state.generation;
+        let (tx,rx)=tokio::sync::watch::channel(crate::capture_setting::VideoSettings {
+            source_id:1, source_generation:old, output:Some((1280,720)), ..Default::default()
+        });
+        let tx=std::sync::Arc::new(tx);
+        state.portal_settings=Some(std::sync::Arc::downgrade(&tx));
+        state.sent(1,old);
+        state.sync_portal(0);
+        let recovered=*rx.borrow();
+        assert_eq!((recovered.source_id,recovered.source_generation,recovered.output),(0,old+1,None));
+        state.sent(1,old);
+        assert!(!state.ready());
+        state.sent(recovered.source_id,recovered.source_generation);
+        assert!(state.ready());
+        state.sync_portal(0);
+        assert!(state.ready());
     }
     #[test]
     #[ignore = "requires an unlocked Wayland session and UU_WAYLAND_MULTISCREEN=1"]
