@@ -1,10 +1,15 @@
 # 实验性防窥 / Experimental privacy screen
 
-仅支持 KDE Plasma Wayland（portal 后端）。开启后，采集和输入切换到 KWin 虚拟输出
+KDE Plasma Wayland（portal 后端）支持壁纸和关屏模式。GNOME Wayland（portal 后端）另有
+实验性的关屏模式：通过 Mutter `DisplayConfig.PowerSaveMode` 关闭显示器，远程采集仍使用当前会话。
+GNOME 不支持隐私屏保/壁纸模式；关屏期间远程输入可能唤醒本机显示器，完整远控流程尚未实机验收。
+GNOME、其他 Wayland 桌面和 X11 不支持壁纸模式。
+
+KDE Plasma Wayland（portal 后端）开启后，采集和输入切换到 KWin 虚拟输出
 （portal ScreenCast 的 VIRTUAL 源），再用 `kscreen-doctor` 禁用物理屏；远程操作不会点亮
 本机屏幕。关闭、最后一个桌面连接断开或正常退出时，先重新启用物理屏，再结束虚拟输出、切回物理屏采集。
 顺序参考 KRdp 虚拟显示器的 replace 策略和 Sunshine 的 KDE 方案：创建虚拟输出前记录物理屏，
-从不禁用虚拟输出本身（KWin bug 527747）。GNOME、其他 Wayland 桌面和 X11 不支持。
+从不禁用虚拟输出本身（KWin bug 527747）。
 
 壁纸模式：窗口随物理屏禁用迁到虚拟输出后，重新启用物理屏，把虚拟输出设为主屏、用 KWin 脚本把窗口
 留在虚拟输出上，再由 `privacy-wallpaper` 子进程在每块物理屏上全屏置顶显示 Plasma 当前桌面壁纸和
@@ -16,7 +21,12 @@ output (portal ScreenCast VIRTUAL source) and disables the physical outputs with
 so remote input cannot wake them. Disabling, the last desktop disconnect or a normal exit re-enables
 the physical outputs first, then ends the virtual share and returns to the monitor. Physical outputs
 are recorded before the virtual one exists; the virtual output itself is never disabled (KWin bug
-527747). GNOME, other Wayland desktops and X11 are unsupported.
+527747).
+
+GNOME Wayland (portal backend) has an experimental screen-off mode using Mutter's
+`DisplayConfig.PowerSaveMode`; capture stays on the current session. GNOME picture mode is not
+supported, and remote input may wake the local display. The complete remote-control flow has not
+been hardware-accepted. GNOME, other Wayland desktops and X11 do not support picture mode.
 
 Wallpaper mode: after the windows have moved to the virtual output, the physical outputs are turned
 back on as secondary outputs, a KWin script keeps the windows on the virtual one, and the
