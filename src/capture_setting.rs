@@ -51,10 +51,13 @@ pub struct VideoSettings {
     pub output: Option<(u32, u32)>,
     /// CHROMA_420 or CHROMA_444 (真彩); 4:4:4 only when the encoder pipeline supports it.
     pub chroma: u64,
+    /// Send-side congestion cap in kbit/s (see video_governor): a bad path must not keep the
+    /// stream above what it carries. Never comes from the protocol, only from our own feedback loop.
+    pub net_kbps: Option<u32>,
 }
 
 impl Default for VideoSettings {
-    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420 } }
+    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None } }
 }
 
 /// Selectable smaller stream sizes with the desktop's aspect ratio (even dimensions).
@@ -80,7 +83,7 @@ impl VideoSettings {
 
     /// Encoder bitrate cap in kbit/s; None keeps the constant-quality default (自动).
     /// Preset caps follow the viewer menu labels: 高清 2M, 超清 8M, 原画 20M.
-    pub fn max_kbps(&self) -> Option<u32> {
+    pub fn requested_kbps(&self) -> Option<u32> {
         match self.quality {
             QUALITY_FAST => Some(1_000),
             QUALITY_GENERAL => Some(2_000),
@@ -89,6 +92,15 @@ impl VideoSettings {
             QUALITY_CUSTOM if self.custom_bps > 0 =>
                 Some((self.custom_bps / 1_000).clamp(1, 100_000)),
             _ => None,
+        }
+    }
+
+    /// Cap handed to the encoder: the viewer's choice, lowered by the congestion governor.
+    pub fn max_kbps(&self) -> Option<u32> {
+        match (self.requested_kbps(), self.net_kbps) {
+            (Some(requested), Some(net)) => Some(requested.min(net)),
+            (requested, None) => requested,
+            (None, net) => net,
         }
     }
 }
@@ -325,7 +337,7 @@ mod tests {
         put_varint(18, 30, &mut body);
         let request = rpc(77, 2, &body);
         let response = handle_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080)).unwrap();
-        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420 });
+        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None });
         assert_eq!(rx.borrow().max_kbps(), Some(2_000));
         let fields = decode_wire(&response).unwrap();
         assert_eq!(message(&fields, 1), Some(&[8u8, 77][..]));

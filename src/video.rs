@@ -958,16 +958,26 @@ async fn read_encoder_with(
             let (width,height)=session.size();
             let mut frame=vec![0;(width as usize)*(height as usize)*4];
             let mut version=None;
+            let (mut fresh,mut repeated)=(0u32,0u32);
+            let mut window=std::time::Instant::now();
             loop {
                 tick.tick().await;
                 let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
                 permits_tx.send(permit).await.map_err(|_|"Encoder stopped")?;
                 let session=session.clone();
-                (frame,version)=tokio::task::spawn_blocking(move || {
-                    session.capture_changed(&mut frame,&mut version)?;
-                    Ok::<_,String>((frame,version))
+                let (next,next_version,changed)=tokio::task::spawn_blocking(move || {
+                    let changed=session.capture_changed(&mut frame,&mut version)?;
+                    Ok::<_,String>((frame,version,changed))
                 }).await.map_err(|e|format!("Portal capture worker: {e}"))??;
+                (frame,version)=(next,next_version);
                 sink.write_all(&frame).await.map_err(|e|format!("Portal encoder pipe: {e}"))?;
+                // Repeats are expected on a static desktop; a compositor that stopped painting
+                // (powered-off outputs) sends zero new frames while the stream still looks alive.
+                if changed { fresh+=1; } else { repeated+=1; }
+                if window.elapsed()>=Duration::from_secs(30) {
+                    log::info!("Portal frames: new={fresh} repeated={repeated} window_s={}",window.elapsed().as_secs());
+                    (fresh,repeated)=(0,0); window=std::time::Instant::now();
+                }
             }
         })))
     } else if let Some(mut capture)=native_capture {
