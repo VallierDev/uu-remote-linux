@@ -68,14 +68,18 @@ is aimed at the virtual output's region. Needs GTK3.
   `UU_PRIVACY_BLOCK_INPUT=0` to keep local input. KWin saves the device flag, so a `privacy-guard`
   child restores devices and outputs from the record whenever the host ends, including SIGKILL; the
   next start retries too. Devices plugged in during privacy are not blocked.
-- 自动开启：`UU_PRIVACY_AUTO=picture`（或 `2`）在第一个桌面控制端连上后自动启用隐私屏保，
-  `UU_PRIVACY_AUTO=screen-off`（或 `3`）自动关屏；默认关闭。远程协助（访客）的桌面会话同样适用。
+- 自动开启：主机记住控制端上一次的选择（`host_settings.json` 的 `privacy_type`，关屏或屏保），
+  下一个桌面控制端连上时自动套用；控制端主动关掉后也记住“不启用”，不再自动开启。
+  `UU_PRIVACY_AUTO=picture`（或 `2`）强制自动启用隐私屏保，`UU_PRIVACY_AUTO=screen-off`（或 `3`）强制自动关屏，
+  优先级高于记忆值。远程协助（访客）的桌面会话同样适用。
   控制端自己的请求优先：一次会话里只要客户端发过隐私请求（包括连接刚建立、会话计数还没开始的
   那一刻），待执行的自动开启就不再触发；断开后照常恢复。主机不支持或依赖缺失时只记日志，不影响连接。
   自动开启后主机会向控制端推送一次 SystemMetrics 和 SystemStateChange，控制端菜单随之更新。支持的主机上，
   每次桌面连接也会先推送一次当前状态（关闭时为关闭），这是新增的主动上报。
-  Auto: `UU_PRIVACY_AUTO=picture` (or `2`) enables picture mode when the first desktop controller
-  connects; `screen-off` (or `3`) turns the physical screens off. Off by default. Remote-assistance
+  Auto: the host remembers the controller's last choice (`privacy_type` in `host_settings.json`) and
+  replays it when the next desktop controller connects, including "off" after the controller turned
+  it off. `UU_PRIVACY_AUTO=picture` (or `2`) forces picture mode, `screen-off` (or `3`) forces
+  screen-off, both ahead of the remembered value. Remote-assistance
   (guest) desktop sessions are covered too. The viewer's own request wins for that session, including
   one that arrives right after the connection opens and before the session counter starts: a pending
   auto-enable then does not run, and a disconnect restores as usual. Unsupported hosts or missing

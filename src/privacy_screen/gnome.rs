@@ -7,7 +7,7 @@ use super::{
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -24,9 +24,9 @@ struct Data {
     power_save_mode: i32,
 }
 
-/// Set while the screen-off mode is in effect: local or remote input may make Mutter leave
+/// Cancellation token of the running verifier: local or remote input may make Mutter leave
 /// PowerSaveMode 3 on its own, and the viewer would still be told that the screen is off.
-static WATCH: AtomicBool = AtomicBool::new(false);
+static WATCH: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 /// Serializes the restore with an in-flight re-off, so `leave` writes last.
 static POWER: Mutex<()> = Mutex::new(());
 
@@ -34,15 +34,28 @@ fn lock_power() -> std::sync::MutexGuard<'static, ()> {
     POWER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Installs a fresh token and cancels the previous generation: a quick leave/enter pair must not
+/// re-arm a verifier that has not noticed its own cancellation yet.
+fn next_generation(slot: &mut Option<Arc<AtomicBool>>) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Some(previous) = slot.replace(cancel.clone()) { previous.store(true, Ordering::SeqCst); }
+    cancel
+}
+
+fn stop_watch() {
+    let mut slot = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cancel) = slot.take() { cancel.store(true, Ordering::SeqCst); }
+}
+
 /// Polls instead of subscribing to PropertiesChanged: one bounded `gdbus` call per period and
 /// nothing to tear down when the mode ends.
 fn watch_power_off() {
-    if WATCH.swap(true, Ordering::SeqCst) { return; }
-    std::thread::spawn(|| {
-        while WATCH.load(Ordering::SeqCst) {
+    let cancel = next_generation(&mut WATCH.lock().unwrap_or_else(|e| e.into_inner()));
+    std::thread::spawn(move || {
+        while !cancel.load(Ordering::SeqCst) {
             std::thread::sleep(WATCH_PERIOD);
             let _power = lock_power();
-            if !WATCH.load(Ordering::SeqCst) { break; }
+            if cancel.load(Ordering::SeqCst) { break; }
             match power_save_mode() {
                 Ok(POWER_OFF) => {}
                 Ok(mode) => {
@@ -134,7 +147,7 @@ impl Backend for Gnome {
     fn leave(&self, data: &serde_json::Value) -> Result<(), String> {
         let data: Data =
             serde_json::from_value(data.clone()).map_err(|_| "invalid GNOME recovery data")?;
-        WATCH.store(false, Ordering::SeqCst);
+        stop_watch();
         let _power = lock_power();
         set_power_save_mode(data.power_save_mode)?;
         log::info!(
@@ -147,7 +160,18 @@ impl Backend for Gnome {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_power_save_mode;
+    use super::{next_generation, parse_power_save_mode};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_new_generation_cancels_the_previous_verifier() {
+        let mut slot = None;
+        let first = next_generation(&mut slot);
+        let second = next_generation(&mut slot);
+        // The old thread must stay cancelled even though the mode is on again.
+        assert!(first.load(Ordering::SeqCst));
+        assert!(!second.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn parses_mutter_power_save_mode() {

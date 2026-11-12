@@ -102,23 +102,30 @@ fn enter(state: &mut State, mode: Mode) -> Result<(), String> {
     log::info!("Privacy screen enabled: backend={} mode={mode:?}", backend.name());
     Ok(())
 }
-fn save_preference(mode: Mode) {
+/// The viewer's last choice (1 off, 2 picture, 3 screen off), replayed on the next desktop connect.
+fn save_preference(privacy_type: u8) {
     // Session lifecycle takes the settings lock before STATE; never take it while holding STATE.
-    if let Err(e) = crate::system_actions::merge_save(|s| s.privacy_type = Some(mode.wire_type())) { log::warn!("Privacy mode not saved: {e}"); }
+    if let Err(e) = crate::system_actions::merge_save(|s| s.privacy_type = Some(privacy_type)) { log::warn!("Privacy mode not saved: {e}"); }
 }
 /// RPC 7: `mode` is None for an unknown privacy_type.
 fn set(enable: bool, mode: Option<Mode>) -> Result<(), String> { set_inner(enable, mode, true) }
 /// `save` records the viewer's preference; the auto-enable path must not overwrite it.
 fn set_inner(enable: bool, mode: Option<Mode>, save: bool) -> Result<(), String> {
     let mut state = STATE.lock().map_err(|_| "privacy state poisoned")?;
-    if !enable { return leave(&mut state); }
+    if !enable {
+        let result = leave(&mut state);
+        drop(state);
+        // "Off" is remembered too, otherwise the next connect would replay the old mode.
+        if result.is_ok() && save { save_preference(mode::TYPE_OFF); }
+        return result;
+    }
     let mode = mode.ok_or("unsupported privacy type")?;
     if state.sessions == 0 { return Err("no active desktop session".into()); }
     let result = enter(&mut state, mode);
     // A failed rollback keeps the record and the guard: the next request, exit or start retries.
     if result.is_err() { if let Err(e) = leave(&mut state) { log::warn!("Privacy rollback failed: {e}"); } }
     drop(state);
-    if result.is_ok() && save { save_preference(mode); }
+    if result.is_ok() && save { save_preference(mode.wire_type()); }
     result
 }
 /// Why RPC 7 cannot be served at all; checked before answering.
@@ -173,6 +180,11 @@ fn parse_auto(value: &str) -> Option<Mode> {
     }
 }
 fn auto_mode() -> Option<Mode> { std::env::var("UU_PRIVACY_AUTO").ok().as_deref().and_then(parse_auto) }
+/// What to enable when a desktop controller connects: `UU_PRIVACY_AUTO` wins, otherwise the
+/// viewer's last choice is replayed (1 off, or nothing saved, does nothing).
+fn startup_mode() -> Option<Mode> {
+    auto_mode().or_else(|| Mode::from_type(u64::from(crate::system_actions::load_settings().privacy_type?)))
+}
 /// Enter the auto mode with the viewer-override check inside the STATE lock, so a request that
 /// lands between the caller's check and this lock still wins. Ok(false): the viewer overrode it.
 fn auto_set(mode: Mode) -> Result<bool, String> {
@@ -212,7 +224,7 @@ fn auto_enable(mode: Mode) {
     log::warn!("Privacy auto: giving up; the viewer can still enable the privacy screen");
 }
 pub fn session_started() {
-    let auto = auto_mode();
+    let auto = startup_mode();
     let first = STATE.lock().ok().is_some_and(|mut s| { s.sessions += 1; s.sessions == 1 });
     let Some(mode) = auto else { return };
     if !first { return; }
@@ -254,7 +266,7 @@ pub fn probe(mode: Mode) -> Result<(), String> {
         state.sessions = 1;
         enter(&mut state, mode)
     };
-    if result.is_ok() { save_preference(mode); }
+    // The local diagnostic never changes what the next controller connection does.
     if result.is_ok() { std::thread::sleep(std::time::Duration::from_secs(5)); }
     let mut state = STATE.lock().map_err(|_| "privacy state poisoned")?;
     let restored = leave(&mut state);
