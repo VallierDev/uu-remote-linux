@@ -9,21 +9,21 @@ const ROOT: &str = "/org/freedesktop/login1";
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(30);
 
-async fn locked(connection: &Connection) -> zbus::Result<bool> {
+async fn locked(connection: &Connection) -> zbus::Result<Option<bool>> {
     let path = format!("{ROOT}/user/_{}", unsafe { libc::getuid() });
     let user = zbus::proxy::Builder::<Proxy<'_>>::new(connection).destination(SERVICE)?
         .path(path)?.interface("org.freedesktop.login1.User")?
         .cache_properties(CacheProperties::No).build().await?;
     // No cached property reads: signals, including invalidations, trigger a fresh snapshot.
     let display: (String, zbus::zvariant::OwnedObjectPath) = user.get_property("Display").await?;
-    if display.0.is_empty() { return Err(zbus::Error::Failure("no graphical session".into())); }
+    if display.0.is_empty() { return Ok(None); }
     let session = zbus::proxy::Builder::<Proxy<'_>>::new(connection).destination(SERVICE)?
         .path(display.1)?.interface("org.freedesktop.login1.Session")?
         .cache_properties(CacheProperties::No).build().await?;
-    session.get_property("LockedHint").await
+    session.get_property("LockedHint").await.map(Some)
 }
 
-async fn snapshot(connection: &Connection) -> zbus::Result<bool> {
+async fn snapshot(connection: &Connection) -> zbus::Result<Option<bool>> {
     tokio::time::timeout(CALL_TIMEOUT, locked(connection)).await
         .map_err(|_| zbus::Error::Failure("lock query timed out".into()))?
 }
@@ -36,7 +36,7 @@ async fn monitor_connection(connection: &Connection, sender: &watch::Sender<Opti
         .sender(SERVICE)?.path_namespace(ROOT)?.build();
     let mut signals = tokio::time::timeout(CALL_TIMEOUT, MessageStream::for_match_rule(rule, connection, Some(64))).await
         .map_err(|_| zbus::Error::Failure("lock subscription timed out".into()))??;
-    publish_lock_state(sender, Some(snapshot(connection).await?));
+    publish_lock_state(sender, snapshot(connection).await?);
     let mut reconcile = tokio::time::interval(RETRY);
     reconcile.tick().await;
     loop {
@@ -44,7 +44,7 @@ async fn monitor_connection(connection: &Connection, sender: &watch::Sender<Opti
             event = signals.next() => { event.ok_or_else(|| zbus::Error::Failure("system bus closed".into()))??; },
             _ = reconcile.tick() => {},
         }
-        publish_lock_state(sender, Some(snapshot(connection).await?));
+        publish_lock_state(sender, snapshot(connection).await?);
     }
 }
 
@@ -120,7 +120,7 @@ mod tests {
         let mut address = String::new();
         tokio::time::timeout(Duration::from_secs(3), BufReader::new(daemon.stdout.take().unwrap()).read_line(&mut address)).await.unwrap().unwrap();
         let address = address.trim();
-        let display = Arc::new(Mutex::new("a".to_owned()));
+        let display = Arc::new(Mutex::new(String::new()));
         let locked = Arc::new(AtomicBool::new(true));
         let valid = Arc::new(AtomicBool::new(true));
         let user_path = format!("{ROOT}/user/_{}", unsafe { libc::getuid() });
@@ -130,16 +130,27 @@ mod tests {
             .serve_at(format!("{ROOT}/session/b"), Session { locked: Arc::new(AtomicBool::new(true)), valid: valid.clone() }).unwrap()
             .build().await.unwrap();
         let client = zbus::connection::Builder::address(address).unwrap().build().await.unwrap();
-        let (tx, mut rx) = watch::channel(None);
+        let (tx, mut rx) = watch::channel(Some(false));
         let monitor = tokio::spawn(async move {
             let result = monitor_connection(&client, &tx).await;
             publish_lock_state(&tx, None);
             result
         });
-        expect(&mut rx, Some(true)).await; // initial lock, no signal required
+        expect(&mut rx, None).await;
+        assert!(!monitor.is_finished(), "no graphical session must keep the D-Bus subscription alive");
+        *display.lock().unwrap() = "a".into();
+        invalidated(&server, &user_path, "org.freedesktop.login1.User", "Display").await;
+        expect(&mut rx, Some(true)).await; // login is observed without waiting for the retry timer
         locked.store(false, Ordering::SeqCst);
         invalidated(&server, &format!("{ROOT}/session/a"), "org.freedesktop.login1.Session", "LockedHint").await;
         expect(&mut rx, Some(false)).await;
+        *display.lock().unwrap() = "b".into();
+        invalidated(&server, &user_path, "org.freedesktop.login1.User", "Display").await;
+        expect(&mut rx, Some(true)).await;
+        display.lock().unwrap().clear();
+        invalidated(&server, &user_path, "org.freedesktop.login1.User", "Display").await;
+        expect(&mut rx, None).await;
+        assert!(!monitor.is_finished(), "logout must keep the D-Bus subscription alive");
         *display.lock().unwrap() = "b".into();
         invalidated(&server, &user_path, "org.freedesktop.login1.User", "Display").await;
         expect(&mut rx, Some(true)).await;
@@ -192,6 +203,6 @@ mod tests {
         let connection = Connection::system().await.unwrap();
         let dbus = snapshot(&connection).await.unwrap();
         let command = tokio::task::spawn_blocking(super::super::locked_now).await.unwrap();
-        assert_eq!(Some(dbus), command);
+        assert_eq!(dbus, command);
     }
 }
