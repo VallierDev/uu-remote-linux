@@ -385,6 +385,8 @@ Common environment variables:
 | Variable | Purpose |
 |---|---|
 | `UU_CONFIG` | Config file path (default `~/.config/uuremote/config.json`) |
+| `UU_CLIENT_VERSION` | Reported host client version (`x-param-vn` and User-Agent), default `4.45.0.4318`; corresponds to `client_version` in config file, environment variable takes precedence |
+| `UU_VERSION_CODE` | Reported host version code (`x-param-vc`), default `4318`; corresponds to `version_code` in config file, environment variable takes precedence |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
 | `UU_DESKTOP_RESIZE=0` | on X11, keep the desktop resolution and only scale the encoded stream when the viewer picks a resolution |
 | `UU_NVENC_RGB=0` / `=1` | NVENC encodes BGRA directly (saves CPU). Off by default when a monitor is connected to the NVIDIA card (slower when the desktop is composited on the same GPU); `0` forces off, `1` forces on |

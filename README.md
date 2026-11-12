@@ -348,6 +348,8 @@ systemctl --user restart uuremote-native.service
 | 变量 | 作用 |
 |---|---|
 | `UU_CONFIG` | 配置文件路径（默认 `~/.config/uuremote/config.json`） |
+| `UU_CLIENT_VERSION` | 上报给网易云端的被控端版本号（`x-param-vn` 与 User-Agent），默认 `4.45.0.4318`；配置文件中对应 `client_version`，环境变量优先 |
+| `UU_VERSION_CODE` | 上报给网易云端的被控端版本代码（`x-param-vc`），默认 `4318`；配置文件中对应 `version_code`，环境变量优先 |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
 | `UU_DESKTOP_RESIZE=0` | X11 下控制端切换分辨率时不改桌面分辨率，只缩放编码画面 |
 | `UU_NVENC_RGB=0` / `=1` | NVENC 直接编码 BGRA（省 CPU）。显示器接在 NVIDIA 卡上时默认关闭（同卡合成时直吃反而更慢），`0` 强制关，`1` 强制开 |

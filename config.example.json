@@ -8,5 +8,7 @@
   "token": "<access token (JWT)>",
   "csrf": "<csrf token>",
   "sign_key": "<optional: overrides the built-in signing key>",
-  "ffmpeg_root": "<optional: bundled FFmpeg prefix; default uses ffmpeg on PATH>"
+  "ffmpeg_root": "<optional: bundled FFmpeg prefix; default uses ffmpeg on PATH>",
+  "client_version": "<optional: reported client version (x-param-vn), default 4.45.0.4318>",
+  "version_code": "<optional: reported client version code (x-param-vc), default 4318>"
 }

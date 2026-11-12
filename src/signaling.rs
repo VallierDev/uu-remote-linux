@@ -515,6 +515,15 @@ impl SignalingClient {
                                 let platform = header.get("controller_platform").or_else(|| header.get("data").and_then(|d| d.get("controller_platform")));
                                 let controller = crate::input::Controller::from_platform(platform);
                                 log::info!("Controller platform: {} controller={:?}", platform.map(|v| v.to_string()).unwrap_or_default().chars().take(24).collect::<String>(), controller);
+
+                                // ConnectOptions field 12: viewer client_version string.
+                                if let Some(viewer_ver) = fields.iter().flatten().find(|f| f.number == 12).and_then(|f| match f.value {
+                                    crate::protocol::WireValue::Bytes(b) => std::str::from_utf8(b).ok(),
+                                    _ => None,
+                                }) {
+                                    check_viewer_version_compatibility(viewer_ver);
+                                }
+
                                 if !send_event(&event_sender, SignalingEvent::ConnectRequest { capture_type, ice_id, transport:crate::session_ice::SessionIce::from_header(&header), controller }).await { break; }
                             }
                         }
@@ -600,3 +609,44 @@ impl SignalingClient {
             .map_err(|e| format!("Send soac error: {}", e))
     }
 }
+
+/// Parses numeric components from a dot-separated version string (e.g. "4.45.0.4318" -> [4, 45, 0, 4318]).
+fn parse_version_components(v: &str) -> Vec<u64> {
+    v.split('.')
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .collect()
+}
+
+/// Checks incoming viewer client_version against the host's reported version.
+/// If the viewer is from a newer release family, warns about potential protocol/RPC divergence.
+fn check_viewer_version_compatibility(viewer_ver: &str) {
+    let host_ver = crate::config::client_version();
+    let v_parts = parse_version_components(viewer_ver);
+    let h_parts = parse_version_components(&host_ver);
+
+    let is_newer = match (v_parts.as_slice(), h_parts.as_slice()) {
+        ([v_maj, v_min, ..], [h_maj, h_min, ..]) => {
+            (v_maj > h_maj) || (v_maj == h_maj && v_min > h_min)
+        }
+        _ => false,
+    };
+
+    let v_count = v_parts.len();
+    let h_count = h_parts.len();
+    if is_newer {
+        log::warn!(
+            "Incoming controller client_version is newer than host reported version: \
+            controller_newer=true viewer_parts_count={} host_parts_count={}. \
+            Potential protocol incompatibility or breaking RPC changes may exist. \
+            If needed, test overriding via UU_CLIENT_VERSION or ~/.config/uuremote/config.json.",
+            v_count, h_count
+        );
+    } else {
+        log::info!(
+            "Incoming controller client_version checked: controller_newer=false \
+            viewer_parts_count={} host_parts_count={}",
+            v_count, h_count
+        );
+    }
+}
+
