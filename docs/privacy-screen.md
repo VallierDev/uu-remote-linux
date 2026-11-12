@@ -2,7 +2,10 @@
 
 KDE Plasma Wayland（portal 后端）支持壁纸和关屏模式。GNOME Wayland（portal 后端）另有
 实验性的关屏模式：通过 Mutter `DisplayConfig.PowerSaveMode` 关闭显示器，远程采集仍使用当前会话。
-GNOME 不支持隐私屏保/壁纸模式；关屏期间远程输入可能唤醒本机显示器，完整远控流程尚未实机验收。
+GNOME 不支持隐私屏保/壁纸模式。关屏后本机或远程输入会让 Mutter 把 PowerSaveMode 改回 0（点亮屏幕），
+主机每 2 秒核验一次并重新关屏，控制端看到的仍是关屏状态；完整远控流程尚未实机验收。
+已在 GNOME 50.1 / Mutter 50.1（Intel HD 4600 + NVIDIA GTX 950M）上实测：PowerSaveMode=3 期间
+portal 采集持续出帧，画面不是黑屏。
 GNOME、其他 Wayland 桌面和 X11 不支持壁纸模式。
 
 KDE Plasma Wayland（portal 后端）开启后，采集和输入切换到 KWin 虚拟输出
@@ -25,8 +28,12 @@ are recorded before the virtual one exists; the virtual output itself is never d
 
 GNOME Wayland (portal backend) has an experimental screen-off mode using Mutter's
 `DisplayConfig.PowerSaveMode`; capture stays on the current session. GNOME picture mode is not
-supported, and remote input may wake the local display. The complete remote-control flow has not
-been hardware-accepted. GNOME, other Wayland desktops and X11 do not support picture mode.
+supported. Local or remote input makes Mutter set PowerSaveMode back to 0 (display on); the host
+checks every 2 s and turns it off again, so the viewer keeps seeing screen-off. The complete
+remote-control flow has not been hardware-accepted.
+Measured on GNOME 50.1 / Mutter 50.1 (Intel HD 4600 + NVIDIA GTX 950M): the portal stream keeps
+producing frames while PowerSaveMode=3, and the frames are the live desktop, not black.
+GNOME, other Wayland desktops and X11 do not support picture mode.
 
 Wallpaper mode: after the windows have moved to the virtual output, the physical outputs are turned
 back on as secondary outputs, a KWin script keeps the windows on the virtual one, and the
@@ -174,6 +181,7 @@ The module has a desktop-independent controller with shared parts, and one backe
 | `cover.rs` | `privacy-wallpaper` 子进程：GTK 全屏遮挡窗口 / GTK cover window process |
 | `tool.rs` | 带超时的外部命令、gdbus、等待生效 / bounded tool calls, gdbus, wait-until |
 | `kde/` | KDE 后端：`outputs.rs` kscreen-doctor 布局，`input.rs` KWin 输入设备，`kwin.rs` KWin 脚本，`mod.rs` 编排 |
+| `gnome.rs` | GNOME 后端：Mutter PowerSaveMode 关屏，唤醒后重新关屏 / Mutter PowerSaveMode screen-off, re-off after a wake |
 
 新增桌面（X11、GNOME…）只需实现 `Backend` 并在 `backend::detect` / `backend::named` 登记：
 `enter` 在每一步改动之前通过 `Journal::save` 写入足以撤销它的数据；`leave` 只依据这些数据撤销，

@@ -4,16 +4,58 @@ use super::{
     record::Journal,
     tool, Mode,
 };
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::Duration,
+};
 
 pub const NAME: &str = "gnome";
 const MUTTER: &str = "org.gnome.Mutter.DisplayConfig";
 const PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 // Mutter DisplayConfig.PowerSaveMode: 0 = on, 3 = off.
 const POWER_OFF: i32 = 3;
+const WATCH_PERIOD: Duration = Duration::from_secs(2);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Data {
     power_save_mode: i32,
+}
+
+/// Set while the screen-off mode is in effect: local or remote input may make Mutter leave
+/// PowerSaveMode 3 on its own, and the viewer would still be told that the screen is off.
+static WATCH: AtomicBool = AtomicBool::new(false);
+/// Serializes the restore with an in-flight re-off, so `leave` writes last.
+static POWER: Mutex<()> = Mutex::new(());
+
+fn lock_power() -> std::sync::MutexGuard<'static, ()> {
+    POWER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Polls instead of subscribing to PropertiesChanged: one bounded `gdbus` call per period and
+/// nothing to tear down when the mode ends.
+fn watch_power_off() {
+    if WATCH.swap(true, Ordering::SeqCst) { return; }
+    std::thread::spawn(|| {
+        while WATCH.load(Ordering::SeqCst) {
+            std::thread::sleep(WATCH_PERIOD);
+            let _power = lock_power();
+            if !WATCH.load(Ordering::SeqCst) { break; }
+            match power_save_mode() {
+                Ok(POWER_OFF) => {}
+                Ok(mode) => {
+                    // The display is on again; the viewer was never told, so turn it off again.
+                    match set_power_save_mode(POWER_OFF) {
+                        Ok(()) => log::info!("Privacy GNOME: display woke (power mode={mode}), turned off again"),
+                        Err(e) => log::warn!("Privacy GNOME: display woke (power mode={mode}), re-off failed: {e}"),
+                    }
+                }
+                Err(e) => log::warn!("Privacy GNOME: display power state unreadable: {e}"),
+            }
+        }
+    });
 }
 
 pub fn detected() -> bool {
@@ -84,6 +126,7 @@ impl Backend for Gnome {
         };
         journal.save(&data)?;
         set_power_save_mode(POWER_OFF)?;
+        watch_power_off();
         log::info!("Privacy GNOME: display power mode set to off");
         Ok(Entered::default())
     }
@@ -91,6 +134,8 @@ impl Backend for Gnome {
     fn leave(&self, data: &serde_json::Value) -> Result<(), String> {
         let data: Data =
             serde_json::from_value(data.clone()).map_err(|_| "invalid GNOME recovery data")?;
+        WATCH.store(false, Ordering::SeqCst);
+        let _power = lock_power();
         set_power_save_mode(data.power_save_mode)?;
         log::info!(
             "Privacy GNOME restored: display power mode={}",
