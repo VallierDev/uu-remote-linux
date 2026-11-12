@@ -67,7 +67,9 @@ pub fn load_font() -> Option<FontVec> {
     let (path, index) = match std::env::var("UU_VIEWER_FONT") {
         Ok(p) if !p.is_empty() => (p, 0),
         _ => {
-            let out = std::process::Command::new("fc-match").args(["-f", "%{file}\t%{index}", "sans-serif:lang=zh-cn"]).output().ok()?;
+            // Request U+63A7 (控, from 控制中心) to prefer a CJK-capable font;
+            // the HUD uses a single font without per-glyph fallback.
+            let out = std::process::Command::new("fc-match").args(["-f", "%{file}\t%{index}", "sans-serif:lang=zh-cn:charset=63a7"]).output().ok()?;
             let line = String::from_utf8(out.stdout).ok()?;
             let (file, index) = line.split_once('\t').unwrap_or((line.as_str(), "0"));
             // fontconfig puts the variable-font named instance in the upper 16 bits; the face is below.
