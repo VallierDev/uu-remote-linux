@@ -11,6 +11,10 @@ GNOME 到 `idle-delay` 会空闲锁屏，gnome-shell 随即关闭 ScreenCast/Rem
 画面停在最后一帧且注入输入失效（关屏防窥期间尤其明显）。
 如果画面冻住但点击仍然有效，那是传输侧问题而不是关屏采集，见
 [send-side-bitrate.md](send-side-bitrate.md)。
+X11 会话（Xorg，或显式 `UU_DESKTOP_BACKEND=x11`）支持关屏：用 `xrandr --brightness 0` 把每个由 CRTC
+驱动的输出的 gamma/亮度归零，扫描输出变黑而帧缓冲不变，所以采集和远控画面不受影响。只支持关屏，不支持
+壁纸模式；会覆盖夜间模式等自定义 gamma；本地键鼠不会被禁用（这一点与 KDE 关屏不同）。进入前把各输出的
+gamma/亮度写进恢复记录，退出、服务停止或崩溃后由 guard 恢复（读到的亮度为 0 视为上次崩溃的残留，恢复为 1.0）。
 GNOME、其他 Wayland 桌面和 X11 不支持壁纸模式。
 
 KDE Plasma Wayland（portal 后端）开启后，采集和输入切换到 KWin 虚拟输出
@@ -45,6 +49,13 @@ ScreenCast/RemoteDesktop sessions and the picture freezes with input dead (worst
 privacy keeps the display dark).
 A frozen picture that still reacts to clicks is a transport problem, not capture; see
 [send-side-bitrate.md](send-side-bitrate.md).
+X11 sessions (Xorg, or an explicit `UU_DESKTOP_BACKEND=x11`) support screen-off by zeroing the gamma
+and brightness of every CRTC-driven output with `xrandr --brightness 0`: scanout turns black while the
+framebuffer stays untouched, so capture and the remote picture are unaffected. Screen-off only, no
+picture mode; it overrides custom gamma such as night light; local input is not disabled (unlike KDE
+screen-off). Each output's gamma and brightness is written to the recovery record first, and the guard
+restores it on exit, service stop or after a crash (a brightness read as 0 is a crash left-over and is
+restored to 1.0).
 GNOME, other Wayland desktops and X11 do not support picture mode.
 
 Wallpaper mode: after the windows have moved to the virtual output, the physical outputs are turned
