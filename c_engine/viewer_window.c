@@ -145,6 +145,17 @@ static void open_more(void) {
         else g_signal_connect(b, "clicked", G_CALLBACK(more_item), (gpointer)kinds[i]);
         gtk_box_pack_start(GTK_BOX(box), b, FALSE, FALSE, 0);
     }
+    const char *independent = getenv("UU_VIEWER_INDEPENDENT");
+    if (independent && !strcmp(independent, "1")) {
+        gtk_box_pack_start(GTK_BOX(box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 8);
+        const char *titles[] = {L("独立远控", "Independent remote"), L("独立会话设置", "Independent session settings")};
+        const char *actions[] = {"independent", "independent-settings"};
+        for (int i = 0; i < 2; i++) {
+            GtkWidget *b = button(titles[i], "cardbtn");
+            g_signal_connect(b, "clicked", G_CALLBACK(more_item), (gpointer)actions[i]);
+            gtk_box_pack_start(GTK_BOX(box), b, FALSE, FALSE, 0);
+        }
+    }
     GtkWidget *foot = hbox(10), *order = button(L("调整顺序", "Reorder"), "secondary"), *close = button(L("关闭", "Close"), "secondary");
     g_signal_connect(order, "clicked", G_CALLBACK(unsupported), L("调整顺序", "Reorder"));
     g_signal_connect_swapped(close, "clicked", G_CALLBACK(gtk_widget_destroy), dialog);
