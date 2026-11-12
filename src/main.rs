@@ -33,6 +33,7 @@ mod signaling;
 mod terminal;
 mod webrtc;
 mod video;
+mod video_governor;
 mod video_select;
 mod video_track;
 mod locked_video;

@@ -386,6 +386,11 @@ impl WebRtcSession {
             })
         }));
 
+        // Per-connection 画质/帧率, changed by the viewer's capture-setting RPCs and lowered by the
+        // congestion governor below.
+        let (video_settings, video_settings_rx) = tokio::sync::watch::channel(crate::capture_setting::VideoSettings::default());
+        let video_settings = Arc::new(video_settings);
+
         // 注册视频轨
         let video_track = Arc::new(crate::video_track::VideoTrack::new());
 
@@ -394,10 +399,12 @@ impl WebRtcSession {
         let sender = pc.add_track(video_track.clone()).await
             .map_err(|e| format!("Add video track failed: {}", e))?;
         let idr_on_feedback = idr_request.clone();
+        let governor_settings = video_settings.clone();
         tokio::spawn(async move {
             let mut feedback = [0u8; 1500];
             let mut reports = 0usize;
             let mut feedback_counts = FeedbackCounts::default();
+            let mut governor = crate::video_governor::Governor::default();
             while let Ok((packets, _)) = sender.read(&mut feedback).await {
                 for packet in packets {
                     feedback_counts.observe(packet.as_any());
@@ -411,14 +418,27 @@ impl WebRtcSession {
                     }
                     if let Some(report) = packet.as_any().downcast_ref::<webrtc::rtcp::receiver_report::ReceiverReport>() {
                         reports += 1;
-                        if reports == 1 || reports % 10 == 0 {
-                            for r in &report.reports {
-                                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                                let ntp=(((now.as_secs()+2_208_988_800)&0xffff)<<16) as u32 | ((u64::from(now.subsec_nanos())*65536/1_000_000_000) as u32);
-                                let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
-                                let rtt=if r.last_sender_report!=0&&elapsed<65536*30 {Some(f64::from(elapsed)*1000./65536.)}else{None};
+                        let log_now = reports == 1 || reports % 10 == 0;
+                        for r in &report.reports {
+                            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                            let ntp=(((now.as_secs()+2_208_988_800)&0xffff)<<16) as u32 | ((u64::from(now.subsec_nanos())*65536/1_000_000_000) as u32);
+                            let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
+                            let rtt=if r.last_sender_report!=0&&elapsed<65536*30 {Some(f64::from(elapsed)*1000./65536.)}else{None};
+                            if log_now {
                                 log::info!("Video receiver report: ssrc={} last_sequence={} lost={} fraction_lost={} rtcp_rtt_ms={:?}",r.ssrc,r.last_sequence_number,r.total_lost,r.fraction_lost,rtt);
                             }
+                            // The viewer's own 自动清晰度 preset stays the ceiling; a real loss burst
+                            // or a swollen round trip is the only thing that lowers it.
+                            let ceiling=governor_settings.borrow().requested_kbps()
+                                .unwrap_or(crate::video_governor::AUTO_CEILING_KBPS);
+                            let loss=f32::from(r.fraction_lost)*100./256.;
+                            if let Some(cap)=governor.observe(loss,rtt,ceiling,std::time::Instant::now()) {
+                                log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
+                                // Restarts the encoder at the new cap through the settings watch.
+                                governor_settings.send_modify(|value| value.net_kbps=Some(cap));
+                            }
+                        }
+                        if log_now {
                             log::info!("Video feedback totals: nack_packets={} pli={} fir={}",feedback_counts.nack_packets,feedback_counts.pli,feedback_counts.fir);
                         }
                     }
@@ -446,9 +466,6 @@ impl WebRtcSession {
         let streaming_pc = pc.clone();
         let capture_size = (capture.width, capture.height);
         let capture_display = capture.display.clone();
-        // Per-connection 画质/帧率, changed by the viewer's capture-setting RPCs.
-        let (video_settings, video_settings_rx) = tokio::sync::watch::channel(crate::capture_setting::VideoSettings::default());
-        let video_settings = Arc::new(video_settings);
         // Per-connection mute / lock-after-session settings (安全 menu).
         let peer_actions = Arc::new(crate::system_actions::PeerActions::default());
         let session_actions = peer_actions.clone();
