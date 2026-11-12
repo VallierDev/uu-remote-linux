@@ -5,7 +5,12 @@ KDE Plasma Wayland（portal 后端）支持壁纸和关屏模式。GNOME Wayland
 GNOME 不支持隐私屏保/壁纸模式。关屏后本机或远程输入会让 Mutter 把 PowerSaveMode 改回 0（点亮屏幕），
 主机每 2 秒核验一次并重新关屏，控制端看到的仍是关屏状态；完整远控流程尚未实机验收。
 已在 GNOME 50.1 / Mutter 50.1（Intel HD 4600 + NVIDIA GTX 950M）上实测：PowerSaveMode=3 期间
-portal 采集持续出帧，画面不是黑屏。
+portal 采集持续出帧（30 秒 1223 个新帧），画面不是黑屏。
+portal 桌面会话期间主机全程持有 `org.gnome.SessionManager` 的空闲抑制，否则只在观看不动手时，
+GNOME 到 `idle-delay` 会空闲锁屏，gnome-shell 随即关闭 ScreenCast/RemoteDesktop 会话，
+画面停在最后一帧且注入输入失效（关屏防窥期间尤其明显）。
+如果画面冻住但点击仍然有效，那是传输侧问题而不是关屏采集，见
+[send-side-bitrate.md](send-side-bitrate.md)。
 GNOME、其他 Wayland 桌面和 X11 不支持壁纸模式。
 
 KDE Plasma Wayland（portal 后端）开启后，采集和输入切换到 KWin 虚拟输出
@@ -32,7 +37,14 @@ supported. Local or remote input makes Mutter set PowerSaveMode back to 0 (displ
 checks every 2 s and turns it off again, so the viewer keeps seeing screen-off. The complete
 remote-control flow has not been hardware-accepted.
 Measured on GNOME 50.1 / Mutter 50.1 (Intel HD 4600 + NVIDIA GTX 950M): the portal stream keeps
-producing frames while PowerSaveMode=3, and the frames are the live desktop, not black.
+producing frames while PowerSaveMode=3 (measured 1223 new frames per 30 s), and the frames are the
+live desktop, not black.
+The host holds an `org.gnome.SessionManager` idle inhibitor for the whole Portal desktop session:
+without it GNOME locks at `idle-delay` whenever the viewer only watches, gnome-shell then ends the
+ScreenCast/RemoteDesktop sessions and the picture freezes with input dead (worst while screen-off
+privacy keeps the display dark).
+A frozen picture that still reacts to clicks is a transport problem, not capture; see
+[send-side-bitrate.md](send-side-bitrate.md).
 GNOME, other Wayland desktops and X11 do not support picture mode.
 
 Wallpaper mode: after the windows have moved to the virtual output, the physical outputs are turned
