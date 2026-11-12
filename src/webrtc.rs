@@ -1253,7 +1253,8 @@ impl WebRtcSession {
                                 let supported = policy <= 1 && crate::microphone::available() && message_role.is_desktop();
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let next = || out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let response = crate::system_actions::session_rpc_response_with_error(rpc_fields.as_deref().unwrap(), u8::from(!supported)).unwrap();
+                                let error = audio_probe_error(crate::microphone::requested(), crate::microphone::available());
+                                let response = crate::system_actions::session_rpc_response_with_error(rpc_fields.as_deref().unwrap(), error).unwrap();
                                 let response = crate::initialization::envelope(next(), ts, 22, &response);
                                 // Windows NevaudioHelper completes the request on TEXT; mirror CONTROL
                                 // for viewers that dispatch responses there, as for privacy RPCs.
@@ -1270,7 +1271,7 @@ impl WebRtcSession {
                                         enqueue(crate::initialization::envelope(next(), ts, 3, &[8, action as u8]));
                                     });
                                 } else { enqueue(response); }
-                                log::info!("Remote microphone policy: value={policy} supported={supported}");
+                                log::info!("Remote microphone policy: value={policy} supported={supported} error={error}");
                                 return;
                             }
                             if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
@@ -1817,6 +1818,11 @@ fn with_max_message_size(sdp: &str) -> String {
     out
 }
 
+/// Error code for the viewer's audio probe. The probe arrives on every connect, so only a
+/// microphone the host was asked to expose and cannot is a fault: an opt-in microphone that is
+/// simply left off must not make a healthy host look broken.
+fn audio_probe_error(requested: bool, available: bool) -> u8 { u8::from(requested && !available) }
+
 fn negotiated_bundle_media(sdp: &str) -> Option<(String, u16)> {
     let preferred: Vec<&str> = sdp.lines().find_map(|l| l.strip_prefix("a=group:BUNDLE "))?
         .split_whitespace().collect();
@@ -1867,6 +1873,13 @@ async fn take_outbound_once<T>(slot: &tokio::sync::Mutex<Option<T>>) -> Option<T
 #[cfg(test)]
 mod tests {
     use super::negotiated_bundle_media;
+    #[test]
+    fn only_a_requested_but_missing_microphone_is_an_audio_fault() {
+        use super::audio_probe_error;
+        assert_eq!(audio_probe_error(false, false), 0, "leaving the opt-in microphone off is not a fault");
+        assert_eq!(audio_probe_error(true, false), 1, "a microphone that was asked for and is missing is a fault");
+        assert_eq!(audio_probe_error(true, true), 0, "a working microphone is not a fault");
+    }
     #[test]
     fn advertises_max_message_size_once_in_the_data_channel_section() {
         use super::with_max_message_size;
