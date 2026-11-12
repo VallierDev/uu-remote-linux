@@ -119,6 +119,7 @@ impl PortalDesktop {
     pub fn begin(&self) {
         // GNOME closes the Portal session on lock; a cached screen with a dead session
         // is not ready (no Allow, no stale video path) until maintain() rebuilds it.
+        if let Some(portal) = &self.snapshot().screen.portal { portal.resume(); }
         self.state.send_modify(|state| state.waiting = state.screen.init_error.is_some()
             || state.screen.portal.as_ref().is_some_and(|portal| !portal.is_alive()));
     }
@@ -146,6 +147,7 @@ impl PortalDesktop {
     fn publish(&self, owner: &DesktopInputSession, screen: Arc<ScreenCapture>) {
         owner.with_current(|| {
             if screen.init_error.is_some() { owner.release_input(); }
+            if let Some(portal) = &screen.portal { crate::portal::register(portal); }
             owner.bind_portal(screen.portal.clone());
             self.state.send_replace(State { screen, waiting: false });
         });

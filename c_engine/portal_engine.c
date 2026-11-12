@@ -50,7 +50,7 @@ struct uu_portal {
     struct spa_hook stream_listener;
     pthread_mutex_t lock;
     pthread_cond_t changed;
-    atomic_int closed;
+    atomic_int closed, suspended;
     uu_portal_cancelled_fn cancelled;
     void *cancel_data;
     int error;
@@ -210,9 +210,9 @@ static int has_interface(struct uu_portal *p, const char *interface) {
     g_variant_unref(r); return 1;
 }
 /* Called with the frame mutex held. Count only the continuous invalid pause,
- * not a healthy pause before format removal, and never arm during startup. */
+ * not a healthy pause before format removal, and never arm during startup or suspension. */
 static void update_interruption(struct uu_portal *p) {
-    if (p->stream_started && p->state == PW_STREAM_STATE_PAUSED && !p->format_valid) {
+    if (p->stream_started && p->state == PW_STREAM_STATE_PAUSED && !p->format_valid && !atomic_load(&p->suspended)) {
         if (!p->interrupted_at) p->interrupted_at = g_get_monotonic_time();
     } else {
         if (p->interrupted_at) p->display_changed_at = 0;
@@ -466,6 +466,7 @@ int uu_portal_dmabuf_acquire(struct uu_portal *p, UuDmaFrame *frame, uint64_t *r
     pw_thread_loop_lock(p->pw_loop);
     pthread_mutex_lock(&p->lock);
     int result = 10;
+    if (atomic_load(&p->suspended)) goto done;
     if (atomic_load(&p->closed) || p->error || p->dma_blocked) result = 14;
     else if (p->dma_bad) result = p->dma_bad;
     else if (!p->dma_requested) {
@@ -492,6 +493,7 @@ int uu_portal_dmabuf_acquire(struct uu_portal *p, UuDmaFrame *frame, uint64_t *r
             }
         }
     }
+done:
     pthread_mutex_unlock(&p->lock);
     /* A lease pins both the pw_buffer and its format across VAAPI's completion fence.
      * No producer buffer may be returned, removed or renegotiated while the GPU reads it. */
@@ -831,9 +833,10 @@ int uu_portal_capture(struct uu_portal *p, uint8_t *frame, size_t length) {
 }
 /* A static desktop can stop producing frames indefinitely. Only time out the
  * paused, format-less renegotiation observed after a live scaling change (#25).
+ * Explicitly suspended streams (parked for other monitors) never stall.
  * Called with the frame mutex held; recovery runs on the Rust capture worker. */
 static int stream_stalled(struct uu_portal *p) {
-    if (p->state != PW_STREAM_STATE_PAUSED || p->format_valid || !p->interrupted_at) return 0;
+    if (atomic_load(&p->suspended) || p->state != PW_STREAM_STATE_PAUSED || p->format_valid || !p->interrupted_at) return 0;
     gint64 now = g_get_monotonic_time();
     return now - p->interrupted_at >= PORTAL_RENEGOTIATION_TIMEOUT ||
         (p->display_changed_at && p->display_changed_at >= p->interrupted_at - PORTAL_DISPLAY_GRACE &&
@@ -841,10 +844,11 @@ static int stream_stalled(struct uu_portal *p) {
 }
 int uu_portal_capture_since(struct uu_portal *p, uint8_t *frame, size_t length, uint64_t *revision) {
     if (!p || !frame) return 11;
+    if (atomic_load(&p->suspended)) return 10;
     uu_portal_dmabuf_disable(p);
     pthread_mutex_lock(&p->lock);
     int result = atomic_load(&p->closed) ? 9 : p->error ? p->error : stream_stalled(p) ? 9 :
-        !p->sequence ? 10 : length != p->frame_length ? 11 : 0;
+        (atomic_load(&p->suspended) || !p->sequence) ? 10 : length != p->frame_length ? 11 : 0;
     if (!result) {
         if (revision && *revision == p->revision) result = 12;
         else memcpy(frame, p->frame, length);
@@ -875,7 +879,7 @@ int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
         return -1;
     }
     uint64_t prev_seq = p->sequence;
-    if (timeout_us <= 0) {
+    if (timeout_us <= 0 || atomic_load(&p->suspended)) {
         int ready = (p->sequence != prev_seq);
         pthread_mutex_unlock(&p->lock);
         return ready;
@@ -888,7 +892,8 @@ int uu_portal_wait_frame(struct uu_portal *p, int64_t timeout_us) {
         until.tv_sec += 1;
         until.tv_nsec -= 1000000000L;
     }
-    while (p->sequence == prev_seq && !p->error && !atomic_load(&p->closed) && !stream_stalled(p)) {
+    while (p->sequence == prev_seq && !p->error && !atomic_load(&p->closed)
+           && !atomic_load(&p->suspended) && !stream_stalled(p)) {
         int rc = pthread_cond_timedwait(&p->changed, &p->lock, &until);
         if (rc != 0) break; // timeout or error
     }
@@ -1009,6 +1014,28 @@ int uu_portal_key(struct uu_portal *p, uint32_t symbol, int keycode, int pressed
     return notify(p, "NotifyKeyboardKeysym", g_variant_new("(o@a{sv}iu)", p->session, empty_options(), (gint)symbol, (guint)!!pressed));
 }
 
+/* Suspend (active=0) or resume (active=1) capture. Suspended streams pause PipeWire
+ * and Mutter stops screen-cast composition, reducing background CPU/GPU work to zero. */
+void uu_portal_set_active(struct uu_portal *p, int active) {
+    if (!p) return;
+    int was_suspended = atomic_load(&p->suspended);
+    if (!active && was_suspended) return;
+    if (active && !was_suspended) return;
+    if (p->pw_loop) pw_thread_loop_lock(p->pw_loop);
+    pthread_mutex_lock(&p->lock);
+    atomic_store(&p->suspended, !active);
+    if (!active) {
+        return_dma_buffer(p, &p->dma_pending);
+        return_dma_buffer(p, &p->dma_current);
+        p->interrupted_at = 0;
+        p->display_changed_at = 0;
+        pthread_cond_broadcast(&p->changed);
+    }
+    pthread_mutex_unlock(&p->lock);
+    if (p->stream) pw_stream_set_active(p->stream, !!active);
+    if (p->pw_loop) pw_thread_loop_unlock(p->pw_loop);
+}
+
 /* Logical position of the granted monitor: matches a Mutter logical monitor. */
 int uu_portal_stream_position(struct uu_portal *p, int32_t *x, int32_t *y) {
     if (!p || !p->has_position) return 11;
@@ -1032,8 +1059,8 @@ int uu_portal_monitors(char *out, size_t length) {
     for (gsize i = 0; i < g_variant_n_children(logical); i++) {
         gint32 x, y; gdouble scale; guint32 transform; gboolean primary; GVariant *specs, *props;
         g_variant_get_child(logical, i, "(iidub@a(ssss)@a{sv})", &x, &y, &scale, &transform, &primary, &specs, &props);
-        const gchar *connector = NULL;
-        if (g_variant_n_children(specs)) g_variant_get_child(specs, 0, "(&s&s&s&s)", &connector, NULL, NULL, NULL);
+        const gchar *connector = NULL, *vendor = NULL, *product = NULL, *serial = NULL;
+        if (g_variant_n_children(specs)) g_variant_get_child(specs, 0, "(&s&s&s&s)", &connector, &vendor, &product, &serial);
         gint32 width = 0, height = 0;
         for (gsize m = 0; connector && m < g_variant_n_children(monitors); m++) {
             GVariant *monitor = g_variant_get_child_value(monitors, m), *spec = g_variant_get_child_value(monitor, 0),
@@ -1050,7 +1077,10 @@ int uu_portal_monitors(char *out, size_t length) {
         }
         if (transform % 2) { gint32 t = width; width = height; height = t; } /* 90/270, flipped or not */
         if (connector && width > 0 && height > 0) {
-            int n = snprintf(out + used, length - used, "%s\t%d\t%d\t%d\t%d\t%d\n", connector, width, height, x, y, primary ? 1 : 0);
+            char id[256];
+            snprintf(id, sizeof(id), "%s:%s:%s", vendor ? vendor : "", product ? product : "", serial ? serial : "");
+            for (char *c = id; *c; c++) if (*c == '\t' || *c == '\n' || *c == '\r') *c = ' ';
+            int n = snprintf(out + used, length - used, "%s\t%d\t%d\t%d\t%d\t%d\t%s\n", connector, width, height, x, y, primary ? 1 : 0, id);
             if (n > 0 && (size_t)n < length - used) { used += (size_t)n; count++; }
         }
         g_variant_unref(specs); g_variant_unref(props);

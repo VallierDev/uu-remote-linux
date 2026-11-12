@@ -219,10 +219,17 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
         return None;
     }
     next.fps = next.fps.clamp(MIN_FPS, MAX_FPS);
-    settings.send_if_modified(|current| if *current != next {
+    settings.send_if_modified(|current| {
+        // Portal recovery can publish a different screen while an RPC is being decoded.
+        if (next.source_id,next.source_generation)!=(current.source_id,current.source_generation) {
+            next.source_id=current.source_id;
+            next.source_generation=current.source_generation;
+            next.output=current.output;
+        }
+        if *current == next { return false; }
         log::info!("Desktop video settings: fps={} quality={} max_kbps={:?} output={:?} chroma={}", next.fps, next.quality, next.max_kbps(), next.output, next.chroma);
         *current = next; true
-    } else { false });
+    });
     let mut out = Vec::new();
     put_bytes(1, header, &mut out);
     put_bytes(2, &[], &mut out); // CaptureSettingResponse without errors: applied

@@ -173,6 +173,39 @@ static void portal_renegotiation_event_order_and_healthy_states(void) {
     assert(!uu_portal_capture_alive(p) && uu_portal_alive(p));
     uu_portal_close(p);
 }
+static void portal_suspended_stream_lifecycle(void) {
+    uint8_t pixels[16];
+    struct uu_portal *p = test_portal();
+    test_monotonic_time = 8000000;
+    test_format(p, 2, 2);
+    stream_state(p, PW_STREAM_STATE_UNCONNECTED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    assert(uu_portal_capture_alive(p));
+
+    /* Suspending the stream stops interruption tracking and stalls */
+    uu_portal_set_active(p, 0);
+    assert(atomic_load(&p->suspended) == 1);
+    stream_state(p, PW_STREAM_STATE_STREAMING, PW_STREAM_STATE_PAUSED, NULL);
+    stream_format(p, SPA_PARAM_Format, NULL);
+    assert(!p->interrupted_at);
+    test_monotonic_time += 10 * G_TIME_SPAN_SECOND;
+    assert(!stream_stalled(p));
+    assert(uu_portal_capture_alive(p));
+
+    /* A stale capture or wait lease must not wake a parked session. */
+    uint64_t revision = 0;
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &revision) == 10);
+    assert(uu_portal_wait_frame(p, 1000000) == 0);
+    assert(atomic_load(&p->suspended) == 1);
+    uu_portal_set_active(p, 1);
+    test_format(p, 2, 2);
+    stream_state(p, PW_STREAM_STATE_PAUSED, PW_STREAM_STATE_STREAMING, NULL);
+    test_frame(p);
+    assert(uu_portal_capture_since(p, pixels, sizeof(pixels), &revision) == 0);
+    assert(atomic_load(&p->suspended) == 0);
+    uu_portal_close(p);
+}
+
 static void portal_changed_physical_format_still_fails(void) {
     struct uu_portal *p = test_portal();
     uint8_t pixels[24];
@@ -437,6 +470,7 @@ static void rotated_token_callback(void) {
 }
 int main(void) {
     rotated_token_callback();
+    portal_suspended_stream_lifecycle();
     portal_renegotiation_timeout();
     portal_renegotiation_recovery();
     portal_renegotiation_event_order_and_healthy_states();
