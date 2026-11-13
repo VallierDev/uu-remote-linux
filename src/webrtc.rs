@@ -401,6 +401,7 @@ impl WebRtcSession {
         let idr_on_feedback = idr_request.clone();
         let governor_settings = video_settings.clone();
         tokio::spawn(async move {
+            let video_ssrc = sender.get_parameters().await.encodings.first().map_or(0, |e| e.ssrc);
             let mut feedback = [0u8; 1500];
             let mut reports = 0usize;
             let mut feedback_counts = FeedbackCounts::default();
@@ -419,7 +420,7 @@ impl WebRtcSession {
                     if let Some(report) = packet.as_any().downcast_ref::<webrtc::rtcp::receiver_report::ReceiverReport>() {
                         reports += 1;
                         let log_now = reports == 1 || reports % 10 == 0;
-                        for r in &report.reports {
+                        for r in video_report_blocks(report, video_ssrc) {
                             let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
                             let ntp=(((now.as_secs()+2_208_988_800)&0xffff)<<16) as u32 | ((u64::from(now.subsec_nanos())*65536/1_000_000_000) as u32);
                             let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
@@ -429,8 +430,7 @@ impl WebRtcSession {
                             }
                             // The viewer's own 自动清晰度 preset stays the ceiling; a real loss burst
                             // or a swollen round trip is the only thing that lowers it.
-                            let ceiling=governor_settings.borrow().requested_kbps()
-                                .unwrap_or(crate::video_governor::AUTO_CEILING_KBPS);
+                            let ceiling=governor_settings.borrow().ceiling_kbps();
                             let loss=f32::from(r.fraction_lost)*100./256.;
                             if let Some(cap)=governor.observe(loss,rtt,ceiling,std::time::Instant::now()) {
                                 log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
@@ -1941,6 +1941,13 @@ impl FeedbackCounts {
     }
 }
 
+/// A compound RTCP packet is delivered to every SSRC's stream (webrtc-srtp), so a video sender
+/// may read audio report blocks; only the video sender's SSRC may drive the governor.
+fn video_report_blocks(report: &webrtc::rtcp::receiver_report::ReceiverReport, video_ssrc: u32)
+    -> impl Iterator<Item = &webrtc::rtcp::reception_report::ReceptionReport> + '_ {
+    report.reports.iter().filter(move |r| video_ssrc != 0 && r.ssrc == video_ssrc)
+}
+
 #[cfg(test)]
 mod network_tests {
     use super::*;
@@ -1956,5 +1963,17 @@ mod network_tests {
         counts.observe(&TransportLayerNack { nacks: vec![NackPair { packet_id: 10, lost_packets: 0b101 }], ..Default::default() });
         counts.observe(&PictureLossIndication::default());
         assert_eq!((counts.nack_packets, counts.pli, counts.fir), (3, 1, 0));
+    }
+    #[test]
+    fn receiver_reports_only_drive_the_governor_for_the_video_ssrc() {
+        use webrtc::rtcp::{reception_report::ReceptionReport, receiver_report::ReceiverReport};
+        let report = ReceiverReport { reports: vec![
+            ReceptionReport { ssrc: 7, ..Default::default() },
+            ReceptionReport { ssrc: 9, fraction_lost: 51, ..Default::default() },
+        ], ..Default::default() };
+        let blocks: Vec<_> = video_report_blocks(&report, 9).collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!((blocks[0].ssrc, blocks[0].fraction_lost), (9, 51));
+        assert!(video_report_blocks(&report, 0).next().is_none());
     }
 }
