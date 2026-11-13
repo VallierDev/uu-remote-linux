@@ -65,6 +65,13 @@ is aimed at the virtual output's region. Needs GTK3.
   tools only log; the connection is unaffected. After an auto-enable the host pushes SystemMetrics
   and SystemStateChange once, so the viewer's menu follows; on supported hosts every desktop
   connection also pushes the current state first (off when it is off), which is new outbound traffic.
+- 空闲抑制：portal 桌面会话期间主机全程持有 `org.gnome.SessionManager` 空闲抑制。只观看不动手时，
+  GNOME 到 `idle-delay` 会空闲锁屏，gnome-shell 随即关闭 ScreenCast/RemoteDesktop 会话，画面停在最后
+  一帧且注入输入失效；抑制在会话建立时取得、会话结束时释放。
+  The host holds an `org.gnome.SessionManager` idle inhibitor for the whole portal desktop session:
+  watching without touching the host lets GNOME lock at `idle-delay`, gnome-shell then ends the
+  ScreenCast/RemoteDesktop sessions, and the picture freezes with input dead. The inhibitor is taken
+  when the session opens and released when it ends.
 - 这是尽力而为的遮挡，不是保密边界。/ This is best-effort obscuring, not a confidentiality boundary.
 - 恢复记录保存在配置文件旁的 `privacy-power.json`（0600）；崩溃后下次启动重新启用记录的物理屏。
   若主机无法启动，可在本机终端执行 `kscreen-doctor output.<name>.enable`。
