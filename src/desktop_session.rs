@@ -68,15 +68,18 @@ impl Drop for IdleGuard {
 }
 
 enum AttemptOutcome {
-    Ready(Arc<ScreenCapture>),
+    /// The attempt's idle inhibitor moves into the session: without it GNOME blanks and
+    /// locks an unattended host after idle-delay, which ends the Portal session and stops
+    /// both frames and injected input.
+    Ready(Arc<ScreenCapture>, IdleGuard),
     Retry(String),
     Terminal(String),
     Cancelled,
 }
 
-fn classify(result: Result<Arc<ScreenCapture>, PortalError>) -> AttemptOutcome {
+fn classify(result: Result<Arc<ScreenCapture>, PortalError>, inhibitor: IdleGuard) -> AttemptOutcome {
     match result {
-        Ok(screen) => AttemptOutcome::Ready(screen),
+        Ok(screen) => AttemptOutcome::Ready(screen, inhibitor),
         Err(error) if error.code == 13 => AttemptOutcome::Cancelled,
         // 4/5/14 are fatal session/geometry states; 6/8 are unsupported
         // consent/format shapes which must not loop prompts forever.
@@ -206,6 +209,10 @@ impl PortalDesktop {
         let mut locked = self.locked.clone();
         let mut previous = None;
         let mut retry_at = Instant::now();
+        // A drop holder, hence the underscore: held for the whole desktop session, not just
+        // while the Portal session opens. GNOME blanks and then locks an idle host, which ends
+        // the Portal session and stops frames and injected input together.
+        let mut _inhibitor: Option<IdleGuard> = None;
         loop {
             if !owner.is_current() { return Ok(()); }
             let state = *locked.borrow_and_update();
@@ -222,7 +229,10 @@ impl PortalDesktop {
                     outcome = self.portal_attempt(&owner, &mut attempt_locked, retry_at, force_wake, wake.clone(), inhibit.clone(), open.clone()) => outcome,
                 };
                 match outcome {
-                    AttemptOutcome::Ready(screen) => self.publish(&owner, screen),
+                    AttemptOutcome::Ready(screen, guard) => {
+                        _inhibitor = Some(guard);
+                        self.publish(&owner, screen);
+                    }
                     AttemptOutcome::Terminal(error) => return Err(error),
                     AttemptOutcome::Retry(error) => {
                         log::warn!("Portal desktop recovery deferred: {error}");
@@ -281,13 +291,13 @@ impl PortalDesktop {
         if let Err(error) = prep.wake { log::warn!("Portal screen wake failed: {error}"); }
         // Held by the cancellable async helper, not the blocking worker, so a
         // lock transition releases it while worker cleanup may still be running.
-        let _inhibitor = prep.inhibitor;
+        let inhibitor = prep.inhibitor;
         if !owner.is_current() || *locked.borrow() != Some(false) {
             return AttemptOutcome::Cancelled;
         }
         // A new controller can arrive while the cached Portal handle is alive
         // but the display has gone to sleep without a lock transition.
-        if healthy { return AttemptOutcome::Ready(screen); }
+        if healthy { return AttemptOutcome::Ready(screen, inhibitor); }
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
             // The worker owns the gate until its real cleanup completes; a
@@ -302,7 +312,7 @@ impl PortalDesktop {
             return AttemptOutcome::Cancelled;
         }
         match result {
-            Ok(result) => classify(result),
+            Ok(result) => classify(result, inhibitor),
             Err(_) => AttemptOutcome::Terminal("Portal initialization worker failed".into()),
         }
     }
@@ -419,13 +429,14 @@ mod tests {
     }
     #[test]
     fn unsupported_portal_shapes_are_terminal_while_transient_codes_retry() {
+        let failed = |code| classify(Err(PortalError { code }), IdleGuard::default());
         for code in [4, 5, 6, 8, 14] {
-            assert!(matches!(classify(Err(PortalError { code })), AttemptOutcome::Terminal(_)), "code {code}");
+            assert!(matches!(failed(code), AttemptOutcome::Terminal(_)), "code {code}");
         }
         for code in [1, 3, 7, 9, 10] {
-            assert!(matches!(classify(Err(PortalError { code })), AttemptOutcome::Retry(_)), "code {code}");
+            assert!(matches!(failed(code), AttemptOutcome::Retry(_)), "code {code}");
         }
-        assert!(matches!(classify(Err(PortalError { code: 13 })), AttemptOutcome::Cancelled));
+        assert!(matches!(failed(13), AttemptOutcome::Cancelled));
     }
     #[test]
     fn fresh_unlock_wakes_even_when_cached_portal_is_healthy() {
@@ -571,5 +582,34 @@ mod tests {
         }
         task.abort();
         let _ = task.await;
+    }
+    #[tokio::test]
+    async fn ready_portal_keeps_the_idle_inhibitor_for_the_session() {
+        let (_lock, locked) = watch::channel(Some(false));
+        let host = Arc::new(PortalDesktop::with_lock_state(
+            Arc::new(ScreenCapture::unavailable("pending".into())), locked));
+        let input = Arc::new(crate::input::InputInjector::without_desktop());
+        let owner = input.desktop_session();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let host = host.clone();
+            let owner = owner.clone();
+            let releases = releases.clone();
+            async move {
+                host.maintain_with(owner, || Ok(()),
+                    move || IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone())))),
+                    |screen, _cancel| Ok(screen)).await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while host.snapshot().waiting {
+            assert!(tokio::time::Instant::now() < deadline, "Portal desktop was never published");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // GNOME must not see the host idle while the viewer is only watching.
+        assert_eq!(releases.load(Ordering::Relaxed), 0);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(releases.load(Ordering::Relaxed), 1);
     }
 }
