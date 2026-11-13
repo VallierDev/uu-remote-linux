@@ -173,6 +173,11 @@ fn shared_engine(name: &str, sources: &[&str], includes: &[&std::path::Path], cf
     command.args(cflags.split_whitespace()).args(sources).args(libs.split_whitespace()).arg("-lpthread");
     let status = command.status().expect("C compiler for the engine plugin");
     assert!(status.success(), "building {name} failed");
-    // OUT_DIR = target/<profile>/build/<package>-<hash>/out
-    if let Some(profile) = out.ancestors().nth(3) { std::fs::copy(&library, profile.join(name)).expect("copy engine plugin"); }
+    // OUT_DIR = target/<profile>/build/<package>-<hash>/out, or target/<profile>/build/<package>/<hash>/out with
+    // the newer Cargo build-dir layout (Rust 1.100 CI): the profile dir is the parent of the `build` component.
+    let profile = out.ancestors().find(|dir| dir.file_name().is_some_and(|n| n == "build")).and_then(|dir| dir.parent());
+    match profile {
+        Some(profile) => { std::fs::copy(&library, profile.join(name)).expect("copy engine plugin"); }
+        None => println!("cargo:warning={name} built in {} but no target/<profile> dir found to copy it to", out.display()),
+    }
 }
