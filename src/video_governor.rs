@@ -42,7 +42,8 @@ impl Governor {
     /// One RTCP receiver report: `loss_percent` is its fraction lost in percent. Returns the new
     /// encoder cap when the encoder must restart.
     pub fn observe(&mut self, loss_percent: f32, rtt_ms: Option<f64>, ceiling_kbps: u32, now: Instant) -> Option<u32> {
-        let ceiling = ceiling_kbps.clamp(FLOOR_KBPS, AUTO_CEILING_KBPS);
+        // The caller supplies the viewer's ceiling; 8 Mbit/s is only its auto/unlimited fallback.
+        let ceiling = ceiling_kbps.max(FLOOR_KBPS);
         let aim = self.broken_at
             .filter(|(_, at)| now.duration_since(*at) < PROBE_AFTER)
             .map_or(ceiling, |(broken, _)| (broken * 9 / 10).clamp(FLOOR_KBPS, ceiling));
@@ -138,9 +139,23 @@ mod tests {
     }
 
     #[test]
-    fn an_unlimited_viewer_choice_is_capped_at_the_auto_ceiling() {
+    fn an_auto_quality_session_halves_from_the_auto_ceiling() {
         let mut governor = Governor::default();
         let start = Instant::now();
-        assert_eq!(governor.observe(20.0, Some(20.0), 100_000, start), Some(4_000));
+        assert_eq!(governor.observe(20.0, Some(20.0), AUTO_CEILING_KBPS, start), Some(4_000));
+    }
+
+    #[test]
+    fn an_explicit_high_rate_recovers_to_the_viewers_choice() {
+        let mut governor = Governor::default();
+        let start = Instant::now();
+        assert_eq!(governor.observe(20.0, Some(900.0), 20_000, start), Some(10_000));
+        let mut at = start + PROBE_AFTER;
+        let mut reached = None;
+        while let Some(cap) = governor.observe(0.0, Some(20.0), 20_000, at) {
+            reached = Some(cap);
+            at += INCREASE_AFTER;
+        }
+        assert_eq!(reached, Some(20_000));
     }
 }

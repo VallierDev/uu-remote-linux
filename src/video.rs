@@ -1402,6 +1402,12 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
 #[cfg(test)]
 mod tests {
     #[test]
+    fn auto_quality_encodes_at_the_8m_ceiling() {
+        assert_eq!(super::rate_args(&crate::capture_setting::VideoSettings::default(), super::Encoder::Cpu).0,
+            format!("{}k", crate::video_governor::AUTO_CEILING_KBPS));
+    }
+
+    #[test]
     fn nvidia_display_is_detected_from_connected_connectors() {
         use std::os::unix::fs::symlink;
         let root = std::env::temp_dir().join(format!("uu-drm-test-{}", std::process::id()));
@@ -1856,8 +1862,9 @@ mod tests {
     fn hevc_options_keep_420_low_latency_and_existing_rate_policy() {
         let settings = VideoSettings { codec: VideoCodec::H265, ..Default::default() };
         let cpu = cpu_hevc_options(&settings, "30");
+        // Auto quality now caps at 8 Mbit/s instead of the old 30M VBV fallback.
         for pair in [["-c:v", "libx265"], ["-profile:v", "main"], ["-pix_fmt", "yuv420p"],
-            ["-bf", "0"], ["-bufsize", "30000k"]] {
+            ["-bf", "0"], ["-bufsize", "8000k"]] {
             assert!(cpu.windows(2).any(|window| window == pair));
         }
         let params = x265_params("30");
