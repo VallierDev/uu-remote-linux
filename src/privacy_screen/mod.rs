@@ -1,7 +1,7 @@
 //! Host privacy screen (防窥): the viewer's RPC 7 hides the local screen and blocks local input
 //! while it controls the desktop. This module is the desktop-independent controller: it counts
 //! desktop sessions, switches modes, rolls back failures, keeps the recovery record and the guard,
-//! and serves the protocol. Desktop work lives behind `backend::Backend` (only `kde` so far).
+//! and serves the protocol. Desktop work lives behind `backend::Backend` (kde, x11).
 mod backend;
 mod cover;
 mod guard;
@@ -10,8 +10,11 @@ mod mode;
 mod protocol;
 mod record;
 mod tool;
+mod x11;
 
 pub use mode::Mode;
+/// Backend name of the X11 implementation, for callers that must know it does not use the portal.
+pub use x11::NAME as X11_BACKEND;
 use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
 
 struct Active { mode: Mode, record: Option<record::Record> }
@@ -261,6 +264,8 @@ pub fn probe(mode: Mode) -> Result<(), String> {
     result.and(restored)
 }
 pub use protocol::screensaver_response;
+/// The backend serving this desktop, for the probe's own requirements.
+pub fn backend_name() -> Option<&'static str> { backend::detect().map(backend::Backend::name) }
 pub fn guard_main() -> i32 { guard::main() }
 pub fn cover_main(args: &[String]) -> i32 { cover::main(args) }
 

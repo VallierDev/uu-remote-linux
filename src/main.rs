@@ -640,7 +640,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if std::env::args().nth(1).as_deref() == Some("privacy-screen-probe") {
         let screen = ScreenCapture::new()?;
-        if screen.portal.is_none() { return Err(std::io::Error::other("privacy screen needs the portal backend").into()); }
+        // KDE and GNOME drive a portal session; the X11 backend dims outputs on its own.
+        if screen.portal.is_none() && privacy_screen::backend_name() != Some(privacy_screen::X11_BACKEND) {
+            return Err(std::io::Error::other("privacy screen needs the portal backend").into());
+        }
         let _input = input::InputInjector::new(); // the privacy screen requires its uinput devices
         let mode = if std::env::var("UU_PRIVACY_PROBE_WALLPAPER").as_deref() == Ok("1") { privacy_screen::Mode::Picture } else { privacy_screen::Mode::ScreenOff };
         tokio::task::spawn_blocking(move || privacy_screen::probe(mode)).await?.map_err(std::io::Error::other)?;
