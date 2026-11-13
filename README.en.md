@@ -691,3 +691,9 @@ Default OFF: set `UU_VIEWER_NATIVE_GAMEPAD=1` to enable input; `UU_VIEWER_NATIVE
 Guide forwarding, multiple controllers and adaptive triggers are unsupported; suspend, forced exit and network recovery are not comprehensively verified.
 One reporting user tested input, phone-hotspot WAN, reconnect and rumble on one Windows/Steam Deck pair.
 See [protocol evidence, design and limits](docs/deckpad-native-gamepad.md).
+
+## Experimental HarmonyOS port
+
+Device ID and verification-code assistance is available to other accounts when enabled in the host UI. Closing the HarmonyOS window keeps sharing active in the system tray. Click the icon to restore the window, or use the tray menu to stop sharing or quit.
+
+For the API 26 ARM64 PC/2-in-1 host, see [HarmonyOS build and limitations](docs/harmony.md). Cross-compilation, device installation and a video connection are verified; cross-account assistance and the drag fix still await live acceptance. If input-method candidates are missing, clear “Hide sensitive information” in the system screen-sharing dialog; see the HarmonyOS guide.

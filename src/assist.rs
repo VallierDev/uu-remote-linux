@@ -70,7 +70,7 @@ fn valid_custom(code: &str) -> bool {
 
 pub enum Command { Allow, Deny, Reset, Stop, Verify(Verify), Refresh(Refresh), Custom(String), Logout, Quit }
 
-#[cfg(uu_gtk)]
+#[cfg(any(uu_gtk, target_env = "ohos"))]
 extern "C" {
     fn uu_assist_ui_start(hidden: libc::c_int, hide_on_close: libc::c_int) -> libc::c_int;
     fn uu_assist_ui_present();
@@ -85,13 +85,13 @@ extern "C" {
 /// and, with `notify`, a desktop notification, or the host window opened when no notification daemon
 /// answers. Returns whether the person was told now.
 pub fn show_problem(summary: &str, text: Option<&str>, notify: bool) -> bool {
-    #[cfg(uu_gtk)] {
+    #[cfg(any(uu_gtk, target_env = "ohos"))] {
         let summary = std::ffi::CString::new(summary).unwrap_or_default();
         let text = text.map(|t| std::ffi::CString::new(t).unwrap_or_default());
         let text = text.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
         unsafe { uu_ui_set_problem(summary.as_ptr(), text, i32::from(notify)) >= 0 }
     }
-    #[cfg(not(uu_gtk))] { let _ = (summary, text, notify); false }
+    #[cfg(not(any(uu_gtk, target_env = "ohos")))] { let _ = (summary, text, notify); false }
 }
 
 /// "243829726" -> "243 829 726", as the official client shows device IDs.
@@ -103,14 +103,14 @@ fn display_id(id: &str) -> String {
 /// Where the ID/code are shown and commands come from: a local GTK window (c_engine/assist_window.c)
 /// when a display is available, otherwise /dev/tty, which bypasses stdout/stderr, journals,
 /// redirected output and the logger. Without either, refuse startup rather than disclose the code.
-pub enum LocalUi { Tty(tokio::io::unix::AsyncFd<std::fs::File>), #[cfg(uu_gtk)] Window }
+pub enum LocalUi { Tty(tokio::io::unix::AsyncFd<std::fs::File>), #[cfg(any(uu_gtk, target_env = "ohos"))] Window }
 impl LocalUi {
     /// Standalone `assist`: visible window (closing it stops assistance), else /dev/tty.
     pub fn open() -> Result<Self, String> { Self::open_visible(false) }
     /// `hide_on_close`: the not-logged-in host service (window stays reachable with `uuremote-server show`).
     pub fn open_visible(hide_on_close: bool) -> Result<Self, String> {
-        #[cfg(not(uu_gtk))] let _ = hide_on_close;
-        #[cfg(uu_gtk)]
+        #[cfg(not(any(uu_gtk, target_env = "ohos")))] let _ = hide_on_close;
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if std::env::var("UU_ASSIST_UI").ok().as_deref() != Some("tty") && Self::display() && unsafe { uu_assist_ui_start(0, i32::from(hide_on_close)) } == 0 {
             return Ok(Self::Window);
         }
@@ -120,26 +120,26 @@ impl LocalUi {
         if unsafe { libc::isatty(tty.as_raw_fd()) } != 1 { return Err("assist output is not a terminal".into()); }
         Ok(Self::Tty(tokio::io::unix::AsyncFd::new(tty).map_err(|_| "assist terminal registration failed")?))
     }
-    fn display() -> bool { std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() }
+    fn display() -> bool { cfg!(target_env = "ohos") || std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() }
     /// Host service: a hidden window opened on demand (`uuremote-server show`); closing only hides it.
     /// No terminal fallback: a background service has nowhere safe to print the code.
     pub fn open_service() -> Result<Self, String> {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if Self::display() && unsafe { uu_assist_ui_start(1, 1) } == 0 { return Ok(Self::Window); }
         Err("remote assistance needs a desktop window for the host service".into())
     }
     /// Account card: signed-in user (name already masked for display).
     pub fn set_user(&self, name: &str) {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if matches!(self, Self::Window) { let name = std::ffi::CString::new(name).unwrap_or_default(); unsafe { uu_ui_set_user(name.as_ptr()) } }
-        #[cfg(not(uu_gtk))] let _ = name;
+        #[cfg(not(any(uu_gtk, target_env = "ohos")))] let _ = name;
     }
     pub fn present(&self) {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if matches!(self, Self::Window) { unsafe { uu_assist_ui_present() } }
     }
     fn show(&self, id: &str, code: &str, allowed: bool, verify: Verify, refresh: Refresh, has_custom: bool) -> Result<(), String> {
-        #[cfg(not(uu_gtk))] let _ = has_custom;
+        #[cfg(not(any(uu_gtk, target_env = "ohos")))] let _ = has_custom;
         match self {
             Self::Tty(tty) => {
                 // Bound/control-character-validated server identifier; no terminal escape injection.
@@ -147,7 +147,7 @@ impl LocalUi {
                 write!(tty, "\n远程协助 / Remote assistance\n设备 ID: {}\n临时验证码: {code}\n允许他人远程协助: {allowed}\n验证方式: {} 自动刷新: {}\n仅向可信的人提供验证码。allow=允许，deny=不允许，reset=换码，mode temporary|custom|both，refresh session|1h|12h|24h|never，off=关闭并撤销\n", display_id(id), verify.name(), refresh.name())
                     .map_err(|_| "assist terminal display failed".into())
             }
-            #[cfg(uu_gtk)]
+            #[cfg(any(uu_gtk, target_env = "ohos"))]
             Self::Window => {
                 let (id, code) = (std::ffi::CString::new(display_id(id)).unwrap_or_default(), std::ffi::CString::new(code).unwrap_or_default());
                 unsafe { uu_assist_ui_set(id.as_ptr(), code.as_ptr(), i32::from(allowed), verify as i32, refresh as i32, i32::from(has_custom)) };
@@ -158,7 +158,7 @@ impl LocalUi {
     pub async fn command(&self) -> Command {
         match self {
             Self::Tty(tty) => Self::tty_command(tty).await,
-            #[cfg(uu_gtk)]
+            #[cfg(any(uu_gtk, target_env = "ohos"))]
             Self::Window => loop {
                 let mut arg = [0 as libc::c_char; 40];
                 let cmd = unsafe { uu_assist_ui_take_command(arg.as_mut_ptr(), arg.len()) };
@@ -200,7 +200,7 @@ impl LocalUi {
 }
 impl Drop for LocalUi {
     fn drop(&mut self) {
-        #[cfg(uu_gtk)]
+        #[cfg(any(uu_gtk, target_env = "ohos"))]
         if matches!(self, Self::Window) { unsafe { uu_assist_ui_close() } }
     }
 }

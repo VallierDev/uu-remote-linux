@@ -17,7 +17,7 @@ pub struct TextKey { pub code: u16, pub shift: u16 }
 /// Resolve an ASCII prefix against the host's current XKB layout and locked modifiers.
 /// X11/XWayland is queried read-only; the returned events are emitted through uinput.
 pub fn text_plan(text: &str) -> Vec<TextKey> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         extern "C" {
             fn uu_uinput_text_plan(text: *const u8, length: usize, plan: *mut TextKey, capacity: usize) -> usize;
@@ -29,11 +29,11 @@ pub fn text_plan(text: &str) -> Vec<TextKey> {
         plan.truncate(count);
         plan
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(target_os = "linux"), target_env = "ohos"))]
     { let _ = text; Vec::new() }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod imp {
     use std::fs::{File, OpenOptions};
     use std::io::Write;
@@ -232,7 +232,7 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 mod imp {
     pub const BTN_LEFT: u16 = 0x110;
     pub const BTN_RIGHT: u16 = 0x111;
