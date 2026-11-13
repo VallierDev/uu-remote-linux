@@ -29,8 +29,13 @@ pub trait Backend: Send + Sync {
 pub fn detect() -> Option<&'static dyn Backend> {
     if cfg!(test) { return None; }
     if super::kde::Kde::detected() { return Some(&super::kde::Kde); }
+    if super::gnome::detected() { return Some(&super::gnome::Gnome); }
     None
 }
 pub fn named(name: &str) -> Option<&'static dyn Backend> {
-    match name { super::kde::NAME => Some(&super::kde::Kde), _ => None }
+    match name {
+        super::kde::NAME => Some(&super::kde::Kde),
+        super::gnome::NAME => Some(&super::gnome::Gnome),
+        _ => None,
+    }
 }

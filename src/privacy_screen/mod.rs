@@ -5,6 +5,7 @@
 mod backend;
 mod cover;
 mod guard;
+mod gnome;
 mod kde;
 mod mode;
 mod protocol;
