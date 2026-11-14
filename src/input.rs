@@ -194,6 +194,12 @@ impl InputInjector {
         }
     }
     pub fn mouse_scroll(&self, dx: i32, dy: i32) {
+        #[cfg(target_env = "ohos")]
+        {
+            static RECEIVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let count = RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if count <= 8 { log::info!("OHOS scroll packets received: count={count}"); }
+        }
         // Official Mac normal wheel=120; precise trackpads use smaller values.
         let mut pending = self.pending.lock().unwrap();
         pending.scroll.0 = (pending.scroll.0 + i64::from(dx)).clamp(-12000,12000);
@@ -293,7 +299,7 @@ impl InputInjector {
             if is_press { held.buttons.insert(button); } else { held.buttons.remove(&button); }
         } else if self.backend != crate::desktop_backend::DesktopBackend::Portal { log::warn!("Desktop mouse injection failed: {}",result); }
         static BUTTON_AUDIT:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
-        if self.backend==crate::desktop_backend::DesktopBackend::X11 && BUTTON_AUDIT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
+        if !cfg!(target_env = "ohos") && self.backend==crate::desktop_backend::DesktopBackend::X11 && BUTTON_AUDIT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
             let (mut x,mut y,mut mask)=(0,0,0);
             let query=unsafe {x11_pointer_state(&mut x,&mut y,&mut mask)};
             log::info!("Pointer button audit: button={} down={} result={} query={} x={} y={} mask={}",button,is_press,result,query,x,y,mask);
@@ -687,7 +693,16 @@ impl InputInjector {
         }
         if self.backend==crate::desktop_backend::DesktopBackend::Portal {return self.portal_result("button", Err("Portal input session is not bound".into()));}
         if self.backend==crate::desktop_backend::DesktopBackend::Wayland { crate::wayland::button(button,pressed) }
-        else { unsafe { x11_mouse_button(button,i32::from(pressed)) } }
+        else {
+            let result = unsafe { x11_mouse_button(button,i32::from(pressed)) };
+            #[cfg(target_env = "ohos")]
+            if pressed && crate::uinput::wheel_step(button).is_some() {
+                static INJECTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let count = INJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if count <= 8 { log::info!("OHOS scroll injection: count={count} result={result}"); }
+            }
+            result
+        }
     }
     fn inject_key(&self,symbol:u64,pressed:bool)->i32 {
         if let Some(uinput)=&self.uinput {

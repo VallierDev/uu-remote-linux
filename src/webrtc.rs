@@ -360,16 +360,16 @@ impl WebRtcSession {
                         if let Err(e) = sig.emit_event(crate::capability::FORWARD_SETTING_EVENT, payload).await {
                             log::error!("Device capability notification failed: {}", e);
                         }
-                        let capture_impl = match crate::desktop_backend::detect() {
+                        let capture_impl = if cfg!(target_env = "ohos") { "AVScreenCapture" } else { match crate::desktop_backend::detect() {
                             Ok(crate::desktop_backend::DesktopBackend::Portal) => "PipeWire",
                             Ok(crate::desktop_backend::DesktopBackend::Wayland) => "Wayland",
                             _ => "X11",
-                        };
-                        let encoder_impl = match encoder {
+                        }};
+                        let encoder_impl = if cfg!(target_env = "ohos") { "HarmonyOS AVCodec" } else { match encoder {
                             crate::video::Encoder::Nvenc => "NVIDIA NVENC",
                             crate::video::Encoder::Vaapi => "VAAPI",
                             crate::video::Encoder::Cpu => "Software",
-                        };
+                        }};
                         if let Err(e) = sig.emit_event(crate::capability::FORWARD_SETTING_EVENT,
                             crate::capability::sender_para_info(client, ice, capture_impl, encoder_impl)).await {
                             log::error!("Sender parameter notification failed: {}", e);

@@ -10,7 +10,7 @@ pub struct ClipboardBridge {
     pub ready: tokio::sync::oneshot::Receiver<bool>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 extern "C" {
     fn clipboard_open(display: *const libc::c_char) -> *mut libc::c_void;
     fn clipboard_set(handle: *mut libc::c_void, text: *const u8, length: usize) -> libc::c_int;
@@ -28,7 +28,7 @@ pub fn start(display: String) -> ClipboardBridge {
     let (incoming, mut input) = watch::channel::<Option<String>>(None);
     let (output, outgoing) = watch::channel(None);
     let (ready_tx, ready) = tokio::sync::oneshot::channel();
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     tokio::task::spawn_blocking(move || {
         let Ok(display) = std::ffi::CString::new(display) else {
             let _ = ready_tx.send(false); return;
@@ -57,7 +57,7 @@ pub fn start(display: String) -> ClipboardBridge {
         }
         unsafe { clipboard_close(handle) };
     });
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     {
         let _ = (display, input, output);
         let _ = ready_tx.send(false);

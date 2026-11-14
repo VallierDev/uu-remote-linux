@@ -23,6 +23,7 @@ pub const FPS: u64 = 60;
 /// official hosts report the monitor's mode (official Mac capability: 120). `UU_DISPLAY_FPS` overrides;
 /// Hyprland from `hyprctl -j monitors`, X11 from the current `xrandr` mode, otherwise 60.
 pub fn display_fps() -> u32 {
+    if cfg!(target_env = "ohos") { return 30; }
     static CACHE: std::sync::Mutex<Option<(std::time::Instant, u32)>> = std::sync::Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, fps)) = *cache { if at.elapsed() < Duration::from_secs(30) { return fps; } }
@@ -214,7 +215,7 @@ pub(crate) fn nvidia_present() -> bool {
 }
 /// 真彩 (4:4:4): NVENC (in-process or FFmpeg) and libx264; h264_vaapi is 4:2:0 only.
 /// A GPU without 4:4:4 NVENC falls back to libx264, which keeps 4:4:4.
-pub(crate) fn full_chroma_for(encoder: Encoder) -> bool { encoder != Encoder::Vaapi }
+pub(crate) fn full_chroma_for(encoder: Encoder) -> bool { !cfg!(target_env = "ohos") && encoder != Encoder::Vaapi }
 
 /// (-profile:v, -pix_fmt) for NVENC / libx264 / libx265: 4:4:4 (真彩) needs a 4:4:4 profile.
 fn chroma_args(settings: &VideoSettings, encoder: Encoder) -> (&'static str, &'static str) {
@@ -390,6 +391,7 @@ pub async fn ffmpeg_encoders() -> Option<Vec<&'static str>> {
 /// logged, shown in the host window, and sent as a desktop notification (at most every 5 minutes).
 /// Installing FFmpeg clears the window line on the next check; no restart is needed.
 pub fn check_ffmpeg_usable() {
+    if cfg!(target_env = "ohos") { return; }
     if crate::desktop_backend::headless() { return; }
     #[cfg(feature = "inproc-av")]
     if native_engine_eligible(crate::video_select::selection().encoder, NativeDisplayKind::Portal)
@@ -612,6 +614,7 @@ pub async fn run_auto_probe() -> crate::video_select::ProbeReport {
 }
 
 pub async fn hevc_available(requested: Encoder) -> bool {
+    if cfg!(target_env = "ohos") { return false; }
     let spec = ffmpeg_spec();
     let cell = hevc_cell(hevc_cache(), &spec, requested);
     *cell.get_or_init(|| probe_hevc(spec, requested)).await
@@ -703,6 +706,8 @@ async fn read_encoder(
     mut settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>,
     selection: crate::video_select::Selection,
 ) -> Result<(), String> {
+    #[cfg(target_env = "ohos")]
+    { return read_ohos_encoder(size, latest, settings, sequence, idr, budget).await; }
     #[cfg(test)]
     if display == wake_tests::DISPLAY { return wake_tests::encode(latest, settings, sequence, budget).await; }
     // The sequence is shared so a CPU fallback or settings restart continues it (skip statistics stay correct).
@@ -1884,5 +1889,27 @@ mod screen_frame_tests {
         settings.source_generation=9;assert!(!frame.matches(&settings));
         settings.source_generation=7;settings.source_id=1;assert!(!frame.matches(&settings));
         settings.source_id=0;settings.codec=VideoCodec::H265;assert!(!frame.matches(&settings));
+    }
+}
+
+#[cfg(target_env = "ohos")]
+async fn read_ohos_encoder(size: (u32, u32), latest: mpsc::Sender<Arc<CompleteFrame>>,
+    mut settings: VideoSettings, sequence: Arc<std::sync::atomic::AtomicU64>, idr: Arc<AtomicBool>, budget: Arc<Semaphore>) -> Result<(), String> {
+    settings.codec = VideoCodec::H264;
+    settings.chroma = crate::capture_setting::CHROMA_420;
+    let output = settings.output.unwrap_or(size);
+    let mut encoder = crate::ohos::Encoder::open(output, settings.fps, settings.max_kbps().unwrap_or(8000))?;
+    let mut tick = tokio::time::interval(Duration::from_millis(3));
+    loop {
+        if latest.is_closed() { return Ok(()); }
+        if idr.swap(false, Ordering::AcqRel) { encoder.request_idr(); }
+        if let Some(data) = encoder.poll()? {
+            // Native queue drops a full GOP after overload, so dependent frames never follow a gap.
+            let permit = budget.clone().acquire_owned().await.map_err(|_| "video budget closed")?;
+            let frame = Arc::new(CompleteFrame { source_id: settings.source_id, source_generation: settings.source_generation,
+                codec: settings.codec, sequence: sequence.fetch_add(1, Ordering::Relaxed), completed_at: Instant::now(), data, _permit: Some(permit) });
+            if latest.send(frame).await.is_err() { return Ok(()); }
+        }
+        tick.tick().await;
     }
 }

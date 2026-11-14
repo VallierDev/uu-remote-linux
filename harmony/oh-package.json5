@@ -1,0 +1,8 @@
+{
+  "modelVersion": "5.0.0",
+  "description": "UU Remote HarmonyOS native HarmonyOS client",
+  "dependencies": {
+  },
+  "devDependencies": {
+  }
+}

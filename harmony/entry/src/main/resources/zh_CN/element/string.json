@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "UU 远程·鸿蒙"
+    },
+    {
+      "name": "module_desc",
+      "value": "非官方 UU 远程鸿蒙被控端"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "鸿蒙桌面远程共享"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "UU 远程·鸿蒙"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "UU Remote · HarmonyOS"
+    },
+    {
+      "name": "module_desc",
+      "value": "Unofficial UU Remote host for HarmonyOS"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "HarmonyOS desktop sharing"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "UU Remote · HarmonyOS"
+    }
+  ]
+}

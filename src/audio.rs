@@ -18,7 +18,8 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 /// One Opus packet per 20 ms frame.
 const FRAME: Duration = Duration::from_millis(20);
 
-pub fn enabled() -> bool { std::env::var("UU_AUDIO").map_or(true, |v| v != "0") }
+pub fn enabled() -> bool {
+    if cfg!(target_env = "ohos") { return false; } std::env::var("UU_AUDIO").map_or(true, |v| v != "0") }
 
 /// Stops one running encoder when dropped: sets the in-process stop flag, or kills the FFmpeg child.
 struct Stopper { stop: Arc<AtomicBool>, child: Option<Child> }
