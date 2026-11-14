@@ -209,6 +209,7 @@ sudo apt install libpulse-dev libopus-dev
 - 需要 Rust 工具链（<https://rustup.rs>）。
 - `libgtk-3-dev` 是可选的：没有 GTK 时只能在终端里扫码登录（也可以设置 `UU_NO_GTK=1` 主动关闭登录窗口）。
 - NVIDIA 显卡用户需要使用带 `h264_nvenc` 的 FFmpeg，否则自动回落到 CPU 编码（libx264）。
+- FFmpeg 要求的 NVENC API 版本由编译时的 nv-codec-headers 决定。例如 Arch 的 FFmpeg 9 对着 nv-codec-headers 13.1 编译，需要 610 及以上驱动；Pascal（GTX 10 系）驱动最高 580，只有 NVENC API 13.0，日志会出现 `Driver does not support the required nvenc API version`，于是回落 CPU。可对着 nv-codec-headers 13.0 另编一份 FFmpeg 装到独立目录，在 `config.json` 里用 `ffmpeg_root` 指向它（#230）。
 
 ### 2. 编译
 

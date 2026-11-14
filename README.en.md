@@ -231,6 +231,7 @@ sudo apt install libpulse-dev libopus-dev
 - `libgtk-3-dev` is optional. Without GTK, login works with a QR code in the terminal (`UU_NO_GTK=1` disables
   the login window explicitly).
 - On NVIDIA GPUs use an FFmpeg build with `h264_nvenc`; otherwise the CPU encoder (libx264) is used.
+- The NVENC API version FFmpeg requires comes from the nv-codec-headers it was built against. For example, Arch's FFmpeg 9 is built against nv-codec-headers 13.1 and needs driver 610 or newer; Pascal (GTX 10 series) tops out at driver 580 with NVENC API 13.0, so the log shows `Driver does not support the required nvenc API version` and encoding falls back to the CPU. Build a separate FFmpeg against nv-codec-headers 13.0 into its own prefix and point `ffmpeg_root` in `config.json` at it (#230).
 
 ### 2. Build
 
