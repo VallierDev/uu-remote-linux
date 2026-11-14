@@ -712,7 +712,7 @@ impl WebRtcSession {
                                         }
                                         let live = state.screen.init_error.is_none()
                                             && (cfg!(test) || state.screen.portal.as_ref().is_some_and(|portal| portal.is_alive()))
-                                            && *manager.lock_state().borrow() == Some(false);
+                                            && manager.capture_allowed(*manager.lock_state().borrow());
                                         if live { break Some(state.screen); }
                                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                         if channel.upgrade().is_none_or(|channel| channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open) { return; }

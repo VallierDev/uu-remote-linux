@@ -12,7 +12,7 @@ mod record;
 mod tool;
 
 pub use mode::Mode;
-use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex};
 
 struct Active { mode: Mode, record: Option<record::Record> }
 struct State { sessions: usize, active: Option<Active> }
@@ -25,6 +25,9 @@ static POINTER: Mutex<Option<[f64; 4]>> = Mutex::new(None);
 /// ends. An auto-enable never overrides it, including an RPC that arrives after the connection
 /// opens but before `session_started` bumps the counter.
 static VIEWER_OVERRIDE: AtomicBool = AtomicBool::new(false);
+/// Bumped when a new first desktop session spawns its auto-enable thread. A reconnect that beats
+/// the 500 ms poll would otherwise leave the old waiter running for up to five minutes.
+static AUTO_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// iOS viewers encode "screen off" as `enable=0, type=3`, and Windows viewers carry every request
 /// in `type` with `enable=0`; see `protocol::Request::normalize_ios_screen_off` and
 /// `protocol::Request::normalize_windows`.
@@ -182,10 +185,42 @@ fn auto_set(mode: Mode) -> Result<bool, String> {
     if result.is_err() { if let Err(e) = leave(&mut state) { log::warn!("Privacy rollback failed: {e}"); } }
     result.map(|_| true)
 }
+/// The watch is authoritative while it has a value. A None (the logind monitor lost the session)
+/// must not fail open: ask logind directly before covering a possibly locked desktop.
+fn currently_locked() -> bool {
+    let locked = crate::session_lock::watch_locked();
+    let state = *locked.borrow();
+    match state {
+        Some(state) => state,
+        None => crate::session_lock::locked_now() == Some(true),
+    }
+}
 /// The capture session and the viewer's CONTROL state need a moment after the peer connects;
 /// retry while the portal session is still missing, and let the viewer's RPC 7 win if it arrives.
-fn auto_enable(mode: Mode) {
+fn auto_enable(mode: Mode, generation: u64) {
+    // A locked desktop is already covered. Switching the share to the virtual output would hide
+    // the lock screen the viewer needs to unlock, so wait for the local unlock first. Bounded:
+    // a viewer that never unlocks, or leaves, must not hold this thread forever.
+    let current = || AUTO_GENERATION.load(Ordering::Acquire) == generation;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while currently_locked() {
+        if !current() { return; }
+        if VIEWER_OVERRIDE.load(Ordering::Relaxed) {
+            log::info!("Privacy auto: skipped, the viewer already chose a mode");
+            return;
+        }
+        if STATE.try_lock().is_ok_and(|state| state.sessions == 0) {
+            log::info!("Privacy auto: skipped, the desktop session ended");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            log::info!("Privacy auto: desktop stayed locked; not covering it");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
     for attempt in 1..=5 {
+        if !current() { return; }
         if VIEWER_OVERRIDE.load(Ordering::Relaxed) {
             log::info!("Privacy auto: skipped, the viewer already chose a mode");
             return;
@@ -215,9 +250,10 @@ pub fn session_started() {
     let first = STATE.lock().ok().is_some_and(|mut s| { s.sessions += 1; s.sessions == 1 });
     let Some(mode) = auto else { return };
     if !first { return; }
+    let generation = AUTO_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        auto_enable(mode);
+        auto_enable(mode, generation);
     });
 }
 pub fn session_ended() {
