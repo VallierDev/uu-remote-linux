@@ -51,10 +51,13 @@ pub struct VideoSettings {
     pub output: Option<(u32, u32)>,
     /// CHROMA_420 or CHROMA_444 (真彩); 4:4:4 only when the encoder pipeline supports it.
     pub chroma: u64,
+    /// Send-side congestion cap in kbit/s (see video_governor): a bad path must not keep the
+    /// stream above what it carries. Never comes from the protocol, only from our own feedback loop.
+    pub net_kbps: Option<u32>,
 }
 
 impl Default for VideoSettings {
-    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420 } }
+    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None } }
 }
 
 /// Selectable smaller stream sizes with the desktop's aspect ratio (even dimensions).
@@ -78,9 +81,9 @@ impl VideoSettings {
         match self.quality { QUALITY_BLURAY => 17, QUALITY_HD => 21, QUALITY_GENERAL => 26, QUALITY_FAST => 30, _ => 18 }
     }
 
-    /// Encoder bitrate cap in kbit/s; None keeps the constant-quality default (自动).
-    /// Preset caps follow the viewer menu labels: 高清 2M, 超清 8M, 原画 20M.
-    pub fn max_kbps(&self) -> Option<u32> {
+    /// Encoder bitrate cap requested by the viewer in kbit/s; None for 自动清晰度 and the
+    /// "unlimited" custom rate. Preset caps follow the menu labels: 高清 2M, 超清 8M, 原画 20M.
+    pub fn requested_kbps(&self) -> Option<u32> {
         match self.quality {
             QUALITY_FAST => Some(1_000),
             QUALITY_GENERAL => Some(2_000),
@@ -90,6 +93,17 @@ impl VideoSettings {
                 Some((self.custom_bps / 1_000).clamp(1, 100_000)),
             _ => None,
         }
+    }
+
+    /// Viewer's ceiling, or the 8 Mbit/s fallback for 自动清晰度 / "unlimited" custom rate.
+    pub fn ceiling_kbps(&self) -> u32 {
+        self.requested_kbps().unwrap_or(crate::video_governor::AUTO_CEILING_KBPS)
+    }
+
+    /// Cap handed to the encoder: the viewer's ceiling, lowered by the congestion governor.
+    pub fn max_kbps(&self) -> Option<u32> {
+        let ceiling = self.ceiling_kbps();
+        Some(self.net_kbps.map_or(ceiling, |net| ceiling.min(net)))
     }
 }
 
@@ -219,10 +233,13 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
         return None;
     }
     next.fps = next.fps.clamp(MIN_FPS, MAX_FPS);
-    settings.send_if_modified(|current| if *current != next {
+    settings.send_if_modified(|current| {
+        // The feedback loop owns net_kbps; keep its newest value instead of replaying the snapshot.
+        next.net_kbps = current.net_kbps;
+        if *current == next { return false; }
         log::info!("Desktop video settings: fps={} quality={} max_kbps={:?} output={:?} chroma={}", next.fps, next.quality, next.max_kbps(), next.output, next.chroma);
         *current = next; true
-    } else { false });
+    });
     let mut out = Vec::new();
     put_bytes(1, header, &mut out);
     put_bytes(2, &[], &mut out); // CaptureSettingResponse without errors: applied
@@ -325,7 +342,7 @@ mod tests {
         put_varint(18, 30, &mut body);
         let request = rpc(77, 2, &body);
         let response = handle_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080)).unwrap();
-        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420 });
+        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None });
         assert_eq!(rx.borrow().max_kbps(), Some(2_000));
         let fields = decode_wire(&response).unwrap();
         assert_eq!(message(&fields, 1), Some(&[8u8, 77][..]));
@@ -507,10 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn auto_quality_keeps_constant_quality_encoding() {
-        assert_eq!(VideoSettings::default().max_kbps(), None);
-        assert_eq!(VideoSettings { quality: QUALITY_CUSTOM, custom_bps: 0, ..Default::default() }.max_kbps(), None);
+    fn auto_and_unlimited_quality_start_at_the_8m_ceiling() {
+        let auto = crate::video_governor::AUTO_CEILING_KBPS;
+        assert_eq!(VideoSettings::default().max_kbps(), Some(auto));
+        assert_eq!(VideoSettings { quality: QUALITY_CUSTOM, custom_bps: 0, ..Default::default() }.max_kbps(), Some(auto));
         assert_eq!(VideoSettings { quality: QUALITY_CUSTOM, custom_bps: 12_000_000, ..Default::default() }.max_kbps(), Some(12_000));
+        assert_eq!(VideoSettings { quality: QUALITY_CUSTOM, custom_bps: 12_000_000, net_kbps: Some(3_000), ..Default::default() }.max_kbps(), Some(3_000));
+    }
+
+    #[test]
+    fn a_setting_rpc_keeps_the_governors_cap() {
+        let (tx, rx) = watch::channel(VideoSettings::default());
+        tx.send_modify(|s| s.net_kbps = Some(1_500));
+        handle_rpc(&decode_wire(&rpc(9, 3, &[8, 30])).unwrap(), &tx, (1920, 1080)).unwrap();
+        assert_eq!((rx.borrow().fps, rx.borrow().net_kbps), (30, Some(1_500)));
     }
 
     #[test]

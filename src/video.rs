@@ -958,16 +958,26 @@ async fn read_encoder_with(
             let (width,height)=session.size();
             let mut frame=vec![0;(width as usize)*(height as usize)*4];
             let mut version=None;
+            let (mut fresh,mut repeated)=(0u32,0u32);
+            let mut window=std::time::Instant::now();
             loop {
                 tick.tick().await;
                 let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
                 permits_tx.send(permit).await.map_err(|_|"Encoder stopped")?;
                 let session=session.clone();
-                (frame,version)=tokio::task::spawn_blocking(move || {
-                    session.capture_changed(&mut frame,&mut version)?;
-                    Ok::<_,String>((frame,version))
+                let (next,next_version,changed)=tokio::task::spawn_blocking(move || {
+                    let changed=session.capture_changed(&mut frame,&mut version)?;
+                    Ok::<_,String>((frame,version,changed))
                 }).await.map_err(|e|format!("Portal capture worker: {e}"))??;
+                (frame,version)=(next,next_version);
                 sink.write_all(&frame).await.map_err(|e|format!("Portal encoder pipe: {e}"))?;
+                // Repeats are expected on a static desktop; a compositor that stopped painting
+                // (powered-off outputs) sends zero new frames while the stream still looks alive.
+                if changed { fresh+=1; } else { repeated+=1; }
+                if window.elapsed()>=Duration::from_secs(30) {
+                    log::info!("Portal frames: new={fresh} repeated={repeated} window_s={}",window.elapsed().as_secs());
+                    (fresh,repeated)=(0,0); window=std::time::Instant::now();
+                }
             }
         })))
     } else if let Some(mut capture)=native_capture {
@@ -1391,6 +1401,12 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auto_quality_encodes_at_the_8m_ceiling() {
+        assert_eq!(super::rate_args(&crate::capture_setting::VideoSettings::default(), super::Encoder::Cpu).0,
+            format!("{}k", crate::video_governor::AUTO_CEILING_KBPS));
+    }
+
     #[test]
     fn nvidia_display_is_detected_from_connected_connectors() {
         use std::os::unix::fs::symlink;
@@ -1846,8 +1862,9 @@ mod tests {
     fn hevc_options_keep_420_low_latency_and_existing_rate_policy() {
         let settings = VideoSettings { codec: VideoCodec::H265, ..Default::default() };
         let cpu = cpu_hevc_options(&settings, "30");
+        // Auto quality now caps at 8 Mbit/s instead of the old 30M VBV fallback.
         for pair in [["-c:v", "libx265"], ["-profile:v", "main"], ["-pix_fmt", "yuv420p"],
-            ["-bf", "0"], ["-bufsize", "30000k"]] {
+            ["-bf", "0"], ["-bufsize", "8000k"]] {
             assert!(cpu.windows(2).any(|window| window == pair));
         }
         let params = x265_params("30");
