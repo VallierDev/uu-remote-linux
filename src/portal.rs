@@ -69,6 +69,7 @@ mod native {
         fn uu_portal_touch(portal: *mut c_void, phase: i32, x: f64, y: f64) -> i32;
         fn uu_portal_stream_position(portal: *mut c_void, x: *mut i32, y: *mut i32) -> i32;
         fn uu_portal_monitors(out: *mut libc::c_char, length: usize) -> i32;
+        fn uu_portal_set_active(portal: *mut c_void, active: i32);
         fn uu_portal_end(portal: *mut c_void);
     }
     struct Handle(NonNull<c_void>);
@@ -99,24 +100,6 @@ mod native {
         drop(old);
         Ok(true)
     }
-    /// Like `replace_handle`, but carries the viewer's clipboard text before the old session
-    /// closes. Clipboard writers wait from before the swap until the carry-over finishes.
-    fn replace_handle_carrying(current: &Mutex<Arc<Handle>>, clipboard_write: &Mutex<()>, locked: MutexGuard<'_, Arc<Handle>>, prepare: impl FnOnce() -> Result<Option<Arc<Handle>>, String>) -> Result<bool, String> {
-        drop(locked);
-        let Some(replacement) = prepare()? else { return Ok(false); };
-        let _clipboard = clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned")?;
-        let _serial = crate::input::lock_portal_held();
-        let (old, installed) = {
-            let mut handle = current.lock().map_err(|_| "Portal session lock poisoned")?;
-            let old = std::mem::replace(&mut *handle, replacement);
-            (old, Arc::clone(&*handle))
-        };
-        unsafe { uu_portal_clipboard_copy(old.0.as_ptr(), installed.0.as_ptr()) };
-        drop(old);
-        // The replaced devices took any held portal input with them.
-        crate::input::portal_session_replaced();
-        Ok(true)
-    }
     #[derive(Default)]
     struct Recovery { retry_at: Option<std::time::Instant>, failed_until: Option<std::time::Instant>, denied: bool }
     impl Recovery {
@@ -142,7 +125,18 @@ mod native {
             was_locked.store(false, std::sync::atomic::Ordering::Release);
         }
     }
-    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, clipboard_write: Mutex<()>, end_generation: Arc<std::sync::atomic::AtomicU64> }
+    pub struct Session {
+        handle: Mutex<Arc<Handle>>,
+        locked: tokio::sync::watch::Receiver<Option<bool>>,
+        was_locked: std::sync::atomic::AtomicBool,
+        recovery: Mutex<Recovery>,
+        size: std::sync::atomic::AtomicU64,
+        monitor: Mutex<Option<String>>,
+        virtual_output: std::sync::atomic::AtomicBool,
+        clipboard_write: Mutex<()>,
+        end_generation: Arc<std::sync::atomic::AtomicU64>,
+        spare: Mutex<Vec<(String, Arc<Handle>, (u32, u32))>>,
+    }
     impl Session {
         fn take_lock_observation(&self) -> Result<bool, String> {
             // A recovery in progress must see the lock even if another capture
@@ -167,32 +161,58 @@ mod native {
         /// closes. `expected` rejects a desktop end that raced the open.
         fn install_replacement(&self, replacement: Self, expected: Option<u64>, defer_held: bool, refresh_privacy: bool) -> Result<(u32, u32), String> {
             let size = replacement.size();
+            let monitor = replacement.monitor();
+            let virtual_output = replacement.is_virtual();
             let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned".to_string())?;
-            let clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned".to_string())?;
-            // Records made against the new handle must postdate the reset below.
-            let serial = crate::input::lock_portal_held();
-            // Checked under the serial lock: an input recorded after an earlier check would
-            // otherwise be destroyed with the session it was sent to.
+            let _clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned")?;
+            let previous = self.swap_handle(&next, size, expected, defer_held, || {
+                if !virtual_output { self.sync_monitor(monitor); }
+            })?;
+            Self::carry_clipboard(&previous, &next);
+            drop(_clipboard);
+            drop(previous);
+            // A replaced virtual output can move in the layout; absolute input needs its new share.
+            if refresh_privacy { crate::privacy_screen::refresh_pointer_region(); }
+            Ok(size)
+        }
+        fn swap_handle(&self, next: &Arc<Handle>, size: (u32, u32), expected: Option<u64>, defer_held: bool,
+            installed: impl FnOnce()) -> Result<Arc<Handle>, String> {
+            let _serial = crate::input::lock_portal_held();
             if defer_held && crate::input::portal_input_held() { return Err("input held during the swap".into()); }
             let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned".to_string())?;
             if expected.is_some_and(|generation| self.end_generation.load(std::sync::atomic::Ordering::Acquire) != generation) {
                 return Err("desktop session ended during the rebuild".into());
             }
+            unsafe { uu_portal_set_active(next.0.as_ptr(), 1) };
             self.size.store(pack(size.0, size.1), std::sync::atomic::Ordering::Release);
-            let previous_handle = std::mem::replace(&mut *handle, next);
-            let installed = Arc::clone(&*handle);
+            let previous = std::mem::replace(&mut *handle, Arc::clone(next));
+            Self::publish_cursor_mode(next);
+            installed();
             drop(handle);
-            if unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) } < 0 {
+            crate::input::portal_session_replaced();
+            Ok(previous)
+        }
+        fn carry_clipboard(previous: &Handle, next: &Handle) {
+            if unsafe { uu_portal_clipboard_copy(previous.0.as_ptr(), next.0.as_ptr()) } < 0 {
                 log::warn!("Portal clipboard ownership could not be carried over");
             }
-            drop(clipboard);
-            drop(previous_handle);
-            // The replaced devices took any held portal input with them.
-            crate::input::portal_session_replaced();
-            drop(serial);
-            // A replaced virtual output can move in the layout; absolute input needs its new share.
-            if refresh_privacy { crate::privacy_screen::refresh_pointer_region(); }
-            Ok(size)
+        }
+        fn sync_monitor(&self, monitor: Option<String>) {
+            if let Some(name) = &monitor { crate::wayland::sync_portal_monitor(name); }
+            if let Ok(mut current) = self.monitor.lock() { *current = monitor; }
+        }
+        fn publish_cursor_mode(handle: &Handle) {
+            use std::sync::atomic::Ordering;
+            let available = unsafe { uu_portal_cursor_modes(handle.0.as_ptr()) };
+            let applied = unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) };
+            if applied > 0 { super::CURSOR_MODE.store(if applied == 2 { 2 } else { 1 }, Ordering::Release); }
+            if available > 0 { super::CURSOR_EMBED.store(if available & 2 != 0 { 2 } else { 1 }, Ordering::Release); }
+        }
+        pub fn publish_initial_source(&self) {
+            if let Ok(handle) = self.handle.lock() {
+                if let Some(name) = self.monitor() { crate::wayland::sync_portal_monitor(&name); }
+                Self::publish_cursor_mode(&handle);
+            }
         }
         /// Point the host and the engine at the cursor mode the installed session really has.
         fn restore_installed_cursor_mode(&self, fallback: bool) {
@@ -222,7 +242,17 @@ mod native {
             let directory = super::permissions::directory();
             let key = super::permissions::desktop_key();
             let wanted = if virtual_output { None } else { monitor.map(str::to_owned).or_else(crate::wayland::portal_monitor) };
-            let wanted_key = wanted.as_deref().map(super::permissions::monitor_key);
+            let monitors = super::monitors();
+            let shadowed = wanted.as_deref().and_then(|w| super::lead_connector(&monitors, w));
+            if let Some(shadowed_conn) = wanted.as_deref().filter(|_| shadowed.is_some()) {
+                if let Some(dir) = directory.as_deref() {
+                    let _ = std::fs::remove_file(dir.join(super::permissions::monitor_key(shadowed_conn)));
+                    let _ = std::fs::remove_file(dir.join(super::permissions::pending_key(&super::permissions::monitor_key(shadowed_conn))));
+                }
+            }
+            let is_shadowed = shadowed.is_some();
+            let fresh = fresh || is_shadowed;
+            let wanted_key = if is_shadowed { None } else { wanted.as_deref().map(super::permissions::monitor_key) };
             let virtual_key = format!("{key}-virtual");
             // One opener at a time: consent tokens are single-use, and two concurrent openers
             // (privacy virtual-output switch and closure recovery after a quick reconnect) each
@@ -320,23 +350,40 @@ mod native {
                 .then(|| crate::wayland::portal_monitor_at(x, y)).flatten();
             let saved = match &granted {
                 _ if virtual_output => virtual_key.clone(),
-                Some(name) => super::permissions::monitor_key(name),
+                Some(name) => match super::lead_connector(&monitors, name) {
+                    Some(lead) => super::permissions::monitor_key(lead),
+                    None => super::permissions::monitor_key(name),
+                },
                 None => key.to_owned(),
             };
-            if cache.rotation.finish(&saved, fresh || virtual_output || granted.is_some()).is_err() {
+            let replace_token = if let Some(name) = granted.as_deref() {
+                super::lead_connector(&monitors, name).is_none()
+            } else {
+                fresh || virtual_output
+            };
+            if cache.rotation.finish(&saved, replace_token).is_err() {
                 log::warn!("Portal permission cache could not be saved");
             }
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
             // before new damage can leave a static desktop permanently blank (#2).
-            let handle = Arc::new(Handle(handle));
-            // The engine records what it actually requested; a backend can refuse the mode the
-            // environment or a runtime switch asked for.
-            let available = unsafe { uu_portal_cursor_modes(handle.0.as_ptr()) };
-            let applied = unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) };
-            if applied > 0 { super::CURSOR_MODE.store(if applied == 2 { 2 } else { 1 }, std::sync::atomic::Ordering::Release); }
-            if available > 0 { super::CURSOR_EMBED.store(if available & 2 != 0 { 2 } else { 1 }, std::sync::atomic::Ordering::Release); }
-            Ok(Self { handle: Mutex::new(handle), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()), end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
+            Ok(Self {
+                handle: Mutex::new(Arc::new(Handle(handle))),
+                locked: crate::session_lock::watch_locked(),
+                was_locked: std::sync::atomic::AtomicBool::new(false),
+                recovery: Mutex::new(Recovery::default()),
+                size: pack(width, height).into(),
+                monitor: Mutex::new(granted),
+                virtual_output: virtual_output.into(),
+                clipboard_write: Mutex::new(()),
+                end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                spare: Mutex::new(Vec::new()),
+            })
+        }
+        pub fn resume(&self) {
+            if let Ok(handle) = self.handle.lock() {
+                unsafe { uu_portal_set_active(handle.0.as_ptr(), 1) };
+            }
         }
         /// Frame pixels of the monitor the stream currently follows.
         pub fn size(&self) -> (u32, u32) {
@@ -345,30 +392,91 @@ mod native {
         }
         /// End the compositor session (screen-share indicator off); the next desktop
         /// connection reopens it with the saved consent.
+        /// Parked shadowed monitors (PBP) whose consent cannot be restored via tokens are preserved.
         pub fn end(&self) {
-            // Invalidate an open that is still waiting for consent: it must not install a share
-            // after the desktop was ended (viewer disconnect, idle shutdown, capture teardown).
+            // Invalidate consent requests that outlive the desktop.
             self.end_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            if let Ok(handle) = self.handle.lock() { unsafe { uu_portal_end(handle.0.as_ptr()) }; }
-            // The ended session's native devices are gone; forget the inputs bound to them.
+            let monitors = super::monitors();
+            if let Ok(mut spare) = self.spare.lock() {
+                spare.retain(|(name, handle, _)| {
+                    let keep = super::lead_connector(&monitors, name).is_some()
+                        && unsafe { uu_portal_capture_alive(handle.0.as_ptr()) != 0 };
+                    if !keep { unsafe { uu_portal_end(handle.0.as_ptr()) }; }
+                    keep
+                });
+            }
             let _serial = crate::input::lock_portal_held();
+            if let Ok(handle) = self.handle.lock() {
+                if !self.is_virtual() && self.monitor().as_deref().and_then(|m| super::lead_connector(&monitors, m)).is_some()
+                    && unsafe { uu_portal_capture_alive(handle.0.as_ptr()) != 0 } {
+                    // The current slot already owns this handle.
+                    unsafe { uu_portal_set_active(handle.0.as_ptr(), 0) };
+                } else {
+                    unsafe { uu_portal_end(handle.0.as_ptr()) };
+                }
+            }
             crate::input::portal_session_replaced();
         }
         /// Mutter connector of the monitor this session captures, when several are advertised.
         pub fn monitor(&self) -> Option<String> { self.monitor.lock().ok().and_then(|m| m.clone()) }
         /// Capture another monitor: open its own session (silently with saved consent; the first
         /// time GNOME asks on the host) and swap it in, so every holder of this Arc follows.
-        pub fn switch_to(&self, connector: &str) -> Result<(), String> {
-            if self.monitor().as_deref() == Some(connector) { return Ok(()); }
-            // Both this and the cursor-mode rebuild replace the handle: serialize them so the
-            // later open cannot install a stale source over the other.
+        pub fn switch_to(&self, connector: &str, owner: &crate::input::DesktopInputSession,
+            expected: (usize, u64), publish: impl FnOnce()) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            let generation = self.end_generation.load(Ordering::Acquire);
             let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
-            let replacement = Self::open_inner(None, Some(connector), false, false).map_err(|error| error.to_string())?;
-            if replacement.monitor().as_deref() != Some(connector) {
-                return Err("Another monitor was shared; choose this monitor in the host dialog".into());
+            if !owner.is_current() || crate::wayland::selection() != expected
+                || self.end_generation.load(Ordering::Acquire) != generation || self.is_virtual() {
+                return Err(crate::i18n::s("切屏时桌面来源已变更", "Desktop source changed during the switch").into());
             }
-            self.install_replacement(replacement, None, false, false)?;
-            if let Ok(mut monitor) = self.monitor.lock() { *monitor = Some(connector.to_owned()); }
+            let previous_monitor = self.monitor();
+            if previous_monitor.as_deref() == Some(connector) { return Ok(()); }
+            let monitors = super::monitors();
+            let shadowed = super::lead_connector(&monitors, connector).is_some();
+            // Keep the parked entry until commit, in case the controller is replaced.
+            let parked = self.spare.lock().map_err(|_| "Portal session lock poisoned")?.iter()
+                .find(|(name, handle, _)| name == connector && unsafe { uu_portal_capture_alive(handle.0.as_ptr()) != 0 })
+                .map(|(_, handle, size)| (Arc::clone(handle), *size));
+            let (next, size) = match parked {
+                Some(parked) => parked,
+                None => {
+                    let mut replacement = Self::open_inner(None, Some(connector), false, false).map_err(|error| error.to_string())?;
+                    if replacement.monitor().as_deref() != Some(connector) && !shadowed && owner.is_current() {
+                        drop(replacement);
+                        replacement = Self::open_inner(None, Some(connector), true, false).map_err(|error| error.to_string())?;
+                    }
+                    if replacement.monitor().as_deref() != Some(connector) {
+                        return Err("Another monitor was shared; choose this monitor in the host dialog".into());
+                    }
+                    let size = replacement.size();
+                    (replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?, size)
+                }
+            };
+            let previous_size = self.size();
+            let clipboard = self.clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned")?;
+            let mut result = Err(crate::i18n::s("切屏时桌面来源已变更", "Desktop source changed during the switch").into());
+            owner.with_input(|| {
+                if crate::wayland::selection() != expected || *self.locked.borrow() != Some(false) { return; }
+                owner.release_input();
+                result = self.swap_handle(&next, size, Some(generation), false, || {
+                    self.sync_monitor(Some(connector.to_owned()));
+                    publish();
+                });
+            });
+            let previous = result?;
+            Self::carry_clipboard(&previous, &next);
+            drop(clipboard);
+            let mut spare = self.spare.lock().map_err(|_| "Portal session lock poisoned")?;
+            spare.retain(|(name, _, _)| name != connector);
+            if let Some(name) = previous_monitor {
+                if unsafe { uu_portal_capture_alive(previous.0.as_ptr()) != 0 }
+                    && self.end_generation.load(Ordering::Acquire) == generation {
+                    unsafe { uu_portal_set_active(previous.0.as_ptr(), 0) };
+                    spare.retain(|(parked, _, _)| parked != &name);
+                    spare.push((name, previous, previous_size));
+                }
+            }
             Ok(())
         }
         pub fn is_virtual(&self) -> bool { self.virtual_output.load(std::sync::atomic::Ordering::Acquire) }
@@ -376,8 +484,16 @@ mod native {
         /// physical monitor (off). The caller enables physical outputs before switching back.
         pub fn set_virtual(&self, on: bool) -> Result<(), String> {
             if self.is_virtual() == on { return Ok(()); }
-            // Closure recovery would otherwise see the replaced share end and reopen the wrong source.
+            // Closure recovery must not reopen the physical share during this swap.
             let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
+            // Do not retain any physical shares while using the privacy output.
+            if on {
+                if let Ok(mut spare) = self.spare.lock() {
+                    for (_, handle, _) in spare.drain(..) {
+                        unsafe { uu_portal_end(handle.0.as_ptr()) };
+                    }
+                }
+            }
             let monitor = self.monitor();
             // KDE restores a monitor share against the whole workspace while the virtual output
             // exists (seen live: 3968x1280 = panel + virtual), so end the virtual share first.
@@ -408,6 +524,12 @@ mod native {
             let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
             if super::cursor_embedded() == embedded { return Ok(false); }
             if *self.locked.borrow() != Some(false) { return Ok(false); }
+            // A shadowed monitor cannot restore its consent for an automatic rebuild.
+            // The next installed session publishes its own capability again.
+            if self.monitor().is_some_and(|name| super::lead_connector(&super::monitors(), &name).is_some()) {
+                super::CURSOR_EMBED.store(1, Ordering::Release);
+                return Ok(false);
+            }
             // The session this rebuild replaces must still be running: a viewer that left or an
             // idle shutdown ends it, and a replacement opened afterwards would share with nobody.
             if !self.is_alive() { return Ok(false); }
@@ -481,8 +603,7 @@ mod native {
                     Ok(true)
                 }
                 Ok(None) => {
-                    // Deferred (input went down during the open): open_inner published the
-                    // replacement's mode, but that session is never installed.
+                    // Restore the mode requested by future opens after a deferred swap.
                     self.restore_installed_cursor_mode(previous);
                     Ok(false)
                 }
@@ -508,7 +629,9 @@ mod native {
             let available = self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_touch_available(handle.0.as_ptr()) } != 0);
             if !available || self.touch_supported() { return Ok(false); }
             // Serialize with recovery and the cursor-mode rebuild: all replace the handle.
+            let generation = self.end_generation.load(std::sync::atomic::Ordering::Acquire);
             let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
+            if !self.is_alive() { return Ok(false); }
             log::info!("Portal touch consent: asking the host again for the touchscreen");
             let monitor = self.monitor();
             let replacement = Self::open_inner(None, monitor.as_deref(), true, self.is_virtual()).map_err(|error| error.to_string())?;
@@ -516,15 +639,21 @@ mod native {
             if replacement.monitor() != monitor { return Err("another monitor was shared".into()); }
             if !replacement.touch_supported() { return Err("the touchscreen was not granted".into()); }
             self.check_geometry(&replacement).map_err(|error| error.to_string())?;
-            self.install_replacement(replacement, None, false, self.is_virtual())?;
+            self.install_replacement(replacement, Some(generation), false, self.is_virtual())?;
             Ok(true)
         }
         pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, super::PortalError> {
             Self::open_inner(Some(cancelled), None, false, false)
         }
+        fn restore_monitor(&self) -> Option<String> {
+            self.monitor().map(|name| {
+                super::lead_connector(&super::monitors(), &name).unwrap_or(&name).to_owned()
+            })
+        }
         pub fn recover(&self, cancelled: &std::sync::atomic::AtomicBool) -> Result<bool, super::PortalError> {
             use std::sync::atomic::Ordering;
             if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+            let generation = self.end_generation.load(Ordering::Acquire);
             // Serialize with the encoder's stream-loss recovery: two openers would ask for consent twice.
             let mut recovery = loop {
                 match self.recovery.try_lock() {
@@ -536,6 +665,7 @@ mod native {
                     Err(TryLockError::Poisoned(_)) => return Err(super::PortalError { code: 3 }),
                 }
             };
+            if self.end_generation.load(Ordering::Acquire) != generation { return Err(super::PortalError { code: 13 }); }
             if recovery.failed_until.is_some_and(|until| std::time::Instant::now() < until) {
                 return Err(super::PortalError { code: 3 });
             }
@@ -547,16 +677,21 @@ mod native {
 
             // The privacy screen's virtual share is reopened as itself, not as the monitor.
             let virtual_output = self.is_virtual();
-            let monitor = self.monitor();
+            let monitor = self.restore_monitor();
             let result = super::open_then_install(cancelled, || Self::open_inner(Some(cancelled), monitor.as_deref(), false, virtual_output), |replacement| {
                 self.check_geometry(&replacement)?;
+                let granted = replacement.monitor();
                 let replacement_handle = replacement.handle.into_inner().map_err(|_| super::PortalError { code: 3 })?;
                 let clipboard = self.clipboard_write.lock().map_err(|_| super::PortalError { code: 3 })?;
                 let serial = crate::input::lock_portal_held();
                 let mut handle = self.handle.lock().map_err(|_| super::PortalError { code: 3 })?;
-                if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+                if cancelled.load(Ordering::Acquire) || self.end_generation.load(Ordering::Acquire) != generation {
+                    return Err(super::PortalError { code: 13 });
+                }
                 let previous_handle = std::mem::replace(&mut *handle, replacement_handle);
                 let installed = Arc::clone(&*handle);
+                if !virtual_output { self.sync_monitor(granted); }
+                Self::publish_cursor_mode(&installed);
                 drop(handle);
                 unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) };
                 drop(clipboard);
@@ -654,36 +789,29 @@ mod native {
                     Err(TryLockError::WouldBlock) => return Ok(blank_changed(frame, version)),
                     Err(TryLockError::Poisoned(_)) => return Err("Portal recovery lock poisoned".into()),
                 };
-                if replace_handle_carrying(&self.handle, &self.clipboard_write, handle, || {
-                    {
-                        let handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
-                        if unsafe { uu_portal_capture_alive(handle.0.as_ptr()) } != 0 {
-                            recovery.retry_at = None;
-                            return Ok(None);
-                        }
+                drop(handle);
+                let generation = self.end_generation.load(std::sync::atomic::Ordering::Acquire);
+                // logind's LockedHint can lag compositor stream closure.
+                if !recovery.ready(std::time::Instant::now(), || {
+                    if crate::session_lock::locked_now() == Some(false) { return true; }
+                    self.was_locked.store(true, std::sync::atomic::Ordering::Release);
+                    false
+                }) { return Ok(blank_changed(frame, version)); }
+                let target_monitor = self.restore_monitor();
+                let replacement = match Self::open_inner(None, target_monitor.as_deref(), false, self.is_virtual()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::warn!("Portal capture recovery deferred: {error}");
+                        recovery.failed(std::time::Instant::now(), error.code);
+                        return Ok(blank_changed(frame, version));
                     }
-                    // logind's LockedHint can lag compositor stream closure.
-                    if !recovery.ready(std::time::Instant::now(), || {
-                        if crate::session_lock::locked_now() == Some(false) { return true; }
-                        self.was_locked.store(true, std::sync::atomic::Ordering::Release);
-                        false
-                    }) { return Ok(None); }
-                    let replacement = match Self::open_inner(None, self.monitor().as_deref(), false, self.is_virtual()) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            log::warn!("Portal capture recovery deferred: {error}");
-                            recovery.failed(std::time::Instant::now(), error.code);
-                            return Ok(None);
-                        }
-                    };
+                };
+                self.check_geometry(&replacement).map_err(|error| error.to_string())?;
+                // Consent can outlive the unlocked state checked above.
+                if *self.locked.borrow() == Some(false) && !self.was_locked.load(std::sync::atomic::Ordering::Acquire)
+                    && self.end_generation.load(std::sync::atomic::Ordering::Acquire) == generation {
+                    self.install_replacement(replacement, Some(generation), false, false)?;
                     recovery.succeeded();
-                    self.check_geometry(&replacement).map_err(|error| error.to_string())?;
-                    // Consent can outlive the unlocked state checked above.
-                    if *self.locked.borrow() != Some(false) || self.was_locked.load(std::sync::atomic::Ordering::Acquire) {
-                        return Ok(None);
-                    }
-                    replacement.handle.into_inner().map(Some).map_err(|_| "Portal session lock poisoned".into())
-                })? {
                     *version = None;
                     log::info!("Portal capture session restored after stream loss");
                 }
@@ -807,6 +935,7 @@ mod native {
                     recovery: Mutex::new(Recovery::default()),
                     size: pack(physical.0, physical.1).into(),
                     monitor: Mutex::new(None), virtual_output: false.into(),
+                    spare: Mutex::new(Vec::new()),
                     clipboard_write: Mutex::new(()),
                     end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 }))
@@ -1103,7 +1232,9 @@ impl PortalSession {
     pub fn size(&self) -> (u32, u32) { (self.width, self.height) }
     pub fn monitor(&self) -> Option<String> { None }
     pub fn end(&self) {}
-    pub fn switch_to(&self, _: &str) -> Result<(), String> { Err(error(15)) }
+    pub fn publish_initial_source(&self) {}
+    pub fn resume(&self) {}
+    pub fn switch_to(&self, _: &str, _: &crate::input::DesktopInputSession, _: (usize, u64), _: impl FnOnce()) -> Result<(), String> { Err(error(15)) }
     pub fn set_virtual(&self, _: bool) -> Result<(), String> { Err(error(15)) }
     pub fn set_cursor_embedded(&self, _: bool) -> Result<bool, String> { Err(error(15)) }
     pub fn is_virtual(&self) -> bool { false }
@@ -1148,7 +1279,10 @@ pub fn permissions_directory() -> Option<std::path::PathBuf> { permissions::dire
 pub fn monitor_key(connector: &str) -> String { permissions::monitor_key(connector) }
 pub fn permission_exists(dir: &std::path::Path, key: &str) -> bool { permissions::exists(dir, key) }
 pub fn register(session: &Arc<PortalSession>) {
-    *ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(session));
+    let mut active = ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if active.as_ref().and_then(std::sync::Weak::upgrade).is_some_and(|old| Arc::ptr_eq(&old, session)) { return; }
+    session.publish_initial_source();
+    *active = Some(Arc::downgrade(session));
 }
 /// Whether a desktop capture session is registered for monitor/virtual switching.
 pub fn available() -> bool {
@@ -1161,15 +1295,16 @@ pub fn set_virtual_active(on: bool) -> Result<(), String> {
     let Some(session) = session else { return if on { Err("Portal desktop unavailable".into()) } else { Ok(()) }; };
     session.set_virtual(on)
 }
-pub fn switch_active(connector: &str) -> Result<(), String> {
+pub fn switch_active(connector: &str, owner: &crate::input::DesktopInputSession,
+    expected: (usize, u64), publish: impl FnOnce()) -> Result<(), String> {
     let session = ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(std::sync::Weak::upgrade)
         .ok_or("Portal desktop unavailable")?;
-    session.switch_to(connector)
+    session.switch_to(connector, owner, expected, publish)
 }
 /// Whether the capture stream carries the compositor's pointer. 0 is "not asked yet"; the
 /// startup answer has to match what the engine reads from UU_PORTAL_CURSOR_MODE.
 static CURSOR_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-/// Embedded cursor support reported by a session: 0 unknown, 1 unavailable, 2 available.
+/// Automatic cursor mode switching for the current session: 0 unknown, 1 unavailable, 2 available.
 static CURSOR_EMBED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 fn cursor_embedded() -> bool {
     use std::sync::atomic::Ordering;
@@ -1288,21 +1423,40 @@ pub fn note_pointer_motion(relative: bool) {
         if let Ok(mut state) = POINTER_MODE.lock() { state.switching = false; }
     }
 }
-pub struct Monitor { pub connector: String, pub width: u32, pub height: u32, pub x: i32, pub y: i32, pub primary: bool }
+pub struct Monitor { pub connector: String, pub width: u32, pub height: u32, pub x: i32, pub y: i32, pub primary: bool, pub identity: String }
 #[cfg(all(target_os = "linux", feature = "portal"))]
 pub use native::monitors;
 #[cfg(not(all(target_os = "linux", feature = "portal")))]
 pub fn monitors() -> Vec<Monitor> { Vec::new() }
-/// `connector\twidth\theight\tx\ty\tprimary` lines from the engine.
+/// `connector\twidth\theight\tx\ty\tprimary\tidentity` lines from the engine.
 fn parse_monitors(text: &str) -> Vec<Monitor> {
     text.lines().filter_map(|line| {
         let mut f = line.split('\t');
         let connector = f.next()?.to_owned();
         let (width, height) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
         let (x, y, primary) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?, f.next()? == "1");
+        let identity = f.next().unwrap_or_default().trim().to_owned();
         (!connector.is_empty() && connector.len() <= 64 && connector.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-            .then_some(Monitor { connector, width, height, x, y, primary })
+            .then_some(Monitor { connector, width, height, x, y, primary, identity })
     }).collect()
+}
+
+/// Returns the leading connector if `connector` is shadowed by an earlier monitor
+/// with the exact same identity (vendor:product:serial) in Mutter's display list.
+/// Portal consent restore always matches the first monitor with that identity,
+/// making shadowed monitors un-restorable via tokens.
+pub fn lead_connector<'a>(monitors: &'a [Monitor], connector: &str) -> Option<&'a str> {
+    let index = monitors.iter().position(|m| m.connector == connector)?;
+    let target = &monitors[index];
+    if target.identity.is_empty() || target.identity == "::" { return None; }
+    monitors[..index].iter().find(|m| m.identity == target.identity).map(|m| m.connector.as_str())
+}
+
+/// Whether `connector` shares its identity with another connector (one PBP panel seen as two monitors).
+pub fn shares_identity(monitors: &[Monitor], connector: &str) -> bool {
+    let Some(target) = monitors.iter().find(|m| m.connector == connector) else { return false; };
+    if target.identity.is_empty() || target.identity == "::" { return false; }
+    monitors.iter().any(|m| m.connector != connector && m.identity == target.identity)
 }
 
 /// Forward frames in-process into encoder stdin. Cancellation drops the Arc;
@@ -1333,6 +1487,15 @@ mod tests {
         let m = super::parse_monitors("eDP-1\t2880\t1800\t0\t0\t1\nHDMI-1\t2560\t1440\t1920\t0\t0\n../x\t1\t1\t0\t0\t0\n");
         assert_eq!(m.len(), 2);
         assert!(m[0].primary && m[0].connector == "eDP-1" && (m[1].width, m[1].x) == (2560, 1920));
+        assert_eq!(m[0].identity, "");
+        let with_id = super::parse_monitors("DP-1\t1920\t2160\t0\t0\t1\tAOC:27:0x000f69b5\nHDMI-1\t1920\t2160\t1920\t0\t0\tAOC:27:0x000f69b5\nDP-3\t3840\t2160\t3840\t0\t0\tPHL:32:12345\n");
+        assert_eq!(with_id.len(), 3);
+        assert_eq!(super::lead_connector(&with_id, "DP-1"), None);
+        assert_eq!(super::lead_connector(&with_id, "HDMI-1"), Some("DP-1"));
+        assert_eq!(super::lead_connector(&with_id, "DP-3"), None);
+        assert!(super::shares_identity(&with_id, "DP-1"));
+        assert!(super::shares_identity(&with_id, "HDMI-1"));
+        assert!(!super::shares_identity(&with_id, "DP-3"));
     }
     #[test]
     fn locked_frames_hide_old_content() { let mut frame = [42; 8]; super::blank(&mut frame); assert_eq!(frame, [0,0,0,255,0,0,0,255]); }
