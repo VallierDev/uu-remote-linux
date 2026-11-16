@@ -395,7 +395,7 @@ fn sync_modifiers(input:&mut Input,keymod:sdl2::keyboard::Mod)->Vec<serde_json::
 fn needs_redraw(event:&Event)->bool{
     matches!(event,Event::Window{win_event:WindowEvent::SizeChanged(..)|WindowEvent::Resized(..)|WindowEvent::Exposed|WindowEvent::Maximized|WindowEvent::Restored,..})
 }
-fn button(b:MouseButton)->Option<i32>{match b{MouseButton::Left=>Some(1),MouseButton::Right=>Some(2),MouseButton::Middle=>Some(4),_=>None}}
+fn button(b:MouseButton)->Option<i32>{match b{MouseButton::Left=>Some(1),MouseButton::Right=>Some(2),MouseButton::Middle=>Some(16),_=>None}}
 impl FrameSink for Window {
     fn present(&mut self,frame:&Frame)->Result<(),String>{
         self.last_frame=Some(Frame{width:frame.width,height:frame.height,rgb:frame.rgb.clone(),content:frame.content});
