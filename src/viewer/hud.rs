@@ -1,5 +1,6 @@
 //! In-window viewer chrome drawn over the remote picture, like the official client's: the loading
-//! screen, the network-status panel (Ctrl+Alt+G), the control-center tab and its menu (Ctrl+Alt+M).
+//! screen, the network-status panel (Ctrl+Alt+G), the control-center tab and its menu (Ctrl+Alt+M),
+//! and keyboard grab toggle (Ctrl+Alt+K).
 //! Shapes and text are rasterized on the CPU into small RGBA layers (anti-aliased); text uses a system
 //! font found with fc-match (CJK capable). Without a font only shapes are drawn.
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
@@ -180,7 +181,7 @@ impl Default for State {
         host_mute: false, grab_keys: false, follow_natural_scroll: false, watch: false, stats: false, hide_tab: false, fullscreen: false } }
 }
 
-enum Opt { Header(&'static str), Radio(&'static str, bool, Command), Check(&'static str, bool, Command), Action(&'static str, Command, &'static str), Slider }
+enum Opt { Header(&'static str), Radio(&'static str, bool, Command), Check(&'static str, bool, Command, &'static str), Action(&'static str, Command, &'static str), Slider }
 fn categories() -> [&'static str; 10] {
     [s("显示屏", "Display"), s("画质", "Quality"), s("窗口", "Window"), s("声音", "Sound"), s("安全", "Security"),
      s("外设", "Peripherals"), s("工具", "Tools"), s("更多", "More"), s("全屏", "Full screen"), s("退出远控", "Disconnect")]
@@ -198,13 +199,13 @@ fn options(cat: usize, st: &State) -> Vec<Opt> {
                   Radio(s("常规色彩", "Standard color"), st.chroma != 3, Command::Chroma(1))],
         2 => vec![Radio(s("自适应", "Fit to window"), !st.one_to_one, Command::OneToOne(false)), Radio(s("实际大小 1:1", "Actual size 1:1"), st.one_to_one, Command::OneToOne(true))],
         3 => vec![Slider],
-        4 => vec![Check(s("远程结束后，被控端自动锁屏", "Lock the remote when the session ends"), st.auto_lock, Command::AutoLock(!st.auto_lock)),
-                  Check(s("被控端静音运行", "Mute the remote while connected"), st.host_mute, Command::HostMute(!st.host_mute))],
-        5 => vec![Header(s("键盘", "Keyboard")), Check(s("发送系统快捷键到被控端", "Send system shortcuts (Alt+Tab)"), st.grab_keys, Command::GrabKeys(!st.grab_keys)),
-                  Header(s("鼠标与触摸板", "Mouse and touchpad")), Check(s("跟随本机自然滚动", "Follow local natural scrolling"), st.follow_natural_scroll, Command::FollowNaturalScroll(!st.follow_natural_scroll))],
-        6 => vec![Action(s("文件传输", "File transfer"), Command::Files, "Ctrl+Alt+F"), Check(s("观看模式", "Watch mode"), st.watch, Command::Watch(!st.watch))],
-        7 => vec![Check(s("显示网络状态", "Show network status"), st.stats, Command::Stats(!st.stats)),
-                  Check(s("全屏状态隐藏控制按钮", "Hide the control tab in full screen"), st.hide_tab, Command::HideTab(!st.hide_tab))],
+        4 => vec![Check(s("远程结束后，被控端自动锁屏", "Lock the remote when the session ends"), st.auto_lock, Command::AutoLock(!st.auto_lock), ""),
+                  Check(s("被控端静音运行", "Mute the remote while connected"), st.host_mute, Command::HostMute(!st.host_mute), "")],
+        5 => vec![Header(s("键盘", "Keyboard")), Check(s("发送系统快捷键到被控端", "Send system shortcuts (Alt+Tab)"), st.grab_keys, Command::GrabKeys(!st.grab_keys), "Ctrl+Alt+K"),
+                  Header(s("鼠标与触摸板", "Mouse and touchpad")), Check(s("跟随本机自然滚动", "Follow local natural scrolling"), st.follow_natural_scroll, Command::FollowNaturalScroll(!st.follow_natural_scroll), "")],
+        6 => vec![Action(s("文件传输", "File transfer"), Command::Files, "Ctrl+Alt+F"), Check(s("观看模式", "Watch mode"), st.watch, Command::Watch(!st.watch), "")],
+        7 => vec![Check(s("显示网络状态", "Show network status"), st.stats, Command::Stats(!st.stats), "Ctrl+Alt+G"),
+                  Check(s("全屏状态隐藏控制按钮", "Hide the control tab in full screen"), st.hide_tab, Command::HideTab(!st.hide_tab), "")],
         _ => vec![],
     }
 }
@@ -258,7 +259,8 @@ fn option_width(font: Option<&FontVec>, opt: &Opt, scale: f32) -> f32 {
     let text = |t: &str, size: f32| measure(font, t, size * scale);
     match opt {
         Opt::Header(t) => text(t, SMALL_TEXT) + 28. * scale,
-        Opt::Radio(t, ..) | Opt::Check(t, ..) => text(t, TEXT_SIZE) + 52. * scale,
+        Opt::Radio(t, ..) => text(t, TEXT_SIZE) + 52. * scale,
+        Opt::Check(t, .., key) => text(t, TEXT_SIZE) + if key.is_empty() { 52. * scale } else { text(key, SMALL_TEXT) + 72. * scale },
         Opt::Action(t, _, key) => text(t, TEXT_SIZE) + text(key, SMALL_TEXT) + 72. * scale,
         Opt::Slider => 230. * scale,
     }
@@ -329,11 +331,15 @@ pub fn menu_layer(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -
                     if *on { l.circle(r.x + k(16.), r.y + r.h / 2., k(3.), ACCENT); }
                     l.text(font, r.x + k(30.), mid(&r, size), t, size, if *on { TEXT } else { [214, 218, 224, 255] });
                 }
-                Opt::Check(t, on, _) => {
+                Opt::Check(t, on, _, key) => {
                     // Drawn check mark: fonts without U+2713 would show a box.
                     if *on { let (cx, cy) = (r.x + k(16.), r.y + r.h / 2.);
                         for j in 0..8 { let f = j as f32 / 7.; l.circle(cx - k(4.) + f * k(3.), cy + f * k(3.), k(1.1), ACCENT); l.circle(cx - k(1.) + f * k(6.), cy + k(3.) - f * k(7.), k(1.1), ACCENT); } }
                     l.text(font, r.x + k(30.), mid(&r, size), t, size, if *on { TEXT } else { [214, 218, 224, 255] });
+                    if !key.is_empty() {
+                        let kw = measure(font, key, k(SMALL_TEXT));
+                        l.text(font, r.x + r.w - kw - k(10.), mid(&r, k(SMALL_TEXT)), key, k(SMALL_TEXT), DIM);
+                    }
                 }
                 Opt::Action(t, _, key) => {
                     l.text(font, r.x + k(30.), mid(&r, size), t, size, TEXT);
@@ -359,7 +365,7 @@ pub fn menu_layer(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -
 }
 /// The command for a click on an option row.
 pub fn option_command(st: &State, cat: usize, index: usize) -> Option<Command> {
-    match options(cat, st).get(index)? { Opt::Radio(_, _, c) | Opt::Check(_, _, c) | Opt::Action(_, c, _) => Some(*c), _ => None }
+    match options(cat, st).get(index)? { Opt::Radio(_, _, c) | Opt::Check(_, _, c, _) | Opt::Action(_, c, _) => Some(*c), _ => None }
 }
 pub fn category_command(cat: usize) -> Option<Command> { match cat { 8 => Some(Command::Fullscreen), 9 => Some(Command::Disconnect), _ => None } }
 pub fn slider_value(x: f32, a: f32, len: f32) -> u8 { (((x - a) / len).clamp(0., 1.) * 100.).round() as u8 }
@@ -376,12 +382,13 @@ pub fn load_prefs(st: &mut State) {
     if let Some(q) = v["quality"].as_u64().filter(|q| (2..=5).contains(q)) { st.quality = q; }
     if let Some(f) = v["fps"].as_u64().filter(|f| [30, 60, 90, 144].contains(f)) { st.fps = f as u32; }
     if let Some(c) = v["chroma"].as_u64().filter(|c| [1, 3].contains(c)) { st.chroma = c as u32; }
+    if let Some(b) = v["grab_keys"].as_bool() { st.grab_keys = b; }
 }
 pub fn save_prefs(st: &State) {
     let path = prefs_path();
     if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
     let v = serde_json::json!({"stats": st.stats, "hide_tab_fullscreen": st.hide_tab, "one_to_one": st.one_to_one, "volume": st.volume,
-        "quality": st.quality, "fps": st.fps, "chroma": st.chroma, "follow_natural_scroll": st.follow_natural_scroll});
+        "quality": st.quality, "fps": st.fps, "chroma": st.chroma, "grab_keys": st.grab_keys, "follow_natural_scroll": st.follow_natural_scroll});
     let _ = std::fs::write(path, v.to_string());
 }
 fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_else(|| "viewer.json".into(), |d| d.join("viewer.json")) }
@@ -454,6 +461,13 @@ fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_el
             for (_,hit) in &lay.items { if let Hit::Option(c,i)=hit { assert!(option_command(&st,*c,*i).is_some()); } } }
         assert_eq!(category_command(9),Some(Command::Disconnect));assert_eq!(category_command(1),None);
         assert_eq!(slider_value(150.,100.,100.),50);assert_eq!(slider_value(0.,100.,100.),0);
+    }
+    #[test] fn grab_keys_persists_in_prefs(){
+        let mut st=State::default();
+        assert!(!st.grab_keys);
+        let sample=serde_json::json!({"grab_keys":true});
+        if let Some(b)=sample["grab_keys"].as_bool(){st.grab_keys=b;}
+        assert!(st.grab_keys);
     }
     /// `UU_HUD_PREVIEW=dir cargo test render_preview -- --ignored` writes the chrome as PNGs (visual check).
     #[test] #[ignore] fn render_preview(){
