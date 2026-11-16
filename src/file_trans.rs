@@ -310,6 +310,14 @@ impl FileSession {
         }
     }
 
+    /// Key of an outstanding request. The viewer answers file_confirm and result with a 0-based
+    /// file_index while our own request carries a 1-based one, and download_files keeps only one of
+    /// each per task, so cases 3 and 6 key on the task alone. block_confirm runs many blocks at
+    /// once, so it keeps the full identity.
+    fn pending_key(case: u32, task: u64, index: u64, block: u64) -> (u32, u64, u64, u64) {
+        if case == 4 { (4, task, index, block) } else { (case, task, 0, 0) }
+    }
+
     /// Key of a FileTransferFtpResponse: 3 file_confirm{id}, 4 block_confirm{id, block_id}, 6 result{id}.
     fn response_key(ftp: &[u8]) -> Option<(u32, u64, u64, u64)> {
         let fields = decode_wire(ftp).ok()?;
@@ -318,7 +326,7 @@ impl FileSession {
         let inner = decode_wire(inner).ok()?;
         let id = TaskId::parse(&inner);
         let block = if case.number == 4 { get_uint(&inner, 2) } else { 0 };
-        Some((case.number, id.task, id.index, block))
+        Some(Self::pending_key(case.number, id.task, id.index, block))
     }
 
     /// Handles one decoded Message. Returns true when it carried file-transfer RPC.
@@ -617,7 +625,7 @@ impl FileSession {
         for (index, (info, path)) in files.iter().enumerate() {
             let index = index + 1;
             let id = TaskId { task, index: index as u64 };
-            let Some(confirm) = self.request(3, Enc::default().msg(1, id.enc()).uint(2, info.modified).uint(3, info.size), (3, id.task, id.index, 0)).await else {
+            let Some(confirm) = self.request(3, Enc::default().msg(1, id.enc()).uint(2, info.modified).uint(3, info.size), Self::pending_key(3, id.task, id.index, 0)).await else {
                 log::warn!("File transfer download: no file_confirm task={} index={}", task, index); return false;
             };
             let [skip, err, resume] = case_uints(&confirm, 3, [2, 3, 4]);
@@ -627,7 +635,7 @@ impl FileSession {
             if skip || (err != FT_SUCCEEDED && err != 0) { continue; }
             let result = self.send_file(id, path, resume.min(info.size), first_block).await;
             let code = match result { Ok(()) => FT_SUCCEEDED, Err(c) => c };
-            let reply = self.request(9, Enc::default().msg(1, id.enc()).uint(2, code), (6, id.task, id.index, 0)).await;
+            let reply = self.request(9, Enc::default().msg(1, id.enc()).uint(2, code), Self::pending_key(6, id.task, id.index, 0)).await;
             let r = reply.map(|r| case_uints(&r, 6, [2])[0]).unwrap_or(0);
             log::info!("File transfer download file done: task={} index={} bytes={} result={} viewer_result={}", task, index, info.size, code, r);
             if code == FT_CANCELED { return false; }
@@ -650,7 +658,7 @@ impl FileSession {
             }
             let me = self.clone();
             let body = Enc::default().msg(1, id.enc()).uint(2, block_id).bytes(3, &buf);
-            let key = (4, id.task, id.index, block_id);
+            let key = Self::pending_key(4, id.task, id.index, block_id);
             inflight.spawn(async move {
                 match me.request(4, body, key).await {
                     Some(r) => { let [e] = case_uints(&r, 4, [3]); if e == 0 { FT_SUCCEEDED } else { e } }
@@ -675,6 +683,17 @@ fn case_uints<const N: usize>(ftp: &[u8], case: u32, numbers: [u32; N]) -> [u64;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_key_tolerates_both_file_index_bases() {
+        // The viewer answers file_confirm and result with a 0-based file_index; we ask with 1-based.
+        assert_eq!(FileSession::pending_key(3, 8, 1, 0), FileSession::pending_key(3, 8, 0, 0));
+        assert_eq!(FileSession::pending_key(6, 8, 1, 0), FileSession::pending_key(6, 8, 0, 9));
+        assert_ne!(FileSession::pending_key(3, 8, 1, 0), FileSession::pending_key(6, 8, 1, 0));
+        assert_ne!(FileSession::pending_key(3, 8, 1, 0), FileSession::pending_key(3, 9, 1, 0));
+        // Blocks of one file are confirmed concurrently, so case 4 must keep both identities.
+        assert_ne!(FileSession::pending_key(4, 8, 1, 2), FileSession::pending_key(4, 8, 1, 3));
+        assert_eq!(FileSession::pending_key(4, 8, 1, 2), FileSession::pending_key(4, 8, 1, 2));
+    }
     #[test]
     fn normalizes_windows_and_relative_paths() {
         assert_eq!(normalize("C:\\..\\home\\a\\.\\b"), PathBuf::from("/home/a/b"));
