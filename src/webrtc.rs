@@ -1031,7 +1031,8 @@ impl WebRtcSession {
                                 // so AUTO_UNLOCK_SYSTEM can arrive on this same CONTROL.
                                 let state = portal_desktop.as_ref().map_or_else(
                                     crate::session_lock::watch_locked, |desktop| desktop.lock_state());
-                                tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), state));
+                                tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), state.clone()));
+                                tokio::spawn(crate::session_lock::local_unlock_fallback(state));
                             }
                             if let Some(manager) = &portal_desktop {
                                 let mut updates = manager.subscribe();
@@ -1156,7 +1157,9 @@ impl WebRtcSession {
                             }
                             if !lock_reported {
                                 lock_reported = true;
-                                tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), crate::session_lock::watch_locked()));
+                                let state = crate::session_lock::watch_locked();
+                                tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), state.clone()));
+                                tokio::spawn(crate::session_lock::local_unlock_fallback(state));
                             }
                             // The viewer's menu only learns about a mode it did not ask for (an
                             // auto-enable) from this push, so desktop peers need it too, not only a

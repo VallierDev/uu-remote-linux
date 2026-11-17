@@ -130,7 +130,7 @@ viewer does not reconnect them automatically.
 | Item | Meaning |
 |---|---|
 | `~/.config/uuremote/config.json` | user_id, device_id, client_id, system_id, machine_guid, token, csrf; optional `sign_key`, `ffmpeg_root`. `$UU_CONFIG` overrides the path |
-| `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent; optional `video_encoder` (`auto`/`cpu`/`vaapi`/`nvenc`) and `video_codec` (`auto`/`h264`/`h265`), written by `set-encoder` / `set-codec` (0600, merge write). Non-`auto` beats `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`. `set-encoder` and `set-codec` both send `SIGUSR2` to the pid in `host.pid` (same binary). Live desktop streams restart the encoder (`EncoderTask::restart`, sequence kept, first frame IDR) without dropping the peer. Codec preference is logged and applies on the next desktop stream. `SIGUSR2` does not re-probe. Hand edits: `kill -USR2 $(cat ~/.config/uuremote/host.pid)` |
+| `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent; optional `local_unlock` (passwordless host-side fallback unlock for viewers that never send SimpleAction 15, i.e. the official Windows client; written by `set-unlock on|off`, off by default, re-read from disk on every desktop connection so no SIGUSR2 or restart is needed, and the viewer security-menu save keeps the disk value); optional `video_encoder` (`auto`/`cpu`/`vaapi`/`nvenc`) and `video_codec` (`auto`/`h264`/`h265`), written by `set-encoder` / `set-codec` (0600, merge write). Non-`auto` beats `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`. `set-encoder` and `set-codec` both send `SIGUSR2` to the pid in `host.pid` (same binary). Live desktop streams restart the encoder (`EncoderTask::restart`, sequence kept, first frame IDR) without dropping the peer. Codec preference is logged and applies on the next desktop stream. `SIGUSR2` does not re-probe. Hand edits: `kill -USR2 $(cat ~/.config/uuremote/host.pid)` |
 | `~/.config/uuremote/env.conf` | durable home for the `UU_*` knobs (`src/env_conf.rs`, loaded first in `main` before the unified/assist decision): one `KEY=VALUE` per line, `#` comments, only `UU_[A-Z0-9_]{1,}` names; a real-environment variable already set wins (unit env stays the override layer); credential keys (`UU_TOKEN`/`UU_CSRF`/`UU_USER_ID`/`UU_SIGN_KEY`/`UU_SECRET`) are refused; rejections are logged by line number and key, never by value; read once at startup (restart to apply) |
 | `UU_DESKTOP_BACKEND` | `auto` (default) / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless: no display; desktop offers ignored; tool peers get a nominal 1920x1080 screen + Allow permissions, which the port-mapping viewer requires) |
 | `UU_X11_MULTISCREEN=1`, `UU_X11_OUTPUT` | X11: advertise each RandR monitor (`xrandr --listmonitors`, read once at start; primary or `UU_X11_OUTPUT` is id 0) through the same screen-switch path as `UU_WAYLAND_MULTISCREEN` (`wayland::outputs`/`select`). x11grab reads `display+x,y` at the monitor size, XTest/uinput absolute input adds the monitor offset, the in-process engine and `desktop_mode` resize are skipped (分辨率 scales). Needs two or more monitors |
@@ -174,7 +174,7 @@ for a new QR login.
 | `src/file_trans.rs` | FileTransferFtp RPC |
 | `src/terminal.rs` | TERM frames + PTY sessions |
 | `src/privacy_screen/`, `c_engine/privacy_wallpaper.c` | host privacy screen (RPC 7): desktop-independent controller, recovery record, guard and cover processes; `Backend` per desktop (`kde/`: KWin virtual output, kscreen-doctor, KWin input devices). See docs/privacy-screen.md |
-| `src/session_lock.rs`, `c_engine/pam_check.c` | lock state reporting, auto unlock via PAM + logind |
+| `src/session_lock.rs`, `c_engine/pam_check.c` | lock state reporting, auto unlock via PAM + logind; passwordless local fallback (`local_unlock_fallback`, 4 s re-check after each desktop connection, opt-in `set-unlock`) for Windows viewers |
 | `src/system_actions.rs`, `src/system_metrics.rs` | SimpleAction system commands, mute, auto-lock, SystemMetrics |
 | `src/annotation.rs`, `c_engine/annotation_overlay.c` | viewer annotation (RPC 27 `draw_req` → RpcResponse 23): click-through X11 ARGB overlay, needs a compositing manager |
 | `src/initialization.rs`, `src/control_protocol.rs`, `src/protocol.rs` | protobuf encoders/decoders for CONTROL |
@@ -298,7 +298,7 @@ started a second full host server instead, so check that a subcommand exists in 
 - Viewer requests: `CONTROL message: fields=[..] simple_action=..` (numbers only), `Capture setting request`,
   `SimpleAction N (...) received`.
 - Features: `File transfer ...`, `Terminal frame`, `Native desktop clipboard text received: bytes=`,
-  `Desktop audio started`, `Auto unlock result`, `Auto lock after remote session`.
+  `Desktop audio started`, `Auto unlock result`, `Local unlock on connect`, `Auto lock after remote session`.
 - When the viewer "does nothing" after a menu click, first check whether any message arrived; usually the
   host did not declare the matching FeatureFlag/SystemMetrics capability.
 
