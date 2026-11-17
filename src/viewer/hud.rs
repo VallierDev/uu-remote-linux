@@ -374,6 +374,9 @@ pub fn slider_value(x: f32, a: f32, len: f32) -> u8 { (((x - a) / len).clamp(0.,
 pub fn load_prefs(st: &mut State) {
     let Ok(text) = std::fs::read_to_string(prefs_path()) else { return };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+    apply_prefs(st, &v);
+}
+pub fn apply_prefs(st: &mut State, v: &serde_json::Value) {
     if let Some(b) = v["stats"].as_bool() { st.stats = b; }
     if let Some(b) = v["hide_tab_fullscreen"].as_bool() { st.hide_tab = b; }
     if let Some(b) = v["one_to_one"].as_bool() { st.one_to_one = b; }
@@ -384,12 +387,14 @@ pub fn load_prefs(st: &mut State) {
     if let Some(c) = v["chroma"].as_u64().filter(|c| [1, 3].contains(c)) { st.chroma = c as u32; }
     if let Some(b) = v["grab_keys"].as_bool() { st.grab_keys = b; }
 }
+pub fn prefs_json(st: &State) -> serde_json::Value {
+    serde_json::json!({"stats": st.stats, "hide_tab_fullscreen": st.hide_tab, "one_to_one": st.one_to_one, "volume": st.volume,
+        "quality": st.quality, "fps": st.fps, "chroma": st.chroma, "grab_keys": st.grab_keys, "follow_natural_scroll": st.follow_natural_scroll})
+}
 pub fn save_prefs(st: &State) {
     let path = prefs_path();
     if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
-    let v = serde_json::json!({"stats": st.stats, "hide_tab_fullscreen": st.hide_tab, "one_to_one": st.one_to_one, "volume": st.volume,
-        "quality": st.quality, "fps": st.fps, "chroma": st.chroma, "grab_keys": st.grab_keys, "follow_natural_scroll": st.follow_natural_scroll});
-    let _ = std::fs::write(path, v.to_string());
+    let _ = std::fs::write(path, prefs_json(st).to_string());
 }
 fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_else(|| "viewer.json".into(), |d| d.join("viewer.json")) }
 
@@ -465,9 +470,11 @@ fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_el
     #[test] fn grab_keys_persists_in_prefs(){
         let mut st=State::default();
         assert!(!st.grab_keys);
-        let sample=serde_json::json!({"grab_keys":true});
-        if let Some(b)=sample["grab_keys"].as_bool(){st.grab_keys=b;}
-        assert!(st.grab_keys);
+        st.grab_keys=true;
+        let v=prefs_json(&st);
+        let mut loaded=State::default();
+        apply_prefs(&mut loaded,&v);
+        assert!(loaded.grab_keys);
     }
     /// `UU_HUD_PREVIEW=dir cargo test render_preview -- --ignored` writes the chrome as PNGs (visual check).
     #[test] #[ignore] fn render_preview(){

@@ -1024,7 +1024,29 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         let (_,out)=translate([focus(WindowEvent::FocusGained),key,Event::Quit{timestamp:0}],&mut input,v,&mut focused);
         assert_eq!(out.len(),2);assert_eq!(out[0]["action"],"kbd_press");assert_eq!(out[1]["action"],"kbd_release");
     }
+    // macOS: SDL video must start on the main thread, which the test harness does not use; CI runs it on Linux.
+    #[cfg_attr(target_os="macos",ignore)]
     #[test] fn grab_keys_shortcut_toggles_state(){
+        if std::env::var_os("UU_VIEWER_GRAB_KEYS_TEST_CHILD").is_none(){
+            let dir=std::env::temp_dir().join(format!("uu-grab-keys-test-{}",std::process::id()));
+            let _=std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let cfg=dir.join("config.json");
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","viewer::sdl::tests::grab_keys_shortcut_toggles_state","--test-threads=1"])
+                .env("SDL_VIDEODRIVER","dummy")
+                .env("UU_CONFIG",&cfg)
+                .env("UU_VIEWER_GRAB_KEYS_TEST_CHILD","1")
+                .output().unwrap();
+            let _=std::fs::remove_dir_all(&dir);
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return
+        }
+        let custom_dir=if std::env::var_os("UU_CONFIG").is_none(){
+            let dir=std::env::temp_dir().join(format!("uu-grab-keys-child-{}",std::process::id()));
+            let _=std::fs::create_dir_all(&dir);
+            std::env::set_var("UU_CONFIG",dir.join("config.json"));
+            Some(dir)
+        }else{None};
         use sdl2::keyboard::{Scancode as S,Mod as M};
         let mut window=Window::new().unwrap();
         assert!(!window.state().grab_keys);
@@ -1032,8 +1054,17 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         let (consumed,changed)=window.chrome_event(&key);
         assert!(consumed && changed);
         assert!(window.state().grab_keys);
+        let mut reloaded=hud::State::default();
+        hud::load_prefs(&mut reloaded);
+        assert!(reloaded.grab_keys);
         let (consumed,changed)=window.chrome_event(&key);
         assert!(consumed && changed);
         assert!(!window.state().grab_keys);
+        hud::load_prefs(&mut reloaded);
+        assert!(!reloaded.grab_keys);
+        if let Some(dir)=custom_dir{
+            let _=std::fs::remove_dir_all(&dir);
+            std::env::remove_var("UU_CONFIG");
+        }
     }
 }
