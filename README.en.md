@@ -624,6 +624,9 @@ terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsd
 
 Key combinations use the left/right modifier state attached to each SDL key event. Focus loss releases remote keys; after focus returns, the next non-modifier key restores any still-held Shift/Ctrl/Alt/Win (Command on Mac). This is built in, with no adapter or setting required.
 
+If touchpad natural scrolling feels reversed remotely, enable **Control center → Peripherals → Follow local natural scrolling** in the remote window.
+Normal mouse wheel direction stays unchanged; the option takes effect immediately for both axes and precise natural scrolling. The `follow_natural_scroll` preference is saved in `~/.config/uuremote/viewer.json` (default `false`) and restored on the next connection.
+
 The viewer mirrors remote PNG pointer shapes (including text and window-resize cursors) with their hotspots. Leaving the remote picture or opening local controls restores the local arrow.
 
 SDL clipboard access reuses the desktop window to avoid temporary-window Dock churn on GNOME Wayland (#37).

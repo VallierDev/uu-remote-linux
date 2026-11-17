@@ -58,13 +58,14 @@ impl Viewport {
     }
 }
 #[derive(Default)]
-pub struct Input { view_only:bool, mac:bool, keys:BTreeMap<i32,i32>, buttons:BTreeSet<i32> }
+pub struct Input { view_only:bool, mac:bool, follow_natural_scroll:bool, keys:BTreeMap<i32,i32>, buttons:BTreeSet<i32> }
 pub fn view_only(argument:Option<&str>,environment:Option<&str>)->Result<bool,String> {
     match argument {None=>Ok(environment==Some("1")),Some("--view-only")=>Ok(true),_=>Err("Expected --view-only".into())}
 }
 impl Input {
     pub fn new(view_only:bool)->Self {Self{view_only,..Default::default()}}
     pub fn set_mac(&mut self,mac:bool){self.mac=mac;}
+    pub fn set_follow_natural_scroll(&mut self,follow:bool){self.follow_natural_scroll=follow;}
     pub fn enabled(&self)->bool {!self.view_only}
     pub fn set_view_only(&mut self,view_only:bool){self.view_only=view_only;}
     pub fn key(&mut self,scan:i32,down:bool)->Option<Value> {
@@ -87,9 +88,12 @@ impl Input {
     }
     /// SDL wheel units are notches; the wire uses the Mac convention (one notch = 120).
     /// Positive y is wheel-up, matching the host's `mouse_scroll` (button 4).
-    pub fn scroll(&mut self,x:f64,y:f64)->Option<Value> {
+    /// SDL marks OS-natural deltas as flipped. Preserve them only when explicitly requested;
+    /// normal wheel events keep their direction under either policy.
+    pub fn scroll(&mut self,x:f64,y:f64,flipped:bool)->Option<Value> {
         if self.view_only {return None}
-        let(dx,dy)=((x*120.).round() as i32,(y*120.).round() as i32);
+        let scale=if flipped&&!self.follow_natural_scroll {-120.}else{120.};
+        let(dx,dy)=((x*scale).round() as i32,(y*scale).round() as i32);
         if dx==0&&dy==0 {return None}
         Some(json!({"action":"mouse_scroll","delta_x":dx,"delta_y":dy}))
     }
@@ -137,12 +141,27 @@ impl Input {
     }
     #[test] fn wheel_notches_use_mac_wire_units(){
         let mut i=Input::default();
-        assert_eq!(i.scroll(0.,1.).unwrap(),json!({"action":"mouse_scroll","delta_x":0,"delta_y":120}));
-        assert_eq!(i.scroll(0.,-1.).unwrap()["delta_y"],-120);
-        assert_eq!(i.scroll(1.,-2.).unwrap(),json!({"action":"mouse_scroll","delta_x":120,"delta_y":-240}));
-        assert_eq!(i.scroll(0.,0.1).unwrap()["delta_y"],12); // precise trackpad deltas
-        assert!(i.scroll(0.,0.).is_none());
-        assert!(Input::new(true).scroll(0.,1.).is_none());
+        assert_eq!(i.scroll(0.,1.,false).unwrap(),json!({"action":"mouse_scroll","delta_x":0,"delta_y":120}));
+        assert_eq!(i.scroll(0.,-1.,false).unwrap()["delta_y"],-120);
+        assert_eq!(i.scroll(1.,-2.,false).unwrap(),json!({"action":"mouse_scroll","delta_x":120,"delta_y":-240}));
+        assert_eq!(i.scroll(0.,0.1,false).unwrap()["delta_y"],12); // precise trackpad deltas
+        assert!(i.scroll(0.,0.,false).is_none());
+        assert!(Input::new(true).scroll(0.,1.,false).is_none());
+    }
+    #[test] fn following_natural_scroll_preserves_normal_wheel_keys_and_buttons(){
+        let mut input=Input::default();input.key(4,true);input.button(1,true);
+        let mouse=input.scroll(1.,-2.,false).unwrap();
+        assert_eq!(input.scroll(1.,-2.,true).unwrap(),json!({"action":"mouse_scroll","delta_x":-120,"delta_y":240}));
+        input.set_follow_natural_scroll(true);
+        assert_eq!(input.scroll(1.,-2.,false).unwrap(),mouse);
+        assert_eq!(input.scroll(1.,-2.,true).unwrap(),mouse);
+        assert_eq!(input.scroll(-0.25,0.5,true).unwrap()["delta_x"],-30);
+        assert_eq!(input.scroll(-0.25,0.5,true).unwrap()["delta_y"],60);
+        assert!(input.scroll(0.,0.,true).is_none());
+        input.set_follow_natural_scroll(false);
+        assert_eq!(input.scroll(0.,1.,true).unwrap()["delta_y"],-120);
+        assert_eq!(input.release_all(),vec![json!({"action":"kbd_release","key":65}),json!({"action":"mouse_release","button":1})]);
+        input.set_view_only(true);input.set_follow_natural_scroll(true);assert!(input.scroll(1.,1.,true).is_none());
     }
     #[test] fn mappings_encoding_and_focus() {
         for (scan,vk) in [(4,65),(29,90),(39,48),(58,112),(80,37),(224,162),(230,165),(52,222)] {assert_eq!(windows_vk(scan),Some(vk));}
