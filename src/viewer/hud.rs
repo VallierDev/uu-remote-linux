@@ -137,18 +137,18 @@ pub fn stats_layer(font: Option<&FontVec>, lines: &[String], scale: f32) -> Laye
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Command {
     Quality(u64), Fps(u32), Chroma(u32), FollowRemote(bool), OneToOne(bool), Volume(u8),
-    AutoLock(bool), HostMute(bool), GrabKeys(bool), Files, Watch(bool), Stats(bool), HideTab(bool), Fullscreen, Disconnect,
+    AutoLock(bool), HostMute(bool), GrabKeys(bool), FollowNaturalScroll(bool), Files, Watch(bool), Stats(bool), HideTab(bool), Fullscreen, Disconnect,
 }
 /// What the menu shows as selected. The host does not report remote settings back; quality, frame
 /// rate and color are saved and sent again when the next session's CONTROL is ready.
 #[derive(Clone, PartialEq)]
 pub struct State {
     pub quality: u64, pub fps: u32, pub chroma: u32, pub follow_remote: bool, pub one_to_one: bool, pub volume: u8,
-    pub auto_lock: bool, pub host_mute: bool, pub grab_keys: bool, pub watch: bool, pub stats: bool, pub hide_tab: bool, pub fullscreen: bool,
+    pub auto_lock: bool, pub host_mute: bool, pub grab_keys: bool, pub follow_natural_scroll: bool, pub watch: bool, pub stats: bool, pub hide_tab: bool, pub fullscreen: bool,
 }
 impl Default for State {
     fn default() -> Self { Self { quality: 5, fps: 60, chroma: 1, follow_remote: true, one_to_one: false, volume: 100, auto_lock: false,
-        host_mute: false, grab_keys: false, watch: false, stats: false, hide_tab: false, fullscreen: false } }
+        host_mute: false, grab_keys: false, follow_natural_scroll: false, watch: false, stats: false, hide_tab: false, fullscreen: false } }
 }
 
 enum Opt { Header(&'static str), Radio(&'static str, bool, Command), Check(&'static str, bool, Command), Action(&'static str, Command, &'static str), Slider }
@@ -171,7 +171,8 @@ fn options(cat: usize, st: &State) -> Vec<Opt> {
         3 => vec![Slider],
         4 => vec![Check(s("远程结束后，被控端自动锁屏", "Lock the remote when the session ends"), st.auto_lock, Command::AutoLock(!st.auto_lock)),
                   Check(s("被控端静音运行", "Mute the remote while connected"), st.host_mute, Command::HostMute(!st.host_mute))],
-        5 => vec![Header(s("键盘", "Keyboard")), Check(s("发送系统快捷键到被控端", "Send system shortcuts (Alt+Tab)"), st.grab_keys, Command::GrabKeys(!st.grab_keys))],
+        5 => vec![Header(s("键盘", "Keyboard")), Check(s("发送系统快捷键到被控端", "Send system shortcuts (Alt+Tab)"), st.grab_keys, Command::GrabKeys(!st.grab_keys)),
+                  Header(s("鼠标与触摸板", "Mouse and touchpad")), Check(s("跟随本机自然滚动", "Follow local natural scrolling"), st.follow_natural_scroll, Command::FollowNaturalScroll(!st.follow_natural_scroll))],
         6 => vec![Action(s("文件传输", "File transfer"), Command::Files, "Ctrl+Alt+F"), Check(s("观看模式", "Watch mode"), st.watch, Command::Watch(!st.watch))],
         7 => vec![Check(s("显示网络状态", "Show network status"), st.stats, Command::Stats(!st.stats)),
                   Check(s("全屏状态隐藏控制按钮", "Hide the control tab in full screen"), st.hide_tab, Command::HideTab(!st.hide_tab))],
@@ -329,6 +330,7 @@ pub fn load_prefs(st: &mut State) {
     if let Some(b) = v["stats"].as_bool() { st.stats = b; }
     if let Some(b) = v["hide_tab_fullscreen"].as_bool() { st.hide_tab = b; }
     if let Some(b) = v["one_to_one"].as_bool() { st.one_to_one = b; }
+    if let Some(b) = v["follow_natural_scroll"].as_bool() { st.follow_natural_scroll = b; }
     if let Some(n) = v["volume"].as_u64() { st.volume = n.min(100) as u8; }
     if let Some(q) = v["quality"].as_u64().filter(|q| (2..=5).contains(q)) { st.quality = q; }
     if let Some(f) = v["fps"].as_u64().filter(|f| [30, 60, 90, 144].contains(f)) { st.fps = f as u32; }
@@ -338,13 +340,35 @@ pub fn save_prefs(st: &State) {
     let path = prefs_path();
     if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
     let v = serde_json::json!({"stats": st.stats, "hide_tab_fullscreen": st.hide_tab, "one_to_one": st.one_to_one, "volume": st.volume,
-        "quality": st.quality, "fps": st.fps, "chroma": st.chroma});
+        "quality": st.quality, "fps": st.fps, "chroma": st.chroma, "follow_natural_scroll": st.follow_natural_scroll});
     let _ = std::fs::write(path, v.to_string());
 }
 fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_else(|| "viewer.json".into(), |d| d.join("viewer.json")) }
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn natural_scroll_preference_survives_reconnect_and_quality_changes(){
+        const CHILD:&str="UU_VIEWER_SCROLL_PREFS_TEST";
+        if std::env::var_os(CHILD).is_none(){
+            let dir=std::env::temp_dir().join(format!("uu-viewer-scroll-{}-{}",std::process::id(),rand::random::<u64>()));
+            std::fs::create_dir(&dir).unwrap();
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","viewer::hud::tests::natural_scroll_preference_survives_reconnect_and_quality_changes"])
+                .env(CHILD,"1").env("UU_CONFIG",dir.join("config.json")).output().unwrap();
+            std::fs::remove_dir_all(dir).unwrap();
+            assert!(result.status.success(),"{}{}",String::from_utf8_lossy(&result.stdout),String::from_utf8_lossy(&result.stderr));return
+        }
+        std::fs::write(prefs_path(),r#"{"quality":4,"volume":65}"#).unwrap();
+        let mut state=State::default();load_prefs(&mut state);
+        assert!(!state.follow_natural_scroll);assert_eq!((state.quality,state.volume),(4,65));
+        state.follow_natural_scroll=true;save_prefs(&state);
+        let mut next=State::default();load_prefs(&mut next);
+        assert!(next.follow_natural_scroll);assert_eq!((next.quality,next.volume),(4,65));
+        next.fps=30;save_prefs(&next);
+        let mut next=State::default();load_prefs(&mut next);assert!(next.follow_natural_scroll);assert_eq!(next.fps,30);
+        next.follow_natural_scroll=false;save_prefs(&next);
+        load_prefs(&mut state);assert!(!state.follow_natural_scroll);
+    }
     #[test] fn layers_blend_inside_bounds_only(){
         let mut l=Layer::new(8,8);l.round_rect(-4.,-4.,20.,20.,3.,[255,0,0,255]);l.circle(100.,100.,5.,[0,0,0,255]);
         assert!(l.px.chunks_exact(4).all(|p|p==[255,0,0,255]));
@@ -366,7 +390,7 @@ fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_el
             crate::viewer::type_ipc::write_png_rgb(&dir.join(name),l.w,l.h,&rgb,false).unwrap();
         };
         let st=State{stats:true,..State::default()};
-        for cat in [1usize,3,4] {let (l,_)=menu_layer(font,&st,&Menu{open:true,category:cat,hover:Some(Hit::Option(cat,1)),dragging:false},1.);save(&format!("menu{cat}.png"),&l,[200,200,210]);}
+        for cat in [1usize,3,4,5] {let (l,_)=menu_layer(font,&st,&Menu{open:true,category:cat,hover:Some(Hit::Option(cat,1)),dragging:false},1.);save(&format!("menu{cat}.png"),&l,[200,200,210]);}
         save("tab.png",&tab_layer(font,1.,false),[230,230,230]);
         let n=NetStats{elapsed:57,route:"UDP · relay".into(),fps:60,kbps:8420.,rtt_ms:Some(36),loss:0.,size:(1920,1080),codec:"H.265",chroma:1};
         save("stats.png",&stats_layer(font,&stats_lines(&n),1.),[230,230,230]);

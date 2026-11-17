@@ -158,6 +158,7 @@ impl Window {
             hud::Command::Stats(b)=>{st.stats=b;hud::save_prefs(st)},
             hud::Command::HideTab(b)=>{st.hide_tab=b;hud::save_prefs(st)},
             hud::Command::GrabKeys(b)=>{st.grab_keys=b;self.canvas.window_mut().set_keyboard_grab(b)},
+            hud::Command::FollowNaturalScroll(b)=>{st.follow_natural_scroll=b;hud::save_prefs(st)},
             hud::Command::Fullscreen=>{
                 st.fullscreen^=true;let mode=if st.fullscreen{sdl2::video::FullscreenType::Desktop}else{sdl2::video::FullscreenType::Off};
                 let _=self.canvas.window_mut().set_fullscreen(mode);
@@ -366,8 +367,7 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
                 Event::MouseButtonUp{mouse_btn,..}=>button(mouse_btn).and_then(|b|input.button(b,false)),
                 Event::MouseWheel{x,y,precise_x,precise_y,direction,..}=>{
                     let(dx,dy)=if precise_x!=0.||precise_y!=0.{(f64::from(precise_x),f64::from(precise_y))}else{(f64::from(x),f64::from(y))};
-                    let(dx,dy)=match direction{sdl2::mouse::MouseWheelDirection::Flipped=>(-dx,-dy),_=>(dx,dy)};
-                    input.scroll(dx,dy)
+                    input.scroll(dx,dy,direction==sdl2::mouse::MouseWheelDirection::Flipped)
                 },
                 _=>None,
             };if let Some(m)=message{
@@ -436,7 +436,8 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let mut type_job:Option<TypeJob>=None;
     let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
     let mut audio=super::audio::Playback::new(&window._sdl,session.peer.audio.clone());
-    let mut input=Input::new(view_only);input.set_mac(window.mac);let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
+    let mut input=Input::new(view_only);input.set_mac(window.mac);input.set_follow_natural_scroll(window.state().follow_natural_scroll);
+    let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
     let mut heartbeat=tokio::time::interval(std::time::Duration::from_secs(1));
     let deadline=tokio::time::sleep(std::time::Duration::from_secs(30));tokio::pin!(deadline);
     window.set_stage(crate::i18n::s("正在传输画面…","Waiting for the remote picture…"));
@@ -523,6 +524,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                         hud::Command::HostMute(false)=>Some(super::wire::simple_action(seq,16,None)),
                         hud::Command::Volume(v)=>{if let Some(playback)=audio.as_mut(){playback.volume=v;}None},
                         hud::Command::Watch(on)=>{messages.extend(input.release_all());input.set_view_only(on||view_only);None},
+                        hud::Command::FollowNaturalScroll(on)=>{input.set_follow_natural_scroll(on);None},
                         hud::Command::Disconnect=>return Ok(()),
                         _=>None,
                     };
@@ -919,6 +921,13 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         let precise=Event::MouseWheel{timestamp:0,window_id:1,which:0,mouse_x:0,mouse_y:0,x:0,y:0,precise_x:0.,precise_y:-0.25,direction:MouseWheelDirection::Normal};
         let(_,out)=translate([precise],&mut input,v,&mut focused);
         assert_eq!(out[0]["delta_y"],-30);
+        input.set_follow_natural_scroll(true);
+        let(_,out)=translate([wheel(MouseWheelDirection::Normal,1,2),wheel(MouseWheelDirection::Flipped,1,2)],&mut input,v,&mut focused);
+        assert_eq!((out[0]["delta_x"].as_i64(),out[0]["delta_y"].as_i64()),(Some(120),Some(240)));
+        assert_eq!((out[1]["delta_x"].as_i64(),out[1]["delta_y"].as_i64()),(Some(120),Some(240)));
+        let precise=Event::MouseWheel{timestamp:0,window_id:1,which:0,mouse_x:0,mouse_y:0,x:0,y:0,precise_x:0.5,precise_y:-0.25,direction:MouseWheelDirection::Flipped};
+        let(_,out)=translate([precise],&mut input,v,&mut focused);
+        assert_eq!((out[0]["delta_x"].as_i64(),out[0]["delta_y"].as_i64()),(Some(60),Some(-30)));
         let mut watch=Input::new(true);let mut watching=true;
         let(_,out)=translate([wheel(MouseWheelDirection::Normal,0,1)],&mut watch,v,&mut watching);
         assert!(out.is_empty());
