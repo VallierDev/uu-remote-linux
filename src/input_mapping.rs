@@ -158,9 +158,13 @@ mod pointer_tests {
     }
 }
 
-/// Official Mac sends mouse button bitmasks, not X11 button ordinals.
+/// Official clients send Windows mouse-key bitmasks, not X11 button ordinals: MK_LBUTTON 1,
+/// MK_RBUTTON 2, MK_MBUTTON 16, MK_XBUTTON1 32, MK_XBUTTON2 64. An official client's middle
+/// button arrives as 16 (it used to log "Unsupported desktop wire mouse button: 16" and be
+/// dropped); 32 and 64 follow the same mask but have not been observed yet. 4 is what older
+/// builds of this project's own viewer sent for the middle button, kept for compatibility.
 pub fn mouse_button_to_x11(button: i32) -> Option<i32> {
-    match button { 1 => Some(1), 2 => Some(3), 4 => Some(2), _ => None }
+    match button { 1 => Some(1), 2 => Some(3), 4 | 16 => Some(2), 32 => Some(8), 64 => Some(9), _ => None }
 }
 #[cfg(test)]
 mod button_tests {
@@ -168,7 +172,10 @@ mod button_tests {
     fn maps_verified_button_bitmasks() {
         assert_eq!(super::mouse_button_to_x11(1),Some(1));
         assert_eq!(super::mouse_button_to_x11(2),Some(3));
+        assert_eq!(super::mouse_button_to_x11(16),Some(2));
         assert_eq!(super::mouse_button_to_x11(4),Some(2));
+        assert_eq!(super::mouse_button_to_x11(32),Some(8));
+        assert_eq!(super::mouse_button_to_x11(64),Some(9));
         assert_eq!(super::mouse_button_to_x11(3),None);
     }
 }
