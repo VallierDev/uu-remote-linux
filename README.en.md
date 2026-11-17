@@ -126,7 +126,11 @@ GNOME Portal CONTROL no longer waits for a consent dialog or the first video fra
 
 The host also accepts a desktop connection while GNOME is locked with no Portal session yet (a cold connection): it reports lock state and accepts auto unlock, then restores picture, input and clipboard after unlock. While Portal is pending, the host sends generated black video once per second on the negotiated track by default, allowing the official iPhone viewer to enter its auto-unlock flow without extra configuration. Verified on Ubuntu GNOME Wayland with the official Mac viewer; iPhone 4.42.0 with H.265 completed a same-executable control experiment: black video ON succeeded, OFF failed, and ON succeeded again ([#29](../../issues/29)). **Limitation**: this is synthetic black video, not the GNOME lock screen, and it does not enable native mouse/keyboard input while locked. Enable 「自动解锁被控端」 in the UU client under 控制中心 → 安全 and enter the password. Without saved Portal permission, local consent is still required after unlock before the real desktop can appear.
 
-Existing screen-off and lock settings remain unchanged. Only capture recovery in an unlocked session temporarily holds a GNOME idle inhibitor; the first frame, lock, disconnect or initialization failure releases it. An idle viewer still allows the normal screen-off and lock timeout, and manual lock remains effective. Desktop input is blocked and real video is hidden while locked or when lock state is unknown. Independent terminal, file-transfer and port-mapping peers do not wait for video initialization and survive desktop reconnection. Automated protocol and lifecycle regression tests cover this path; auto unlock and capture recovery after a cold locked connection are verified on GNOME hardware with the official Mac and iPhone 4.42.0 viewers, while screen-off and the other scenarios still need acceptance testing. Waking a fully suspended or hibernating machine is outside this CONTROL path.
+On KDE Plasma (KWin), the Portal screencast stays alive after the session locks. The host now opens capture while locked by default, so a cold connection shows the real lock screen and the password can be entered with the remote keyboard instead of receiving black video ([#227](../../issues/227), [#229](../../pull/229)). Set `UU_LOCKED_CAPTURE=0` to disable this and return to the black-video and auto-unlock path. Detection requires `XDG_CURRENT_DESKTOP` or `XDG_SESSION_DESKTOP` in the systemd user environment. Without either the host falls back to black video, and `UU_LOCKED_CAPTURE=1` forces the new behavior. Portal pointer input remains blocked while locked, and the keyboard uses uinput and can enter the password. This does not apply to GNOME: Mutter closes the Portal session on lock, so the black-video and auto-unlock behavior above is unchanged.
+
+Existing screen-off and lock settings remain unchanged. Only capture recovery in an unlocked session temporarily holds a GNOME idle inhibitor; the first frame, lock, disconnect or initialization failure releases it. An idle viewer still allows the normal screen-off and lock timeout, and manual lock remains effective. Portal input is blocked while locked. KDE keeps sending the real lock screen, while GNOME hides real video and uses black video. Independent terminal, file-transfer and port-mapping peers do not wait for video initialization and survive desktop reconnection. Automated protocol and lifecycle regression tests cover this path; auto unlock and capture recovery after a cold locked connection are verified on GNOME hardware with the official Mac and iPhone 4.42.0 viewers, while screen-off and the other scenarios still need acceptance testing. Waking a fully suspended or hibernating machine is outside this CONTROL path.
+
+Lock monitoring reads logind `LockedHint` over the system D-Bus and subscribes to changes instead of spawning `loginctl` every second. Without a graphical session it stays subscribed with unknown state, so login signals trigger a fresh read. It reconciles the session over D-Bus every 30 seconds; if D-Bus fails, it retries with a bounded `loginctl` fallback every 30 seconds, resolving the executable path once. Notifications may be delayed during fallback; unreadable state remains unknown. The locker must still report its state to logind. Suspend, locking and remote connection policies are unchanged.
 
 Locked black video requires FFmpeg's libx264/libx265 encoder for the negotiated H.264/H.265 codec; hardware encoding support alone does not satisfy this dependency. Encoder failures are logged explicitly. Synthetic video does not change capture permissions or advertised monitor dimensions. It pauses on unlock or unknown lock state, ends when capture is ready/rejected or the connection closes, and then hands the same video track to real capture. See [#29](../../issues/29) and [#34](../../pull/34) for the controlled experiment and validation scope.
 
@@ -160,8 +164,8 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
-| Privacy screen on the host | Experimental, KDE Plasma Wayland (portal) only; off, picture and screen-off status labels verified with Mac 4.43.0; `UU_PRIVACY_AUTO=picture` / `screen-off` enables it automatically on desktop connect; see [docs/privacy-screen.md](docs/privacy-screen.md) |
-| Microphone (viewer audio played on the host) | Not implemented (needs a virtual sound card) |
+| Privacy screen on the host | Experimental: KDE Plasma Wayland (portal) supports picture and screen-off, and Mac 4.43.0 was verified for the off, picture and screen-off labels; `UU_PRIVACY_AUTO=picture` / `screen-off` enables it automatically on desktop connect. GNOME Wayland (portal) supports Mutter screen-off only and turns the display off again after local or remote input wakes it; full remote-control behavior is unverified; see [docs/privacy-screen.md](docs/privacy-screen.md) |
+| Microphone (viewer audio played on the host) | Experimental: Opus to a virtual input with `UU_MICROPHONE=1`; supports PulseAudio / PipeWire-pulse, see [notes](docs/remote-microphone.md) |
 | Plugins such as the WoW queue notifier | Not supported; the client is told that no plugins exist |
 | Linux login screen | The system login screen (before anyone logs in to the Linux desktop) cannot be controlled yet; use headless mode or a virtual desktop (see below). This is about the Linux login: **without a UU account** the host can now be used through remote assistance |
 | Relay connections on restrictive networks | Uses the ICE servers provided by the UU cloud; complex network setups are not thoroughly tested |
@@ -227,6 +231,7 @@ sudo apt install libpulse-dev libopus-dev
 - `libgtk-3-dev` is optional. Without GTK, login works with a QR code in the terminal (`UU_NO_GTK=1` disables
   the login window explicitly).
 - On NVIDIA GPUs use an FFmpeg build with `h264_nvenc`; otherwise the CPU encoder (libx264) is used.
+- The NVENC API version FFmpeg requires comes from the nv-codec-headers it was built against. For example, Arch's FFmpeg 9 is built against nv-codec-headers 13.1 and needs driver 610 or newer; Pascal (GTX 10 series) tops out at driver 580 with NVENC API 13.0, so the log shows `Driver does not support the required nvenc API version` and encoding falls back to the CPU. Build a separate FFmpeg against nv-codec-headers 13.0 into its own prefix and point `ffmpeg_root` in `config.json` at it (#230).
 
 ### 2. Build
 
@@ -387,6 +392,8 @@ Common environment variables:
 | Variable | Purpose |
 |---|---|
 | `UU_CONFIG` | Config file path (default `~/.config/uuremote/config.json`) |
+| `UU_CLIENT_VERSION` | Reported host client version (`x-param-vn` and User-Agent), default `4.45.0.4318`; corresponds to `client_version` in config file, environment variable takes precedence |
+| `UU_VERSION_CODE` | Reported host version code (`x-param-vc`), default `4318`; corresponds to `version_code` in config file, environment variable takes precedence |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
 | `UU_DESKTOP_RESIZE=0` | on X11, keep the desktop resolution and only scale the encoded stream when the viewer picks a resolution |
 | `UU_NVENC_RGB=0` / `=1` | NVENC encodes BGRA directly (saves CPU). Off by default when a monitor is connected to the NVIDIA card (slower when the desktop is composited on the same GPU); `0` forces off, `1` forces on |
@@ -407,7 +414,7 @@ Common environment variables:
 | `UU_ASSIST_ALLOW=1` | Allow remote assistance at start (overrides the saved switch) |
 | `UU_LOGIN_WINDOW=0` | Do not open the login window automatically when credentials are missing |
 | `UU_PORT_MAPPING=0` | Disable port mapping (the official host's controlled-side switch) |
-| `UU_WOL_HELPER=1` | Experimental: act as a remote-boot helper like the official Windows host — report this host's LAN info after sign-in and send a magic packet to the LAN when the cloud asks to wake a PC (not verified end to end) |
+| `UU_WOL_HELPER=1` | Experimental: act as a remote-boot helper like the official Windows host — report this host's LAN info after sign-in and send a magic packet to the LAN when the cloud asks to wake a PC (verified end to end with a headless Linux host on a NAS and the official iOS controller) |
 | `UU_USE_PROXY=1` | Share environment HTTP/HTTPS proxy policy between REST and host/viewer WebSocket signaling; proxies are ignored by default |
 
 
@@ -440,7 +447,7 @@ until #33.
 
 Custom bitrate follows the Mbps value selected in the client; for example, 1 Mbps sets an encoder cap of 1000 kbit/s.
 
-With external FFmpeg CPU encoding, the bitrate presets (Original / Ultra / HD / custom) use average bitrate (ABR) to avoid gray keyframes at 4K and low bitrates; Auto keeps constant rate factor (CRF).
+FFmpeg and in-process libx264 CPU H.264 encoding use the same average bitrate (ABR) policy: target 3/4 of the effective cap, with a VBV buffer equal to the cap clamped to 500–8000 kbit. Auto and unlimited custom quality start with an 8 Mbit/s ceiling; other modes use the viewer’s selection. The congestion governor can lower this cap and applies changes by restarting the encoder.
 
 ## Let an AI agent install or develop it
 

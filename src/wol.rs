@@ -83,10 +83,18 @@ pub fn lan_info() -> Option<(String, String, String)> {
 #[cfg(not(target_os = "linux"))]
 pub fn lan_info() -> Option<(String, String, String)> { None }
 
+/// Body of the helper registration request (same address as `inner_ip` and `ip`: this host has one LAN address).
+fn report_body(mac: &str, ip: &str, subnet_mask: &str) -> serde_json::Value {
+    serde_json::json!({ "mac": mac, "inner_ip": ip, "ip": ip, "subnet_mask": subnet_mask })
+}
+
 /// Report this host's LAN identity like the official host after sign-in.
+/// The server rejects the report (HTTP 422, code 1001) unless `inner_ip` is present; the official macOS
+/// client sends `inner_ip`, `ip`, `mac` and `subnet_mask`. Verified live: with `inner_ip` the helper is
+/// accepted (HTTP 200) and the cloud forwards `wake_on_lan` pushes to this host.
 pub async fn report(auth: &crate::auth::UUAuthClient) {
     let Some((mac, ip, subnet_mask)) = lan_info() else { log::warn!("WOL helper: no IPv4 default-route interface"); return; };
-    let body = serde_json::json!({ "mac": mac, "ip": ip, "subnet_mask": subnet_mask });
+    let body = report_body(&mac, &ip, &subnet_mask);
     match auth.post_json_url("https://api-ipv4.nrd.nie.163.com", "/api/v1/device/wake_on_lan/info", &body).await {
         Ok((status, value)) => log::info!("WOL helper: LAN info reported: status={status} code={:?} turn_on_wol={:?}",
             value.get("code").and_then(serde_json::Value::as_i64),
@@ -108,6 +116,15 @@ mod tests {
         assert_eq!(&packet[..6], &[0xff; 6]);
         assert_eq!(&packet[96..], &[1, 2, 3, 4, 5, 6]);
     }
+    #[test]
+    fn report_body_has_inner_ip() {
+        let body = report_body("aa:bb:cc:dd:ee:01", "192.168.2.29", "255.255.255.0");
+        assert_eq!(body["inner_ip"], "192.168.2.29");
+        assert_eq!(body["ip"], "192.168.2.29");
+        assert_eq!(body["mac"], "aa:bb:cc:dd:ee:01");
+        assert_eq!(body["subnet_mask"], "255.255.255.0");
+    }
+
     #[test]
     fn directed_broadcast() {
         assert_eq!(subnet_broadcast("192.168.2.29", "255.255.255.0"), Some(Ipv4Addr::new(192, 168, 2, 255)));

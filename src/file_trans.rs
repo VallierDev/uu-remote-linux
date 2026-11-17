@@ -568,6 +568,13 @@ impl FileSession {
     fn send_request(self: &Arc<Self>, rid: u64, f: &[WireField]) {
         let id = TaskId::parse(f);
         let raw = get_text(f, 2);
+        // Newer viewers (Windows 4.44.1, #208) send only the task id here; an empty path must not
+        // become "/" and walk the whole filesystem into a misleading permission error.
+        if raw.trim().is_empty() {
+            log::info!("File transfer send_request without path: task={} fields={:?}", id.task, f.iter().map(|x| x.number).collect::<Vec<_>>());
+            self.respond(rid, 2, Enc::default().msg(1, id.enc()).uint(2, FT_PROTOCOL));
+            return;
+        }
         let path = normalize(&raw);
         let collected = collect_download(&path).map_err(|e| io_error(&e));
         let mut body = Enc::default().msg(1, id.enc());

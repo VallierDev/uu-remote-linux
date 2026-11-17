@@ -48,3 +48,22 @@ pub fn ffmpeg_root() -> Option<PathBuf> {
     std::env::var_os("UU_FFMPEG_ROOT").filter(|v| !v.is_empty()).map(PathBuf::from)
         .or_else(|| file().ok().flatten().and_then(|f| f.get("ffmpeg_root")).and_then(|v| v.as_str()).map(PathBuf::from))
 }
+
+/// Reported client version (x-param-vn and User-Agent).
+/// Defaults to matching modern official Windows client (4.45.0.4318).
+/// Can be overridden via UU_CLIENT_VERSION or config "client_version".
+pub fn client_version() -> String {
+    std::env::var("UU_CLIENT_VERSION").ok().filter(|v| !v.is_empty())
+        .or_else(|| file().ok().flatten().and_then(|f| f.get("client_version")).and_then(|v| v.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "4.45.0.4318".into())
+}
+
+/// Reported client version code (x-param-vc).
+/// Defaults to matching modern official Windows client (4318).
+/// Can be overridden via UU_VERSION_CODE or config "version_code".
+pub fn version_code() -> String {
+    std::env::var("UU_VERSION_CODE").ok().filter(|v| !v.is_empty())
+        .or_else(|| file().ok().flatten().and_then(|f| f.get("version_code")).and_then(|v| v.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "4318".into())
+}
+

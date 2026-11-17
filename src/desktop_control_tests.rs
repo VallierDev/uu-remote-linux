@@ -243,7 +243,16 @@ async fn locked_control_unlock_requests_and_tools_work_without_a_video_frame() {
         let frame = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let (channel, message) = terminal_viewer.messages.recv().await.unwrap();
-                if channel == "BINARY_DATA_CHANNEL" { break crate::terminal::decode(&message).unwrap(); }
+                if channel != "BINARY_DATA_CHANNEL" {
+                    continue;
+                }
+                // The process-global terminal change watch also broadcasts the field-28
+                // list-invalidated notification here, which is not a TERM frame.
+                if let Some(frame) = crate::terminal::decode(&message) {
+                    if frame.kind == crate::terminal::LIST_RESP && frame.session == 71 {
+                        break frame;
+                    }
+                }
             }
         }).await.unwrap();
         assert_eq!((frame.kind, frame.session), (crate::terminal::LIST_RESP, 71));
@@ -299,7 +308,16 @@ async fn locked_control_unlock_requests_and_tools_work_without_a_video_frame() {
         let frame = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let (channel, message) = terminal_viewer.messages.recv().await.unwrap();
-                if channel == "BINARY_DATA_CHANNEL" { break crate::terminal::decode(&message).unwrap(); }
+                if channel != "BINARY_DATA_CHANNEL" {
+                    continue;
+                }
+                // The process-global terminal change watch also broadcasts the field-28
+                // list-invalidated notification here, which is not a TERM frame.
+                if let Some(frame) = crate::terminal::decode(&message) {
+                    if frame.kind == crate::terminal::LIST_RESP && frame.session == 72 {
+                        break frame;
+                    }
+                }
             }
         }).await.unwrap();
         assert_eq!((frame.kind, frame.session), (crate::terminal::LIST_RESP, 72));

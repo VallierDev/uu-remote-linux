@@ -81,7 +81,7 @@ impl Input {
     }
     pub fn button(&mut self,button:i32,down:bool)->Option<Value> {
         if self.view_only {return None}
-        if !matches!(button,1|2|4) {return None}
+        if !matches!(button,1|2|16) {return None}
         let changed=if down{self.buttons.insert(button)}else{self.buttons.remove(&button)};
         changed.then(||json!({"action":if down{"mouse_press"}else{"mouse_release"},"button":button}))
     }
@@ -156,7 +156,7 @@ assert!(i.release_all().is_empty());
     #[test] fn aliased_physical_keys_release_only_after_last_keyup() {
         let mut i=Input::default();assert!(i.key(40,true).is_some());assert!(i.key(88,true).is_none());
         assert!(i.key(40,false).is_none());assert_eq!(i.key(88,false).unwrap(),json!({"action":"kbd_release","key":13}));
-        assert!(i.button(3,true).is_none());assert_eq!(i.button(4,true).unwrap()["button"],4);
+        assert!(i.button(3,true).is_none());assert_eq!(i.button(16,true).unwrap()["button"],16);
     }
     #[test] fn letterbox() {
         let v=Viewport::fit((1000,1000),(1920,1080));

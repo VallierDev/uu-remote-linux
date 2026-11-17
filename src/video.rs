@@ -320,7 +320,7 @@ fn encoder_options(settings: &VideoSettings, encoder: Encoder, gop: &str, rgb: O
     let mut options = vec!["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency",
         "-profile:v", profile, "-pix_fmt", pix_fmt, "-g", gop, "-threads", "4",
         "-maxrate", &maxrate, "-bufsize", &bufsize, "-x264-params", &params];
-    // Capped CRF starves repeated 4K keyframes; use ABR for bitrate presets.
+    // Capped CRF starves repeated 4K keyframes; use ABR for the effective cap, including Auto.
     if settings.max_kbps().is_some() { options.extend(["-b:v", &target]); }
     else { options.extend(["-crf", &cq]); }
     options.into_iter().map(str::to_owned).collect()
@@ -873,9 +873,8 @@ fn buffer_for(settings: &VideoSettings, encoder: Encoder) -> u32 {
     } else { buffer_kbits(settings.max_kbps().unwrap_or(30_000), encoder) }
 }
 
-/// The in-process engines take the same rate-control mapping as the FFmpeg child: a viewer
-/// bitrate preset uses ABR at 3/4 of the cap, 自动 keeps CRF (the `abr` flag), and both set the
-/// same VBV bound. Without the flag every session was ABR at the 16M target and CRF never ran.
+/// Match the FFmpeg child's effective cap, including the governor: CPU H.264 uses ABR at
+/// 3/4 of that cap and the same VBV bound. Auto now has an 8 Mbit/s ceiling, so it also uses ABR.
 #[cfg(feature = "inproc-av")]
 struct InprocRateControl { abr: bool, target_bps: i64, max_bps: i64, buffer_bits: i64 }
 
@@ -890,8 +889,7 @@ fn inproc_rate_control(settings: &VideoSettings, encoder: Encoder) -> InprocRate
     }
 }
 
-/// Rate-control arguments: constant quality capped at 30M (自动), or capped at the viewer's
-/// chosen bitrate.
+/// Rate-control bounds use the viewer's ceiling reduced by the congestion governor.
 fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
     let max_kbps = settings.max_kbps().unwrap_or(30_000);
     (format!("{max_kbps}k"), format!("{}k", buffer_for(settings, encoder)))
@@ -1022,16 +1020,26 @@ async fn read_encoder_with(
             let (width,height)=session.size();
             let mut frame=vec![0;(width as usize)*(height as usize)*4];
             let mut version=None;
+            let (mut fresh,mut repeated)=(0u32,0u32);
+            let mut window=std::time::Instant::now();
             loop {
                 tick.tick().await;
                 let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
                 permits_tx.send(permit).await.map_err(|_|"Encoder stopped")?;
                 let session=session.clone();
-                (frame,version)=tokio::task::spawn_blocking(move || {
-                    session.capture_changed(&mut frame,&mut version)?;
-                    Ok::<_,String>((frame,version))
+                let (next,next_version,changed)=tokio::task::spawn_blocking(move || {
+                    let changed=session.capture_changed(&mut frame,&mut version)?;
+                    Ok::<_,String>((frame,version,changed))
                 }).await.map_err(|e|format!("Portal capture worker: {e}"))??;
+                (frame,version)=(next,next_version);
                 sink.write_all(&frame).await.map_err(|e|format!("Portal encoder pipe: {e}"))?;
+                // Repeats are expected on a static desktop; a compositor that stopped painting
+                // (powered-off outputs) sends zero new frames while the stream still looks alive.
+                if changed { fresh+=1; } else { repeated+=1; }
+                if window.elapsed()>=Duration::from_secs(30) {
+                    log::info!("Portal frames: new={fresh} repeated={repeated} window_s={}",window.elapsed().as_secs());
+                    (fresh,repeated)=(0,0); window=std::time::Instant::now();
+                }
             }
         })))
     } else if let Some(mut capture)=native_capture {
@@ -1100,7 +1108,7 @@ pub(crate) fn transport_closed(pc: &RTCPeerConnection) -> bool {
 pub(crate) fn probe_plan() -> Result<(crate::video_select::Selection, VideoSettings), String> {
     let fps=crate::wayland::capture_fps(std::env::var("UU_PROBE_FPS").ok().as_deref())?;
     // UU_PROBE_QUALITY selects a viewer preset (1 fast 1M, 2 general 2M, 3 HD 8M, 4 bluray 20M,
-    // 5 auto); bitrate presets exercise the capped/ABR encoder path instead of CRF.
+    // 5 auto); all CPU H.264 modes exercise ABR with the effective cap (Auto starts at 8M).
     let quality=match std::env::var("UU_PROBE_QUALITY").ok().as_deref() {
         None=>crate::capture_setting::QUALITY_AUTO,
         Some(v)=>v.parse::<u64>().ok().filter(|q|(1..=5).contains(q)).ok_or("UU_PROBE_QUALITY must be 1-5")?,
@@ -1473,6 +1481,12 @@ mod tests {
     fn hardware_inprocess_gop_is_unchanged() {
         assert_eq!(super::gop_frames_with_override(60, true, None), 120);
     }
+    #[test]
+    fn auto_quality_encodes_at_the_8m_ceiling() {
+        assert_eq!(super::rate_args(&crate::capture_setting::VideoSettings::default(), super::Encoder::Cpu).0,
+            format!("{}k", crate::video_governor::AUTO_CEILING_KBPS));
+    }
+
     #[test]
     fn nvidia_display_is_detected_from_connected_connectors() {
         use std::os::unix::fs::symlink;
@@ -1928,8 +1942,9 @@ mod tests {
     fn hevc_options_keep_420_low_latency_and_existing_rate_policy() {
         let settings = VideoSettings { codec: VideoCodec::H265, ..Default::default() };
         let cpu = cpu_hevc_options(&settings, "30");
+        // Auto quality now caps at 8 Mbit/s instead of the old 30M VBV fallback.
         for pair in [["-c:v", "libx265"], ["-profile:v", "main"], ["-pix_fmt", "yuv420p"],
-            ["-bf", "0"], ["-bufsize", "30000k"]] {
+            ["-bf", "0"], ["-bufsize", "8000k"]] {
             assert!(cpu.windows(2).any(|window| window == pair));
         }
         let params = x265_params("30");
@@ -1965,17 +1980,25 @@ mod tests {
     }
     #[cfg(feature = "inproc-av")]
     #[test]
-    fn inproc_x264_keeps_crf_for_auto_and_uses_abr_for_bitrate_presets() {
-        // 自动 has no cap in settings but still gets the 30M VBV bound; it must not turn into ABR 16M.
-        let auto = VideoSettings::default();
-        let rate = inproc_rate_control(&auto, Encoder::Cpu);
-        assert!(!rate.abr);
-        assert_eq!((rate.target_bps, rate.max_bps, rate.buffer_bits), (16_000_000, 30_000_000, 8_000_000));
-        // 超清 8M: ABR at 3/4 of the cap, the same numbers the FFmpeg child receives.
-        let hd = VideoSettings { quality: crate::capture_setting::QUALITY_HD, ..Default::default() };
-        let rate = inproc_rate_control(&hd, Encoder::Cpu);
-        assert!(rate.abr);
-        assert_eq!((rate.target_bps, rate.max_bps, rate.buffer_bits), (6_000_000, 8_000_000, 8_000_000));
+    fn inproc_x264_matches_ffmpeg_effective_rate_control() {
+        use crate::capture_setting::{QUALITY_GENERAL, QUALITY_BLURAY, QUALITY_CUSTOM};
+        for (settings, cap, target, buffer) in [
+            (VideoSettings::default(), 8_000, 6_000, 8_000),
+            (VideoSettings { quality: QUALITY_GENERAL, ..Default::default() }, 2_000, 1_500, 2_000),
+            (VideoSettings { net_kbps: Some(1_500), ..Default::default() }, 1_500, 1_125, 1_500),
+            (VideoSettings { quality: QUALITY_BLURAY, net_kbps: Some(3_000), ..Default::default() }, 3_000, 2_250, 3_000),
+            (VideoSettings { quality: QUALITY_CUSTOM, custom_bps: 0, ..Default::default() }, 8_000, 6_000, 8_000),
+        ] {
+            let rate = inproc_rate_control(&settings, Encoder::Cpu);
+            assert!(rate.abr);
+            assert_eq!((rate.target_bps, rate.max_bps, rate.buffer_bits),
+                (i64::from(target) * 1000, i64::from(cap) * 1000, i64::from(buffer) * 1000));
+            let options = encoder_options(&settings, Encoder::Cpu, "30", None);
+            for (flag, value) in [("-b:v", target), ("-maxrate", cap), ("-bufsize", buffer)] {
+                assert!(options.windows(2).any(|pair| pair[0] == flag && pair[1] == format!("{value}k")));
+            }
+            assert!(!options.iter().any(|arg| arg == "-crf"));
+        }
     }
 }
 

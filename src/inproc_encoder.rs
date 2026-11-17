@@ -185,7 +185,7 @@ pub struct Config {
     pub fps: u32,
     pub gop: u32,
     pub cq: u32,
-    /// Viewer bitrate preset: the x264 engine uses ABR + VBV; 自动 keeps CRF with the same VBV bound.
+    /// Effective cap: x264 uses ABR + VBV, including Auto and governor reductions.
     pub abr: bool,
     pub target_bps: i64,
     pub max_bps: i64,

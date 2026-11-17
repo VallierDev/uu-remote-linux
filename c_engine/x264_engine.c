@@ -2,8 +2,8 @@
 // the X11 ZPixmap frame (little-endian [B,G,R,X], the same word-order ARGB that NVENC receives)
 // is converted to I420 on the CPU and encoded with the superfast/zerolatency preset the FFmpeg
 // child process used to use. Because the encoder lives in the host, PLI/FIR can force an IDR
-// immediately, so this path may keep the long 2 s GOP (GOP_SECONDS_INPROC) instead of the
-// 0.5 s fallback the child-process path needs (see the GOP comment in src/video.rs).
+// immediately; CPU H.264 still defaults to a 0.5 s GOP like the child process, with an
+// optional UU_VIDEO_GOP_SECONDS override (see src/video.rs).
 // The compile-time x264.h must match the runtime library's X264_BUILD; a mismatch fails the
 // versioned x264_encoder_open_<BUILD> lookup and the caller falls back to the process pipeline.
 
@@ -25,7 +25,7 @@ typedef struct X264cConfig {
     uint32_t fps;
     uint32_t gop;
     uint32_t cq;
-    uint32_t abr;   // 1: viewer bitrate preset -> ABR + VBV; 0: 自动 -> capped CRF
+    uint32_t abr;   // 1: effective cap -> ABR + VBV (including Auto); 0: capped CRF
     int64_t target_bps;
     int64_t max_bps;
     int64_t buffer_bits;
@@ -111,8 +111,8 @@ void *x264c_create(const X264cConfig *cfg, int *error) {
     p.b_aud = 1;               // the reader splits access units on AUD, like the child process
     p.b_repeat_headers = 1;    // SPS/PPS ahead of every IDR
     p.i_threads = 4;           // the child process ran -threads 4
-    // Same rate control as the FFmpeg child: a viewer preset is ABR at 3/4 of the cap, 自动 is
-    // CRF, and both set the same VBV bound.
+    // Same rate control as the FFmpeg child: ABR at 3/4 of the effective cap, including
+    // Auto and governor reductions, with the same VBV bound.
     if (cfg->abr) {
         p.rc.i_rc_method = X264_RC_ABR;
         p.rc.i_bitrate = (int)(cfg->target_bps / 1000);

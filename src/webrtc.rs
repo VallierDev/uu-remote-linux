@@ -274,6 +274,8 @@ impl WebRtcSession {
 
         let role = Arc::new(DesktopRole::new(desktop));
         if desktop { *role.input.lock().unwrap() = Some(input.desktop_session()); }
+        let microphone = crate::microphone::Session::new();
+        if crate::microphone::available() { microphone.attach(&pc, role.active.subscribe()); }
         let context = Arc::new(Mutex::new(SessionContext::default()));
         crate::network_diagnostics::start(Arc::downgrade(&pc));
 
@@ -384,6 +386,11 @@ impl WebRtcSession {
             })
         }));
 
+        // Per-connection 画质/帧率, changed by the viewer's capture-setting RPCs and lowered by the
+        // congestion governor below.
+        let (video_settings, video_settings_rx) = tokio::sync::watch::channel(crate::capture_setting::VideoSettings::default());
+        let video_settings = Arc::new(video_settings);
+
         // 注册视频轨
         let video_track = Arc::new(crate::video_track::VideoTrack::new());
 
@@ -392,10 +399,13 @@ impl WebRtcSession {
         let sender = pc.add_track(video_track.clone()).await
             .map_err(|e| format!("Add video track failed: {}", e))?;
         let idr_on_feedback = idr_request.clone();
+        let governor_settings = video_settings.clone();
         tokio::spawn(async move {
+            let video_ssrc = sender.get_parameters().await.encodings.first().map_or(0, |e| e.ssrc);
             let mut feedback = [0u8; 1500];
             let mut reports = 0usize;
             let mut feedback_counts = FeedbackCounts::default();
+            let mut governor = crate::video_governor::Governor::default();
             while let Ok((packets, _)) = sender.read(&mut feedback).await {
                 for packet in packets {
                     feedback_counts.observe(packet.as_any());
@@ -409,14 +419,26 @@ impl WebRtcSession {
                     }
                     if let Some(report) = packet.as_any().downcast_ref::<webrtc::rtcp::receiver_report::ReceiverReport>() {
                         reports += 1;
-                        if reports == 1 || reports % 10 == 0 {
-                            for r in &report.reports {
-                                let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                                let ntp=(((now.as_secs()+2_208_988_800)&0xffff)<<16) as u32 | ((u64::from(now.subsec_nanos())*65536/1_000_000_000) as u32);
-                                let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
-                                let rtt=if r.last_sender_report!=0&&elapsed<65536*30 {Some(f64::from(elapsed)*1000./65536.)}else{None};
+                        let log_now = reports == 1 || reports % 10 == 0;
+                        for r in video_report_blocks(report, video_ssrc) {
+                            let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                            let ntp=(((now.as_secs()+2_208_988_800)&0xffff)<<16) as u32 | ((u64::from(now.subsec_nanos())*65536/1_000_000_000) as u32);
+                            let elapsed=ntp.wrapping_sub(r.last_sender_report).wrapping_sub(r.delay);
+                            let rtt=if r.last_sender_report!=0&&elapsed<65536*30 {Some(f64::from(elapsed)*1000./65536.)}else{None};
+                            if log_now {
                                 log::info!("Video receiver report: ssrc={} last_sequence={} lost={} fraction_lost={} rtcp_rtt_ms={:?}",r.ssrc,r.last_sequence_number,r.total_lost,r.fraction_lost,rtt);
                             }
+                            // The viewer's own 自动清晰度 preset stays the ceiling; a real loss burst
+                            // or a swollen round trip is the only thing that lowers it.
+                            let ceiling=governor_settings.borrow().ceiling_kbps();
+                            let loss=f32::from(r.fraction_lost)*100./256.;
+                            if let Some(cap)=governor.observe(loss,rtt,ceiling,std::time::Instant::now()) {
+                                log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
+                                // Restarts the encoder at the new cap through the settings watch.
+                                governor_settings.send_modify(|value| value.net_kbps=Some(cap));
+                            }
+                        }
+                        if log_now {
                             log::info!("Video feedback totals: nack_packets={} pli={} fir={}",feedback_counts.nack_packets,feedback_counts.pli,feedback_counts.fir);
                         }
                     }
@@ -444,9 +466,6 @@ impl WebRtcSession {
         let streaming_pc = pc.clone();
         let capture_size = (capture.width, capture.height);
         let capture_display = capture.display.clone();
-        // Per-connection 画质/帧率, changed by the viewer's capture-setting RPCs.
-        let (video_settings, video_settings_rx) = tokio::sync::watch::channel(crate::capture_setting::VideoSettings::default());
-        let video_settings = Arc::new(video_settings);
         // Per-connection mute / lock-after-session settings (安全 menu).
         let peer_actions = Arc::new(crate::system_actions::PeerActions::default());
         let session_actions = peer_actions.clone();
@@ -530,6 +549,7 @@ impl WebRtcSession {
         // Settings arrive on CONTROL or TEXT; serialize both queues for this peer.
         let settings_serial=Arc::new(Mutex::new(()));
         let data_role = role.clone();
+        let data_microphone = microphone.clone();
         // 监听 DataChannel
         pc.on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
             let label = d.label().to_string();
@@ -538,6 +558,7 @@ impl WebRtcSession {
             let peer_settings_serial=settings_serial.clone();
             let input_inst = input_clone.clone();
             let channel_role=data_role.clone();
+            let channel_microphone = data_microphone.clone();
             let screen = control_capture.clone();
             let portal_desktop = portal_desktop.clone();
             let desktop_pc = desktop_pc.clone();
@@ -708,7 +729,7 @@ impl WebRtcSession {
                                         }
                                         let live = state.screen.init_error.is_none()
                                             && (cfg!(test) || state.screen.portal.as_ref().is_some_and(|portal| portal.is_alive()))
-                                            && *manager.lock_state().borrow() == Some(false);
+                                            && manager.capture_allowed(*manager.lock_state().borrow());
                                         if live { break Some(state.screen); }
                                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                         if channel.upgrade().is_none_or(|channel| channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open) { return; }
@@ -739,7 +760,10 @@ impl WebRtcSession {
                                     if let Some(owner)=&switch_owner {owner.with_current(|| {
                                         if crate::wayland::selection()==target && crate::wayland::select(source_before).is_ok() {
                                             let (source_id,source_generation)=crate::wayland::selection();
-                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,..settings_before});
+                                            // The feedback loop owns net_kbps; a rollback of the
+                                            // switch must not replay its snapshot over the cap.
+                                            let net_kbps=settings.borrow().net_kbps;
+                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,net_kbps,..settings_before});
                                         }
                                     });}
                                     log::warn!("Screen switch failed; previous source requested");
@@ -1169,6 +1193,7 @@ impl WebRtcSession {
                     let input_worker = inp.clone();
                     let message_input_session=channel_role.input();
                     let message_role=channel_role.clone();
+                    let message_microphone = channel_microphone.clone();
                     let terminal_worker = terminal_conn.clone();
                     let rpc_out = outbound.clone();
                     let text_out = text_out.clone();
@@ -1242,6 +1267,30 @@ impl WebRtcSession {
                                 // answer on TEXT like the privacy RPCs above.
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let _ = text_out.send(crate::initialization::envelope(out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed), ts, 22, &response));
+                                return;
+                            }
+                            if let Some(policy) = rpc_fields.as_deref().and_then(crate::microphone::policy_request) {
+                                let supported = policy <= 1 && crate::microphone::available() && message_role.is_desktop();
+                                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let next = || out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let response = crate::system_actions::session_rpc_response_with_error(rpc_fields.as_deref().unwrap(), u8::from(!supported)).unwrap();
+                                let response = crate::initialization::envelope(next(), ts, 22, &response);
+                                // Windows NevaudioHelper completes the request on TEXT; mirror CONTROL
+                                // for viewers that dispatch responses there, as for privacy RPCs.
+                                let enqueue = |message: Vec<u8>| {
+                                    let _ = text_out.send(message.clone());
+                                    if channel_name != "TEXT_DATA_CHANNEL" { let _ = rpc_out.send(message); }
+                                };
+                                if supported {
+                                    let action = if policy == 1 { 23 } else { 24 };
+                                    // Use the channel's ordered outbox: a stalled SCTP send must
+                                    // never delay this state transition past a later close on TEXT.
+                                    message_microphone.action_with(action, || {
+                                        enqueue(response);
+                                        enqueue(crate::initialization::envelope(next(), ts, 3, &[8, action as u8]));
+                                    });
+                                } else { enqueue(response); }
+                                log::info!("Remote microphone policy: value={policy} supported={supported}");
                                 return;
                             }
                             if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
@@ -1452,6 +1501,8 @@ impl WebRtcSession {
                                             } else {
                                                 log::info!("SimpleAction 4 (capture_desktop) not handled: tool connection without a desktop route");
                                             }
+                                        } else if matches!(action, 23 | 24) && crate::microphone::available() && message_role.is_desktop() {
+                                            message_microphone.action(action);
                                         } else if action > 1 && action != 15 {
                                             let args = action_fields.iter().find_map(|f| match (&f.value, f.number) { (WireValue::Bytes(v), 2) => Some(*v), _ => None }).unwrap_or(&[]);
                                             log::info!("SimpleAction {} ({}) not handled: args={}", action, crate::control_protocol::simple_action_name(action).unwrap_or("?"), sa::args_shape(args));
@@ -1893,6 +1944,13 @@ impl FeedbackCounts {
     }
 }
 
+/// A compound RTCP packet is delivered to every SSRC's stream (webrtc-srtp), so a video sender
+/// may read audio report blocks; only the video sender's SSRC may drive the governor.
+fn video_report_blocks(report: &webrtc::rtcp::receiver_report::ReceiverReport, video_ssrc: u32)
+    -> impl Iterator<Item = &webrtc::rtcp::reception_report::ReceptionReport> + '_ {
+    report.reports.iter().filter(move |r| video_ssrc != 0 && r.ssrc == video_ssrc)
+}
+
 #[cfg(test)]
 mod network_tests {
     use super::*;
@@ -1908,5 +1966,17 @@ mod network_tests {
         counts.observe(&TransportLayerNack { nacks: vec![NackPair { packet_id: 10, lost_packets: 0b101 }], ..Default::default() });
         counts.observe(&PictureLossIndication::default());
         assert_eq!((counts.nack_packets, counts.pli, counts.fir), (3, 1, 0));
+    }
+    #[test]
+    fn receiver_reports_only_drive_the_governor_for_the_video_ssrc() {
+        use webrtc::rtcp::{reception_report::ReceptionReport, receiver_report::ReceiverReport};
+        let report = ReceiverReport { reports: vec![
+            ReceptionReport { ssrc: 7, ..Default::default() },
+            ReceptionReport { ssrc: 9, fraction_lost: 51, ..Default::default() },
+        ], ..Default::default() };
+        let blocks: Vec<_> = video_report_blocks(&report, 9).collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!((blocks[0].ssrc, blocks[0].fraction_lost), (9, 51));
+        assert!(video_report_blocks(&report, 0).next().is_none());
     }
 }

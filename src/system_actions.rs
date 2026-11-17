@@ -300,15 +300,26 @@ impl PeerActions {
 /// 0 is always sent), 21 virtual_audio_driver_policy_req -> 17 (no virtual driver needed: the
 /// sink monitor is captured directly). Responses carry error_code 0 (default).
 pub fn session_rpc_response(rpc: &[crate::protocol::WireField]) -> Option<Vec<u8>> {
+    session_rpc_response_with_error(rpc, 0)
+}
+pub fn session_rpc_response_with_error(rpc: &[crate::protocol::WireField], error: u8) -> Option<Vec<u8>> {
     use crate::protocol::{decode_wire, WireValue};
     let body = |n: u32| rpc.iter().find_map(|f| match (f.number, &f.value) { (x, WireValue::Bytes(b)) if x == n => Some(*b), _ => None });
     let (request, response_field) = [(15u32, 11u8), (21, 17)].into_iter().find_map(|(req, resp)| body(req).map(|b| (b, resp)))?;
     let value = decode_wire(request).ok().and_then(|f| f.iter().find_map(|f| match (f.number, &f.value) { (1, WireValue::Varint(v)) => Some(*v), _ => None }));
     log::info!("Session RPC answered: response_field={} value={:?}", response_field, value);
     let header = body(1).unwrap_or(&[]);
-    let mut out = vec![10, header.len() as u8];
+    fn varint(mut value: usize, out: &mut Vec<u8>) {
+        while value >= 128 { out.push((value as u8 & 127) | 128); value >>= 7; }
+        out.push(value as u8);
+    }
+    let mut out = vec![10];
+    varint(header.len(), &mut out);
     out.extend_from_slice(header);
-    out.extend_from_slice(&[response_field << 3 | 2, 0]);
+    // Field 17 has a two-byte tag (0x8a 0x01). A truncated tag prevents the client's
+    // microphone request from completing even though the data channel delivers it.
+    varint(usize::from(response_field) << 3 | 2, &mut out);
+    if error == 0 { out.push(0); } else { out.extend([2, 8, error]); }
     Some(out)
 }
 
@@ -336,6 +347,20 @@ pub fn plugin_response(rpc: &[crate::protocol::WireField]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn virtual_audio_policy_reply_completes_field_17_and_preserves_request_id() {
+        use crate::protocol::{decode_wire, WireValue};
+        let request = [10, 2, 8, 9, 170, 1, 2, 8, 1];
+        let rpc = decode_wire(&request).unwrap();
+        let response = session_rpc_response(&rpc).unwrap();
+        let fields = decode_wire(&response).expect("valid protobuf reply, including the field 17 tag");
+        assert_eq!(fields[0].value, WireValue::Bytes(&[8, 9]));
+        assert_eq!(fields[1].number, 17);
+        assert_eq!(fields[1].value, WireValue::Bytes(&[]));
+        let denied = session_rpc_response_with_error(&rpc, 1).unwrap();
+        let fields = decode_wire(&denied).unwrap();
+        assert_eq!(fields[1].value, WireValue::Bytes(&[8, 1]));
+    }
     #[test]
     fn toggle_values_from_value_field_json_and_text() {
         assert!(!toggle_value(Some(0), b"1"));

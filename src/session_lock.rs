@@ -11,10 +11,14 @@
 //! (`loginctl unlock-session`, allowed for the session owner), which avoids remote keystrokes
 //! and gives an exact wrong-password result. The password is never logged or stored.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::watch;
+
+mod logind;
 
 /// Official UnlockResult cases (LockScreenManager).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,10 +33,44 @@ extern "C" {
     fn uu_pam_check(service: *const libc::c_char, user: *const libc::c_char, password: *const libc::c_char) -> libc::c_int;
 }
 
+// Resolve once: execvp's unsuccessful PATH candidates are also recorded by auditd.
+fn loginctl_path() -> Option<&'static Path> {
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("PATH").into_iter().flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .map(|dir| dir.join("loginctl"))
+            .find(|path| path.is_file() && std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .map(|p| unsafe { libc::access(p.as_ptr(), libc::X_OK) == 0 }).unwrap_or(false))
+            .and_then(|path| std::fs::canonicalize(path).ok())
+    }).as_deref()
+}
+
+#[cfg(test)]
+static COMMAND_STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn bounded_command(path: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    use std::io::Read;
+    #[cfg(test)]
+    COMMAND_STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut child = Command::new(path).args(args).stdin(Stdio::null()).stdout(Stdio::piped())
+        .stderr(Stdio::null()).spawn().ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() { return None; }
+                let mut text = String::new();
+                child.stdout.take()?.take(4096).read_to_string(&mut text).ok()?;
+                return Some(text.trim().to_owned());
+            }
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => { let _ = child.kill(); let _ = child.wait(); return None; }
+        }
+    }
+}
+
 fn loginctl(args: &[&str]) -> Option<String> {
-    let out = Command::new("loginctl").args(args).output().ok()?;
-    if !out.status.success() { return None; }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+    bounded_command(loginctl_path()?, args, Duration::from_secs(3)).filter(|s| !s.is_empty())
 }
 
 /// The logind session that owns this user's graphical display.
@@ -44,7 +82,7 @@ fn display_session() -> Option<String> {
 pub fn locked_now() -> Option<bool> { display_session().as_deref().and_then(session_locked) }
 
 fn session_locked(session: &str) -> Option<bool> {
-    loginctl(&["show-session", session, "-p", "LockedHint", "--value"]).map(|v| v == "yes")
+    loginctl(&["show-session", session, "-p", "LockedHint", "--value"]).and_then(|v| match v.as_str() { "yes" => Some(true), "no" => Some(false), _ => None })
 }
 
 fn user_name() -> Option<String> {
@@ -78,28 +116,26 @@ pub fn supported() -> bool {
     *SUPPORTED.get_or_init(|| pam_available() && display_session().is_some())
 }
 
-/// Current lock state (None = unknown), refreshed every second by one background thread.
+/// Current lock state (None = unknown), shared by all desktop connections.
 pub fn watch_locked() -> watch::Receiver<Option<bool>> {
     static STATE: OnceLock<watch::Sender<Option<bool>>> = OnceLock::new();
     STATE.get_or_init(|| {
         let (tx, _) = watch::channel(None);
         let sender = tx.clone();
         std::thread::Builder::new().name("uu-lock-state".into()).spawn(move || {
-            let mut session = None;
-            loop {
-                if session.is_none() { session = display_session(); }
-                let locked = session.as_deref().and_then(session_locked);
-                if locked.is_none() { session = None; } // session ended or changed: look it up again
-                sender.send_if_modified(|current| if *current != locked {
-                    log::info!("Desktop lock state: {}", match locked { Some(true) => "locked", Some(false) => "unlocked", None => "unknown" });
-                    if locked == Some(true) { log::info!("Desktop is locked; capture continues while the compositor supplies frames"); }
-                    *current = locked; true
-                } else { false });
-                std::thread::sleep(Duration::from_secs(1));
-            }
+            tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .expect("lock monitor runtime").block_on(logind::monitor(sender));
         }).expect("spawn lock state thread");
         tx
     }).subscribe()
+}
+
+fn publish_lock_state(sender: &watch::Sender<Option<bool>>, locked: Option<bool>) {
+    sender.send_if_modified(|current| if *current != locked {
+        log::info!("Desktop lock state: {}", match locked { Some(true) => "locked", Some(false) => "unlocked", None => "unknown" });
+        if locked == Some(true) { log::info!("Desktop is locked; capture continues while the compositor supplies frames"); }
+        *current = locked; true
+    } else { false });
 }
 
 /// Verifies the session user's password and unlocks the display session. Blocking (PAM may
@@ -117,7 +153,7 @@ fn unlock_with(password: &str) -> UnlockResult {
     let Some(user) = user_name() else { return UnlockResult::NoLoggedInUser };
     if password.is_empty() || password.contains('\0') { return UnlockResult::WrongPassword; }
     match pam_check(&user, password) { 0 => {}, 1 => return UnlockResult::WrongPassword, _ => return UnlockResult::Failed }
-    if Command::new("loginctl").args(["unlock-session", &session]).status().map(|s| !s.success()).unwrap_or(true) {
+    if loginctl_path().and_then(|path| bounded_command(path, &["unlock-session", &session], Duration::from_secs(3))).is_none() {
         return UnlockResult::NoPermission;
     }
     if let Err(error) = crate::capture::keep_display_awake() {
@@ -204,6 +240,25 @@ pub fn password_from_args(args: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unknown_state_is_preserved_and_repeated_states_do_not_notify() {
+        let (tx, mut rx) = watch::channel(Some(true));
+        publish_lock_state(&tx, None);
+        assert_eq!(*rx.borrow_and_update(), None);
+        publish_lock_state(&tx, None);
+        assert!(!rx.has_changed().unwrap());
+        publish_lock_state(&tx, Some(false));
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), Some(false));
+    }
+
+    #[test]
+    fn hung_fallback_is_killed_and_reaped() {
+        let start = std::time::Instant::now();
+        assert_eq!(bounded_command(Path::new("/bin/sleep"), &["10"], Duration::from_millis(30)), None);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
     #[test]
     fn password_comes_from_the_official_key_field() {
         assert_eq!(password_from_args(br#"{"key":"p@ss word"}"#).as_deref(), Some("p@ss word"));

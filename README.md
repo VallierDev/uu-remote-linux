@@ -112,7 +112,11 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 
 桌面锁屏且尚未建立 Portal 时（冷连接），主机也会建立控制通道：上报锁屏状态并接受自动解锁，解锁后再恢复画面、键鼠和剪贴板。Portal 等待就绪期间，主机默认通过已协商的视频轨每秒发送一帧生成的纯黑画面，让官方 iPhone 客户端进入自动解锁流程，无需额外配置。Ubuntu GNOME Wayland 上已用官方 Mac 客户端验证；iPhone 4.42.0 的 H.265 冷连接完成了同一实验二进制「开启黑帧成功 → 关闭失败 → 再开成功」对照（[#29](../../issues/29)）。**局限**：黑帧不是真实 GNOME 锁屏画面，也不支持在锁屏界面操作原生键鼠；需要在 UU 客户端 控制中心 → 安全 → 自动解锁被控端 中启用自动解锁并输入密码。若本机没有已保存的 Portal 授权，解锁后仍需本机确认授权才能显示真实桌面。
 
-无需修改现有熄屏和锁屏设置。主机仅在会话已解锁的采集恢复期间临时申请 GNOME 的 idle 抑制，拿到首帧后立即释放；锁屏、断开或初始化失败也会释放。远控窗口空闲时仍按原策略熄屏和锁屏，手动锁屏也继续生效。锁屏及锁状态未知时停止桌面输入并隐藏真实画面；独立终端、文件传输和端口映射连接不依赖画面初始化，也不会因桌面重连被关闭。这一恢复路径已覆盖自动化协议与生命周期回归测试，锁屏冷连接后的自动解锁与采集恢复已用官方 Mac 和 iPhone 4.42.0 客户端在 GNOME 实机验证，熄屏等其余场景仍待验收；不支持从整机挂起或休眠状态通过现有控制通道唤醒。
+KDE Plasma（KWin）的 Portal 采集在锁屏后仍会继续。主机默认在锁屏时也打开采集，冷连接可以直接看到真实锁屏界面，并用远程键盘输入密码，不再只发黑帧（[#227](../../issues/227)、[#229](../../pull/229)）。`UU_LOCKED_CAPTURE=0` 关闭这一行为，回到黑帧和自动解锁的路径。KDE 判断依赖 systemd 用户环境里的 `XDG_CURRENT_DESKTOP` 或 `XDG_SESSION_DESKTOP`，两者都没有时回落到黑帧行为，可以手动设 `UU_LOCKED_CAPTURE=1` 开启。锁屏时 Portal 指针输入仍会被拦截，键盘通过 uinput 注入，可以输入密码。GNOME 不适用这一段，Mutter 在锁屏时关闭 Portal 会话，仍走上面的黑帧和自动解锁。
+
+无需修改现有熄屏和锁屏设置。主机仅在会话已解锁的采集恢复期间临时申请 GNOME 的 idle 抑制，拿到首帧后立即释放；锁屏、断开或初始化失败也会释放。远控窗口空闲时仍按原策略熄屏和锁屏，手动锁屏也继续生效。锁屏时停止 Portal 输入。KDE 下继续传输真实锁屏画面，GNOME 下隐藏真实画面并发黑帧。独立终端、文件传输和端口映射连接不依赖画面初始化，也不会因桌面重连被关闭。这一恢复路径已覆盖自动化协议与生命周期回归测试，锁屏冷连接后的自动解锁与采集恢复已用官方 Mac 和 iPhone 4.42.0 客户端在 GNOME 实机验证，熄屏等其余场景仍待验收；不支持从整机挂起或休眠状态通过现有控制通道唤醒。
+
+锁屏状态优先通过系统 D-Bus 读取 logind 的 `LockedHint` 并监听变化，正常监测不按秒启动 `loginctl`。尚无图形会话时保持未知并继续监听，登录后由信号触发重新读取。每 30 秒通过 D-Bus 校验会话；D-Bus 异常时每 30 秒重试并使用带超时的 `loginctl` 回退查询，命令路径只解析一次。回退期间状态通知可能延迟；无法读取时保持未知。锁屏程序仍需正确上报 logind 状态，这不改变睡眠、锁屏或远程连接策略。
 
 锁屏黑帧使用 FFmpeg 的 libx264/libx265 编码器（按已协商的 H.264/H.265 选择），硬件编码器可用并不代表这些软件编码器已安装。编码失败会明确记录日志。黑帧不改变采集权限或上报的真实屏幕尺寸；解锁或锁状态未知时暂停，采集就绪、拒绝或连接关闭时结束，再由真实视频接续同一条视频轨。对照实验与验证范围见 [#29](../../issues/29)、[#34](../../pull/34)。
 
@@ -141,8 +145,8 @@ niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通
 | 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；`inproc-av` 原生 NVENC 输出 H.264 High 4:4:4 / HEVC FRExt；VAAPI 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
-| 被控端防窥模式 | 实验性，仅 KDE Plasma Wayland（portal）；Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显；`UU_PRIVACY_AUTO=picture` / `screen-off` 可在桌面连接时自动开启，见 [docs/privacy-screen.md](docs/privacy-screen.md) |
-| 麦克风（控制端声音传到被控端） | 未实现（需要虚拟声卡） |
+| 被控端防窥模式 | 实验性：KDE Plasma Wayland（portal）支持隐私屏保和关屏，Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显；`UU_PRIVACY_AUTO=picture` / `screen-off` 可在桌面连接时自动开启。GNOME Wayland（portal）仅支持通过 Mutter 关屏，被本机或远程输入点亮时主机会再次关屏，完整远控尚未验收；见 [docs/privacy-screen.md](docs/privacy-screen.md) |
+| 麦克风（控制端声音传到被控端） | 实验性：Opus → 虚拟麦克风，需 `UU_MICROPHONE=1`；支持 PulseAudio / PipeWire-pulse，见 [说明](docs/remote-microphone.md) |
 | 魔兽世界排队提醒等插件 | 不支持，会明确告诉客户端「无插件」 |
 | Linux 系统登录界面 | 还不支持控制开机后的系统登录界面（还没有人登录 Linux 桌面时）；这种情况可以用无头模式或虚拟桌面（见下文）。注意：这里说的是 Linux 系统登录，**不登录 UU 账号**现在可以通过「远程协助」使用 |
 | 跨运营商 / 受限网络的中继连接 | 已接入官方下发的 ICE 服务器，但复杂网络环境未充分测试 |
@@ -205,6 +209,7 @@ sudo apt install libpulse-dev libopus-dev
 - 需要 Rust 工具链（<https://rustup.rs>）。
 - `libgtk-3-dev` 是可选的：没有 GTK 时只能在终端里扫码登录（也可以设置 `UU_NO_GTK=1` 主动关闭登录窗口）。
 - NVIDIA 显卡用户需要使用带 `h264_nvenc` 的 FFmpeg，否则自动回落到 CPU 编码（libx264）。
+- FFmpeg 要求的 NVENC API 版本由编译时的 nv-codec-headers 决定。例如 Arch 的 FFmpeg 9 对着 nv-codec-headers 13.1 编译，需要 610 及以上驱动；Pascal（GTX 10 系）驱动最高 580，只有 NVENC API 13.0，日志会出现 `Driver does not support the required nvenc API version`，于是回落 CPU。可对着 nv-codec-headers 13.0 另编一份 FFmpeg 装到独立目录，在 `config.json` 里用 `ffmpeg_root` 指向它（#230）。
 
 ### 2. 编译
 
@@ -350,6 +355,8 @@ systemctl --user restart uuremote-native.service
 | 变量 | 作用 |
 |---|---|
 | `UU_CONFIG` | 配置文件路径（默认 `~/.config/uuremote/config.json`） |
+| `UU_CLIENT_VERSION` | 上报给网易云端的被控端版本号（`x-param-vn` 与 User-Agent），默认 `4.45.0.4318`；配置文件中对应 `client_version`，环境变量优先 |
+| `UU_VERSION_CODE` | 上报给网易云端的被控端版本代码（`x-param-vc`），默认 `4318`；配置文件中对应 `version_code`，环境变量优先 |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
 | `UU_DESKTOP_RESIZE=0` | X11 下控制端切换分辨率时不改桌面分辨率，只缩放编码画面 |
 | `UU_NVENC_RGB=0` / `=1` | NVENC 直接编码 BGRA（省 CPU）。显示器接在 NVIDIA 卡上时默认关闭（同卡合成时直吃反而更慢），`0` 强制关，`1` 强制开 |
@@ -370,7 +377,7 @@ systemctl --user restart uuremote-native.service
 | `UU_REMOTE_ASSIST=0` | 关闭远程协助（未登录时也不再以访客身份提供协助） |
 | `UU_ASSIST_ALLOW=1` | 启动时就允许他人远程协助（覆盖窗口里保存的开关状态） |
 | `UU_PORT_MAPPING=0` | 关闭端口映射（对应官方被控端的开关） |
-| `UU_WOL_HELPER=1` | 实验性：让这台主机像官方 Windows 被控端一样充当「远程开机」辅助设备——登录后向网易上报本机局域网信息，收到云端唤醒请求时向同一局域网发送唤醒包（未经端到端验证） |
+| `UU_WOL_HELPER=1` | 实验性：让这台主机像官方 Windows 被控端一样充当「远程开机」辅助设备——登录后向网易上报本机局域网信息，收到云端唤醒请求时向同一局域网发送唤醒包（已在 NAS 上的无头 Linux 主机配合官方 iOS 控制端实测可远程开机） |
 | `UU_USE_PROXY=1` | REST API 与 host/viewer WebSocket 信令共用环境 HTTP/HTTPS 代理策略；默认忽略代理、直连 |
 
 
@@ -382,7 +389,7 @@ systemctl --user restart uuremote-native.service
 
 自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 
-选择码率档（原画 / 超清 / 高清 / 自定义）时，外部 FFmpeg 的 CPU 编码以平均码率（ABR）为目标，避免 4K 低码率下关键帧发灰；「自动」档仍使用恒定质量（CRF）。
+CPU H.264 的外部 FFmpeg 和进程内 libx264 使用相同的平均码率（ABR）策略：目标为有效编码上限的 3/4，VBV 缓冲为该上限的 500–8000 kbit 范围值。「自动」和无限制自定义档以 8 Mbit/s 为上限，其他档按客户端选择；拥塞治理器可进一步降低该上限，并通过重启编码器应用。
 
 本地编码诊断 `desktop-video-probe [output.h264]` 可设置 `UU_PROBE_FPS`、`UU_PROBE_FRAMES`（默认 5）和 `UU_PROBE_QUALITY`（1–5）；设置 `UU_PROBE_INPUT=clip.y4m`（也支持 `.mp4`、`frames/%05d.png`）可绕过桌面采集，以相同的生产 FFmpeg 编码参数测量固定输入并打印分辨率和编码统计，`UU_PROBE_LOOP=1` 循环到指定帧数，输入无法打开或帧数不足时以非零状态退出（固定输入始终使用外部 FFmpeg 管线）。
 
