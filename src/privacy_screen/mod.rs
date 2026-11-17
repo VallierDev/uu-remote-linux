@@ -239,6 +239,9 @@ fn auto_enable(mode: Mode, generation: u64) {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    // Only portal backends ride the capture's portal session; the X11 backend dims outputs on
+    // its own, so waiting for a portal on an Xorg session would stall the auto-enable forever.
+    let portal_backend = backend::detect().is_some_and(|backend| backend.name() != X11_BACKEND);
     for attempt in 1..=5 {
         if !current() { return; }
         if VIEWER_OVERRIDE.load(Ordering::Relaxed) {
@@ -247,7 +250,7 @@ fn auto_enable(mode: Mode, generation: u64) {
         }
         // Not a failure yet: the desktop capture opens its portal session a moment after the peer
         // connects, and entering without it would roll back and log a restore for nothing.
-        if !crate::portal::available() {
+        if portal_backend && !crate::portal::available() {
             log::info!("Privacy auto: waiting for the desktop capture (attempt {attempt})");
             std::thread::sleep(std::time::Duration::from_secs(1));
             continue;

@@ -38,6 +38,16 @@ pub fn detected() -> bool {
         && tool::available("timeout")
 }
 
+/// The display to drive: the environment's DISPLAY, or the one the X11 capture engine opened —
+/// it falls back to :0/:1 when DISPLAY is unset, and privacy must dim that same screen (the
+/// engine's choice lands in the recovery record, so the guard restores it too).
+fn display() -> Result<String, String> {
+    match std::env::var("DISPLAY") {
+        Ok(display) if !display.is_empty() => Ok(display),
+        _ => crate::capture::x11_display().ok_or_else(|| "X11 privacy screen needs DISPLAY or a live X11 capture".into()),
+    }
+}
+
 fn xrandr(display: &str, args: &[String]) -> Result<String, String> {
     let mut all = vec!["--display".to_owned(), display.to_owned()];
     all.extend_from_slice(args);
@@ -101,8 +111,8 @@ impl Backend for X11 {
         if mode == Mode::Picture {
             return Some("X11 privacy picture mode is not supported".into());
         }
-        match std::env::var("DISPLAY") {
-            Err(_) => Some("X11 privacy screen needs DISPLAY".into()),
+        match display() {
+            Err(e) => Some(e),
             Ok(display) => xrandr(&display, &["--query".to_owned()])
                 .err()
                 .map(|e| format!("X11 output control unavailable: {e}")),
@@ -113,7 +123,7 @@ impl Backend for X11 {
         if mode != Mode::ScreenOff {
             return Err("X11 privacy picture mode is not supported".into());
         }
-        let data = darken(&std::env::var("DISPLAY").map_err(|_| "X11 privacy screen needs DISPLAY")?)?;
+        let data = darken(&display()?)?;
         journal.save(&data)?;
         if let Err(e) = xrandr(&data.display, &black_args(&data.outputs)) {
             let _ = xrandr(&data.display, &restore_args(&data.outputs));
