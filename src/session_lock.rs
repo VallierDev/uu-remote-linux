@@ -153,18 +153,32 @@ fn unlock_with(password: &str) -> UnlockResult {
     let Some(user) = user_name() else { return UnlockResult::NoLoggedInUser };
     if password.is_empty() || password.contains('\0') { return UnlockResult::WrongPassword; }
     match pam_check(&user, password) { 0 => {}, 1 => return UnlockResult::WrongPassword, _ => return UnlockResult::Failed }
-    if loginctl_path().and_then(|path| bounded_command(path, &["unlock-session", &session], Duration::from_secs(3))).is_none() {
+    unlock_granted_session(&session)
+}
+
+/// Clears the logind lock and waits for the lock screen to actually go away (post-unlock
+/// confirmation like the official host). The caller has already established the trust.
+fn unlock_granted_session(session: &str) -> UnlockResult {
+    if loginctl_path().and_then(|path| bounded_command(path, &["unlock-session", session], Duration::from_secs(3))).is_none() {
         return UnlockResult::NoPermission;
     }
     if let Err(error) = crate::capture::keep_display_awake() {
         log::warn!("Display wake after auto unlock failed: {error}");
     }
-    // Post-unlock confirmation like the official host: the lock screen must actually go away.
     for _ in 0..100 { // GNOME takes ~3 s to drop the shield after logind's Unlock
-        if session_locked(&session) == Some(false) { return UnlockResult::Success; }
+        if session_locked(session) == Some(false) { return UnlockResult::Success; }
         std::thread::sleep(Duration::from_millis(100));
     }
     UnlockResult::Failed
+}
+
+/// Passwordless unlock for the host-local fallback: the accepted desktop connection is the
+/// trust (same UU account device), so only logind is asked. Idempotent: an unlocked session
+/// returns Success without touching logind.
+pub fn unlock_local() -> UnlockResult {
+    let Some(session) = display_session() else { return UnlockResult::NoLoggedInUser };
+    if session_locked(&session) == Some(false) { return UnlockResult::Success; }
+    unlock_granted_session(&session)
 }
 
 type Channel = std::sync::Arc<webrtc::data_channel::RTCDataChannel>;
@@ -216,6 +230,24 @@ pub async fn handle_auto_unlock(password: Option<String>, channel: Channel, sequ
     }
 }
 
+/// Grace for the viewer's own AUTO_UNLOCK_SYSTEM flow: Android / Mac send action 15 right after
+/// CONTROL opens, so the fallback re-checks only after this delay and skips an already-unlocked screen.
+const LOCAL_UNLOCK_DELAY: Duration = Duration::from_secs(4);
+
+/// The fallback acts only when enabled and the screen is known locked (None = unknown, e.g. a
+/// session logind cannot answer for, is never touched).
+fn should_local_unlock(state: Option<bool>, enabled: bool) -> bool { enabled && state == Some(true) }
+
+/// Host-side fallback for viewers that never send SimpleAction 15 (the official Windows client
+/// has no auto unlock): after a desktop connection starts, if the screen is still locked, clear
+/// the logind lock without a password. opt-in via `host_settings.json` local_unlock.
+pub async fn local_unlock_fallback(mut state: watch::Receiver<Option<bool>>) {
+    tokio::time::sleep(LOCAL_UNLOCK_DELAY).await;
+    if !should_local_unlock(*state.borrow_and_update(), crate::system_actions::local_unlock_enabled()) { return; }
+    let result = tokio::task::spawn_blocking(unlock_local).await.unwrap_or(UnlockResult::Failed);
+    log::info!("Local unlock on connect: result={result:?}");
+}
+
 /// `uuremote-server unlock-check`: diagnostics for auto unlock; password from stdin, never echoed.
 pub fn check_from_stdin() -> Result<(), String> {
     let session = display_session();
@@ -257,6 +289,14 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(bounded_command(Path::new("/bin/sleep"), &["10"], Duration::from_millis(30)), None);
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn local_unlock_acts_only_on_known_lock_when_enabled() {
+        assert!(should_local_unlock(Some(true), true));
+        assert!(!should_local_unlock(Some(true), false));
+        assert!(!should_local_unlock(Some(false), true));
+        assert!(!should_local_unlock(None, true));
     }
 
     #[test]

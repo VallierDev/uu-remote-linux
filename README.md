@@ -71,7 +71,7 @@ UU_LANG=en uuremote-server
 | 声音 | 采集系统声音（PulseAudio / PipeWire），Opus 编码传到控制端 |
 | 文件传输 | 上传、下载（含文件夹）、新建文件夹、重命名、删除；iOS 直接上传使用默认接收目录（当前用户的主目录） |
 | 终端 | 官方「终端」工具，PTY 会话，支持多会话、重命名、结束会话和列表自动刷新；重连后旧连接的输入和断开消息不会影响当前会话 |
-| 锁屏与自动解锁 | 向控制端上报锁屏状态；开启「自动解锁被控端」后，通过 PAM 校验密码并解锁当前会话 |
+| 锁屏与自动解锁 | 向控制端上报锁屏状态；开启「自动解锁被控端」后，通过 PAM 校验密码并解锁当前会话；Windows 控制端没有该入口，可开启主机侧兜底解锁（默认关，见「锁屏与自动解锁」） |
 | 远程结束后自动锁屏 | 设置保存在本机，重连后依然生效 |
 | 被控端静音运行 | 主机扬声器静音，控制端照常能听到声音；结束后恢复原来的音量设置 |
 | 系统操作 | 锁屏、显示桌面、任务管理器（系统监视器）、重启、关机（通过 `systemctl`，需要当前用户有 polkit 权限：通常本机有活动的图形会话即可；没有权限时直接失败并记日志，不会在被控端弹出密码框） |
@@ -111,6 +111,8 @@ GNOME 缩放桌面在使用 Portal 原生键鼠时，若支持 `ConnectToEIS` �
 GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通知客户端当前选择桌面，再上报锁屏状态、接收官方客户端的「自动解锁被控端」请求。官方 Android 客户端需要桌面目标通知才会进入自动解锁流程，因此该通知不能等待采集就绪；真实屏幕尺寸、编码信息及采集权限仍按实际就绪状态上报。请在客户端启用自动解锁，使用当前 Linux 用户的登录密码；主机通过 PAM 验证后解锁当前 GNOME 会话、请求点亮屏幕，并恢复同一 Portal 会话中的画面、键鼠和剪贴板。首次授权或权限被撤销时仍需本机确认。物理或逻辑分辨率变化后需要重连。
 
 桌面锁屏且尚未建立 Portal 时（冷连接），主机也会建立控制通道：上报锁屏状态并接受自动解锁，解锁后再恢复画面、键鼠和剪贴板。Portal 等待就绪期间，主机默认通过已协商的视频轨每秒发送一帧生成的纯黑画面，让官方 iPhone 客户端进入自动解锁流程，无需额外配置。Ubuntu GNOME Wayland 上已用官方 Mac 客户端验证；iPhone 4.42.0 的 H.265 冷连接完成了同一实验二进制「开启黑帧成功 → 关闭失败 → 再开成功」对照（[#29](../../issues/29)）。**局限**：黑帧不是真实 GNOME 锁屏画面，也不支持在锁屏界面操作原生键鼠；需要在 UU 客户端 控制中心 → 安全 → 自动解锁被控端 中启用自动解锁并输入密码。若本机没有已保存的 Portal 授权，解锁后仍需本机确认授权才能显示真实桌面。
+
+**Windows 控制端的兜底解锁**：官方「自动解锁被控端」仅在 macOS / iOS / Android 控制端发起时生效，Windows 控制端不会发送解锁请求，桌面锁屏时只能停在黑帧。`uuremote-server set-unlock on` 开启主机侧兜底：每次桌面连接建立后延时 4 秒复查锁状态（安卓 / Mac 自己的自动解锁先跑，已解锁或状态未知则跳过），仍锁屏就以内置的 `loginctl unlock-session` 直接解除当前会话的锁屏，不做密码校验，随后恢复同一会话的画面、键鼠和剪贴板；日志只记结果（`Local unlock on connect: result=…`）。`host_settings.json` 里的 `local_unlock` 在每次桌面连接时读盘，写完下一条连接即生效，无需重启服务；`set-unlock off`（默认）恢复原行为。官方帮助文档口径：自动密码功能不支持 Windows 主控端发起（uuyc.163.com 被控端锁屏验证说明）。**安全提示**：开启后任何登录同一 UU 账号的设备连入桌面都会直接无密码解锁屏幕，是否开启由你决定（见「安全与隐私」）。
 
 KDE Plasma（KWin）的 Portal 采集在锁屏后仍会继续。主机默认在锁屏时也打开采集，冷连接可以直接看到真实锁屏界面，并用远程键盘输入密码，不再只发黑帧（[#227](../../issues/227)、[#229](../../pull/229)）。`UU_LOCKED_CAPTURE=0` 关闭这一行为，回到黑帧和自动解锁的路径。KDE 判断依赖 systemd 用户环境里的 `XDG_CURRENT_DESKTOP` 或 `XDG_SESSION_DESKTOP`，两者都没有时回落到黑帧行为，可以手动设 `UU_LOCKED_CAPTURE=1` 开启。锁屏时 Portal 指针输入仍会被拦截，键盘通过 uinput 注入，可以输入密码。GNOME 不适用这一段，Mutter 在锁屏时关闭 Portal 会话，仍走上面的黑帧和自动解锁。
 
@@ -383,7 +385,7 @@ systemctl --user restart uuremote-native.service
 
 开启后主机还会经 TCP/TLS 连接云端 TURN 中继（使用 `HTTPS_PROXY`/`ALL_PROXY` 里的无认证 `http://` 代理做 CONNECT，没有代理则直连），适用于 UDP 到不了 TURN 服务器、只有 TCP/代理能出网的主机；TURN 证书按 CA 链校验，云端下发的 TURN 地址是 IP 时容忍名称不匹配（媒体本身由 DTLS-SRTP 端到端加密）。默认（不开代理）只用 UDP 中继，行为不变。**这不创建任何新的网络出口**：登录、信令和媒体仍需各自有允许使用的网络路径。连接器只返回固定错误类别/HTTP 状态；不要为诊断开启会记录 URL/认证信息的依赖库 TRACE 日志。
 
-「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto（有 NVIDIA 时 NVENC 优先，失败再 CPU；没有 NVIDIA 时就是 CPU，不探测；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。成功结果缓存到进程退出，但 NVIDIA 是否存在（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）与报告不一致时，下一次桌面连接会在后台再探测一次（`warm_auto_probe`），这一路仍用缓存的编码器，直到新结果写入。NVENC 失败只缓存 10 分钟，到期后的桌面连接同样在后台再探测一次，这一路仍用当前结果。`set-encoder` 和 `set-codec` 写完后若 `host.pid` 指向正在运行的本程序，都会发 `SIGUSR2`：编码器变化时进行中的桌面流立刻换编码器（不断开，沿用本会话已协商的 codec；新编码器起不来时按进程内 → FFmpeg 进程 → CPU 回退）。手改文件后可 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。`SIGUSR2` 不重新探测。codec 偏好仍在下次建立桌面连接时生效（运行中的 host 只记日志，不重开编码）。显式 `vaapi` 请求真彩时仍用 VAAPI、编码 4:2:0，并在 CaptureSettingSync 的 field 3 回报 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。VAAPI 进入 auto 要等 #33。
+「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `local_unlock`（Windows 控制端兜底解锁，见「锁屏与自动解锁」）用 `uuremote-server set-unlock on|off` 写入（非法参数退出码 2），默认关闭；每次桌面连接时读盘，下一条连接即生效，无需重启。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto（有 NVIDIA 时 NVENC 优先，失败再 CPU；没有 NVIDIA 时就是 CPU，不探测；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。成功结果缓存到进程退出，但 NVIDIA 是否存在（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）与报告不一致时，下一次桌面连接会在后台再探测一次（`warm_auto_probe`），这一路仍用缓存的编码器，直到新结果写入。NVENC 失败只缓存 10 分钟，到期后的桌面连接同样在后台再探测一次，这一路仍用当前结果。`set-encoder` 和 `set-codec` 写完后若 `host.pid` 指向正在运行的本程序，都会发 `SIGUSR2`：编码器变化时进行中的桌面流立刻换编码器（不断开，沿用本会话已协商的 codec；新编码器起不来时按进程内 → FFmpeg 进程 → CPU 回退）。手改文件后可 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。`SIGUSR2` 不重新探测。codec 偏好仍在下次建立桌面连接时生效（运行中的 host 只记日志，不重开编码）。显式 `vaapi` 请求真彩时仍用 VAAPI、编码 4:2:0，并在 CaptureSettingSync 的 field 3 回报 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。VAAPI 进入 auto 要等 #33。
 
 自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 
@@ -418,6 +420,7 @@ flowchart LR
 - 已登录的图形主机默认会将当前壁纸图片上传到 UU 的文件服务，供设备卡片显示背景；可用 `UU_WALLPAPER_UPLOAD=0` 关闭上传。
 - 日志不记录键盘输入、终端内容、剪贴板内容、文件内容、密码和令牌。
 - 自动解锁的密码保存在**控制端**（官方客户端）里，被控端只拿来做一次 PAM 校验，不落盘、不写日志。
+- 主机侧兜底解锁（`uuremote-server set-unlock on`）不做密码校验，直接 `loginctl unlock-session`：信任模型是「已登录同一 UU 账号的设备」，与登录后终端工具可执行任意命令的权限同级。默认关闭，开启即代表你接受同账号设备可无密码解锁屏幕；被锁在门外的正规解法仍是用安卓 / Mac / iPhone 的「自动解锁被控端」输密码。
 - 能连上这台机器的，只有登录了同一个 UU 账号的设备。请保管好你的 UU 账号。
 
 ## 许可证

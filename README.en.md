@@ -82,7 +82,7 @@ Protocol strings and messages that come from the UU servers are shown as the ser
 | Sound | System audio captured from PulseAudio / PipeWire and sent as Opus |
 | File transfer | Upload, download (including folders), create folder, rename, delete; iOS quick uploads use the default receive directory (the current user’s home) |
 | Terminal | The official "Terminal" tool, PTY sessions, multiple sessions, rename, termination and automatic list refresh; input and detach messages from an old connection cannot affect a reattached session |
-| Lock state and auto unlock | Lock state is reported to the viewer; with "auto unlock" enabled in the client, the password is verified with PAM and the session is unlocked |
+| Lock state and auto unlock | Lock state is reported to the viewer; with "auto unlock" enabled in the client, the password is verified with PAM and the session is unlocked; the Windows viewer has no such option, so the host can enable a passwordless fallback unlock (off by default, see "Lock state and auto unlock") |
 | Lock after remote session | Stored on the host, so it still applies after reconnecting |
 | Mute host while controlled | Host speakers are muted while the viewer still hears the sound; the previous mute state is restored afterwards |
 | System actions | Lock, show desktop, task manager (system monitor), reboot, shut down (via `systemctl`; needs polkit permission for the user, usually an active local graphical session; without it the action fails and is logged, no password dialog appears on the host) |
@@ -125,6 +125,8 @@ Scaled GNOME desktops using native Portal input use EIS on the same authorized s
 GNOME Portal CONTROL no longer waits for a consent dialog or the first video frame. It announces the selected desktop before reporting secure-desktop state and receiving the official viewer's “auto unlock host” request. The official Android viewer requires this desktop selection before entering its auto-unlock flow, so the notification must precede capture readiness; actual screen dimensions, codec information and capture permissions still follow their real readiness state. Enable auto unlock in the viewer and use the current Linux user's login password. The host verifies it with PAM, unlocks the existing GNOME session, requests display wake, and restores capture, input and clipboard through the shared Portal session. Initial consent or revoked permissions still require local approval. Reconnect if physical or logical dimensions change.
 
 The host also accepts a desktop connection while GNOME is locked with no Portal session yet (a cold connection): it reports lock state and accepts auto unlock, then restores picture, input and clipboard after unlock. While Portal is pending, the host sends generated black video once per second on the negotiated track by default, allowing the official iPhone viewer to enter its auto-unlock flow without extra configuration. Verified on Ubuntu GNOME Wayland with the official Mac viewer; iPhone 4.42.0 with H.265 completed a same-executable control experiment: black video ON succeeded, OFF failed, and ON succeeded again ([#29](../../issues/29)). **Limitation**: this is synthetic black video, not the GNOME lock screen, and it does not enable native mouse/keyboard input while locked. Enable 「自动解锁被控端」 in the UU client under 控制中心 → 安全 and enter the password. Without saved Portal permission, local consent is still required after unlock before the real desktop can appear.
+
+**Fallback unlock for Windows viewers**: the official auto-unlock feature only works when the viewer is macOS / iOS / Android — the Windows viewer never sends an unlock request, so a locked desktop stays on black video. `uuremote-server set-unlock on` enables the host-side fallback: after each desktop connection it waits 4 s and re-checks the lock state (an Android / Mac auto unlock that already succeeded, or an unknown state, skips the action); if still locked it clears the session lock directly with `loginctl unlock-session`, no password check, then restores picture, input and clipboard in the same session. Only the result is logged (`Local unlock on connect: result=…`). The `local_unlock` value in `host_settings.json` is read on every desktop connection, so the next connection already sees a change and no service restart is needed; `set-unlock off` (the default) restores the previous behavior. Per NetEase's own help pages, saved-password auto unlock is not supported when the controller is Windows. **Security note**: once enabled, any device logged in to the same UU account unlocks the screen without a password just by opening the desktop — enable it only if you accept that.
 
 On KDE Plasma (KWin), the Portal screencast stays alive after the session locks. The host now opens capture while locked by default, so a cold connection shows the real lock screen and the password can be entered with the remote keyboard instead of receiving black video ([#227](../../issues/227), [#229](../../pull/229)). Set `UU_LOCKED_CAPTURE=0` to disable this and return to the black-video and auto-unlock path. Detection requires `XDG_CURRENT_DESKTOP` or `XDG_SESSION_DESKTOP` in the systemd user environment. Without either the host falls back to black video, and `UU_LOCKED_CAPTURE=1` forces the new behavior. Portal pointer input remains blocked while locked, and the keyboard uses uinput and can enter the password. This does not apply to GNOME: Mutter closes the Portal session on lock, so the black-video and auto-unlock behavior above is unchanged.
 
@@ -421,7 +423,9 @@ Common environment variables:
 With it the host also reaches the cloud TURN relays over TCP/TLS (CONNECT through the unauthenticated `http://` proxy in `HTTPS_PROXY`/`ALL_PROXY`, or directly without one), for hosts whose UDP cannot reach the TURN servers but whose TCP/proxy can. TURN certificates are chain-verified; a name mismatch is tolerated only when the cloud-supplied TURN address is an IP (media itself is end-to-end DTLS-SRTP). Without the setting only UDP relays are used, as before. **This creates no new network access**: login, signaling and media each still need an allowed network path. Connector errors expose only fixed categories/HTTP status; do not enable dependency TRACE logs that may record URLs or authentication information.
 
 Host settings such as "lock after remote session" and "mute host" are stored in
-`~/.config/uuremote/host_settings.json`. The same file stores `video_encoder`
+`~/.config/uuremote/host_settings.json`. The same file also stores `local_unlock` (the
+Windows-viewer fallback unlock, written by `uuremote-server set-unlock on|off`, off by default and
+re-read on every desktop connection, so no restart is needed). The same file stores `video_encoder`
 (`auto`/`cpu`/`vaapi`/`nvenc`) and `video_codec` (`auto`/`h264`/`h265`), written by
 `uuremote-server set-encoder` and `uuremote-server set-codec` (illegal arguments exit 2).
 A value other than `auto` beats `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`; `auto` or a missing
@@ -479,6 +483,11 @@ flowchart LR
 - Logs never contain keystrokes, terminal text, clipboard contents, file contents, passwords or tokens.
 - For auto unlock the password is stored in the **viewer** (the official client). The host only checks it
   once with PAM; it is never written to disk or logs.
+- The host-side fallback unlock (`uuremote-server set-unlock on`) skips the password and runs
+  `loginctl unlock-session` directly: its trust model is "a device logged in to the same UU account",
+  the same level of access the terminal tool already has against a logged-in user. It is off by
+  default; enabling it means you accept that same-account devices unlock the screen without a
+  password. The password-based path from Android / Mac / iPhone viewers is unchanged.
 - Only devices logged in to the same UU account can connect. Keep your UU account safe.
 
 ## License
