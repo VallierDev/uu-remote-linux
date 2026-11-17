@@ -760,7 +760,10 @@ impl WebRtcSession {
                                     if let Some(owner)=&switch_owner {owner.with_current(|| {
                                         if crate::wayland::selection()==target && crate::wayland::select(source_before).is_ok() {
                                             let (source_id,source_generation)=crate::wayland::selection();
-                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,..settings_before});
+                                            // The feedback loop owns net_kbps; a rollback of the
+                                            // switch must not replay its snapshot over the cap.
+                                            let net_kbps=settings.borrow().net_kbps;
+                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,net_kbps,..settings_before});
                                         }
                                     });}
                                     log::warn!("Screen switch failed; previous source requested");

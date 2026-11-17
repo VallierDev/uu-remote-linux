@@ -41,6 +41,9 @@ const RECOVERY_AFTER_DECREASE: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 pub struct Governor {
+    /// The cap last returned to the caller, i.e. what settings.net_kbps holds. The encoder runs
+    /// at `ceiling.min(cap)`, so this is only the governor's view while the ceiling matches;
+    /// `effective` reconciles the two.
     cap: Option<u32>,
     applied: Option<Instant>,
     /// Reports in a row that asked for the knee.
@@ -54,15 +57,17 @@ pub struct Governor {
 }
 
 impl Governor {
-    /// One RTCP receiver report: `loss_percent` is its fraction lost in percent. Returns the new
-    /// encoder cap when the encoder must restart.
+    /// One RTCP receiver report: `loss_percent` is its fraction lost in percent, `ceiling_kbps`
+    /// the viewer's ceiling. Returns the new encoder cap when the encoder must restart.
     pub fn observe(&mut self, loss_percent: f32, rtt_ms: Option<f64>, ceiling_kbps: u32, now: Instant) -> Option<u32> {
-        // The caller supplies the viewer's ceiling; 8 Mbit/s is only its auto/unlimited fallback.
-        let ceiling = ceiling_kbps.max(FLOOR_KBPS);
+        // The current rate is measured against the viewer's ceiling itself: clamping the
+        // ceiling up to the floor would leave the governor aiming at a rate the encoder never
+        // had (a 500k custom stream capped below the floor looked like an applied 800k cap,
+        // and after a raise to 6M congestion found "current == floor" and never stepped down).
+        let current = self.effective(ceiling_kbps);
         let aim = self.broken_at
             .filter(|(_, at)| now.duration_since(*at) < PROBE_AFTER)
-            .map_or(ceiling, |(broken, _)| (broken * 9 / 10).clamp(FLOOR_KBPS, ceiling));
-        let current = self.cap.unwrap_or(aim).min(aim);
+            .map_or(ceiling_kbps, |(broken, _)| (broken * 9 / 10).max(FLOOR_KBPS).min(ceiling_kbps));
         // Loss at that level only shows up when a path genuinely breaks, so one report is enough. A
         // round trip spike looks the same for a single report, so it has to hold across reports.
         let congested = loss_percent >= CONGESTION_LOSS_PERCENT
@@ -70,25 +75,32 @@ impl Governor {
         let clean = loss_percent < CLEAN_LOSS_PERCENT
             && rtt_ms.is_none_or(|rtt| rtt < CLEAN_RTT_MS)
             && self.settled(now);
-        let mut broken = None;
-        let (target, gate) = if congested {
-            broken = Some(current);
+        if congested {
             self.rtt_over = 0;
-            ((current / 2).max(FLOOR_KBPS), DECREASE_AFTER)
-        } else if clean {
-            ((current + (current / 4).max(MIN_STEP_KBPS)).min(aim), INCREASE_AFTER)
-        } else {
-            // Between the knee and the cliff: hold, so a marginal path does not flap.
-            self.cap = Some(current);
-            return None;
-        };
-        if target == current || self.applied.is_some_and(|at| now.duration_since(at) < gate) {
-            self.cap = Some(current);
-            return None;
-        }
-        if let Some(broken) = broken {
-            self.broken_at = Some((broken, now));
+            // The cooldown runs from the most recent congestion, not from the last applied
+            // decrease: at the floor no step is left to apply, and a stale timestamp let a
+            // brief recovery probe back into the rate that broke the path a moment earlier.
+            self.broken_at = Some((current, now));
             self.decreased_at = Some(now);
+            return self.apply((current / 2).max(FLOOR_KBPS).min(current), current, DECREASE_AFTER, now);
+        }
+        if clean {
+            return self.apply((current + (current / 4).max(MIN_STEP_KBPS)).min(aim.max(current)),
+                current, INCREASE_AFTER, now);
+        }
+        // Between the knee and the cliff: hold, so a marginal path does not flap.
+        None
+    }
+
+    /// What the encoder is actually capped at right now.
+    fn effective(&self, ceiling_kbps: u32) -> u32 {
+        self.cap.map_or(ceiling_kbps, |cap| cap.min(ceiling_kbps))
+    }
+
+    /// Hand out a new cap unless it equals the current rate or the restart gate has not passed.
+    fn apply(&mut self, target: u32, current: u32, gate: Duration, now: Instant) -> Option<u32> {
+        if target == current || self.applied.is_some_and(|at| now.duration_since(at) < gate) {
+            return None;
         }
         self.applied = Some(now);
         self.cap = Some(target);
@@ -140,7 +152,7 @@ mod tests {
         // sample over the knee is not a congested path, so the cap stays where it is.
         assert_eq!(report(&mut governor, start + Duration::from_secs(1), 0.0, Some(1_300.0)), None);
         assert_eq!(report(&mut governor, start + Duration::from_secs(2), 0.0, Some(72.0)), None);
-        assert_eq!(governor.cap, Some(6_000));
+        assert_eq!(governor.effective(6_000), 6_000);
         // A round trip that stays over the knee halves the cap on the second confirming report.
         assert_eq!(report(&mut governor, start + Duration::from_secs(3), 0.0, Some(900.0)), None);
         assert_eq!(report(&mut governor, start + Duration::from_secs(4), 0.0, Some(900.0)), Some(3_000));
@@ -193,7 +205,7 @@ mod tests {
         let start = Instant::now();
         assert_eq!(report(&mut governor, start, 3.5, Some(60.0)), None);
         assert_eq!(report(&mut governor, start + Duration::from_secs(2), 6.0, Some(90.0)), None);
-        assert_eq!(governor.cap, Some(6_000));
+        assert_eq!(governor.effective(6_000), 6_000);
     }
 
     #[test]
@@ -215,5 +227,35 @@ mod tests {
             at += INCREASE_AFTER;
         }
         assert_eq!(reached, Some(20_000));
+    }
+
+    #[test]
+    fn a_rate_below_the_floor_does_not_blind_the_governor_to_a_raise() {
+        let mut governor = Governor::default();
+        let start = Instant::now();
+        // 500k custom sits below the floor: there is no cap to write, the encoder runs at 500.
+        assert_eq!(governor.observe(20.0, Some(20.0), 500, start), None);
+        // Raised to 6M: the governor must see the real 6M and halve it, not "current == floor".
+        assert_eq!(governor.observe(20.0, Some(20.0), 6_000, start + Duration::from_secs(1)), Some(3_000));
+    }
+
+    #[test]
+    fn sustained_congestion_at_the_floor_keeps_moving_the_probe_clock() {
+        let mut governor = Governor::default();
+        let start = Instant::now();
+        let mut at = start;
+        while let Some(cap) = report(&mut governor, at, 20.0, Some(20.0)) {
+            assert_eq!(Some(cap), governor.cap);
+            at += DECREASE_AFTER;
+        }
+        // At the floor, ongoing congestion applies no step but must keep the clock fresh.
+        assert_eq!(report(&mut governor, at, 20.0, Some(20.0)), None);
+        // A brief recovery inside the probe window (from this last congested report) climbs
+        // nothing: the aim is still the floor the path just broke at.
+        at += PROBE_AFTER - Duration::from_secs(1);
+        assert_eq!(report(&mut governor, at, 0.0, Some(20.0)), None);
+        // Past the window, the climb restarts from the floor.
+        at += Duration::from_secs(2);
+        assert_eq!(report(&mut governor, at, 0.0, Some(20.0)), Some(1_300));
     }
 }
