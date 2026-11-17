@@ -363,6 +363,21 @@ pub fn selection()->(usize,u64) {let s=SELECTION.lock().unwrap();(s.id,s.generat
 pub fn selected()->usize {selection().0}
 pub fn source(id:usize)->Option<&'static Output> {outputs().get(id)}
 pub fn input_size(fallback:(u32,u32))->(u32,u32) {source(selected()).map_or(fallback,|s|(s.width,s.height))}
+/// Where the captured output sits inside the compositor-wide desktop plus that desktop's
+/// size: `(offset_x, offset_y, monitor_w, monitor_h, desktop_w, desktop_h)`. uinput's ABS
+/// axes span every monitor, so absolute motion from the viewer (monitor pixel space) must be
+/// shifted by the placement before it is normalized.
+pub fn portal_desktop_bounds()->Option<(i32,i32,u32,u32,u32,u32)> {
+    let all=outputs();
+    let sel=source(selected())?;
+    if all.is_empty() {return None;}
+    let min_x=all.iter().map(|o|o.x).min()?;
+    let min_y=all.iter().map(|o|o.y).min()?;
+    let max_x=all.iter().map(|o|o.x.saturating_add(o.width as i32)).max()?;
+    let max_y=all.iter().map(|o|o.y.saturating_add(o.height as i32)).max()?;
+    if max_x<=min_x || max_y<=min_y {return None;}
+    Some((sel.x-min_x,sel.y-min_y,sel.width,sel.height,(max_x-min_x) as u32,(max_y-min_y) as u32))
+}
 /// Region the encoder captures for this display: the Wayland output, or the selected X11 monitor.
 pub fn capture_source(display:&str,portal:bool,id:usize)->Option<&'static Output> {
     if display.starts_with("wayland:") || (!portal && !display.starts_with("kms:") && x11_multiscreen()) {source(id)} else {None}

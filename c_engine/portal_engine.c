@@ -592,10 +592,12 @@ static int read_stream_result(struct uu_portal *p, GVariant *results) {
     fprintf(stderr, "Portal authorization result: devices_present=%d device_bits=%u stream_count=%zu\n",
         has_devices, devices, streams ? (size_t)g_variant_n_children(streams) : 0);
     int error = 0;
-    if (!has_devices || (devices & 3) != 3 || !streams || g_variant_n_children(streams) != 1) {
+    /* A ScreenCast-only session (see open_persist) never returns "devices": input is
+     * uinput-based. Only the single monitor stream is required. */
+    if (!streams || g_variant_n_children(streams) != 1) {
         error = 6;
     } else {
-        p->devices = devices;
+        if (has_devices) p->devices = devices;
         GVariant *entry = g_variant_get_child_value(streams, 0), *properties;
         g_variant_get(entry, "(u@a{sv})", &p->node, &properties);
         /* Optional 'size' is compositor logical coordinates, not frame pixels. */
@@ -647,7 +649,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
     char token[64]; snprintf(token, sizeof(token), "uu_session_%u_%u", (unsigned)getpid(), atomic_fetch_add(&token_sequence, 1));
     g_variant_builder_add(&options, "{sv}", "session_handle_token", g_variant_new_string(token));
-    results = request(p, REMOTE, "CreateSession", &options, 0, error);
+    results = request(p, SCREEN, "CreateSession", &options, 0, error);
     if (!results) goto done;
     const char *handle = NULL;
     if (g_variant_lookup(results, "session_handle", "&s", &handle)) p->session = g_strdup(handle);
@@ -656,22 +658,20 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     p->closed_subscription = g_dbus_connection_signal_subscribe(p->bus, DEST, SESSION, "Closed", p->session,
         NULL, G_DBUS_SIGNAL_FLAGS_NONE, session_closed, p, NULL);
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    /* Keyboard and pointer, plus the touchscreen (4) where the portal offers one (mobile viewers). */
-    p->available = remote_property(p, "AvailableDeviceTypes");
-    g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(3 | (p->available & 4)));
-    guint version = remote_property(p, "version");
-    if (version >= 2) {
-        g_variant_builder_add(&options, "{sv}", "persist_mode", g_variant_new_uint32(2));
-        if (restore && *restore) g_variant_builder_add(&options, "{sv}", "restore_token", g_variant_new_string(restore));
-    }
-
-    results = request(p, REMOTE, "SelectDevices", &options, 1, error);
-    if (!results) goto done;
-    g_variant_unref(results);
-    g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    /* GNOME 50 (xdg-desktop-portal-gnome 50.0) SEGVs inside RemoteDesktop.Start and
+     * rejects ScreenCast.Start on a RemoteDesktop-created session. Input is already
+     * uinput-based, so use a ScreenCast-only session: same streams, no RemoteDesktop
+     * round trip (no SelectDevices, no RemoteDesktop.Start). */
+    p->available = 0;
     /* 1 monitor; 4 virtual (KDE creates a KWin virtual output for the stream). */
     g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(source_types));
     g_variant_builder_add(&options, "{sv}", "multiple", g_variant_new_boolean(FALSE));
+    /* persist_mode/restore_token keep the consent prompt from reappearing on every connection. */
+    guint version = interface_property(p, SCREEN, "version");
+    if (version >= 4) {
+        g_variant_builder_add(&options, "{sv}", "persist_mode", g_variant_new_uint32(2));
+        if (restore && *restore) g_variant_builder_add(&options, "{sv}", "restore_token", g_variant_new_string(restore));
+    }
     /* Hidden cursor avoids a duplicate pointer in absolute mode: the viewer draws its own where
      * it last sent motion. Relative mode has no such position, so the game's cursor has to come
      * from the compositor. The host flips this at runtime through uu_portal_set_cursor_mode();
@@ -702,7 +702,11 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
         if (reply) g_variant_unref(reply);
     }
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    results = request(p, REMOTE, "Start", &options, 2, error);
+    /* GNOME 50's org.freedesktop.portal.RemoteDesktop.Start never replies
+     * ("Session creation inhibited" on locked sessions, silent hang otherwise).
+     * ScreenCast.Start returns the streams on the same session; input stays on
+     * uinput, so use it instead of the RemoteDesktop entry point. */
+    results = request(p, SCREEN, "Start", &options, 2, error);
     if (!results) goto done;
     gboolean clipboard_enabled=FALSE;
     g_variant_lookup(results,"clipboard_enabled","b",&clipboard_enabled);
