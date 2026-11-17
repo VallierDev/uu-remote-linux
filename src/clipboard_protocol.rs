@@ -54,9 +54,14 @@ pub(crate) fn nested(field: u32, payload: &[u8], out: &mut Vec<u8>) {
     varint(payload.len() as u64, out); out.extend_from_slice(payload);
 }
 pub fn text_request(request_id: u64, text: &str) -> Vec<u8> {
+    text_chunk_request(request_id, text, false)
+}
+/// One ClipboardChange RPC (field 10). Official hosts send these next to the rich offer:
+/// mobile viewers only act on this form and ignore the rich format list.
+pub fn text_chunk_request(request_id: u64, part: &str, more: bool) -> Vec<u8> {
     let mut header=vec![8];varint(request_id,&mut header);
     // Official ClipboardMobileManager uses format_id=1 for text.
-    let data=encode(1,text,false);
+    let data=encode(1,part,more);
     let mut request=Vec::new();nested(1,&header,&mut request);nested(10,&data,&mut request);request
 }
 pub fn read_text_request(request: &[u8]) -> Result<Option<(Vec<u8>,String)>, &'static str> {
@@ -116,6 +121,22 @@ mod tests {
         assert!(read_text_request(&[10,1,255,82,0]).is_err());
         assert!(read_text_request(&[10,0,82,2,8,2]).is_err());
         assert!(read_text_request(&[10,0,74,0]).unwrap().is_none());
+    }
+    #[test]
+    fn chunked_text_rpc_assembles_by_content_id_and_single_chunk_reads_as_request() {
+        let text="中文🙂".repeat(3000); // > 8192 bytes: at least two chunks
+        let parts=chunks(&text).unwrap();
+        assert!(parts.len()>1);
+        let mut assembly=Assembly::default();
+        for (index,part) in parts.iter().enumerate() {
+            let rpc=text_chunk_request(0x42+index as u64,part,index+1<parts.len());
+            let inner=decode_wire(&rpc).unwrap();
+            let WireValue::Bytes(data)=inner.iter().find(|f|f.number==10).unwrap().value else {panic!("field 10 missing")};
+            if index+1==parts.len(){assert_eq!(assembly.accept(data).unwrap().as_deref(),Some(text.as_str()));}
+            else{assert!(assembly.accept(data).unwrap().is_none());}
+        }
+        let single=text_chunk_request(7,"short",false);
+        assert_eq!(read_text_request(&single).unwrap().unwrap().1,"short");
     }
     #[test]
     fn unicode_chunk_roundtrip_and_empty_copy() {

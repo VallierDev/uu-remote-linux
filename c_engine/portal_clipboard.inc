@@ -97,6 +97,13 @@ static void selection_transfer(GDBusConnection *bus,const gchar *sender,const gc
 }
 int uu_portal_clipboard_supported(struct uu_portal *p) { return p && p->clipboard_enabled; }
 int uu_portal_clipboard_ready(struct uu_portal *p) { return p && p->clipboard_enabled && uu_portal_alive(p); }
+int uu_portal_clipboard_owns(struct uu_portal *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&p->lock);
+    int owns = p->clipboard_owns;
+    pthread_mutex_unlock(&p->lock);
+    return owns;
+}
 int uu_portal_clipboard_set(struct uu_portal *p,const uint8_t *text,size_t length) {
     if (!uu_portal_clipboard_ready(p) || length>CLIP_LIMIT || !g_utf8_validate((const char *)text,(gssize)length,NULL)) return -1;
     char *copy=g_malloc(length+1); memcpy(copy,text,length); copy[length]=0;
