@@ -263,15 +263,20 @@ impl PortalDesktop {
         let mut previous: Option<Option<bool>> = None;
         let mut defer_until_unlock = false;
         let mut retry_at = Instant::now();
-        // A drop holder, hence the underscore: held for the whole desktop session, not just
-        // while the Portal session opens. GNOME blanks and then locks an idle host, which ends
-        // the Portal session and stops frames and injected input together.
+        // A drop holder, hence the underscore: held while frames flow for the whole desktop
+        // session, not just while the Portal session opens. GNOME blanks and then locks an idle
+        // host, which ends the Portal session and stops frames and injected input together. It is
+        // dropped whenever capture is not allowed or recovery fails, matching the README promise
+        // that locking or a failed initialization releases the inhibition.
         let mut _inhibitor: Option<IdleGuard> = None;
         loop {
             if !owner.is_current() { return Ok(()); }
             let state = *locked.borrow_and_update();
             if state == Some(false) { defer_until_unlock = false; }
             if state != Some(false) && previous == Some(Some(false)) { self.pause(&owner); }
+            // A state that forbids capture gives up the inhibition too: the viewer sees nothing
+            // while paused, and the host must be free to blank and lock on its own schedule.
+            if !attempt_allowed(state, allow_locked) { _inhibitor = None; }
             if state == Some(true) && previous != Some(Some(true)) && allow_locked {
                 log::info!("Desktop is locked; opening Portal capture for the lock screen");
             }
@@ -293,9 +298,15 @@ impl PortalDesktop {
                     AttemptOutcome::Terminal(error) => return Err(error),
                     AttemptOutcome::Retry(error) => {
                         log::warn!("Portal desktop recovery deferred: {error}");
+                        // No frames flow while recovery keeps failing; a stale host must not be
+                        // held awake through the outage, and the next Ready takes a fresh guard.
+                        _inhibitor = None;
                         retry_at = Instant::now() + std::time::Duration::from_secs(5);
                     }
-                    AttemptOutcome::Deferred => { defer_until_unlock = true; }
+                    AttemptOutcome::Deferred => {
+                        defer_until_unlock = true;
+                        _inhibitor = None;
+                    }
                     AttemptOutcome::Cancelled => {}
                 }
                 if !attempt_allowed(*locked.borrow_and_update(), allow_locked) { self.pause(&owner); }
@@ -785,6 +796,40 @@ mod tests {
         assert_eq!(releases.load(Ordering::Relaxed), 0);
         task.abort();
         let _ = task.await;
+        assert_eq!(releases.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn locking_after_ready_releases_the_saved_inhibitor() {
+        let (lock, locked) = watch::channel(Some(false));
+        let host = Arc::new(PortalDesktop::with_lock_state(
+            Arc::new(ScreenCapture::unavailable("pending".into())), locked));
+        let input = Arc::new(crate::input::InputInjector::without_desktop());
+        let owner = input.desktop_session();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let host = host.clone();
+            let owner = owner.clone();
+            let releases = releases.clone();
+            async move {
+                host.maintain_with(owner, || Ok(()),
+                    move || IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone())))),
+                    |screen, _cancel| Ok(screen)).await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while host.snapshot().waiting {
+            assert!(tokio::time::Instant::now() < deadline, "Portal desktop was never published");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The compositor closes the session on lock; the saved guard must not outlive it.
+        lock.send_replace(Some(true));
+        while releases.load(Ordering::Relaxed) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "locking kept the inhibitor held");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        // Dropped exactly once at the lock transition and not replaced while locked.
         assert_eq!(releases.load(Ordering::Relaxed), 1);
     }
 }
