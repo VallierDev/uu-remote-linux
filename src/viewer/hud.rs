@@ -42,11 +42,12 @@ impl Layer {
     /// Text with its top-left at (x, y); returns the advance width.
     pub fn text(&mut self, font: Option<&FontVec>, x: f32, y: f32, text: &str, size: f32, c: Rgba) -> f32 {
         let Some(font) = font else { return 0. };
-        let scaled = font.as_scaled(PxScale::from(size));
+        let scale = text_scale(font, size);
+        let scaled = font.as_scaled(scale);
         let mut caret = x;
         for ch in text.chars() {
             let id = scaled.glyph_id(ch);
-            let glyph = id.with_scale_and_position(PxScale::from(size), ab_glyph::point(caret, y + scaled.ascent()));
+            let glyph = id.with_scale_and_position(scale, ab_glyph::point(caret, y + scaled.ascent()));
             caret += scaled.h_advance(id);
             if let Some(outline) = font.outline_glyph(glyph) {
                 let b = outline.px_bounds();
@@ -56,9 +57,17 @@ impl Layer {
         caret - x
     }
 }
+// PxScale is ascent-to-descent height, not pixels per em. CJK fonts have generous line
+// metrics, so passing the requested UI size directly makes their visible glyphs too small.
+fn text_scale(font: &FontVec, size: f32) -> PxScale {
+    font.pt_to_px_scale(size * 72. / 96.).unwrap_or_else(|| PxScale::from(size))
+}
+fn text_height(font: Option<&FontVec>, size: f32) -> f32 {
+    font.map_or(size * 1.25, |font| font.as_scaled(text_scale(font, size)).height())
+}
 pub fn measure(font: Option<&FontVec>, text: &str, size: f32) -> f32 {
     let Some(font) = font else { return text.chars().count() as f32 * size * 0.55 };
-    let scaled = font.as_scaled(PxScale::from(size));
+    let scaled = font.as_scaled(text_scale(font, size));
     text.chars().map(|ch| scaled.h_advance(scaled.glyph_id(ch))).sum()
 }
 
@@ -101,8 +110,27 @@ pub fn spinner(t: f32, size: u32) -> Layer {
 }
 
 pub fn label_layer(font: Option<&FontVec>, text: &str, size: f32, c: Rgba) -> Layer {
-    let mut l = Layer::new(measure(font, text, size).ceil() as u32 + 4, (size * 1.4).ceil() as u32);
-    l.text(font, 2., 0., text, size, c);
+    // Keep the logical line/advance box, but also include accents and negative bearings
+    // outside it. Shift the origin as well as growing the layer, with two transparent pixels.
+    let mut min = ab_glyph::point(0., 0.);
+    let mut max = ab_glyph::point(measure(font, text, size), text_height(font, size));
+    if let Some(font) = font {
+        let scale = text_scale(font, size);
+        let scaled = font.as_scaled(scale);
+        let mut caret = 0.;
+        for ch in text.chars() {
+            let id = scaled.glyph_id(ch);
+            if let Some(outline) = font.outline_glyph(id.with_scale_and_position(scale, ab_glyph::point(caret, scaled.ascent()))) {
+                let b = outline.px_bounds();
+                min.x = min.x.min(b.min.x); min.y = min.y.min(b.min.y);
+                max.x = max.x.max(b.max.x); max.y = max.y.max(b.max.y);
+            }
+            caret += scaled.h_advance(id);
+        }
+    }
+    let (left, top) = (min.x.floor(), min.y.floor());
+    let mut l = Layer::new((max.x.ceil() - left) as u32 + 4, (max.y.ceil() - top) as u32 + 4);
+    l.text(font, 2. - left, 2. - top, text, size, c);
     l
 }
 
@@ -123,12 +151,13 @@ pub fn stats_lines(n: &NetStats) -> Vec<String> {
     ]
 }
 pub fn stats_layer(font: Option<&FontVec>, lines: &[String], scale: f32) -> Layer {
-    let size = 13. * scale;
+    let size = 14. * scale;
+    let line = text_height(font, size).max(size * 1.45);
     let w = lines.iter().map(|l| measure(font, l, size)).fold(0., f32::max) + 24. * scale;
-    let h = lines.len() as f32 * size * 1.45 + 16. * scale;
+    let h = lines.len() as f32 * line + 16. * scale;
     let mut l = Layer::new(w.ceil() as u32, h.ceil() as u32);
     l.round_rect(0., 0., w, h, 8. * scale, [0, 0, 0, 150]);
-    for (i, line) in lines.iter().enumerate() { l.text(font, 12. * scale, 8. * scale + i as f32 * size * 1.45, line, size, TEXT); }
+    for (i, text) in lines.iter().enumerate() { l.text(font, 12. * scale, 8. * scale + i as f32 * line, text, size, TEXT); }
     l
 }
 
@@ -189,12 +218,13 @@ impl Default for Menu { fn default() -> Self { Self { open: false, category: 1, 
 pub struct Rect { pub x: f32, pub y: f32, pub w: f32, pub h: f32 }
 impl Rect { pub fn contains(&self, x: f32, y: f32) -> bool { x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h } }
 
-pub const TAB_H: f32 = 30.;
+pub const TAB_H: f32 = 36.;
+const TAB_TEXT: f32 = 14.;
 pub fn tab_text() -> &'static str { s("控制中心", "Control center") }
 /// Width of the drawn menu icon plus its gap; fonts without U+2630 would show a box.
 const ICON_W: f32 = 18.;
 pub fn tab_rect(font: Option<&FontVec>, window: (u32, u32), scale: f32) -> Rect {
-    let w = measure(font, tab_text(), 13. * scale) + (28. + ICON_W) * scale;
+    let w = measure(font, tab_text(), TAB_TEXT * scale) + (28. + ICON_W) * scale;
     Rect { x: (window.0 as f32 - w) / 2., y: 0., w, h: TAB_H * scale }
 }
 pub fn tab_layer(font: Option<&FontVec>, scale: f32, hover: bool) -> Layer {
@@ -203,7 +233,7 @@ pub fn tab_layer(font: Option<&FontVec>, scale: f32, hover: bool) -> Layer {
     // Flat top edge: the pill hangs from the window border.
     l.round_rect(0., -12. * scale, r.w, r.h + 12. * scale, 12. * scale, if hover { [40, 44, 52, 235] } else { [24, 26, 31, 205] });
     for i in 0..3 { l.round_rect(14. * scale, r.h / 2. + (i as f32 * 4. - 5.) * scale, 11. * scale, 1.6 * scale, 0.8 * scale, TEXT); }
-    l.text(font, (14. + ICON_W) * scale, (r.h - 13. * scale * 1.25) / 2., tab_text(), 13. * scale, TEXT);
+    l.text(font, (14. + ICON_W) * scale, (r.h - text_height(font, TAB_TEXT * scale)) / 2., tab_text(), TAB_TEXT * scale, TEXT);
     l
 }
 
@@ -211,16 +241,26 @@ pub fn tab_layer(font: Option<&FontVec>, scale: f32, hover: bool) -> Layer {
 /// Cascading like the official client: a narrow category list and, beside the hovered row,
 /// a card sized to the selected category's options.
 pub struct Layout { pub w: f32, pub h: f32, pub items: Vec<(Rect, Hit)>, pub panels: Vec<Rect> }
-const ROW: f32 = 30.; const HEADER: f32 = 22.; const SLIDER: f32 = 36.; const PAD: f32 = 6.; const SHADOW: f32 = 14.;
-const MAIN_W: f32 = 150.; const GAP: f32 = 6.; const TEXT_SIZE: f32 = 13.;
+const ROW: f32 = 36.; const HEADER: f32 = 26.; const SLIDER: f32 = 44.; const PAD: f32 = 8.; const SHADOW: f32 = 14.;
+const MAIN_W: f32 = 180.; const GAP: f32 = 6.; const TEXT_SIZE: f32 = 16.; const SMALL_TEXT: f32 = 12.;
+const VOLUME_TEXT: f32 = 14.; const KNOB_RADIUS: f32 = 7.; const VOLUME_GAP: f32 = 10.;
+struct SliderGeometry { start: f32, len: f32, label_right: f32 }
+fn slider_geometry(font: Option<&FontVec>, panel: &Rect, scale: f32) -> SliderGeometry {
+    let start = panel.x + 18. * scale;
+    let label_right = panel.x + panel.w - 14. * scale;
+    // Reserve the widest percentage up front so dragging does not move its own hit geometry.
+    let label_width = measure(font, "100%", VOLUME_TEXT * scale);
+    let end = label_right - label_width - (KNOB_RADIUS + VOLUME_GAP) * scale;
+    SliderGeometry { start, len: (end - start).max(scale), label_right }
+}
 fn option_height(opt: &Opt) -> f32 { match opt { Opt::Header(_) => HEADER, Opt::Slider => SLIDER, _ => ROW } }
 fn option_width(font: Option<&FontVec>, opt: &Opt, scale: f32) -> f32 {
     let text = |t: &str, size: f32| measure(font, t, size * scale);
     match opt {
-        Opt::Header(t) => text(t, 11.) + 28. * scale,
+        Opt::Header(t) => text(t, SMALL_TEXT) + 28. * scale,
         Opt::Radio(t, ..) | Opt::Check(t, ..) => text(t, TEXT_SIZE) + 52. * scale,
-        Opt::Action(t, _, key) => text(t, TEXT_SIZE) + text(key, 11.) + 72. * scale,
-        Opt::Slider => 210. * scale,
+        Opt::Action(t, _, key) => text(t, TEXT_SIZE) + text(key, SMALL_TEXT) + 72. * scale,
+        Opt::Slider => 230. * scale,
     }
 }
 pub fn layout(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -> Layout {
@@ -242,7 +282,7 @@ pub fn layout(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -> La
             let r = Rect { x: sub.x + k(PAD), y, w: sub.w - k(PAD * 2.), h: k(option_height(opt)) };
             match opt {
                 Opt::Header(_) => {}
-                Opt::Slider => items.push((r, Hit::Slider(sub.x + k(18.), sub.w - k(70.)))),
+                Opt::Slider => { let g = slider_geometry(font, &sub, scale); items.push((r, Hit::Slider(g.start, g.len))); },
                 _ => items.push((r, Hit::Option(menu.category, i))),
             }
             y += k(option_height(opt));
@@ -267,7 +307,7 @@ pub fn menu_layer(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -
     let mut l = Layer::new(lay.w.ceil() as u32, lay.h.ceil() as u32);
     for p in &lay.panels { card(&mut l, p, scale); }
     let size = k(TEXT_SIZE);
-    let mid = |r: &Rect, size: f32| r.y + (r.h - size * 1.25) / 2.;
+    let mid = |r: &Rect, size: f32| r.y + (r.h - text_height(font, size)) / 2.;
     let opts = options(menu.category, st);
     for (i, name) in categories().iter().enumerate() {
         let r = &lay.items[i].0;
@@ -284,7 +324,7 @@ pub fn menu_layer(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -
             let r = Rect { x: sub.x + k(PAD), y, w: sub.w - k(PAD * 2.), h: k(option_height(opt)) };
             if menu.hover == Some(Hit::Option(menu.category, i)) { l.round_rect(r.x, r.y + 1., r.w, r.h - 2., k(6.), HOVER); }
             match opt {
-                Opt::Header(t) => { l.text(font, r.x + k(10.), r.y + k(6.), t, k(11.), DIM); }
+                Opt::Header(t) => { l.text(font, r.x + k(10.), mid(&r, k(SMALL_TEXT)), t, k(SMALL_TEXT), DIM); }
                 Opt::Radio(t, on, _) => {
                     if *on { l.circle(r.x + k(16.), r.y + r.h / 2., k(3.), ACCENT); }
                     l.text(font, r.x + k(30.), mid(&r, size), t, size, if *on { TEXT } else { [214, 218, 224, 255] });
@@ -297,18 +337,19 @@ pub fn menu_layer(font: Option<&FontVec>, st: &State, menu: &Menu, scale: f32) -
                 }
                 Opt::Action(t, _, key) => {
                     l.text(font, r.x + k(30.), mid(&r, size), t, size, TEXT);
-                    let kw = measure(font, key, k(11.));
-                    l.text(font, r.x + r.w - kw - k(10.), mid(&r, k(11.)), key, k(11.), DIM);
+                    let kw = measure(font, key, k(SMALL_TEXT));
+                    l.text(font, r.x + r.w - kw - k(10.), mid(&r, k(SMALL_TEXT)), key, k(SMALL_TEXT), DIM);
                 }
                 Opt::Slider => {
-                    let (a, len) = (sub.x + k(18.), sub.w - k(70.));
+                    let g = slider_geometry(font, sub, scale);
+                    let (a, len) = (g.start, g.len);
                     let v = st.volume as f32 / 100.; let cy = r.y + r.h / 2.;
                     l.round_rect(a, cy - k(2.), len, k(4.), k(2.), [255, 255, 255, 40]);
                     l.round_rect(a, cy - k(2.), (len * v).max(k(4.)), k(4.), k(2.), ACCENT);
-                    l.circle(a + len * v, cy, k(7.), [0, 0, 0, 60]);
+                    l.circle(a + len * v, cy, k(KNOB_RADIUS), [0, 0, 0, 60]);
                     l.circle(a + len * v, cy, k(6.), [255, 255, 255, 255]);
                     let label = format!("{}%", st.volume);
-                    l.text(font, sub.x + sub.w - k(14.) - measure(font, &label, k(12.)), mid(&r, k(12.)), &label, k(12.), DIM);
+                    l.text(font, g.label_right - measure(font, &label, k(VOLUME_TEXT)), mid(&r, k(VOLUME_TEXT)), &label, k(VOLUME_TEXT), DIM);
                 }
             }
             y += r.h;
@@ -347,6 +388,39 @@ fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_el
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn ui_font_size_keeps_cjk_glyphs_readable(){
+        let Some(font)=load_font() else {eprintln!("Skipping font raster check: no UI font available");return};
+        let ch=if font.glyph_id('控').0!=0 {'控'}else{'H'};
+        let mut layer=Layer::new(64,64);layer.text(Some(&font),4.,4.,&ch.to_string(),16.,TEXT);
+        let rows:Vec<_>=(0..layer.h as usize).filter(|y|layer.px[y*layer.w as usize*4..(y+1)*layer.w as usize*4]
+            .chunks_exact(4).any(|p|p[3]>0)).collect();
+        let height=rows.last().unwrap()-rows.first().unwrap()+1;
+        assert!(height>=if ch=='控'{14}else{10},"16 px UI glyph rendered at only {height} px");
+    }
+    #[test] fn text_layers_fit_accents_descenders_and_cjk(){
+        let Some(font)=load_font() else {eprintln!("Skipping font raster check: no UI font available");return};
+        for scale in [1.,1.25,1.5,2.] {for text in ["控制中心", "ÁÉ gjpq", "Ấj", "Ctrl+Alt+M"] {
+            let layer=label_layer(Some(&font),text,16.*scale,TEXT);
+            let alpha=|x:usize,y:usize|layer.px[(y*layer.w as usize+x)*4+3];
+            assert!((0..layer.w as usize).all(|x|alpha(x,0)==0&&alpha(x,layer.h as usize-1)==0),"vertical clipping: {text}");
+            assert!((0..layer.h as usize).all(|y|alpha(0,y)==0&&alpha(layer.w as usize-1,y)==0),"horizontal clipping: {text}");
+        }}
+    }
+    #[test] fn volume_label_stays_clear_of_the_thumb_and_uses_the_same_hit_geometry(){
+        let font=load_font();let font=font.as_ref();
+        for scale in [1.,1.25,1.5,2.] {for volume in [0,50,100] {
+            let state=State{volume,..State::default()};
+            let (_,lay)=menu_layer(font,&state,&Menu{category:3,..Default::default()},scale);
+            let sub=&lay.panels[1];let g=slider_geometry(font,sub,scale);
+            let label_left=g.label_right-measure(font,&format!("{volume}%"),VOLUME_TEXT*scale);
+            let thumb_right=g.start+g.len*f32::from(volume)/100.+KNOB_RADIUS*scale;
+            assert!(label_left-thumb_right>=VOLUME_GAP*scale-0.01,"volume label overlaps the thumb");
+            let (start,len)=lay.items.iter().find_map(|(_,h)|match h{Hit::Slider(a,l)=>Some((*a,*l)),_=>None}).unwrap();
+            assert_eq!((start,len),(g.start,g.len));
+            assert_eq!(slider_value(start,start,len),0);assert_eq!(slider_value(start+len,start,len),100);
+            assert_eq!(slider_value(start+len/2.,start,len),50);
+        }}
+    }
     #[test] fn natural_scroll_preference_survives_reconnect_and_quality_changes(){
         const CHILD:&str="UU_VIEWER_SCROLL_PREFS_TEST";
         if std::env::var_os(CHILD).is_none(){
@@ -390,12 +464,16 @@ fn prefs_path() -> std::path::PathBuf { crate::config::path().parent().map_or_el
             crate::viewer::type_ipc::write_png_rgb(&dir.join(name),l.w,l.h,&rgb,false).unwrap();
         };
         let st=State{stats:true,..State::default()};
-        for cat in [1usize,3,4,5] {let (l,_)=menu_layer(font,&st,&Menu{open:true,category:cat,hover:Some(Hit::Option(cat,1)),dragging:false},1.);save(&format!("menu{cat}.png"),&l,[200,200,210]);}
+        for scale in [1.,1.5,2.] {for cat in [1usize,3,4,5] {
+            let (l,_)=menu_layer(font,&st,&Menu{open:true,category:cat,hover:Some(Hit::Option(cat,1)),dragging:false},scale);
+            save(&format!("menu{cat}-{}x.png",scale),&l,[200,200,210]);
+        }}
         save("tab.png",&tab_layer(font,1.,false),[230,230,230]);
         let n=NetStats{elapsed:57,route:"UDP · relay".into(),fps:60,kbps:8420.,rtt_ms:Some(36),loss:0.,size:(1920,1080),codec:"H.265",chroma:1};
         save("stats.png",&stats_layer(font,&stats_lines(&n),1.),[230,230,230]);
         save("spinner.png",&spinner(0.3,56),[17,19,24]);
         save("title.png",&label_layer(font,"Connecting to PUNOSEVAC",20.,[240,242,245,255]),[17,19,24]);
+        save("label-accents.png",&label_layer(font,"ÁÉ gjpq Ấj",16.,TEXT),[17,19,24]);
     }
     #[test] fn stats_lines_format_numbers(){
         let n=NetStats{elapsed:3723,route:"UDP · relay".into(),fps:60,kbps:8420.,rtt_ms:Some(36),loss:0.25,size:(1920,1080),codec:"H.265",chroma:3};

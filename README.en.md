@@ -624,6 +624,8 @@ terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsd
 
 Key combinations use the left/right modifier state attached to each SDL key event. Focus loss releases remote keys; after focus returns, the next non-modifier key restores any still-held Shift/Ctrl/Alt/Win (Command on Mac). This is built in, with no adapter or setting required.
 
+Control-center text uses actual font em sizes, with 16 px menu labels so CJK fonts remain readable. To enlarge the controls further, launch with `UU_VIEWER_UI_SCALE=1.5 uuremote-viewer ui`; menu geometry and hit targets scale together.
+
 If touchpad natural scrolling feels reversed remotely, enable **Control center → Peripherals → Follow local natural scrolling** in the remote window.
 Normal mouse wheel direction stays unchanged; the option takes effect immediately for both axes and precise natural scrolling. The `follow_natural_scroll` preference is saved in `~/.config/uuremote/viewer.json` (default `false`) and restored on the next connection.
 

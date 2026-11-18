@@ -807,6 +807,57 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
 #[cfg(test)] mod tests {
     use super::*;
     #[cfg_attr(target_os="macos",ignore)]
+    #[test] fn readable_menus_render_and_click_at_multiple_scales(){
+        const CHILD:&str="UU_VIEWER_READABILITY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none(){
+            let dir=std::env::temp_dir().join(format!("uu-viewer-readability-{}-{}",std::process::id(),rand::random::<u64>()));
+            std::fs::create_dir(&dir).unwrap();
+            for lang in ["zh","en"] {for scale in ["1","1.5","2"] {
+                let output=std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","viewer::sdl::tests::readable_menus_render_and_click_at_multiple_scales","--test-threads=1"])
+                    .env(CHILD,"1").env("SDL_VIDEODRIVER","dummy").env("UU_LANG",lang).env("UU_VIEWER_UI_SCALE",scale)
+                    .env("UU_CONFIG",dir.join("config.json")).output().unwrap();
+                assert!(output.status.success(),"{lang} {scale}x: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            }}
+            std::fs::remove_dir_all(dir).unwrap();return
+        }
+        let mut window=Window::new().unwrap();let scale=window.chrome.scale;
+        window.canvas.window_mut().set_size((1280.*scale) as u32,(720.*scale) as u32).unwrap();
+        let frame=Frame{width:1280,height:720,rgb:[60,64,72].repeat(1280*720),content:None};
+        window.chrome.menu.open=true;window.chrome.menu.category=1;
+        window.draw(&frame).unwrap();
+        let (_,layout)=window.menu_layout();let origin=window.menu_origin(&layout);
+        let (row,_)=layout.items.iter().find(|(_,h)|matches!(h,hud::Hit::Option(1,1))).unwrap();
+        let event=Event::MouseButtonDown{timestamp:0,window_id:window.canvas.window().id(),which:0,mouse_btn:MouseButton::Left,clicks:1,
+            x:(origin.0+row.x+row.w/2.) as i32,y:(origin.1+row.y+row.h/2.) as i32};
+        window._sdl.event().unwrap().push_event(event).unwrap();
+        let (_,remote)=window.poll(&mut Input::new(false));
+        assert!(remote.is_empty());assert_eq!(window.state().quality,4);
+        assert!(window.take_commands().contains(&hud::Command::Quality(4)));
+        window.chrome.menu.category=3;
+        for volume in [0,50,100] {
+            let (_,layout)=window.menu_layout();let origin=window.menu_origin(&layout);
+            let (row,start,len)=layout.items.iter().find_map(|(r,h)|match h{hud::Hit::Slider(a,l)=>Some((r,*a,*l)),_=>None}).unwrap();
+            let x=(origin.0+start+len*volume as f32/100.).round() as i32;
+            let y=(origin.1+row.y+row.h/2.).round() as i32;
+            let id=window.canvas.window().id();
+            window._sdl.event().unwrap().push_event(Event::MouseButtonDown{timestamp:0,window_id:id,which:0,mouse_btn:MouseButton::Left,clicks:1,x,y}).unwrap();
+            window._sdl.event().unwrap().push_event(Event::MouseButtonUp{timestamp:0,window_id:id,which:0,mouse_btn:MouseButton::Left,clicks:1,x,y}).unwrap();
+            let (_,remote)=window.poll(&mut Input::new(false));
+            assert!(remote.is_empty());assert_eq!(window.state().volume,volume);
+            assert!(window.take_commands().contains(&hud::Command::Volume(volume)));
+        }
+        if let Some(dir)=std::env::var_os("UU_HUD_WINDOW_PREVIEW") {
+            for category in [1,3] {
+                window.chrome.menu.category=category;window.draw(&frame).unwrap();
+                let size=window.canvas.output_size().unwrap();
+                let rgb=window.canvas.read_pixels(None,PixelFormatEnum::RGB24).unwrap();
+                let name=crate::tr!("zh-{scale}x-menu{category}.png","en-{scale}x-menu{category}.png");
+                super::super::type_ipc::write_png_rgb(&std::path::PathBuf::from(&dir).join(name),size.0,size.1,&rgb,false).unwrap();
+            }
+        }
+    }
+    #[cfg_attr(target_os="macos",ignore)]
     #[test] fn remote_window_disables_local_text_input_and_forwards_shift(){
         if std::env::var_os("UU_VIEWER_IME_TEST_CHILD").is_none(){
             let output=std::process::Command::new(std::env::current_exe().unwrap())
