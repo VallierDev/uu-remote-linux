@@ -937,7 +937,9 @@ impl WebRtcSession {
                                           changed = updates.changed() => {
                                               if changed.is_err() { break; }
                                               let text = updates.borrow_and_update().clone();
-                                              let Some(text) = text else { continue; };
+                                              // Reading an empty clipboard publishes Some(""); a zero-length offer means
+                                              // nothing to the viewer, so skip it rather than send one per connection.
+                                              let Some(text) = text.filter(|t| !t.is_empty()) else { continue; };
                                               {
                                                   let request_id=clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
                                                   let payload = match rich_outgoing.lock().unwrap().offer(request_id,text.clone()) {
