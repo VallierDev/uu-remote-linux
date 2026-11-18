@@ -45,6 +45,11 @@ pub fn set_viewer_controller(controller: crate::input::Controller) {
     VIEWER_WINDOWS.store(controller == crate::input::Controller::Windows, Ordering::Relaxed);
 }
 pub fn active() -> bool { ACTIVE.load(Ordering::Relaxed) }
+/// Whether the running privacy backend is the X11 gamma one: it only recolors outputs, owning
+/// neither a portal idle inhibitor nor an input block, so idle keep-alive must keep running.
+pub fn x11_gamma_active() -> bool {
+    active() && backend::detect().is_some_and(|backend| backend.name() == X11_BACKEND)
+}
 /// The viewer's privacy_type now in effect.
 pub fn current_type() -> u8 {
     if !active() { mode::TYPE_OFF } else if PICTURE.load(Ordering::Relaxed) { Mode::Picture.wire_type() } else { Mode::ScreenOff.wire_type() }
