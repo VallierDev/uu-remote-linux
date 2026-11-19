@@ -143,6 +143,31 @@ mod native {
         }
     }
     pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, clipboard_write: Mutex<()>, end_generation: Arc<std::sync::atomic::AtomicU64> }
+    /// Whether a failed open means the portal has already seen (and therefore spent) the
+    /// single-use restore token. Codes 1 (no bus), 2 (no interface) and 8 (allocation) fail
+    /// inside the engine before anything is sent, and 13 is this side giving up (screen locked,
+    /// viewer gone). In all of those the cached grant is still valid, while a token-less retry
+    /// would put a consent dialog on an unattended screen.
+    fn token_spent(code: i32) -> bool { !matches!(code, 1 | 2 | 8 | 13) }
+
+    #[cfg(test)]
+    mod token_spent_tests {
+        use super::token_spent;
+        // 1 bus unavailable, 2 interface missing, 8 allocation: the token never left the process.
+        // 13 cancel is also raised while waiting for the response; a cancel that lands that late
+        // leaves a token the portal still accepts, and were it ever spent the next open falls back
+        // to the dialog, so erring towards keeping it costs nothing.
+        #[test] fn failures_before_the_portal_keep_the_cached_grant() {
+            for code in [1, 2, 8, 13] { assert!(!token_spent(code), "code {code} never reached the portal"); }
+        }
+        // 3 D-Bus rejection (an unknown token answers this), 4 user denied, 5 consent timeout,
+        // 9 connection closed: all of them happen after Start carried the token. 0 means the
+        // engine reported nothing usable, so it is treated as spent like any unknown failure.
+        #[test] fn failures_at_the_portal_consume_the_token() {
+            for code in [0, 3, 4, 5, 9, 15] { assert!(token_spent(code), "code {code} reached the portal"); }
+        }
+    }
+
     impl Session {
         fn take_lock_observation(&self) -> Result<bool, String> {
             // A recovery in progress must see the lock even if another capture
@@ -355,9 +380,16 @@ mod native {
             // its consent dialog and issues a fresh one. Failures after Start carry a returned
             // token (rotation.received()), which excludes them from this retry.
             if pointer.is_null() && !restore.is_null() && !cache.rotation.received() {
-                log::warn!("Portal request failed with a restore token; discarding it and retrying once without restore (a consent dialog may appear)");
-                restore = std::ptr::null();
-                (pointer, error, width, height) = engine_open!(restore);
+                if token_spent(error) {
+                    log::warn!("Portal request failed with a restore token; discarding it and retrying once without restore (a consent dialog may appear)");
+                    restore = std::ptr::null();
+                    (pointer, error, width, height) = engine_open!(restore);
+                } else {
+                    // Nothing was submitted, so the grant this attempt borrowed is still good.
+                    // Put it back rather than trading a valid consent for a dialog nobody can see.
+                    log::warn!("Portal request failed with code {error} before the restore token was submitted; keeping the cached consent");
+                    return Err(failed(error, &cache, true));
+                }
             }
             let Some(handle) = NonNull::new(pointer) else {
                 // The retry carried no token, so its outcome tells the two failure shapes apart:
