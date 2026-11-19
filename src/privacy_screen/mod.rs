@@ -247,6 +247,11 @@ fn auto_enable(mode: Mode, generation: u64) {
     // Only portal backends ride the capture's portal session; the X11 backend dims outputs on
     // its own, so waiting for a portal on an Xorg session would stall the auto-enable forever.
     let portal_backend = backend::detect().is_some_and(|backend| backend.name() != X11_BACKEND);
+    // A live portal Session object is not proof the capture produces content: a stale session
+    // from the previous peer can still read `available` while the new request is in flight, and
+    // ScreenOff before the first real frame makes GNOME fail the pending restore (display-off
+    // deadlock). Wait for the encoder to report at least one fresh frame past this point.
+    let fresh_baseline = crate::video::portal_fresh_frames();
     for attempt in 1..=5 {
         if !current() { return; }
         if VIEWER_OVERRIDE.load(Ordering::Relaxed) {
@@ -255,7 +260,7 @@ fn auto_enable(mode: Mode, generation: u64) {
         }
         // Not a failure yet: the desktop capture opens its portal session a moment after the peer
         // connects, and entering without it would roll back and log a restore for nothing.
-        if portal_backend && !crate::portal::available() {
+        if portal_backend && crate::video::portal_fresh_frames() == fresh_baseline {
             log::info!("Privacy auto: waiting for the desktop capture (attempt {attempt})");
             std::thread::sleep(std::time::Duration::from_secs(1));
             continue;
