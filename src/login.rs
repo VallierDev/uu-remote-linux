@@ -241,16 +241,25 @@ pub async fn wait_for_credentials(stale_token: Option<String>) -> Credentials {
 pub async fn run(gui: bool) -> Result<(), String> {
     let _lock = single_instance().map_err(|e| { eprintln!("login failed: {e}"); e })?;
     let ui = if gui { LoginUi::open(&hostname(), &os_name(), &cpu_name(), &video().iter().map(|v| gpu_label(v)).collect::<Vec<_>>().join("\n")) } else { LoginUi::none() };
-    let result = tokio::select! {
-        r = flow(&ui) => r,
-        _ = ui.wait_closed() => Err("login window closed".into()),
+    // Checked before any request so the window can explain it in the UI language; the log stays English.
+    let invalid_base = crate::config::custom_base_url().err();
+    let result = match &invalid_base {
+        Some(e) => Err(e.to_string()),
+        None => tokio::select! {
+            r = flow(&ui) => r,
+            _ = ui.wait_closed() => Err("login window closed".into()),
+        },
     };
     match &result {
         Ok(name) => {
             ui.done(&crate::tr!("登录成功\n{name}","Signed in\n{name}"));
             ui.status(crate::i18n::s("登录信息已保存到本机配置，可以关闭此窗口","Sign-in saved to the local config; you can close this window"), Tone::Ok);
         }
-        Err(e) => { eprintln!("login failed: {e}"); ui.status(&crate::tr!("登录失败：{e}","Sign-in failed: {e}"), Tone::Error); }
+        Err(e) => {
+            eprintln!("login failed: {e}");
+            let shown = invalid_base.as_ref().map_or_else(|| e.clone(), |b| b.localized());
+            ui.status(&crate::tr!("登录失败：{shown}","Sign-in failed: {shown}"), Tone::Error);
+        }
     }
     if ui.shown() { ui.wait_closed().await; }
     result.map(|_| ())
