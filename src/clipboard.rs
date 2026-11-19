@@ -184,7 +184,7 @@ pub fn start_portal(session: std::sync::Arc<crate::portal::PortalSession>) -> Cl
         }
         let available=session.clipboard_ready(); let _=ready_tx.send(available);
         if !available { return; }
-        let mut last=None; let mut pending=None; let mut deferred=false; let mut owned=false;
+        let mut last=None; let mut pending=None; let mut deferred=false;
         while !output.is_closed() && input.has_changed().is_ok() {
             if input.has_changed().unwrap_or(false) {
                 pending=input.borrow_and_update().clone().filter(|text|text.len()<=MAX_TEXT);
@@ -203,53 +203,10 @@ pub fn start_portal(session: std::sync::Arc<crate::portal::PortalSession>) -> Cl
             if let Some(text)=session.clipboard_poll() {
                 if last.as_ref()!=Some(&text) { last=Some(text.clone()); output.send_replace(Some(text)); }
             }
-            // Ownership must be sampled while the session is alive: `session_closed()` and
-            // `uu_portal_end()` both clear the portal's ownership flag before this loop can
-            // observe the dead session.
-            if session.is_alive() { owned=session.clipboard_owns(); }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        reclaim_desktop_clipboard(reclaim_text(owned,session.clipboard_ready(),last));
     });
     ClipboardBridge {incoming,outgoing,ready}
 }
 
-/// Whether the bridge has to hand the text back to a local client. `owned` is the ownership
-/// seen while the session was still alive; `usable` is false once `uu_portal_end()` or
-/// `session_closed()` has run, which is also when a local paste starts reading empty.
-fn reclaim_text(owned_while_alive: bool, usable: bool, last: Option<String>) -> Option<String> {
-    if owned_while_alive && !usable { last } else { None }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::reclaim_text;
-    #[test] fn reclaims_only_text_this_session_still_owned_when_the_session_is_gone() {
-        assert_eq!(reclaim_text(true,false,Some("text".into())),Some("text".into()));
-        // Session still serving the clipboard: the portal keeps answering local pastes.
-        assert_eq!(reclaim_text(true,true,Some("text".into())),None);
-        // A local application took the selection before the disconnect.
-        assert_eq!(reclaim_text(false,false,Some("text".into())),None);
-        assert_eq!(reclaim_text(true,false,None),None);
-    }
-}
-
-/// GNOME keeps the closed portal session as clipboard owner, and every local paste then
-/// reads empty until some client reclaims the selection. Hand the text this session provided
-/// to wl-copy so the desktop clipboard survives the disconnect.
-fn reclaim_desktop_clipboard(owned: Option<String>) {
-    let Some(text)=owned else { return };
-    let mut child=match std::process::Command::new("wl-copy")
-        .args(["--type","text/plain;charset=utf-8"])
-        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child)=>child,
-        Err(error)=>{ log::warn!("Clipboard reclaim failed to spawn wl-copy: {error}"); return; }
-    };
-    if let Some(mut stdin)=child.stdin.take() { use std::io::Write; let _=stdin.write_all(text.as_bytes()); }
-    match child.wait() {
-        Ok(status) if status.success() => log::info!("Desktop clipboard reclaimed after portal session end: bytes={}",text.len()),
-        _ => log::warn!("Clipboard reclaim wl-copy did not take ownership"),
-    }
-}
