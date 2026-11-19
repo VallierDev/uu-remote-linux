@@ -162,7 +162,7 @@ for a new QR login.
 | `src/file_trans.rs` | FileTransferFtp RPC |
 | `src/terminal.rs` | TERM frames + PTY sessions |
 | `src/privacy_screen/`, `c_engine/privacy_wallpaper.c` | host privacy screen (RPC 7): desktop-independent controller, recovery record, guard and cover processes; `Backend` per desktop (`kde/`: KWin virtual output, kscreen-doctor, KWin input devices). See docs/privacy-screen.md |
-| `src/session_lock.rs`, `c_engine/pam_check.c` | lock state reporting, auto unlock via PAM + logind; passwordless local fallback (`local_unlock_fallback`, 4 s re-check after each desktop connection, opt-in `set-unlock`) for Windows viewers |
+| `src/session_lock.rs`, `c_engine/pam_check.c` | lock state reporting, auto unlock via PAM + logind; passwordless local fallback (`local_unlock_fallback`, 4 s re-check after each desktop connection, opt-in `set-unlock`) for Windows viewers; a peer that sent action 15 is excluded for the rest of the connection, so a rejected password is never bypassed |
 | `src/system_actions.rs`, `src/system_metrics.rs` | SimpleAction system commands, mute, auto-lock, SystemMetrics |
 | `src/annotation.rs`, `c_engine/annotation_overlay.c` | viewer annotation (RPC 27 `draw_req` → RpcResponse 23): click-through X11 ARGB overlay, needs a compositing manager |
 | `src/initialization.rs`, `src/control_protocol.rs`, `src/protocol.rs` | protobuf encoders/decoders for CONTROL |
