@@ -338,13 +338,14 @@ mod native {
                 }};
             }
             let mut restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
-            let failed = |code: i32, cache: &TokenCache, sent_restore: bool| {
+            let failed = |code: i32, cache: &TokenCache, save_grant: bool| {
                 // A single-use restore token is consumed by the portal when it validates it, so a
                 // rejection (expiry, permission-store reset, rotation drift) leaves no valid grant.
                 // Writing the dead token back poisons every later attempt with an instant rejection
                 // and no dialog - no picture, nothing to click, an unattended host bricks itself
-                // (seen live on GNOME). Only a failure that never sent a token may keep the grant.
-                if let (Some(dir), Some((k, value)), false, false) = (directory.as_deref(), taken.as_ref(), cache.rotation.received(), sent_restore) {
+                // (seen live on GNOME). But a portal that refuses every session outright is not the
+                // token's fault; only the caller knows which case this was.
+                if let (Some(dir), Some((k, value)), false, true) = (directory.as_deref(), taken.as_ref(), cache.rotation.received(), save_grant) {
                     if super::permissions::save(dir, k, value).is_err() { log::warn!("Portal permission cache could not be restored"); }
                 }
                 super::PortalError { code }
@@ -354,11 +355,19 @@ mod native {
             // its consent dialog and issues a fresh one. Failures after Start carry a returned
             // token (rotation.received()), which excludes them from this retry.
             if pointer.is_null() && !restore.is_null() && !cache.rotation.received() {
-                log::warn!("Portal restore token was rejected; discarding it and retrying once without restore (a consent dialog may appear)");
+                log::warn!("Portal request failed with a restore token; discarding it and retrying once without restore (a consent dialog may appear)");
                 restore = std::ptr::null();
                 (pointer, error, width, height) = engine_open!(restore);
             }
-            let Some(handle) = NonNull::new(pointer) else { return Err(failed(if error == 0 { 15 } else { error }, &cache, !restore.is_null())) };
+            let Some(handle) = NonNull::new(pointer) else {
+                // The retry carried no token, so its outcome tells the two failure shapes apart:
+                // a fast code 3 means the portal refuses every session (seen wedged live on GNOME
+                // after heavy session churn) - keep the grant, a portal restart will then restore
+                // silently. A consent timeout (5) or cancel (13) means the dialog did open, i.e.
+                // the portal is healthy and the token was genuinely dead: leave it discarded.
+                let wedged = restore.is_null() && taken.is_some() && error == 3;
+                return Err(failed(if error == 0 { 15 } else { error }, &cache, wedged));
+            };
             let (mut x, mut y) = (0, 0);
             let granted = (!virtual_output && unsafe { uu_portal_stream_position(handle.as_ptr(), &mut x, &mut y) } == 0)
                 .then(|| crate::wayland::portal_monitor_at(x, y)).flatten();
