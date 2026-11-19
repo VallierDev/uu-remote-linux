@@ -151,12 +151,17 @@ pub fn unlock(password: String) -> UnlockResult {
     result
 }
 
+/// 100 ms polls (2 s) the lock screen greeter gets to exit after logind's Unlock.
+#[cfg_attr(test, allow(dead_code))]
+const GREETER_EXIT_POLLS: u32 = 20;
+
 fn unlock_with(password: &str) -> UnlockResult {
     let Some(session) = display_session() else { return UnlockResult::NoLoggedInUser };
     if session_locked(&session) == Some(false) { return UnlockResult::Success; }
     let Some(user) = user_name() else { return UnlockResult::NoLoggedInUser };
     if password.is_empty() || password.contains('\0') { return UnlockResult::WrongPassword; }
     match pam_check(&user, password) { 0 => {}, 1 => return UnlockResult::WrongPassword, _ => return UnlockResult::Failed }
+    let requested_at = stale_greeter::boot_ticks();
     if loginctl_path().and_then(|path| bounded_command(path, &["unlock-session", &session], Duration::from_secs(3))).is_none() {
         return UnlockResult::NoPermission;
     }
@@ -164,8 +169,13 @@ fn unlock_with(password: &str) -> UnlockResult {
         log::warn!("Display wake after auto unlock failed: {error}");
     }
     // Post-unlock confirmation like the official host: the lock screen must actually go away.
-    for _ in 0..100 { // GNOME takes ~3 s to drop the shield after logind's Unlock
+    for attempt in 0..100 { // GNOME takes ~3 s to drop the shield after logind's Unlock
         if session_locked(&session) == Some(false) { return UnlockResult::Success; }
+        // KDE unlocks only once its greeter has exited; a healthy one is gone within milliseconds.
+        #[cfg(not(test))]
+        if attempt == GREETER_EXIT_POLLS { if let Some(at) = requested_at { stale_greeter::kill_ignoring_unlock(&session, at); } }
+        #[cfg(test)]
+        let _ = (attempt, requested_at);
         std::thread::sleep(Duration::from_millis(100));
     }
     UnlockResult::Failed

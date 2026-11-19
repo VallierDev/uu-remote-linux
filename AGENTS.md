@@ -273,7 +273,9 @@ started a second full host server instead, so check that a subcommand exists in 
   finger, the next lock cannot start a greeter (input grabbed, desktop visible) and the old greeter's exit unlocks.
   `session_lock/stale_greeter.rs` kills a greeter started before the unlock in that logind session (cgroup
   `session-<id>.scope`, else `XDG_SESSION_ID` of the greeter or, as the greeter is non-dumpable, of its parent;
-  unknown = untouched) still running 3 s after the session unlocks.
+  unknown = untouched) still running 3 s after the session unlocks. Auto unlock hits the same hang: ksld answers
+  logind's Unlock by SIGTERMing the greeter and unlocks when it exits, so the session stays locked behind a black
+  lock window; `unlock_with` kills such a greeter when the session is still locked 2 s after `unlock-session`.
 - GNOME closes the portal session on lock; capture/input must share one portal session and be rebuilt after
   unlock. Portal input/clipboard permissions are persisted per desktop (0600 file); a revoked permission asks again.
 

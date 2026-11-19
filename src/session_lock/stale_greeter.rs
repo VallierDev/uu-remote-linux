@@ -12,6 +12,13 @@
 //! leftover is killed. ksld ignores that exit while unlocked (`s_lockProcessRequestedExit`); if
 //! the user already locked again, ksld sees a crashed greeter and starts a fresh one.
 //!
+//! Auto unlock (`loginctl unlock-session`) hits the same wait from the other side: ksld's
+//! `requestUnlock` handler only sets `s_logindExit` and SIGTERMs the greeter, and unlocks in
+//! `QProcess::finished`. The greeter quits its event loop, closes its windows and then waits for
+//! the fingerprint thread, so the session stays locked behind ksld's black lock window (observed:
+//! unlock-session sent, LockedHint still set 10 s later, viewer sees black plus its own cursor).
+//! Killing that greeter delivers `finished`, and with `s_logindExit` set ksld unlocks.
+//!
 //! Only greeters of the logind session whose unlock was observed (`User.Display`) are touched:
 //! the same user can have a second graphical session that is still locked, and its greeter is
 //! healthy. A greeter whose session cannot be determined is left alone.
@@ -45,7 +52,7 @@ fn greeter_stat(pid: libc::pid_t) -> Option<(libc::pid_t, u64)> {
 fn start_time(pid: libc::pid_t) -> Option<u64> { greeter_stat(pid).map(|(_, start)| start) }
 
 /// Time since boot in the unit of stat field 22 (`sysconf(_SC_CLK_TCK)` ticks of CLOCK_BOOTTIME).
-fn boot_ticks() -> Option<u64> {
+pub(super) fn boot_ticks() -> Option<u64> {
     let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 { return None; }
     let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|&hz| hz > 0)?;
@@ -117,6 +124,15 @@ pub(super) fn reap_after_unlock() {
         if killed > 0 { log::warn!("Lock screen greeter still running after unlock; removed: count={killed}"); }
     });
     if let Err(error) = spawned { log::warn!("Lock screen greeter check not started: {}", error.kind()); }
+}
+
+/// Call when `session` is still locked a while after logind was asked (at `requested_at`) to
+/// unlock it: a greeter started before the request has been told to exit by ksld and did not.
+pub(super) fn kill_ignoring_unlock(session: &str, requested_at: u64) {
+    let killed = greeters(session, requested_at).into_iter()
+        .filter(|&(pid, start)| start_time(pid) == Some(start) && unsafe { libc::kill(pid, libc::SIGKILL) } == 0)
+        .count();
+    if killed > 0 { log::warn!("Lock screen greeter ignored the unlock request; removed: count={killed}"); }
 }
 
 #[cfg(test)]
