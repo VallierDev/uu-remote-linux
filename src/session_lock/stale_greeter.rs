@@ -27,17 +27,22 @@ const COMM: &str = "kscreenlocker_g";
 /// (pid, start time in clock ticks): the start time tells a reused pid from the same process.
 type Greeter = (libc::pid_t, u64);
 
-/// `/proc/<pid>/stat` → (comm, starttime). comm may contain spaces and parentheses.
-fn parse_stat(stat: &str) -> Option<(&str, u64)> {
+/// `/proc/<pid>/stat` → (comm, ppid, starttime). comm may contain spaces and parentheses.
+fn parse_stat(stat: &str) -> Option<(&str, libc::pid_t, u64)> {
     let (open, close) = (stat.find('(')?, stat.rfind(')')?);
-    let start = stat.get(close + 1..)?.split_ascii_whitespace().nth(19)?.parse().ok()?; // field 22
-    Some((stat.get(open + 1..close)?, start))
+    let mut rest = stat.get(close + 1..)?.split_ascii_whitespace();
+    let parent = rest.nth(1)?.parse().ok()?; // field 4
+    let start = rest.nth(17)?.parse().ok()?; // field 22
+    Some((stat.get(open + 1..close)?, parent, start))
 }
 
-fn start_time(pid: libc::pid_t) -> Option<u64> {
+/// (ppid, starttime) of a greeter; None for any other process.
+fn greeter_stat(pid: libc::pid_t) -> Option<(libc::pid_t, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat(&stat).filter(|(comm, _)| *comm == COMM).map(|(_, start)| start)
+    parse_stat(&stat).filter(|(comm, ..)| *comm == COMM).map(|(_, parent, start)| (parent, start))
 }
+
+fn start_time(pid: libc::pid_t) -> Option<u64> { greeter_stat(pid).map(|(_, start)| start) }
 
 /// `/proc/<pid>/cgroup` → logind session id, when the process sits in `session-<id>.scope`.
 fn cgroup_session(cgroup: &str) -> Option<&str> {
@@ -55,14 +60,21 @@ fn environ_session(environ: &[u8]) -> Option<&str> {
 /// and the greeter under `user@<uid>.service` instead (observed on Plasma 6.3: cgroup
 /// `plasma-ksmserver.service`, and `/proc/<pid>/sessionid` names the user manager's own session,
 /// not the graphical one); there the environment imported from the graphical session names it.
-fn in_session(cgroup: &str, environ: &[u8], session: &str) -> bool {
-    cgroup_session(cgroup).or_else(|| environ_session(environ)) == Some(session)
+fn session_from(cgroup: &str, environ: &[u8]) -> Option<String> {
+    cgroup_session(cgroup).or_else(|| environ_session(environ)).map(str::to_owned)
 }
 
-fn belongs_to(pid: libc::pid_t, session: &str) -> bool {
+fn session_of(pid: libc::pid_t) -> Option<String> {
     let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
     let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
-    in_session(&cgroup, &environ, session)
+    session_from(&cgroup, &environ)
+}
+
+/// The greeter makes itself non-dumpable (`prctl(PR_SET_DUMPABLE, 0)` in its main.cpp), so its
+/// `environ` cannot be read; the process that started it (ksld in ksmserver / kwin_wayland)
+/// belongs to the same session and can be.
+fn belongs_to(pid: libc::pid_t, parent: libc::pid_t, session: &str) -> bool {
+    session_of(pid).or_else(|| session_of(parent)).as_deref() == Some(session)
 }
 
 fn greeters(session: &str) -> Vec<Greeter> {
@@ -71,8 +83,8 @@ fn greeters(session: &str) -> Vec<Greeter> {
     entries.flatten().filter_map(|entry| {
         let pid: libc::pid_t = entry.file_name().to_str()?.parse().ok()?;
         if entry.metadata().ok()?.uid() != uid { return None; }
-        let start = start_time(pid)?;
-        belongs_to(pid, session).then_some((pid, start))
+        let (parent, start) = greeter_stat(pid)?;
+        belongs_to(pid, parent, session).then_some((pid, start))
     }).collect()
 }
 
@@ -99,9 +111,9 @@ mod tests {
     #[test]
     fn stat_line_gives_comm_and_start_time() {
         let stat = "438154 (kscreenlocker_g) S 2217 2217 2217 0 -1 4194304 9 0 0 0 5 3 0 0 20 0 12 0 7654321 1 2 3";
-        assert_eq!(parse_stat(stat), Some(("kscreenlocker_g", 7654321)));
+        assert_eq!(parse_stat(stat), Some(("kscreenlocker_g", 2217, 7654321)));
         let odd = "7 (a b) c) R 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 42 0";
-        assert_eq!(parse_stat(odd), Some(("a b) c", 42)));
+        assert_eq!(parse_stat(odd), Some(("a b) c", 1, 42)));
         assert_eq!(parse_stat("7 (short) R 1"), None);
         assert_eq!(parse_stat("garbage"), None);
     }
@@ -120,17 +132,26 @@ mod tests {
     #[test]
     fn a_greeter_of_another_or_unknown_session_is_not_selected() {
         let managed = "0::/user.slice/user-1000.slice/user@1000.service/session.slice/plasma-ksmserver.service\n";
+        let is = |cgroup: &str, environ: &[u8], session: &str| session_from(cgroup, environ).as_deref() == Some(session);
         // Two graphical sessions of one user, session 3 just unlocked, session 7 still locked.
-        assert!(in_session(managed, b"XDG_SESSION_ID=3\0", "3"));
-        assert!(!in_session(managed, b"XDG_SESSION_ID=7\0", "3"));
-        assert!(in_session("0::/user.slice/user-1000.slice/session-3.scope\n", b"", "3"));
-        assert!(!in_session("0::/user.slice/user-1000.slice/session-7.scope\n", b"", "3"));
+        assert!(is(managed, b"XDG_SESSION_ID=3\0", "3"));
+        assert!(!is(managed, b"XDG_SESSION_ID=7\0", "3"));
+        assert!(is("0::/user.slice/user-1000.slice/session-3.scope\n", b"", "3"));
+        assert!(!is("0::/user.slice/user-1000.slice/session-7.scope\n", b"", "3"));
         // The scope wins over an inherited variable; "3" must not match "31".
-        assert!(!in_session("0::/user.slice/user-1000.slice/session-7.scope\n", b"XDG_SESSION_ID=3\0", "3"));
-        assert!(!in_session(managed, b"XDG_SESSION_ID=31\0", "3"));
-        // Unknown session: leave it alone.
-        assert!(!in_session(managed, b"DISPLAY=:0\0", "3"));
-        assert!(!in_session("", b"", "3"));
+        assert!(!is("0::/user.slice/user-1000.slice/session-7.scope\n", b"XDG_SESSION_ID=3\0", "3"));
+        assert!(!is(managed, b"XDG_SESSION_ID=31\0", "3"));
+        // Unknown session (the greeter's own unreadable environ, or nothing at all): no answer.
+        assert_eq!(session_from(managed, b""), None);
+        assert_eq!(session_from(managed, b"DISPLAY=:0\0"), None);
+        assert_eq!(session_from("", b""), None);
+    }
+
+    #[test]
+    fn a_process_without_a_known_session_belongs_to_none() {
+        // Neither a missing process nor a missing parent may select a greeter.
+        assert!(!belongs_to(libc::pid_t::MAX, libc::pid_t::MAX, "3"));
+        assert!(!belongs_to(libc::pid_t::MAX, libc::pid_t::MAX, ""));
     }
 
     #[test]
