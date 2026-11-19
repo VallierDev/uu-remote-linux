@@ -19,6 +19,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 mod logind;
+#[cfg_attr(test, allow(dead_code))] // not called from tests: it kills real processes
+mod stale_greeter;
 
 /// Official UnlockResult cases (LockScreenManager).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +136,8 @@ fn publish_lock_state(sender: &watch::Sender<Option<bool>>, locked: Option<bool>
     sender.send_if_modified(|current| if *current != locked {
         log::info!("Desktop lock state: {}", match locked { Some(true) => "locked", Some(false) => "unlocked", None => "unknown" });
         if locked == Some(true) { log::info!("Desktop is locked; capture continues while the compositor supplies frames"); }
+        #[cfg(not(test))]
+        if *current == Some(true) && locked == Some(false) { stale_greeter::reap_after_unlock(); }
         *current = locked; true
     } else { false });
 }
