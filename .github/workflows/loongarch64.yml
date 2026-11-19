@@ -126,6 +126,10 @@ jobs:
           cd /work/src || { echo "::error::the checkout is not mounted at /work/src"; exit 1; }
 
           echo "::group::apt"
+          # apt writes to a log so a failing package shows only its tail, but the log
+          # is also dumped when the group closes: a 7-minute silent apt phase is
+          # impossible to audit otherwise, and a diagnose run is worthless if it does
+          # not say what it actually fetched.
           : > /tmp/apt.log
           apt-get update >>/tmp/apt.log 2>&1 || {
             echo "--- apt-get update failed:"
@@ -165,6 +169,8 @@ jobs:
           if [ -n "$missing_optional" ]; then
             note "optional packages unavailable on this port:$missing_optional"
           fi
+          echo "--- apt log (tail):"
+          tail -40 /tmp/apt.log | sed 's/^/    /'
           echo "::endgroup::"
 
           echo "::group::toolchain"
@@ -195,13 +201,20 @@ jobs:
             printf '  %-24s MISSING\n' "$label"; return 1
           }
           probe "gtk+-3.0"            gtk+-3.0
-          probe "libwayland-client"   libwayland-client
+          probe "wayland-client"      wayland-client
           probe "xkbcommon"           xkbcommon
           probe "sdl2"                sdl2
           probe "gio-2.0"             gio-2.0 gio-unix-2.0
           probe "libpipewire-0.3"     libpipewire-0.3
           probe "libei >= 1.1"        "libei-1.0 >= 1.1"
           probe "libeis"              libeis-1.0
+          # build.rs shells out to wayland-scanner (libwayland-bin) to generate the
+          # protocol bindings; pkg-config does not cover it, so check the binary.
+          if command -v wayland-scanner >/dev/null; then
+            printf '  %-24s ok (%s)\n' "wayland-scanner" "$(command -v wayland-scanner)"
+          else
+            printf '  %-24s MISSING\n' "wayland-scanner"
+          fi
           # GTK is mandatory: the deb is expected to ship the GTK login window.
           pkg-config --exists gtk+-3.0 || fail "gtk+-3.0 development files are missing: the package would have no GUI"
           echo "::endgroup::"
@@ -211,13 +224,13 @@ jobs:
           else
 
           # Release feature set, minus whatever this port is missing. build.rs only
-          # warns about a missing libei or GTK, but a missing libwayland-client would
+          # warns about a missing libei or GTK, but a missing wayland-client would
           # break the link, so decide up front instead of discovering it at link time.
           feats=engine-plugins
-          if pkg-config --exists libwayland-client xkbcommon; then
+          if pkg-config --exists wayland-client xkbcommon; then
             feats="wayland,$feats"
           else
-            note "libwayland-client/xkbcommon missing: building without the wlroots engine."
+            note "wayland-client/xkbcommon missing: building without the wlroots engine."
           fi
           if pkg-config --exists gio-2.0 gio-unix-2.0 libpipewire-0.3 "libei-1.0 >= 1.1"; then
             feats="portal,$feats"
