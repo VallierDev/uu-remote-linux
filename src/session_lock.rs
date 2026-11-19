@@ -280,16 +280,24 @@ pub async fn handle_auto_unlock(password: Option<String>, channel: Channel, sequ
 /// CONTROL opens, so the fallback re-checks only after this delay and skips an already-unlocked screen.
 const LOCAL_UNLOCK_DELAY: Duration = Duration::from_secs(4);
 
-/// The fallback acts only when enabled and the screen is known locked (None = unknown, e.g. a
-/// session logind cannot answer for, is never touched).
-fn should_local_unlock(state: Option<bool>, enabled: bool) -> bool { enabled && state == Some(true) }
+/// The fallback acts only when enabled, the screen is known locked (None = unknown, e.g. a
+/// session logind cannot answer for, is never touched) and this peer never tried the viewer
+/// password: a failed action 15 is a password check the host must not walk around.
+fn should_local_unlock(state: Option<bool>, enabled: bool, attempted: bool) -> bool { enabled && state == Some(true) && !attempted }
+
+type UnlockAttempted = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
 /// Host-side fallback for viewers that never send SimpleAction 15 (the official Windows client
 /// has no auto unlock): after a desktop connection starts, if the screen is still locked, clear
-/// the logind lock without a password. opt-in via `host_settings.json` local_unlock.
-pub async fn local_unlock_fallback(mut state: watch::Receiver<Option<bool>>) {
+/// the logind lock without a password. opt-in via `host_settings.json` local_unlock. A peer that
+/// did send action 15 is excluded, so a wrong password cannot be answered with a free unlock.
+pub async fn local_unlock_fallback(mut state: watch::Receiver<Option<bool>>, attempted: UnlockAttempted) {
     tokio::time::sleep(LOCAL_UNLOCK_DELAY).await;
-    if !should_local_unlock(*state.borrow_and_update(), crate::system_actions::local_unlock_enabled()) { return; }
+    let attempted = attempted.load(std::sync::atomic::Ordering::Relaxed);
+    if !should_local_unlock(*state.borrow_and_update(), crate::system_actions::local_unlock_enabled(), attempted) {
+        if attempted { log::info!("Local unlock on connect skipped: password auto unlock was used on this peer"); }
+        return;
+    }
     let result = tokio::task::spawn_blocking(unlock_local).await.unwrap_or(UnlockResult::Failed);
     log::info!("Local unlock on connect: result={result:?}");
 }
@@ -358,10 +366,12 @@ mod tests {
 
     #[test]
     fn local_unlock_acts_only_on_known_lock_when_enabled() {
-        assert!(should_local_unlock(Some(true), true));
-        assert!(!should_local_unlock(Some(true), false));
-        assert!(!should_local_unlock(Some(false), true));
-        assert!(!should_local_unlock(None, true));
+        assert!(should_local_unlock(Some(true), true, false));
+        assert!(!should_local_unlock(Some(true), false, false));
+        assert!(!should_local_unlock(Some(false), true, false));
+        assert!(!should_local_unlock(None, true, false));
+        // A password the viewer tried — even a wrong one — rules the fallback out.
+        assert!(!should_local_unlock(Some(true), true, true));
     }
 
     #[test]

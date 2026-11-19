@@ -523,6 +523,10 @@ impl WebRtcSession {
         // session, otherwise the global lock watcher. Unknown state fails closed below.
         let channel_lock_state = portal_desktop.as_ref().map_or_else(
             crate::session_lock::watch_locked, |manager| manager.lock_state());
+        // Set once this peer sends SimpleAction 15: after the viewer has tried its password the
+        // passwordless local fallback stands down for the rest of the connection, so a wrong
+        // password cannot be answered with a free unlock.
+        let unlock_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // One file-transfer session per peer. The viewer may send FileTransferFtp RPCs on CONTROL,
         // but it receives file traffic only through streamerDidReceiveFileData, so every reply and
         // host-initiated request goes out on FILE_DATA_CHANNEL.
@@ -583,6 +587,7 @@ impl WebRtcSession {
             let last_echo_request = last_echo_request.clone();
             let echo_seen = echo_seen.clone();
             let channel_lock_state = channel_lock_state.clone();
+            let unlock_attempted = unlock_attempted.clone();
             let peer_files = peer_files.clone();
             let text_out = text_tx.clone();
             let text_rx = text_rx.clone();
@@ -885,6 +890,7 @@ impl WebRtcSession {
                     let open_screen = screen.clone();
                     let open_selection = peer_selection;
                     let open_text_out = text_out.clone();
+                    let open_unlock_attempted = unlock_attempted.clone();
                     d.on_open(Box::new(move || {
                         if let Some(start_drain) = open_drain { tokio::spawn(start_drain()); }
                         let init_actions = open_actions.clone();
@@ -1032,7 +1038,7 @@ impl WebRtcSession {
                                 let state = portal_desktop.as_ref().map_or_else(
                                     crate::session_lock::watch_locked, |desktop| desktop.lock_state());
                                 tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), state.clone()));
-                                tokio::spawn(crate::session_lock::local_unlock_fallback(state));
+                                tokio::spawn(crate::session_lock::local_unlock_fallback(state, open_unlock_attempted.clone()));
                             }
                             if let Some(manager) = &portal_desktop {
                                 let mut updates = manager.subscribe();
@@ -1159,7 +1165,7 @@ impl WebRtcSession {
                                 lock_reported = true;
                                 let state = crate::session_lock::watch_locked();
                                 tokio::spawn(crate::session_lock::report_states(channel.clone(), sequence.clone(), state.clone()));
-                                tokio::spawn(crate::session_lock::local_unlock_fallback(state));
+                                tokio::spawn(crate::session_lock::local_unlock_fallback(state, open_unlock_attempted.clone()));
                             }
                             // The viewer's menu only learns about a mode it did not ask for (an
                             // auto-enable) from this push, so desktop peers need it too, not only a
@@ -1260,6 +1266,7 @@ impl WebRtcSession {
                     let actions = channel_actions.clone();
                     let portal_for_message = portal_desktop.clone();
                     let lock_for_message = channel_lock_state.clone();
+                    let unlock_for_message = unlock_attempted.clone();
                     let echo_for_message = last_echo_request.clone();
                     let echo_seen_for_message = echo_seen.clone();
                     let capture_requests = capture_tx.clone();
@@ -1523,6 +1530,9 @@ impl WebRtcSession {
                                             // AUTO_UNLOCK_SYSTEM: args JSON {"key": saved password}; never logged.
                                             let args = action_fields.iter().find_map(|f| match (&f.value, f.number) { (WireValue::Bytes(v), 2) => Some(*v), _ => None }).unwrap_or(&[]);
                                             let password = crate::session_lock::password_from_args(args);
+                                            // The viewer tried its password: even a rejected one rules out the
+                                            // passwordless local fallback for the rest of this peer.
+                                            unlock_for_message.store(true, std::sync::atomic::Ordering::SeqCst);
                                             let (chan, seq_out) = (reply_chan.clone(), out_sequence.clone());
                                             tokio::spawn(crate::session_lock::handle_auto_unlock(password, chan, seq_out));
                                         }
