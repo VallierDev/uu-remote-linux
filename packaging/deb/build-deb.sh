@@ -4,7 +4,7 @@
 set -eu
 version=$1 bin=$2 out=$3
 here=$(cd "$(dirname "$0")" && pwd) root=$(cd "$here/../.." && pwd)
-case $(uname -m) in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac
+case $(uname -m) in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; loongarch64) arch=loong64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac
 pkg=$(mktemp -d)
 trap 'rm -rf "$pkg"' EXIT
 install -Dm755 "$bin/uuremote-server" "$pkg/usr/bin/uuremote-server"

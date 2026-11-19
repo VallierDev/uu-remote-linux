@@ -1,0 +1,346 @@
+name: Build linux-loongarch64 (qemu)
+
+# GitHub has no loongarch64 runners, so the host is built natively inside a
+# Debian/loong64 container made runnable by qemu-user (docker/setup-qemu-action).
+# Same idea as the .NET cross container in UotanStudio's loongarch-publish.yml,
+# with one difference: a Rust build has no cross toolchain to drive. rustc, cc,
+# GTK3, Wayland and SDL2 all exist for loong64, so rather than cross-compiling we
+# install the loong64 toolchain in the guest and run the ordinary build there;
+# qemu only has to make the foreign binaries executable. Expect hours, not
+# minutes, so the registry and target dir are cached and the container script is
+# written to report every problem in one run instead of dying on the first.
+#
+# The loongarch64-only dependency patches this build needs live in vendor/nix and
+# vendor/rcgen (see their PATCHES.md) and are wired up through [patch.crates-io]
+# in Cargo.toml, so a plain checkout builds here with no extra flags.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (empty = version from Cargo.toml)"
+        required: false
+        default: ""
+      diagnose_only:
+        description: "Only probe the loong64 environment (apt, pkg-config, rustc); skip the build"
+        type: boolean
+        default: false
+      run_tests:
+        description: "Also run cargo test (roughly doubles the emulated build time)"
+        type: boolean
+        default: false
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: loongarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Debian trixie is the current loong64 port: apt works, and it carries GTK3,
+  # Wayland, PipeWire and libei >= 1.1.
+  IMAGE: ghcr.io/loong64/debian:trixie-slim
+
+jobs:
+  build:
+    name: linux-loongarch64
+    runs-on: ubuntu-24.04
+    # 360 min is the platform ceiling for a single job, so this is already the
+    # maximum and cannot be raised further; an emulated release build is the one
+    # thing here that could plausibly need all of it.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.inputs.version }}"
+          # A tag push has no inputs: the tag is the version, matching release.yml.
+          if [ -z "$version" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${{ github.ref_name }}"
+          fi
+          if [ -z "$version" ]; then
+            version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          fi
+          version="${version#v}"
+          if [ -z "$version" ]; then
+            echo "::error::No version from the input and none found in Cargo.toml." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $version"
+
+      # binfmt registration comes from tonistiigi/binfmt; `all` is used because the
+      # action's platform list is not guaranteed to know the loong64 alias.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      # The registry is small and saves the crate downloads; the target dir is ~2 GB
+      # and is what makes a failed run cheap to retry, since a rebuild of ~370
+      # emulated crates costs hours. Both are saved even when the job fails, so a
+      # compile error does not throw the work away.
+      - name: Cache cargo registry and target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/loongarch/cache
+            ${{ runner.temp }}/loongarch/target
+          key: loongarch64-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            loongarch64-${{ hashFiles('Cargo.lock') }}-
+            loongarch64-
+
+      - name: Build inside the loong64 container
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          RUN_TESTS: ${{ github.event.inputs.run_tests }}
+          DIAGNOSE_ONLY: ${{ github.event.inputs.diagnose_only }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/loongarch"
+          mkdir -p "$work/out" "$work/cache" "$work/target"
+          cat > "$work/container.sh" <<'CONTAINER'
+          # Deliberately no `set -e`: every phase records its own failure and the
+          # script reports all of them at the end. A run costs hours under qemu, so
+          # dying on the first missing package would mean one fix per run.
+          set -uo pipefail
+
+          FAILED=()
+          fail() { echo "::error::$*"; FAILED+=("$*"); }
+          note() { echo "::warning::$*"; }
+
+          export DEBIAN_FRONTEND=noninteractive CARGO_TERM_COLOR=always
+          # CARGO_HOME and the target dir live on the mounted cache so both survive
+          # between runs; RUSTUP_HOME stays in the container and is re-downloaded,
+          # which is a minute next to an emulated build.
+          export CARGO_HOME=/work/cache/cargo RUSTUP_HOME=/root/.rustup
+          export CARGO_TARGET_DIR=/work/target
+          cd /work/src || { echo "::error::the checkout is not mounted at /work/src"; exit 1; }
+
+          echo "::group::apt"
+          : > /tmp/apt.log
+          apt-get update >>/tmp/apt.log 2>&1 || {
+            echo "--- apt-get update failed:"
+            tail -20 /tmp/apt.log | sed 's/^/    /'
+            fail "apt-get update failed (no usable loong64 mirror?)"
+          }
+          # apt_install returns 1 and shows the tail of the log, so a missing package
+          # is reported without aborting the phase.
+          apt_install() {
+            if apt-get install -y --no-install-recommends "$1" >>/tmp/apt.log 2>&1; then
+              return 0
+            fi
+            echo "--- apt-get install $1 failed:"
+            tail -5 /tmp/apt.log | sed 's/^/    /'
+            return 1
+          }
+
+          # Hard requirements: without these there is no build at all.
+          REQUIRED="build-essential pkg-config ca-certificates curl xz-utils git file dpkg-dev
+          libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev"
+          # Optional: each one only enables a feature; build.rs already tolerates the
+          # absence, and the pkg-config probes below decide what gets compiled.
+          OPTIONAL="fonts-dejavu-core libsdl2-dev libwayland-dev libwayland-bin libxkbcommon-dev
+          libglib2.0-dev libpipewire-0.3-dev libei-dev libeis-dev"
+
+          missing_required=""
+          for pkg in $REQUIRED; do
+            apt_install "$pkg" || missing_required="$missing_required $pkg"
+          done
+          missing_optional=""
+          for pkg in $OPTIONAL; do
+            apt_install "$pkg" || missing_optional="$missing_optional $pkg"
+          done
+          if [ -n "$missing_required" ]; then
+            fail "required packages unavailable on this port:$missing_required"
+          fi
+          if [ -n "$missing_optional" ]; then
+            note "optional packages unavailable on this port:$missing_optional"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::toolchain"
+          # rustup ships loongarch64-unknown-linux-gnu host builds, so the guest gets
+          # current stable instead of the distribution's older rustc.
+          if curl -fsSL --retry 3 https://sh.rustup.rs -o /tmp/rustup.sh \
+            && sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable --no-modify-path; then
+            :
+          else
+            note "rustup failed on loong64; falling back to the distribution toolchain."
+            apt_install rustc || fail "neither rustup nor the distribution rustc is available"
+            apt_install cargo || fail "neither rustup nor the distribution cargo is available"
+          fi
+          export PATH="$CARGO_HOME/bin:$PATH"
+          cargo --version || fail "cargo is not runnable"
+          rustc -vV || fail "rustc is not runnable"
+          command -v cc >/dev/null || fail "no C compiler in PATH"
+          echo "::endgroup::"
+
+          echo "::group::environment report"
+          echo "uname: $(uname -m) $(uname -r)"
+          echo "dpkg arch: $(dpkg --print-architecture)"
+          probe() {
+            label=$1; shift
+            if pkg-config --exists "$@" 2>/dev/null; then
+              printf '  %-24s ok\n' "$label"; return 0
+            fi
+            printf '  %-24s MISSING\n' "$label"; return 1
+          }
+          probe "gtk+-3.0"            gtk+-3.0
+          probe "libwayland-client"   libwayland-client
+          probe "xkbcommon"           xkbcommon
+          probe "sdl2"                sdl2
+          probe "gio-2.0"             gio-2.0 gio-unix-2.0
+          probe "libpipewire-0.3"     libpipewire-0.3
+          probe "libei >= 1.1"        "libei-1.0 >= 1.1"
+          probe "libeis"              libeis-1.0
+          # GTK is mandatory: the deb is expected to ship the GTK login window.
+          pkg-config --exists gtk+-3.0 || fail "gtk+-3.0 development files are missing: the package would have no GUI"
+          echo "::endgroup::"
+
+          if [ "${DIAGNOSE_ONLY:-false}" = "true" ]; then
+            echo "diagnose_only: stopping before the build."
+          else
+
+          # Release feature set, minus whatever this port is missing. build.rs only
+          # warns about a missing libei or GTK, but a missing libwayland-client would
+          # break the link, so decide up front instead of discovering it at link time.
+          feats=engine-plugins
+          if pkg-config --exists libwayland-client xkbcommon; then
+            feats="wayland,$feats"
+          else
+            note "libwayland-client/xkbcommon missing: building without the wlroots engine."
+          fi
+          if pkg-config --exists gio-2.0 gio-unix-2.0 libpipewire-0.3 "libei-1.0 >= 1.1"; then
+            feats="portal,$feats"
+          else
+            note "libei >= 1.1 missing: libuu-portal.so is not built, so GNOME/KDE portal sessions are unsupported in this package."
+          fi
+          echo "Features: $feats"
+
+          echo "::group::build"
+          if [ "${RUN_TESTS:-false}" = "true" ]; then
+            cargo test --release --locked || fail "cargo test failed"
+          fi
+          # Continue past the host build so a viewer failure is reported in the same
+          # run; the packaging step below is guarded on the host binary existing.
+          host_ok=1
+          cargo build --release --locked --features "$feats" || { host_ok=0; fail "cargo build (host) failed"; }
+
+          if [ "$host_ok" = 1 ]; then
+            if pkg-config --exists sdl2; then
+              cargo build --release --locked --features native-viewer,viewer-sdl --bin uuremote-viewer \
+                || fail "cargo build (uuremote-viewer) failed"
+            else
+              note "SDL2 missing: skipping uuremote-viewer."
+            fi
+          fi
+          echo "::endgroup::"
+
+          if [ "$host_ok" = 1 ]; then
+            echo "::group::verify"
+            file "$CARGO_TARGET_DIR/release/uuremote-server"
+            if ! readelf -d "$CARGO_TARGET_DIR/release/uuremote-server" | grep -q 'libgtk-3'; then
+              fail "uuremote-server is not linked against GTK3; the login window would be missing"
+            fi
+            echo "::endgroup::"
+
+            echo "::group::package"
+            if packaging/deb/build-deb.sh "$VERSION" "$CARGO_TARGET_DIR/release" /work/out; then
+              deb=$(ls /work/out/uu-remote-linux_*.deb)
+              # build-deb.sh maps uname -m loongarch64 to the Debian port name loong64.
+              if ! dpkg-deb -f "$deb" Architecture | grep -qx loong64; then
+                fail "$(basename "$deb") is not Architecture: loong64"
+              fi
+              dpkg-deb -I "$deb" | sed -n '1,12p'
+
+              name=uu-remote-linux-${VERSION}-loongarch64-linux
+              stage=/work/out/$name
+              mkdir -p "$stage"
+              cp "$CARGO_TARGET_DIR"/release/uuremote-server LICENSE README.md README.en.md \
+                config.example.json packaging/tarball/install.sh "$stage/" \
+                || fail "staging the tarball failed"
+              for f in uuremote-viewer libuu-wayland.so libuu-portal.so; do
+                [ -f "$CARGO_TARGET_DIR/release/$f" ] && cp "$CARGO_TARGET_DIR/release/$f" "$stage/"
+              done
+              cp -r contrib "$stage/"
+              tar czf "/work/out/$name.tar.gz" -C /work/out "$name" || fail "tar failed"
+              rm -rf "$stage"
+              (cd /work/out && sha256sum ./*.deb ./*.tar.gz > SHA256SUMS && cat SHA256SUMS)
+            else
+              fail "packaging/deb/build-deb.sh failed"
+            fi
+            echo "::endgroup::"
+          fi
+
+          fi  # diagnose_only
+
+          echo "::group::summary"
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "${#FAILED[@]} problem(s) found in this run:"
+            for f in "${FAILED[@]}"; do echo "  - $f"; done
+            echo "::endgroup::"
+            exit 1
+          fi
+          echo "no problems found."
+          echo "::endgroup::"
+          CONTAINER
+
+          docker run --rm --platform linux/loong64 \
+            -v "$GITHUB_WORKSPACE:/work/src" \
+            -v "$work/out:/work/out" \
+            -v "$work/cache:/work/cache" \
+            -v "$work/target:/work/target" \
+            -v "$work/container.sh:/work/container.sh:ro" \
+            -w /work/src \
+            -e VERSION="$VERSION" -e RUN_TESTS="$RUN_TESTS" -e DIAGNOSE_ONLY="$DIAGNOSE_ONLY" \
+            "$IMAGE" bash /work/container.sh
+
+      - name: Show the produced packages
+        if: always()
+        shell: bash
+        run: |
+          ls -l "$RUNNER_TEMP/loongarch/out" || echo "no output was produced (see the container log above)"
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !inputs.diagnose_only }}
+        with:
+          name: uu-remote-linux-${{ steps.ver.outputs.version }}-linux-loongarch64
+          path: |
+            ${{ runner.temp }}/loongarch/out/*.deb
+            ${{ runner.temp }}/loongarch/out/*.tar.gz
+            ${{ runner.temp }}/loongarch/out/SHA256SUMS
+          # The build step already failed the job in that case; a second red step here
+          # would only bury the real error.
+          if-no-files-found: warn
+          retention-days: 30
+
+      # On a tag, release.yml is creating the GitHub release from the other matrix
+      # legs at the same time, so upload into the existing release with --clobber
+      # instead of letting action-gh-release race to create a second one.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
+            sleep 15
+          done
+          gh release view "$TAG" >/dev/null
+          gh release upload "$TAG" \
+            "$RUNNER_TEMP"/loongarch/out/*.deb \
+            "$RUNNER_TEMP"/loongarch/out/*.tar.gz \
+            "$RUNNER_TEMP"/loongarch/out/SHA256SUMS \
+            --clobber
