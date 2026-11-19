@@ -405,6 +405,9 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
                     cfg["csrf"] = json!(csrf_from_token(token).ok_or("token carries no csrf claim")?);
                     let nickname = d.get("nickname").and_then(|v| v.as_str()).unwrap_or("");
                     if !nickname.is_empty() { cfg["account_name"] = json!(nickname); }
+                    // The token belongs to the server that issued it: processes started without UU_BASE_URL
+                    // (the host service the viewer restarts) must send it there, not to the default.
+                    if let Some(base) = crate::config::custom_base_url()? { cfg["base_url"] = json!(base); }
                     // Keep settings saved meanwhile (e.g. from the assist card): merge into the fresh file.
                     if let Ok(Some(Value::Object(fresh))) = crate::config::read_fresh() {
                         for (k, v) in fresh { if cfg.get(&k).is_none() { cfg[k] = v; } }

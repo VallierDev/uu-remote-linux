@@ -390,7 +390,7 @@ Common environment variables:
 | Variable | Purpose |
 |---|---|
 | `UU_CONFIG` | Config file path (default `~/.config/uuremote/config.json`) |
-| `UU_BASE_URL` | Cloud API base URL (default `https://api.nrd.nie.163.com`); corresponds to `base_url` in config file, environment variable takes precedence; a set but invalid value (e.g. missing `https://`) is an error |
+| `UU_BASE_URL` | Cloud API base URL (default `https://api.nrd.nie.163.com`); corresponds to `base_url` in config file, environment variable takes precedence; a set but invalid value (e.g. missing `https://`) is an error; a successful QR login saves the address it used as `base_url` in the config file, so a host service started without the variable sends the credentials to the same server |
 | `UU_CLIENT_VERSION` | Reported host client version (`x-param-vn` and User-Agent), default `4.45.0.4318`; corresponds to `client_version` in config file, environment variable takes precedence |
 | `UU_VERSION_CODE` | Reported host version code (`x-param-vc`), default `4318`; corresponds to `version_code` in config file, environment variable takes precedence |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
