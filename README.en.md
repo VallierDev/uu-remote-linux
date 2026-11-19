@@ -661,6 +661,11 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
   Logs and `--dry-run` report lengths/event counts only. When reusing a session, about one second after sending, a PNG frame is saved (default under `$XDG_RUNTIME_DIR/uu-viewer-type/`, mode 0600); the path is logged and printed as `snapshot=…`.
 - In the desktop window: Ctrl+Alt+F opens the files window on the same connection, Ctrl+Alt+M toggles the control center, Ctrl+Alt+G toggles the network-status HUD, and Ctrl+Alt+K toggles sending system shortcuts to the remote host (keyboard grab). `UU_VIEWER_AUDIO=0` disables sound,
   `UU_VIEWER_CLIPBOARD=0` the clipboard, `UU_VIEWER_VIEW_ONLY=1` input; `UU_VIEWER_FFMPEG` selects the ffmpeg binary.
+- **Relay or direct** (`UU_VIEWER_FORCE_RELAY`): the default follows the `force_relay` the cloud sent. Set it to
+  `1` to use only the cloud's TURN relay instead of letting a direct candidate compete — with both peers behind
+  NAT the direct path can be far slower than the relay. Measured against the official macOS host, the direct
+  round trip was 350–1570 ms while the relay gave 18–24 ms. The request has no effect when the cloud lists no
+  TURN server: the cloud's ICE policy is kept and a warning is logged.
 - Desktop offers H.264 / H.265; the host chooses the codec. `UU_VIEWER_CODEC=h264` limits both SDP and decoder capabilities to H.264.
   The default request stays 4:2:0; `UU_VIEWER_CHROMA=444` requests true color (4:4:4) after CONTROL opens. The host may fall back to
   4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
