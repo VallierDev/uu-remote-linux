@@ -239,7 +239,6 @@ mod native {
             }
             // engine-plugins: libuu-portal.so (or one of its libraries) may be missing on this host.
             crate::engine_plugin::load(crate::engine_plugin::Engine::Portal).map_err(|_| super::PortalError { code: 15 })?;
-            let (mut error, mut width, mut height) = (0, 0, 0);
             let directory = super::permissions::directory();
             let key = super::permissions::desktop_key();
             let wanted = if virtual_output { None } else { monitor.map(str::to_owned).or_else(crate::wayland::portal_monitor) };
@@ -281,13 +280,6 @@ mod native {
             extern "C" fn save_token(token: *const libc::c_char, data: *mut c_void) {
                 save_detailed(token, data, 0, 0, 0);
             }
-            let restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
-            let failed = |code: i32, cache: &TokenCache| {
-                if let (Some(dir), Some((k, value)), false) = (directory.as_deref(), taken.as_ref(), cache.rotation.received()) {
-                    if super::permissions::save(dir, k, value).is_err() { log::warn!("Portal permission cache could not be restored"); }
-                }
-                super::PortalError { code }
-            };
             // Release packages can temporarily have an older libuu-portal.so than the host.
             #[cfg(feature = "engine-plugins")]
             let detailed = crate::engine_plugin::symbol(crate::engine_plugin::Engine::Portal, "uu_portal_open_detailed\0") != 0;
@@ -300,42 +292,73 @@ mod native {
                 && !std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v| v == "0") {
                 prefer_dmabuf = true;
             }
-            let pointer = if detailed {
-                // Virtual shares can wait for consent too; cancel them like monitor opens.
-                let cancel = cancelled;
-                let callback = cancel.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
-                let cancel_data = cancel.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
-                unsafe { uu_portal_open_detailed(
-                    restore, save_detailed, &mut cache as *mut _ as *mut c_void, callback, cancel_data,
-                    i32::from(prefer_dmabuf), if virtual_output { 4 } else { 1 },
-                    &mut error, &mut width, &mut height,
-                ) }
-            } else {
-                #[allow(unused_mut)]
-                let mut pointer: *mut c_void = std::ptr::null_mut();
-                #[cfg(feature = "inproc-av")]
-                if prefer_dmabuf {
-                    let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
-                    let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
-                    pointer = unsafe { uu_portal_open_persist_capture(
-                        restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
-                        &mut error, &mut width, &mut height,
-                    ) };
-                    if pointer.is_null() && error != 0 { return Err(failed(error, &cache)); }
-                    if pointer.is_null() { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
-                }
-                if !pointer.is_null() { pointer } else { unsafe {
-                    if virtual_output {
-                        uu_portal_open_virtual(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
-                    } else if let Some(cancelled) = cancelled {
-                        uu_portal_open_persist_cancellable(restore, save_token, &mut cache as *mut _ as *mut c_void,
-                            is_cancelled, cancelled as *const _ as *mut c_void, &mut error, &mut width, &mut height)
+            // One engine attempt with a given restore token. Reusable because a rejected token
+            // needs an immediate second attempt without one.
+            macro_rules! engine_open {
+                ($restore:expr) => {{
+                    let (mut error, mut width, mut height) = (0, 0, 0);
+                    let pointer = if detailed {
+                        // Virtual shares can wait for consent too; cancel them like monitor opens.
+                        let cancel = cancelled;
+                        let callback = cancel.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
+                        let cancel_data = cancel.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
+                        unsafe { uu_portal_open_detailed(
+                            $restore, save_detailed, &mut cache as *mut _ as *mut c_void, callback, cancel_data,
+                            i32::from(prefer_dmabuf), if virtual_output { 4 } else { 1 },
+                            &mut error, &mut width, &mut height,
+                        ) }
                     } else {
-                        uu_portal_open_persist(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
-                    }
-                } }
+                        #[allow(unused_mut)]
+                        let mut pointer: *mut c_void = std::ptr::null_mut();
+                        #[allow(unused_mut)]
+                        let mut dmabuf_failed = false;
+                        #[cfg(feature = "inproc-av")]
+                        if prefer_dmabuf {
+                            let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
+                            let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
+                            pointer = unsafe { uu_portal_open_persist_capture(
+                                $restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
+                                &mut error, &mut width, &mut height,
+                            ) };
+                            if pointer.is_null() && error != 0 { dmabuf_failed = true; }
+                            if pointer.is_null() && !dmabuf_failed { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
+                        }
+                        if !dmabuf_failed && pointer.is_null() { unsafe {
+                            if virtual_output {
+                                uu_portal_open_virtual($restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
+                            } else if let Some(cancelled) = cancelled {
+                                uu_portal_open_persist_cancellable($restore, save_token, &mut cache as *mut _ as *mut c_void,
+                                    is_cancelled, cancelled as *const _ as *mut c_void, &mut error, &mut width, &mut height)
+                            } else {
+                                uu_portal_open_persist($restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
+                            }
+                        } } else { pointer }
+                    };
+                    (pointer, error, width, height)
+                }};
+            }
+            let mut restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
+            let failed = |code: i32, cache: &TokenCache, sent_restore: bool| {
+                // A single-use restore token is consumed by the portal when it validates it, so a
+                // rejection (expiry, permission-store reset, rotation drift) leaves no valid grant.
+                // Writing the dead token back poisons every later attempt with an instant rejection
+                // and no dialog - no picture, nothing to click, an unattended host bricks itself
+                // (seen live on GNOME). Only a failure that never sent a token may keep the grant.
+                if let (Some(dir), Some((k, value)), false, false) = (directory.as_deref(), taken.as_ref(), cache.rotation.received(), sent_restore) {
+                    if super::permissions::save(dir, k, value).is_err() { log::warn!("Portal permission cache could not be restored"); }
+                }
+                super::PortalError { code }
             };
-            let Some(handle) = NonNull::new(pointer) else { return Err(failed(if error == 0 { 15 } else { error }, &cache)) };
+            let (mut pointer, mut error, mut width, mut height) = engine_open!(restore);
+            // Self-heal a dead consent: retry once without the restore token so the portal pops
+            // its consent dialog and issues a fresh one. Failures after Start carry a returned
+            // token (rotation.received()), which excludes them from this retry.
+            if pointer.is_null() && !restore.is_null() && !cache.rotation.received() {
+                log::warn!("Portal restore token was rejected; discarding it and retrying once without restore (a consent dialog may appear)");
+                restore = std::ptr::null();
+                (pointer, error, width, height) = engine_open!(restore);
+            }
+            let Some(handle) = NonNull::new(pointer) else { return Err(failed(if error == 0 { 15 } else { error }, &cache, !restore.is_null())) };
             let (mut x, mut y) = (0, 0);
             let granted = (!virtual_output && unsafe { uu_portal_stream_position(handle.as_ptr(), &mut x, &mut y) } == 0)
                 .then(|| crate::wayland::portal_monitor_at(x, y)).flatten();
