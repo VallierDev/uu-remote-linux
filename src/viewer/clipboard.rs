@@ -96,7 +96,9 @@ impl CommandBackend {
 }
 #[derive(Default)]
 // target_mac: Some(true) official Mac host, Some(false) Windows-type host (official or this project), None unknown.
-struct SyncState {last:Option<String>,assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
+// assembly reassembles the field-17 ClipboardChange stream, rpc_assembly the field-21 case-10 one;
+// a host may interleave the two, and one shared buffer would splice fragments across them.
+struct SyncState {last:Option<String>,assembly:text::Assembly,rpc_assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
 impl SyncState {
     async fn apply(&mut self,backend:&Backend,value:String)->Result<(),()>{
         if backend.write(&value).await? {
@@ -133,7 +135,7 @@ impl SyncState {
                     let result=self.rich.request(payload,&mut ||{*seq=seq.wrapping_add(1).max(100);*seq})?;
                     if result.text.is_some(){value=result.text;}
                     for (kind,body) in result.messages {replies.push(wire::envelope(self.next(),kind,&body));}
-                    if let Some((header,text))=text::read_text_request(payload)?{
+                    if let Some((header,text))=text::read_text_request(&mut self.rpc_assembly,payload)?{
                         value=Some(text);replies.push(wire::envelope(self.next(),22,&text::text_response(&header)));
                     }
                 },
@@ -149,6 +151,9 @@ impl SyncState {
             }
         }
         if value.as_ref().is_some_and(|text|text.contains('\0')){return Err("clipboard text contains NUL")}
+        // One copy can reach us twice, as case-10 text and again inside the rich answer. Writing
+        // it twice would announce a second local clipboard ownership change for a single copy.
+        let value=value.filter(|text|self.last.as_ref()!=Some(text));
         Ok((replies,value))
     }
 }
@@ -365,7 +370,20 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         let mut viewer=SyncState::default();
         let messages=viewer.local("windows 中文".into()).unwrap().unwrap();assert_eq!(messages.len(),2);
         let rpc=decode_wire(&messages[1]).unwrap().into_iter().find_map(|f|match (f.number,f.value){(21,WireValue::Bytes(b))=>Some(b.to_vec()),_=>None}).unwrap();
-        let (_,text)=crate::clipboard_protocol::read_text_request(&rpc).unwrap().unwrap();assert_eq!(text,"windows 中文");
+        let mut assembly=crate::clipboard_protocol::Assembly::default();
+        let (_,text)=crate::clipboard_protocol::read_text_request(&mut assembly,&rpc).unwrap().unwrap();assert_eq!(text,"windows 中文");
+    }
+    #[test] fn case10_chunks_reassemble_and_a_repeat_of_the_applied_text_is_dropped(){
+        let mut state=SyncState::default();let value="中文🙂".repeat(3000);
+        let parts=text::chunks(&value).unwrap();assert!(parts.len()>1);
+        for (i,part) in parts.iter().enumerate(){
+            let (replies,received)=state.receive(&wire::envelope(1,21,&text::text_chunk_request(200+i as u64,part,i+1<parts.len()))).unwrap();
+            if i+1==parts.len(){assert_eq!(received.as_deref(),Some(value.as_str()));assert_eq!(replies.len(),1,"only the final chunk acknowledges");}
+            else{assert!(received.is_none(),"chunk {} was applied as a whole copy",i);assert!(replies.is_empty());}
+        }
+        state.last=Some(value.clone());
+        let(replies,repeated)=state.receive(&wire::envelope(2,21,&text::text_request(210,&value))).unwrap();
+        assert_eq!(repeated,None);assert_eq!(replies.len(),1,"the host still gets its acknowledgement");
     }
     #[test] fn control_clipboard_reproduces_native_host_failures(){
         assert_eq!(native_host_exchange(0,false),(None,false)); // Complete transfer, no CONTROL desktop sink.

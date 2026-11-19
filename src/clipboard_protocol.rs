@@ -56,15 +56,18 @@ pub(crate) fn nested(field: u32, payload: &[u8], out: &mut Vec<u8>) {
 pub fn text_request(request_id: u64, text: &str) -> Vec<u8> {
     text_chunk_request(request_id, text, false)
 }
-/// One ClipboardChange RPC (field 10). Official hosts send these next to the rich offer:
-/// mobile viewers only act on this form and ignore the rich format list.
+/// One ClipboardChange RPC (field 10). Live-tested with the Android viewer: it acts on this
+/// form only and ignores the rich format list, so the host also pushes it for mobile controllers.
 pub fn text_chunk_request(request_id: u64, part: &str, more: bool) -> Vec<u8> {
     let mut header=vec![8];varint(request_id,&mut header);
-    // Official ClipboardMobileManager uses format_id=1 for text.
+    // Format id 1 for plain text, as used by the Android viewer in both directions.
     let data=encode(1,part,more);
     let mut request=Vec::new();nested(1,&header,&mut request);nested(10,&data,&mut request);request
 }
-pub fn read_text_request(request: &[u8]) -> Result<Option<(Vec<u8>,String)>, &'static str> {
+/// Take one clipboard text out of an RPC. `assembly` has to outlive the call: text bigger than
+/// the chunk limit arrives as several RPCs and only completes on the last one, so `Ok(None)`
+/// means either "this RPC carries no text" or "one chunk is buffered, more to come".
+pub fn read_text_request(assembly: &mut Assembly, request: &[u8]) -> Result<Option<(Vec<u8>,String)>, &'static str> {
     if request.len()>MAX_TEXT+256 {return Err("clipboard RPC exceeds limit");}
     let fields=decode_wire(request).map_err(|_|"invalid clipboard RPC")?;
     let data=fields.iter().find(|f|f.number==10);
@@ -77,7 +80,7 @@ pub fn read_text_request(request: &[u8]) -> Result<Option<(Vec<u8>,String)>, &'s
     let WireValue::Bytes(data)=data.value else {return Err("invalid clipboard RPC text");};
     let parts=decode_wire(data).map_err(|_|"invalid clipboard RPC text")?;
     if !parts.iter().any(|f|f.number==1 && f.value==WireValue::Varint(1)) || parts.iter().any(|f|f.number==1 && f.value!=WireValue::Varint(1)) {return Err("unsupported clipboard RPC format");}
-    let text=Assembly::default().accept(data)?.ok_or("incomplete clipboard RPC text")?;
+    let Some(text)=assembly.accept(data)? else {return Ok(None)};
     Ok(Some((header.to_vec(),text)))
 }
 pub fn text_response(header: &[u8]) -> Vec<u8> {
@@ -111,32 +114,32 @@ mod tests {
     #[test]
     fn rpc_text_roundtrip_preserves_request_id_and_returns_official_success() {
         let text="UU-test-中文🙂\n";
+        let mut assembly=Assembly::default();
         let request=text_request(0x12345678,text);
-        let (header,received)=read_text_request(&request).unwrap().unwrap();
+        let (header,received)=read_text_request(&mut assembly,&request).unwrap().unwrap();
         assert_eq!(received,text);
         assert_eq!(header,vec![8,0xf8,0xac,0xd1,0x91,1]);
         let response=text_response(&header);
         assert_eq!(&response[response.len()-4..],&[50,2,8,1]);
         assert_eq!(&response[2..2+header.len()],header.as_slice());
-        assert!(read_text_request(&[10,1,255,82,0]).is_err());
-        assert!(read_text_request(&[10,0,82,2,8,2]).is_err());
-        assert!(read_text_request(&[10,0,74,0]).unwrap().is_none());
+        assert!(read_text_request(&mut assembly,&[10,1,255,82,0]).is_err());
+        assert!(read_text_request(&mut assembly,&[10,0,82,2,8,2]).is_err());
+        assert!(read_text_request(&mut assembly,&[10,0,74,0]).unwrap().is_none());
     }
     #[test]
-    fn chunked_text_rpc_assembles_by_content_id_and_single_chunk_reads_as_request() {
+    fn chunked_text_rpc_reassembles_across_requests_with_one_shared_assembly() {
         let text="中文🙂".repeat(3000); // > 8192 bytes: at least two chunks
         let parts=chunks(&text).unwrap();
         assert!(parts.len()>1);
         let mut assembly=Assembly::default();
         for (index,part) in parts.iter().enumerate() {
             let rpc=text_chunk_request(0x42+index as u64,part,index+1<parts.len());
-            let inner=decode_wire(&rpc).unwrap();
-            let WireValue::Bytes(data)=inner.iter().find(|f|f.number==10).unwrap().value else {panic!("field 10 missing")};
-            if index+1==parts.len(){assert_eq!(assembly.accept(data).unwrap().as_deref(),Some(text.as_str()));}
-            else{assert!(assembly.accept(data).unwrap().is_none());}
+            let read=read_text_request(&mut assembly,&rpc).unwrap();
+            if index+1==parts.len(){assert_eq!(read.unwrap().1,text);}
+            else{assert!(read.is_none(),"chunk {} was handed out as a whole text",index);}
         }
         let single=text_chunk_request(7,"short",false);
-        assert_eq!(read_text_request(&single).unwrap().unwrap().1,"short");
+        assert_eq!(read_text_request(&mut assembly,&single).unwrap().unwrap().1,"short");
     }
     #[test]
     fn unicode_chunk_roundtrip_and_empty_copy() {

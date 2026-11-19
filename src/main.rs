@@ -1039,9 +1039,8 @@ async fn serve(mut capture: Arc<ScreenCapture>, input: Arc<InputInjector>, shutd
                         if desktop && portal_desktop.is_none() { input.bind_portal(session_capture.portal.clone()); }
                         if desktop { if let Some(portal) = &portal_desktop { portal.begin(); } }
                         match WebRtcSession::new(session_capture, input.clone(), signaling_client.clone(), desktop, transport,
-                            if desktop { portal_desktop.clone() } else { None }).await {
-                            Ok(mut sess) => {
-                                sess.controller = controller;
+                            if desktop { portal_desktop.clone() } else { None }, controller).await {
+                            Ok(sess) => {
                                 if desktop { crate::privacy_screen::set_viewer_controller(controller); }
                                 if !desktop {
                                     let (requests, peer) = (desktop_requests.clone(), ice.clone());
