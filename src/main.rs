@@ -584,6 +584,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return wayland::text_probe().map_err(|e|e.into());
     }
     if std::env::args().nth(1).as_deref() == Some("doctor") {
+        // Report tool: end quietly like other CLI tools when piped into `head` (#16).
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
         return doctor::run().await.map_err(|e| e.into());
     }
     if std::env::args().nth(1).as_deref() == Some("wayland-capture") {
