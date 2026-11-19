@@ -44,6 +44,18 @@ fn greeter_stat(pid: libc::pid_t) -> Option<(libc::pid_t, u64)> {
 
 fn start_time(pid: libc::pid_t) -> Option<u64> { greeter_stat(pid).map(|(_, start)| start) }
 
+/// Time since boot in the unit of stat field 22 (`sysconf(_SC_CLK_TCK)` ticks of CLOCK_BOOTTIME).
+fn boot_ticks() -> Option<u64> {
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 { return None; }
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|&hz| hz > 0)?;
+    Some(u64::try_from(now.tv_sec).ok()? * hz + u64::try_from(now.tv_nsec).ok()? * hz / 1_000_000_000)
+}
+
+/// A greeter belongs to the lock that just ended only if it was started before the unlock was
+/// observed; one started in the same tick or later serves a new lock.
+fn started_before(start: u64, unlocked_at: u64) -> bool { start < unlocked_at }
+
 /// `/proc/<pid>/cgroup` → logind session id, when the process sits in `session-<id>.scope`.
 fn cgroup_session(cgroup: &str) -> Option<&str> {
     cgroup.lines().flat_map(|line| line.rsplit('/'))
@@ -77,23 +89,26 @@ fn belongs_to(pid: libc::pid_t, parent: libc::pid_t, session: &str) -> bool {
     session_of(pid).or_else(|| session_of(parent)).as_deref() == Some(session)
 }
 
-fn greeters(session: &str) -> Vec<Greeter> {
+fn greeters(session: &str, unlocked_at: u64) -> Vec<Greeter> {
     let uid = unsafe { libc::getuid() };
     let Ok(entries) = std::fs::read_dir("/proc") else { return Vec::new() };
     entries.flatten().filter_map(|entry| {
         let pid: libc::pid_t = entry.file_name().to_str()?.parse().ok()?;
         if entry.metadata().ok()?.uid() != uid { return None; }
         let (parent, start) = greeter_stat(pid)?;
-        belongs_to(pid, parent, session).then_some((pid, start))
+        (started_before(start, unlocked_at) && belongs_to(pid, parent, session)).then_some((pid, start))
     }).collect()
 }
 
-/// Call when the display session changes from locked to unlocked. Its greeters alive at that
-/// moment belong to the lock that just ended; any still running after `GRACE` is stuck and is killed.
+/// Call when the display session changes from locked to unlocked. Its greeters started before
+/// that moment belong to the lock that just ended; any still running after `GRACE` is stuck and
+/// is killed. The moment is taken here, on the caller's thread: the session query and the /proc
+/// scan run later, and by then the session may be locked again with a new, healthy greeter.
 pub(super) fn reap_after_unlock() {
-    let spawned = std::thread::Builder::new().name("uu-greeter-reap".into()).spawn(|| {
+    let Some(unlocked_at) = boot_ticks() else { return };
+    let spawned = std::thread::Builder::new().name("uu-greeter-reap".into()).spawn(move || {
         let Some(session) = super::display_session() else { return };
-        let seen = greeters(&session);
+        let seen = greeters(&session, unlocked_at);
         if seen.is_empty() { return; }
         std::thread::sleep(GRACE);
         let killed = seen.into_iter()
@@ -152,6 +167,32 @@ mod tests {
         // Neither a missing process nor a missing parent may select a greeter.
         assert!(!belongs_to(libc::pid_t::MAX, libc::pid_t::MAX, "3"));
         assert!(!belongs_to(libc::pid_t::MAX, libc::pid_t::MAX, ""));
+    }
+
+    #[test]
+    fn a_greeter_started_after_the_unlock_is_not_selected() {
+        // Old greeter of the lock that ended; then one started for a new lock in the same tick or later.
+        assert!(started_before(7_654_321, 7_654_900));
+        assert!(!started_before(7_654_900, 7_654_900));
+        assert!(!started_before(7_655_000, 7_654_900));
+    }
+
+    #[test]
+    fn unlock_time_uses_the_clock_of_stat_start_times() {
+        // This process started before now and a moment from now is later still, in the same unit.
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let (_, _, own_start) = parse_stat(&stat).unwrap();
+        let now = boot_ticks().unwrap();
+        assert!(own_start <= now, "start={own_start} now={now}");
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        assert!(now - own_start < 3600 * hz, "start={own_start} now={now}");
+        let child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", child.id())).unwrap();
+        let (_, _, child_start) = parse_stat(&stat).unwrap();
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!started_before(child_start, now), "a process started after `now` must not be older than it");
     }
 
     #[test]
