@@ -318,7 +318,21 @@ impl PortalDesktop {
                         defer_until_unlock = true;
                         _inhibitor = None;
                     }
-                    AttemptOutcome::Cancelled => {}
+                    AttemptOutcome::Cancelled => {
+                        // A Retry released the inhibitor earlier and the encoder's own
+                        // stream-loss recovery has since brought the share back: the healthy
+                        // cache now exits portal_attempt as Cancelled without touching power,
+                        // so re-arm the inhibition here, or a watching-only viewer is locked
+                        // out again once idle-delay passes.
+                        if _inhibitor.is_none()
+                            && attempt_allowed(*locked.borrow(), allow_locked)
+                            && health(self.snapshot().screen.as_ref()) {
+                            _inhibitor = tokio::task::spawn_blocking({
+                                let inhibit = inhibit.clone();
+                                move || inhibit()
+                            }).await.ok();
+                        }
+                    }
                 }
                 if !attempt_allowed(*locked.borrow_and_update(), allow_locked) { self.pause(&owner); }
             }
@@ -905,5 +919,57 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert_eq!(releases.load(Ordering::Relaxed), 2, "each guard was released exactly once");
+    }
+
+    /// After a Retry released the inhibitor, the encoder's own stream-loss recovery can bring
+    /// the share back on its own: the healthy cache then exits portal_attempt as Cancelled
+    /// without ever touching power, so nothing would re-arm inhibition and a watching-only
+    /// viewer would hit idle-delay lockout again. The supervisor must re-acquire a guard.
+    #[tokio::test]
+    async fn encoder_side_recovery_reacquires_the_idle_inhibitor() {
+        let (_lock, locked) = watch::channel(Some(false));
+        let host = Arc::new(PortalDesktop::with_lock_state(
+            Arc::new(ScreenCapture::unavailable("pending".into())), locked));
+        let input = Arc::new(crate::input::InputInjector::without_desktop());
+        let owner = input.desktop_session();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let acquires = Arc::new(AtomicUsize::new(0));
+        let healthy = Arc::new(AtomicBool::new(false));
+        let (healthy_health, healthy_rearm) = (healthy.clone(), healthy.clone());
+        let (acquires_inhibit, acquires_assert) = (acquires.clone(), acquires.clone());
+        let task = tokio::spawn({
+            let host = host.clone();
+            let owner = owner.clone();
+            let releases = releases.clone();
+            async move {
+                host.maintain_with(owner, || Ok(()),
+                    move || {
+                        acquires_inhibit.fetch_add(1, Ordering::Relaxed);
+                        IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone()))))
+                    },
+                    move |_screen| healthy_health.load(Ordering::Relaxed),
+                    // The reopen always fails: only the encoder's side recovery (the flag)
+                    // ever makes the share healthy again, exactly like a lost stream that
+                    // PipeWire revives without a new portal session.
+                    move |_screen, _cancel| Err(PortalError { code: 3 })).await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while releases.load(Ordering::Relaxed) == 0 {
+            assert!(tokio::time::Instant::now() < deadline, "Retry never released the attempt guard");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(acquires_assert.load(Ordering::Relaxed), 1);
+        // The encoder-side recovery lands after the Retry: frames flow again, no reopen runs.
+        healthy_rearm.store(true, Ordering::Release);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while acquires_assert.load(Ordering::Relaxed) < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "healthy encoder-side recovery never re-armed inhibition");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(releases.load(Ordering::Relaxed), 1, "the re-armed guard must stay held");
+        task.abort();
+        let _ = task.await;
+        assert_eq!(releases.load(Ordering::Relaxed), 2);
     }
 }

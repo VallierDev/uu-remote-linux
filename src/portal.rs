@@ -215,8 +215,15 @@ mod native {
             alive && !self.recovery_failed()
         }
         fn recovery_failed(&self) -> bool {
-            self.recovery.lock().ok().is_some_and(|recovery|
-                recovery.failed_until.is_some_and(|until| std::time::Instant::now() < until))
+            // Called from async health checks: a blocking lock here would stall the whole
+            // supervisor for as long as an in-progress consent dialog can wait (upgrade_touch
+            // holds this mutex across its open). A held lock means an open or recovery is
+            // running, not that recovery failed - the stream aliveness read beside it stays
+            // the judge of health until that operation reports its outcome.
+            match self.recovery.try_lock() {
+                Ok(recovery) => recovery.failed_until.is_some_and(|until| std::time::Instant::now() < until),
+                Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => false,
+            }
         }
         /// Opens a session for `monitor` (a Mutter connector) with that monitor's saved consent;
         /// None means the screen currently selected, or the only monitor.
@@ -848,6 +855,30 @@ mod native {
             assert!(original.session().check_geometry(same.session()).is_ok());
             assert!(original.session().check_geometry(width_changed.session()).is_err());
             assert!(original.session().check_geometry(height_changed.session()).is_err());
+        }
+
+        /// upgrade_touch() holds the recovery mutex for as long as its consent dialog can wait
+        /// (up to the consent timeout), and the desktop supervisor reads `capture_healthy()` from
+        /// an async task. The health check must read around the held lock instead of stalling the
+        /// whole supervisor; a held lock is an open in progress, not a failed recovery.
+        #[test]
+        fn health_check_reads_around_a_recovery_lock_held_by_an_open_in_progress() {
+            let fixture = Fixture::new((1920, 1080));
+            let session = fixture.session();
+            let held = session.recovery.lock().unwrap();
+            assert!(!session.recovery_failed(), "an in-progress open is not a failed recovery");
+            drop(held);
+            assert!(!session.recovery_failed());
+        }
+
+        #[test]
+        fn health_check_still_reports_a_recorded_recovery_backoff() {
+            let fixture = Fixture::new((1920, 1080));
+            let session = fixture.session();
+            session.recovery.lock().unwrap().failed(std::time::Instant::now(), 3);
+            assert!(session.recovery_failed());
+            session.recovery.lock().unwrap().succeeded();
+            assert!(!session.recovery_failed());
         }
 
         struct TestHandle {
