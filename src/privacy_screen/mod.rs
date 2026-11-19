@@ -222,6 +222,10 @@ fn currently_locked() -> bool {
 }
 /// The capture session and the viewer's CONTROL state need a moment after the peer connects;
 /// retry while the portal session is still missing, and let the viewer's RPC 7 win if it arrives.
+/// Whether the desktop capture backing privacy is up: the portal answers, and the capture
+/// session that is running now has delivered at least one fresh frame.
+fn capture_ready_for_privacy(available: bool, fresh_frames: u64) -> bool { available && fresh_frames > 0 }
+
 fn auto_enable(mode: Mode, generation: u64) {
     // A locked desktop is already covered. Switching the share to the virtual output would hide
     // the lock screen the viewer needs to unlock, so wait for the local unlock first. Bounded:
@@ -247,11 +251,6 @@ fn auto_enable(mode: Mode, generation: u64) {
     // Only portal backends ride the capture's portal session; the X11 backend dims outputs on
     // its own, so waiting for a portal on an Xorg session would stall the auto-enable forever.
     let portal_backend = backend::detect().is_some_and(|backend| backend.name() != X11_BACKEND);
-    // A live portal Session object is not proof the capture produces content: a stale session
-    // from the previous peer can still read `available` while the new request is in flight, and
-    // ScreenOff before the first real frame makes GNOME fail the pending restore (display-off
-    // deadlock). Wait for the encoder to report at least one fresh frame past this point.
-    let fresh_baseline = crate::video::portal_fresh_frames();
     for attempt in 1..=5 {
         if !current() { return; }
         if VIEWER_OVERRIDE.load(Ordering::Relaxed) {
@@ -259,8 +258,12 @@ fn auto_enable(mode: Mode, generation: u64) {
             return;
         }
         // Not a failure yet: the desktop capture opens its portal session a moment after the peer
-        // connects, and entering without it would roll back and log a restore for nothing.
-        if portal_backend && crate::video::portal_fresh_frames() == fresh_baseline {
+        // connects, and entering without it would roll back and log a restore for nothing. A live
+        // Session object alone is not proof either — a stale one from the previous peer still
+        // reads available — so require a fresh frame from the capture that is running now
+        // (counter reset when the installed handle changes). ScreenOff before the first real
+        // frame makes GNOME fail the pending restore (display-off deadlock).
+        if portal_backend && !capture_ready_for_privacy(crate::portal::available(), crate::portal::fresh_frames()) {
             log::info!("Privacy auto: waiting for the desktop capture (attempt {attempt})");
             std::thread::sleep(std::time::Duration::from_secs(1));
             continue;
@@ -337,6 +340,16 @@ pub fn cover_main(args: &[String]) -> i32 { cover::main(args) }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn privacy_waits_until_the_running_capture_shows_a_fresh_frame() {
+        use super::capture_ready_for_privacy as ready;
+        // Portal not up yet, or up but no frame delivered by this capture: keep waiting.
+        assert!(!ready(false, 0));
+        assert!(!ready(true, 0), "a session object alone (possibly stale) must not enable");
+        // One fresh frame from the current capture is enough even if the desktop then stays
+        // static and the counter never moves again.
+        assert!(ready(true, 1));
+    }
     #[test]
     fn parses_auto_privacy_modes() {
         use super::{parse_auto, Mode};
