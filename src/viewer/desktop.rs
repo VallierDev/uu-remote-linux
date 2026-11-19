@@ -14,6 +14,9 @@ pub trait Decoder { fn set_codec(&mut self,codec:super::media::Codec)->Result<()
 pub trait FrameSink { fn present(&mut self,frame:&Frame)->Result<(),String>; }
 /// Counts only (access units, presented frames, decode errors) for the periodic stats line.
 pub static STATS:[std::sync::atomic::AtomicU64;3]=[std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0)];
+/// Key frames received. A session that decodes no picture keeps receiving access units without
+/// a single key frame: it joined a track that was already encoded for another viewer (#124).
+pub static KEY_FRAMES:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
 fn wants_key_frame(units:u64,presented:u64)->bool {presented==0 && units%30==0}
 /// True when an Annex-B access unit carries a picture the decoder can restart from: an IDR/IRAP,
 /// an H.264 recovery-point SEI or an H.264 I slice (some hosts answer PLI without an IDR, #136).
@@ -87,6 +90,7 @@ fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn Fra
         if desktop.reset.swap(false,Ordering::AcqRel) {decoder.reset();gate.arm();}
         if !gate.admit(au.codec,&au.data) {desktop.pli.store(true,Ordering::Release);}
         else {
+            if is_key_frame(au.codec,&au.data) {KEY_FRAMES.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
             decoder.set_codec(au.codec)?;codec=Some(au.codec);
             if let Some(frame)=decode(decoder,&au.data,au.codec,&desktop.pli).pop() {newest=Some(frame);}
         }

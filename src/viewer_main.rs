@@ -107,6 +107,10 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     // Reconnecting asks for a new track, so retry the session a few times before giving up.
     // Each attempt re-joins the room: a fresh room is what makes the host start a new track.
     let attempts=std::env::var("UU_VIEWER_RECONNECT_ATTEMPTS").ok().and_then(|v|v.parse().ok()).unwrap_or(5u32);
+    // One command reader for all attempts: a reader per attempt would leave stale threads
+    // blocked on stdin and they would swallow each other's commands.
+    #[cfg(feature="viewer-sdl")]
+    let commands=viewer::sdl::command_channel();
     let mut attempt=0u32;
     loop {
         attempt+=1;
@@ -129,7 +133,7 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
         let options=Options{timeout:Duration::from_secs(12),legacy_prefix:legacy,ready_policy:policy,clipboard};
         let mut session=wait!(i18n::s("正在建立安全连接…","Establishing a secure connection…"),Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()))?;
         #[cfg(feature="viewer-sdl")]
-        let result=if let Some((window,decoder))=desktop.as_mut(){viewer::sdl::run(&mut session,window,decoder.as_mut(),view_only,&args[1]).await}else{session.run().await};
+        let result=if let Some((window,decoder))=desktop.as_mut(){viewer::sdl::run(&mut session,window,decoder.as_mut(),view_only,&args[1],commands.clone()).await}else{session.run().await};
         #[cfg(not(feature="viewer-sdl"))]
         let result=session.run().await;
         session.close().await;

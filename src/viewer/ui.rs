@@ -49,6 +49,8 @@ fn watch_session(mut child: tokio::process::Child, mut cancel: tokio::sync::ones
             let reason = match last.as_str() {
                 "" => crate::i18n::s("连接已断开","Disconnected").to_owned(),
                 "CONTROL echo timed out" => crate::i18n::s("连接超时：被控端没有响应（官方主机互通尚未完成）","Timed out: the remote device did not answer (official host interop is not finished)").to_owned(),
+                "control channel not open" => crate::i18n::s("连接失败：控制通道没有打开（官方主机互通尚未完成）","Connection failed: the control channel did not open (official host interop is not finished)").to_owned(),
+                "no key frame" => crate::i18n::s("连接失败：没有收到关键帧，画面无法解码","Connection failed: no key frame, the picture cannot be decoded").to_owned(),
                 "Remote session released" => crate::i18n::s("被控端结束了本次连接","The remote device ended the connection").to_owned(),
                 other => other.to_owned(),
             };

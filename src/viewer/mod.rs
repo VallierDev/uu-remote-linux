@@ -35,7 +35,7 @@ pub mod secure_input;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum NoPicture {
     /// The CONTROL data channel never opened, so the echo handshake and the
-    /// sendVideoTrack RPC never happened and the host kept its existing track.
+    /// sendVideoTrack RPC never happened and the host cannot show a picture.
     ControlNotOpen,
     /// CONTROL is open but no frame was ever presented.
     NoKeyFrame,
