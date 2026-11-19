@@ -19,6 +19,14 @@ use crate::capture_setting::{VideoCodec, VideoSettings};
 /// Default frame rate; the viewer's 帧率 setting overrides it per connection.
 pub const FPS: u64 = 60;
 
+/// Total fresh portal frames captured since process start. Privacy auto compares the delta
+/// against its start value as proof the desktop capture really produces content before hiding
+/// the screen: a stale portal Session object from the previous peer still reads `available`,
+/// and entering ScreenOff before the first real frame makes GNOME fail the pending restore.
+static PORTAL_FRESH_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Fresh-frame counter for `PORTAL_FRESH_FRAMES`; see the static for why it exists.
+pub fn portal_fresh_frames() -> u64 { PORTAL_FRESH_FRAMES.load(Ordering::Relaxed) }
+
 /// Refresh rate reported to the viewer (display_info / capability / codec negotiation), like the
 /// official hosts report the monitor's mode (official Mac capability: 120). `UU_DISPLAY_FPS` overrides;
 /// Hyprland from `hyprctl -j monitors`, X11 from the current `xrandr` mode, otherwise 60.
@@ -973,7 +981,7 @@ async fn read_encoder_with(
                 sink.write_all(&frame).await.map_err(|e|format!("Portal encoder pipe: {e}"))?;
                 // Repeats are expected on a static desktop; a compositor that stopped painting
                 // (powered-off outputs) sends zero new frames while the stream still looks alive.
-                if changed { fresh+=1; } else { repeated+=1; }
+                if changed { fresh+=1; PORTAL_FRESH_FRAMES.fetch_add(1, Ordering::Relaxed); } else { repeated+=1; }
                 if window.elapsed()>=Duration::from_secs(30) {
                     log::info!("Portal frames: new={fresh} repeated={repeated} window_s={}",window.elapsed().as_secs());
                     (fresh,repeated)=(0,0); window=std::time::Instant::now();
