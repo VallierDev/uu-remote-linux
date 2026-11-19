@@ -448,7 +448,9 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let mut type_job:Option<TypeJob>=None;
     let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
     let mut audio=super::audio::Playback::new(&window._sdl,session.peer.audio.clone());
-    let mut input=Input::new(view_only);input.set_mac(window.mac);input.set_follow_natural_scroll(window.state().follow_natural_scroll);
+    // The window keeps its Watch mode across a reconnect, so the input must start from it too:
+    // otherwise a retry would forward keys and mouse again while the menu still shows Watch.
+    let mut input=Input::new(view_only||window.state().watch);input.set_mac(window.mac);input.set_follow_natural_scroll(window.state().follow_natural_scroll);
     let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
     let mut heartbeat=tokio::time::interval(std::time::Duration::from_secs(1));
     // The echo handshake can be slow: the official macOS host opens the CONTROL channel late,

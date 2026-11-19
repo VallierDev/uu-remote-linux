@@ -124,7 +124,12 @@ impl Decoder for Cli {
     fn set_codec(&mut self,codec:Codec)->Result<(),String>{
         if self.codec!=codec {*self=Self::with_codec(codec,self.fixed)?;}Ok(())
     }
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        // Drop the frames the finished process still has queued: a leftover picture would be
+        // handed to the next session and counted as its first frame. The process itself stays:
+        // rebuilding it would also drop the stdin handle the access units are written to.
+        while self.frames.try_recv().is_ok() {}
+    }
     fn decode(&mut self,au:&[u8])->Result<Vec<Frame>,String> {
         if self.resized.load(Ordering::Acquire) {
             // The caller resets and asks for a key frame; the new process sizes itself from it.
