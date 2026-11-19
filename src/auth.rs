@@ -23,7 +23,11 @@ impl std::fmt::Display for RoomError {
     }
 }
 
-pub const BASE_URL: &str = "https://api.nrd.nie.163.com";
+pub const DEFAULT_BASE_URL: &str = "https://api.nrd.nie.163.com";
+
+pub fn base_url() -> Result<String, String> {
+    crate::config::base_url()
+}
 
 /// Account binding and request-signing key. Never committed: loaded at startup from
 /// a private config file or environment variables (see config.example.json).
@@ -294,7 +298,7 @@ impl UUAuthClient {
     /// Signed JSON POST; returns (HTTP status, decoded body).
     pub async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<(u16, serde_json::Value), String> {
         let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
-        let resp = self.http.post(format!("{}{}", BASE_URL, path))
+        let resp = self.http.post(format!("{}{}", base_url()?, path))
             .headers(self.build_headers("POST", path, &body_str)).body(body_str)
             .send().await.map_err(|e| format!("HTTP post {path} failed: {}", transport_error(&e)))?;
         let status = resp.status().as_u16();
@@ -308,7 +312,8 @@ impl UUAuthClient {
         let started = std::time::Instant::now();
         let body_str = body.map(serde_json::to_string).transpose()
             .map_err(|_| QrRequestError::new(QrRequestErrorKind::Request, "encode", started, None))?.unwrap_or_default();
-        let request = self.http.post(format!("{}{}", BASE_URL, path)).timeout(timeout)
+        let base = base_url().map_err(|_| QrRequestError::new(QrRequestErrorKind::Request, "base_url", started, None))?;
+        let request = self.http.post(format!("{base}{path}")).timeout(timeout)
             .headers(self.build_headers("POST", path, &body_str)).body(body_str);
         send_qr_request(request, started).await
     }
@@ -330,7 +335,7 @@ impl UUAuthClient {
     }
     /// Account share info is a GET (POST answers 405, verified live).
     pub async fn assist_get(&self, path: &str) -> Result<(u16, serde_json::Value), String> {
-        let request = self.http.get(format!("{BASE_URL}{path}")).headers(self.build_headers("GET", path, "")).build()
+        let request = self.http.get(format!("{}{path}", base_url()?)).headers(self.build_headers("GET", path, "")).build()
             .map_err(|_| "assist request construction failed")?;
         self.assist_send(request).await
     }
@@ -346,7 +351,7 @@ impl UUAuthClient {
 
     fn assist_request(&self, path: &str, body: Option<&serde_json::Value>) -> Result<reqwest::Request, String> {
         let body = body.map(serde_json::to_string).transpose().map_err(|_| "assist request encoding failed")?.unwrap_or_default();
-        self.http.post(format!("{BASE_URL}{path}"))
+        self.http.post(format!("{}{path}", base_url()?))
             .headers(self.build_headers("POST", path, &body)).body(body).build()
             .map_err(|_| "assist request construction failed".into())
     }
