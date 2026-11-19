@@ -449,6 +449,15 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     // After a local drop the decoder has no reference picture; P-frames would only smear blocks.
     let mut key_gate=super::desktop::KeyGate::new();
     let mut next_thumb=std::time::Instant::now()+std::time::Duration::from_secs(5);
+    // Some hosts (observed with the official macOS host) answer a fresh session with a
+    // continuation stream that carries no SPS/PPS/IDR, so the decoder can never start and
+    // the screen stays black while every other part of the session works. Reconnecting gets
+    // a new track, so give up on the picture after a grace period and let the caller retry.
+    // UU_VIEWER_BLACK_GRACE_MS: how long a session may run without a picture.
+    let black_grace=std::env::var("UU_VIEWER_BLACK_GRACE_MS").ok().and_then(|v|v.parse().ok()).unwrap_or(6_000u64);
+    // UU_VIEWER_CONTROL_WAIT_MS: how long to wait for the CONTROL channel to open.
+    let control_wait=std::env::var("UU_VIEWER_CONTROL_WAIT_MS").ok().and_then(|v|v.parse().ok()).unwrap_or(5_000u64);
+    let mut black_since:Option<std::time::Instant>=None;
     let result=async {
         loop {tokio::select!{
             command=commands.recv(),if command_open=>{
@@ -480,12 +489,29 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
             _=terminate.recv()=>return Ok(()),
             _=tokio::signal::ctrl_c()=>return Ok(()),
             result=session.step()=>result?,
-            _=&mut deadline,if !session.peer.observed.echo_received.load(std::sync::atomic::Ordering::Acquire)=>return Err("CONTROL echo timed out".into()),
+            _=&mut deadline,if !session.peer.observed.echo_received.load(std::sync::atomic::Ordering::Acquire)=>return Err(super::NoPicture::ControlNotOpen.reason().to_owned()),
             _=heartbeat.tick()=>{
                 if input.enabled() && session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false){session.peer.send_input(&Input::heartbeat()).await?;}
                 let o=&session.peer.observed;let s=&super::desktop::STATS;let r=std::sync::atomic::Ordering::Relaxed;
                 log::info!("Viewer desktop stats: control_open={} echo={} media_packets={} access_units={} presented={} decode_errors={}",
                     o.control_open.load(r),o.echo_received.load(r),o.media_packets.load(r),s[0].load(r),s[1].load(r),s[2].load(r));
+                // The CONTROL channel never opened (observed with the official macOS host):
+                // without it the echo handshake and the sendVideoTrack RPC never happen, so the
+                // host keeps its existing track and the picture stays black. Retry right away
+                // instead of waiting for the full echo timeout.
+                if !o.control_open.load(r)&&o.media_packets.load(r)>0&&started.elapsed()>=std::time::Duration::from_millis(control_wait) {
+                    log::warn!("CONTROL channel still closed after {control_wait} ms (media flowing)");
+                    return Err(super::NoPicture::ControlNotOpen.reason().to_owned());
+                }
+                // Black-screen guard: the session is alive (CONTROL open, media flowing) but no
+                // frame was ever presented, so the host only sent a continuation stream.
+                if black_grace>0&&s[1].load(r)==0&&o.echo_received.load(r)&&o.control_open.load(r)&&o.media_packets.load(r)>0 {
+                    let since=*black_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed()>=std::time::Duration::from_millis(black_grace) {
+                        log::warn!("No picture after {black_grace} ms (control open, media flowing)");
+                        return Err(super::NoPicture::NoKeyFrame.reason().to_owned());
+                    }
+                } else if s[1].load(r)>0 {black_since=None;}
                 // Network-status panel: per-second deltas of local counters plus the selected ICE pair.
                 let now=(s[1].load(r),o.media_bytes.load(r),o.video_received.load(r),o.video_expected.load(r),std::time::Instant::now());
                 let secs=now.4.duration_since(last.4).as_secs_f64().max(0.2);

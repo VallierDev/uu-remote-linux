@@ -576,6 +576,12 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
   日志与 `--dry-run` 输出只含长度/事件数，不含明文。复用会话时，发送约 1 秒后会保存一帧 PNG（默认写在 `$XDG_RUNTIME_DIR/uu-viewer-type/`，权限 0600），路径打在日志并打印 `snapshot=…`。
 - 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
   `UU_VIEWER_VIEW_ONLY=1` 只看不控，`UU_VIEWER_FFMPEG` 指定 ffmpeg 路径。
+- **黑屏自动重连**：部分主机（实测为官方 macOS 4.44 主机）会对某条会话只下发**没有 SPS/PPS/IDR 的续传流**，
+  解码器无法初始化，窗口一直黑屏且不报错。控制端检测到「CONTROL 通道未打开」或「已连接但无画面」时，
+  会丢弃该会话、**重新 join 房间**重建连接（重新入会才会让主机新起一路视频轨道）。
+  `UU_VIEWER_RECONNECT_ATTEMPTS` 控制最多尝试次数（默认 5），`UU_VIEWER_CONTROL_WAIT_MS` 控制等待 CONTROL
+  通道打开的毫秒数（默认 5000），`UU_VIEWER_BLACK_GRACE_MS` 控制已连接后无画面的宽限毫秒数（默认 6000）。
+  重连期间窗口显示「正在重连…」。日志只记录原因（`control channel not open` / `no key frame`）与计数，不含房间、token 等敏感字段。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。

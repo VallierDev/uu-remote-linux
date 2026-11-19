@@ -102,27 +102,61 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     #[cfg(not(feature="viewer-sdl"))]
     macro_rules! wait {($stage:expr,$fut:expr)=>{{let _=$stage;$fut.await}}}
     let contacting=i18n::s("正在连接远端设备…","Contacting the remote device…");
-    let room=wait!(contacting,async{match code {
-        Some(code)=>api.join_share(&args[1],&code).await,
-        None=>api.join(&args[1],force,true).await,
-    }}).map_err(|e|e.to_string())?;
-    let target_mac=if shape.capture_type==1 {wait!(contacting,api.target_is_mac(&room,account_connection.then_some(args[1].as_str())))} else {Err(viewer::api::Error::UnknownKeyboardPlatform)};
-    #[cfg(feature="viewer-sdl")]
-    if let Some((window,_))=desktop.as_mut().filter(|_|!view_only){
-        window.set_mac(*target_mac.as_ref().map_err(|e|e.to_string())?);
+    // A host can answer a session with a continuation stream that carries no key frame, leaving
+    // the picture black for the whole session (the decoder can never start without SPS/PPS/IDR).
+    // Reconnecting asks for a new track, so retry the session a few times before giving up.
+    // Each attempt re-joins the room: a fresh room is what makes the host start a new track.
+    let attempts=std::env::var("UU_VIEWER_RECONNECT_ATTEMPTS").ok().and_then(|v|v.parse().ok()).unwrap_or(5u32);
+    let mut attempt=0u32;
+    loop {
+        attempt+=1;
+        let room=wait!(contacting,async{match &code {
+            Some(code)=>api.join_share(&args[1],code).await,
+            None=>api.join(&args[1],force,true).await,
+        }}).map_err(|e|e.to_string())?;
+        let target_mac=if shape.capture_type==1 {wait!(contacting,api.target_is_mac(&room,account_connection.then_some(args[1].as_str())))} else {Err(viewer::api::Error::UnknownKeyboardPlatform)};
+        #[cfg(feature="viewer-sdl")]
+        if let Some((window,_))=desktop.as_mut().filter(|_|!view_only){
+            window.set_mac(*target_mac.as_ref().map_err(|e|e.to_string())?);
+        }
+        let mac_hint=target_mac.ok();
+        // The clipboard bridge owns a polling task, so each attempt needs a fresh one.
+        #[cfg(feature="viewer-sdl")]
+        let mut clipboard=desktop.as_ref().map(|(window,_)|window.clipboard_bridge()).unwrap_or_else(||clipboard::Bridge::new(false));
+        #[cfg(not(feature="viewer-sdl"))]
+        let mut clipboard=clipboard::Bridge::new(shape.capture_type==1);
+        clipboard.set_target_mac(mac_hint);
+        let options=Options{timeout:Duration::from_secs(12),legacy_prefix:legacy,ready_policy:policy,clipboard};
+        let mut session=wait!(i18n::s("正在建立安全连接…","Establishing a secure connection…"),Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()))?;
+        #[cfg(feature="viewer-sdl")]
+        let result=if let Some((window,decoder))=desktop.as_mut(){viewer::sdl::run(&mut session,window,decoder.as_mut(),view_only,&args[1]).await}else{session.run().await};
+        #[cfg(not(feature="viewer-sdl"))]
+        let result=session.run().await;
+        session.close().await;
+        match result {
+            Err(e) if e==viewer::NoPicture::ControlNotOpen.reason()||e==viewer::NoPicture::NoKeyFrame.reason()=>{
+                let reason=e.clone();
+                if attempt>=attempts {
+                    log::warn!("Viewer session failed after {attempt} attempt(s): {reason}");
+                    return Err(e);
+                }
+                log::warn!("Viewer session {attempt}/{attempts} had no picture ({reason}); reconnecting");
+                // Tell the user what is happening instead of leaving an unexplained black window.
+                #[cfg(feature="viewer-sdl")]
+                if let Some((window,_))=desktop.as_mut(){
+                    let stage=if i18n::english(){format!("Reconnecting… (attempt {attempt})")}else{format!("正在重连…（第 {attempt} 次）")};
+                    window.set_stage(&stage);
+                    window.loading_frame(true);
+                }
+                // Reset the decoder: a continuation stream may have left it without a reference.
+                #[cfg(feature="viewer-sdl")]
+                if let Some((_,decoder))=desktop.as_mut(){decoder.reset();}
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                continue;
+            }
+            other=>break other,
+        }
     }
-    #[cfg(feature="viewer-sdl")]
-    let mut clipboard=desktop.as_ref().map(|(window,_)|window.clipboard_bridge()).unwrap_or_else(||clipboard::Bridge::new(false));
-    #[cfg(not(feature="viewer-sdl"))]
-    let mut clipboard=clipboard::Bridge::new(shape.capture_type==1);
-    clipboard.set_target_mac(target_mac.ok());
-    let options=Options{timeout:Duration::from_secs(12),legacy_prefix:legacy,ready_policy:policy,clipboard};
-    let mut session=wait!(i18n::s("正在建立安全连接…","Establishing a secure connection…"),Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()))?;
-    #[cfg(feature="viewer-sdl")]
-    let result=if let Some((window,decoder))=desktop.as_mut(){viewer::sdl::run(&mut session,window,decoder.as_mut(),view_only,&args[1]).await}else{session.run().await};
-    #[cfg(not(feature="viewer-sdl"))]
-    let result=session.run().await;
-    session.close().await;result
 }
 async fn type_command(args:&[String])->Result<(),String>{
     // type DEVICE [--delay-ms MS] [--omit-last N] [--snapshot PATH] [--dry-run] [--new-session]
