@@ -585,9 +585,6 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
   注：官方 macOS 主机的 CONTROL 通道可能十几秒后才打开，且**画面恰好在它打开后立刻出现**，
   因此过早判定失败会误杀正常会话。重连期间窗口显示「正在重连…」。
   日志只记录原因（`control channel not open` / `no key frame`）与计数，不含房间、token 等敏感字段。
-- **优先走中继**（`UU_VIEWER_FORCE_RELAY`，默认开启）：双方都在 NAT 后时，直连候选（host）可能远慢于
-  云端 TURN 中继。实测连官方 macOS 主机，直连的往返是 350～1570 ms，走中继只有 18～24 ms。
-  设为 `UU_VIEWER_FORCE_RELAY=0` 可恢复由云端决定。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
