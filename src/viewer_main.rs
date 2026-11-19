@@ -106,7 +106,7 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
     // the picture black for the whole session (the decoder can never start without SPS/PPS/IDR).
     // Reconnecting asks for a new track, so retry the session a few times before giving up.
     // Each attempt re-joins the room: a fresh room is what makes the host start a new track.
-    let attempts=std::env::var("UU_VIEWER_RECONNECT_ATTEMPTS").ok().and_then(|v|v.parse().ok()).unwrap_or(5u32);
+    let attempts=std::env::var("UU_VIEWER_RECONNECT_ATTEMPTS").ok().and_then(|v|v.parse().ok()).unwrap_or(10u32);
     // One command reader for all attempts: a reader per attempt would leave stale threads
     // blocked on stdin and they would swallow each other's commands.
     #[cfg(feature="viewer-sdl")]

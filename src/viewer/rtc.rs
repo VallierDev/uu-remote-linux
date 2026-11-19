@@ -21,8 +21,14 @@ pub fn configuration(result:&Value)->Result<RTCConfiguration,String> {
     }
     let relay=match result.get("force_relay") {None=>false,Some(Value::Bool(b))=>*b,_=>return Err("Invalid relay policy".into())};
     if relay && !servers.iter().any(|s|s.urls.iter().any(|u|u.starts_with("turn:")||u.starts_with("turns:"))) {return Err("Relay-only session without TURN".into())}
+    // UU_VIEWER_FORCE_RELAY: prefer the cloud's TURN relay over a direct host candidate. With
+    // both peers behind NAT the direct path can be far slower than the relay: measured against
+    // the official macOS host, a direct host candidate gave 350-1570 ms round trips while the
+    // relay gave 18-24 ms. Set UU_VIEWER_FORCE_RELAY=0 to keep the cloud's choice.
+    let force_relay=relay||std::env::var("UU_VIEWER_FORCE_RELAY").map(|v|v!="0").unwrap_or(true);
+    if force_relay&&!servers.iter().any(|s|s.urls.iter().any(|u|u.starts_with("turn:")||u.starts_with("turns:"))) {return Err("Relay-only session without TURN".into())}
     // An empty cloud list means host candidates only. Never invent public STUN.
-    Ok(RTCConfiguration{ice_servers:servers,ice_transport_policy:if relay{RTCIceTransportPolicy::Relay}else{RTCIceTransportPolicy::All},..Default::default()})
+    Ok(RTCConfiguration{ice_servers:servers,ice_transport_policy:if force_relay{RTCIceTransportPolicy::Relay}else{RTCIceTransportPolicy::All},..Default::default()})
 }
 #[derive(Clone,Copy)]
 pub enum ReadyPolicy { EchoOnly, Explicit }
@@ -295,6 +301,12 @@ impl Peer {
                 let candidate=if let Some(s)=value.as_str() {
                     RTCIceCandidateInit {candidate:s.into(),sdp_mid:body.get("sdp_mid").and_then(Value::as_str).map(str::to_owned),sdp_mline_index:body.get("sdp_mline_index").and_then(Value::as_u64).and_then(|v|u16::try_from(v).ok()),..Default::default()}
                 } else {serde_json::from_value(value.clone()).map_err(|_|"Invalid candidate")?};
+                // Diagnostic: the candidate type only, no address.
+                if let Ok(init)=serde_json::from_value::<RTCIceCandidateInit>(value.clone()) {
+                    let line=init.candidate;
+                    let kind=if line.contains("typ relay"){"relay"}else if line.contains("typ srflx"){"srflx"}else if line.contains("typ host"){"host"}else if line.contains("typ prflx"){"prflx"}else{"?"};
+                    log::info!("Viewer remote ICE candidate: type={kind}");
+                }
                 if self.answered {self.pc.add_ice_candidate(candidate).await.map_err(|_|"ICE candidate failed")?;}
                 else {if self.early.len()>=256{return Err("Too many early ICE candidates".into())}self.early.push(candidate);}
             }

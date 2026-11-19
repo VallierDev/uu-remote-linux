@@ -579,12 +579,15 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
 - **黑屏自动重连**：部分主机（实测为官方 macOS 4.44 主机）会对某条会话只下发**没有 SPS/PPS/IDR 的续传流**，
   解码器无法初始化，窗口一直黑屏且不报错。控制端检测到「CONTROL 通道迟迟不打开」或「已连接但无画面」时，
   会丢弃该会话、**重新 join 房间**重建连接（重新入会才会让主机新起一路视频轨道）。
-  `UU_VIEWER_RECONNECT_ATTEMPTS` 控制最多尝试次数（默认 5），`UU_VIEWER_CONTROL_WAIT_MS` 控制等待 CONTROL
+  `UU_VIEWER_RECONNECT_ATTEMPTS` 控制最多尝试次数（默认 10），`UU_VIEWER_CONTROL_WAIT_MS` 控制等待 CONTROL
   通道打开的毫秒数（默认 30000），`UU_VIEWER_BLACK_GRACE_MS` 控制 CONTROL 已打开后仍无画面的宽限毫秒数
   （默认 6000），`UU_VIEWER_ECHO_TIMEOUT_MS` 控制等待 echo 握手完成的毫秒数（默认 45000）。
   注：官方 macOS 主机的 CONTROL 通道可能十几秒后才打开，且**画面恰好在它打开后立刻出现**，
   因此过早判定失败会误杀正常会话。重连期间窗口显示「正在重连…」。
   日志只记录原因（`control channel not open` / `no key frame`）与计数，不含房间、token 等敏感字段。
+- **优先走中继**（`UU_VIEWER_FORCE_RELAY`，默认开启）：双方都在 NAT 后时，直连候选（host）可能远慢于
+  云端 TURN 中继。实测连官方 macOS 主机，直连的往返是 350～1570 ms，走中继只有 18～24 ms。
+  设为 `UU_VIEWER_FORCE_RELAY=0` 可恢复由云端决定。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
