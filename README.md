@@ -353,7 +353,7 @@ systemctl --user restart uuremote-native.service
 | 变量 | 作用 |
 |---|---|
 | `UU_CONFIG` | 配置文件路径（默认 `~/.config/uuremote/config.json`） |
-| `UU_BASE_URL` | 云端 API 基础地址（默认 `https://api.nrd.nie.163.com`）；配置文件中对应 `base_url`，环境变量优先；已设置但无效（如缺少 `https://`）时报错；扫码登录成功后会把所用地址写入配置文件的 `base_url`，使不带该变量启动的被控端服务把凭据发往同一服务器 |
+| `UU_BASE_URL` | 云端 API 基础地址（默认 `https://api.nrd.nie.163.com`）；配置文件中对应 `base_url`，环境变量优先；已设置但无效（如缺少 `https://`）时报错；扫码登录成功后会把所用地址写入配置文件的 `base_url`，使不带该变量启动的被控端服务把凭据发往同一服务器。长期使用请只写配置文件的 `base_url`，不要在 systemd unit 里设置本变量：它会覆盖配置文件，若与登录时所用地址不同，凭据会被发往另一台服务器 |
 | `UU_CLIENT_VERSION` | 上报给网易云端的被控端版本号（`x-param-vn` 与 User-Agent），默认 `4.45.0.4318`；配置文件中对应 `client_version`，环境变量优先 |
 | `UU_VERSION_CODE` | 上报给网易云端的被控端版本代码（`x-param-vc`），默认 `4318`；配置文件中对应 `version_code`，环境变量优先 |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
