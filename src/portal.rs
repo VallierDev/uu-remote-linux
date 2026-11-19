@@ -52,6 +52,7 @@ mod native {
         fn uu_portal_clipboard_poll(portal: *mut c_void, text: *mut u8, capacity: usize) -> i32;
         fn uu_portal_close(portal: *mut c_void);
         fn uu_portal_alive(portal: *mut c_void) -> i32;
+        fn uu_portal_restore_sent() -> i32;
         fn uu_portal_capture_alive(portal: *mut c_void) -> i32;
         fn uu_portal_wait_frame(portal: *mut c_void, timeout_us: i64) -> i32;
         fn uu_portal_input_dispatch(portal: *mut c_void);
@@ -147,24 +148,38 @@ mod native {
     /// single-use restore token. Codes 1 (no bus), 2 (no interface) and 8 (allocation) fail
     /// inside the engine before anything is sent, and 13 is this side giving up (screen locked,
     /// viewer gone). In all of those the cached grant is still valid, while a token-less retry
-    /// would put a consent dialog on an unattended screen.
+    /// would put a consent dialog on an unattended screen. Only a fallback for engines that
+    /// predate `uu_portal_restore_sent`: code 5 (timeout) and 3 (invalid reply) also happen at
+    /// CreateSession, before the token is ever submitted.
     fn token_spent(code: i32) -> bool { !matches!(code, 1 | 2 | 8 | 13) }
 
+    /// Whether a failed open leaves the cached restore grant valid. `submitted` is the engine's
+    /// word on whether SelectDevices carried the token; `None` means an old engine that cannot
+    /// report it, falling back to the error code.
+    fn keep_restore_grant(submitted: Option<bool>, code: i32) -> bool {
+        match submitted { Some(sent) => !sent, None => !token_spent(code) }
+    }
+
     #[cfg(test)]
-    mod token_spent_tests {
-        use super::token_spent;
-        // 1 bus unavailable, 2 interface missing, 8 allocation: the token never left the process.
-        // 13 cancel is also raised while waiting for the response; a cancel that lands that late
-        // leaves a token the portal still accepts, and were it ever spent the next open falls back
-        // to the dialog, so erring towards keeping it costs nothing.
-        #[test] fn failures_before_the_portal_keep_the_cached_grant() {
-            for code in [1, 2, 8, 13] { assert!(!token_spent(code), "code {code} never reached the portal"); }
+    mod restore_grant_tests {
+        use super::keep_restore_grant;
+        // The regression Codex measured: CreateSession (portal_engine.c) answers 5 (timeout)
+        // or 3 (invalid session handle) before SelectDevices ever carries the token, so the
+        // two-strike code rule discarded a grant the portal had never seen. The engine's
+        // submission flag keeps it.
+        #[test] fn create_session_timeout_keeps_the_cached_grant() {
+            for code in [3, 5, 13] { assert!(keep_restore_grant(Some(false), code), "code {code} before submission keeps the grant"); }
         }
-        // 3 D-Bus rejection (an unknown token answers this), 4 user denied, 5 consent timeout,
-        // 9 connection closed: all of them happen after Start carried the token. 0 means the
-        // engine reported nothing usable, so it is treated as spent like any unknown failure.
-        #[test] fn failures_at_the_portal_consume_the_token() {
-            for code in [0, 3, 4, 5, 9, 15] { assert!(token_spent(code), "code {code} reached the portal"); }
+        // Once SelectDevices carried the token the portal may have consumed it: discard and
+        // retry without, regardless of code — including the cancels that land mid-dialog.
+        #[test] fn submitted_failures_discard_the_grant() {
+            for code in [0, 3, 4, 5, 9, 13, 15] { assert!(!keep_restore_grant(Some(true), code), "code {code} after submission spent the token"); }
+        }
+        // Engines without uu_portal_restore_sent keep the previous code-based rule:
+        // 1 bus, 2 interface, 8 allocation never reached the portal; the rest are treated as spent.
+        #[test] fn unknown_engines_fall_back_to_codes() {
+            for code in [1, 2, 8, 13] { assert!(keep_restore_grant(None, code), "code {code} never reached the portal"); }
+            for code in [0, 3, 4, 5, 9, 15] { assert!(!keep_restore_grant(None, code), "code {code} assumed at the portal"); }
         }
     }
 
@@ -375,12 +390,19 @@ mod native {
                 }
                 super::PortalError { code }
             };
+            // Release packages can ship an older libuu-portal.so without the submission flag;
+            // then the error code is all we have.
+            #[cfg(feature = "engine-plugins")]
+            let reports_submission = crate::engine_plugin::symbol(crate::engine_plugin::Engine::Portal, "uu_portal_restore_sent\0") != 0;
+            #[cfg(not(feature = "engine-plugins"))]
+            let reports_submission = true;
             let (mut pointer, mut error, mut width, mut height) = engine_open!(restore);
             // Self-heal a dead consent: retry once without the restore token so the portal pops
             // its consent dialog and issues a fresh one. Failures after Start carry a returned
             // token (rotation.received()), which excludes them from this retry.
             if pointer.is_null() && !restore.is_null() && !cache.rotation.received() {
-                if token_spent(error) {
+                let submitted = reports_submission.then(|| unsafe { uu_portal_restore_sent() != 0 });
+                if !keep_restore_grant(submitted, error) {
                     log::warn!("Portal request failed with a restore token; discarding it and retrying once without restore (a consent dialog may appear)");
                     restore = std::ptr::null();
                     (pointer, error, width, height) = engine_open!(restore);
