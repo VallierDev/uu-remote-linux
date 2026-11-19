@@ -14,6 +14,10 @@ impl Window {
         // SDL's default nearest-neighbour scaling makes remote text uneven whenever the window size
         // differs from the stream; filter instead. Set before the renderer/textures exist.
         sdl2::hint::set_with_priority("SDL_RENDER_SCALE_QUALITY","linear",&sdl2::hint::Hint::Default);
+        // SDL sets _NET_WM_BYPASS_COMPOSITOR=1 on every X11 window (meant for fullscreen games). KWin
+        // then suspends compositing for the whole desktop while the viewer is open: no shadows or
+        // animations, opaque black where shadows were. Default priority keeps the env override.
+        sdl2::hint::set_with_priority("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR","0",&sdl2::hint::Hint::Default);
         #[cfg(uu_gtk)] cairo_decorations();
         let sdl=sdl2::init()?;let video=sdl.video()?;
         let name=super::device_label(std::env::var("UU_VIEWER_DEVICE_NAME").ok().as_deref()).to_owned();
