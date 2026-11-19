@@ -90,11 +90,14 @@ is aimed at the virtual output's region. Needs GTK3.
   connection also pushes the current state first (off when it is off), which is new outbound traffic.
 - 空闲抑制：portal 桌面会话期间主机全程持有 `org.gnome.SessionManager` 空闲抑制。只观看不动手时，
   GNOME 到 `idle-delay` 会空闲锁屏，gnome-shell 随即关闭 ScreenCast/RemoteDesktop 会话，画面停在最后
-  一帧且注入输入失效；抑制在会话建立时取得、会话结束时释放。
+  一帧且注入输入失效；抑制在会话建立时取得、会话结束时释放。健康与否看帧是否真的在送达，不只看
+  Portal 会话对象是否存活：帧中断且重开失败时抑制随之释放，不在查看端看不见的故障期空占主机。
   The host holds an `org.gnome.SessionManager` idle inhibitor for the whole portal desktop session:
   watching without touching the host lets GNOME lock at `idle-delay`, gnome-shell then ends the
   ScreenCast/RemoteDesktop sessions, and the picture freezes with input dead. The inhibitor is taken
-  when the session opens and released when it ends.
+  when the session opens and released when it ends. Health means frames actually arriving, not just
+  a live Portal session object: when frames stop and the reopen fails the inhibitor goes with them,
+  instead of holding the host awake through an outage the viewer cannot see through.
 - 这是尽力而为的遮挡，不是保密边界。/ This is best-effort obscuring, not a confidentiality boundary.
 - 恢复记录保存在配置文件旁的 `privacy-power.json`（0600）；崩溃后下次启动重新启用记录的物理屏。
   若主机无法启动，可在本机终端执行 `kscreen-doctor output.<name>.enable`。

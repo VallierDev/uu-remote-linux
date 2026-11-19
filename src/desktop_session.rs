@@ -107,6 +107,14 @@ fn should_prepare_power(healthy: bool, force_wake: bool) -> bool {
     !healthy || force_wake
 }
 
+/// Whether frames actually reach the viewer. The Portal session object staying alive is not
+/// enough: the PipeWire stream can be interrupted past its deadline, or the encoder's own reopen
+/// can be backing off, and neither comes with a lock event. Idle inhibition belongs to a working
+/// stream, so both read as unhealthy here.
+fn screen_capture_healthy(screen: &ScreenCapture) -> bool {
+    screen.portal.as_ref().is_some_and(|portal| portal.capture_healthy())
+}
+
 /// KWin keeps the Portal screencast, including the lock screen, alive while the session is
 /// locked, so a cold connection can show the real lock screen. Mutter closes the session on
 /// lock, so other desktops keep the existing black-frame path. `UU_LOCKED_CAPTURE=0` opts out.
@@ -239,6 +247,7 @@ impl PortalDesktop {
                 Ok(guard) => IdleGuard(Some(Inhibitor::Real(guard))),
                 Err(error) => { log::warn!("Desktop idle inhibition unavailable: {error}"); IdleGuard::default() }
             },
+            screen_capture_healthy,
             |screen, cancel| {
                 if let Some(portal) = &screen.portal {
                     portal.recover(&cancel)?;
@@ -249,14 +258,16 @@ impl PortalDesktop {
             }).await
     }
 
-    async fn maintain_with<W, I, O>(&self, owner: Arc<DesktopInputSession>, wake: W, inhibit: I, open: O) -> Result<(), String>
+    async fn maintain_with<W, I, H, O>(&self, owner: Arc<DesktopInputSession>, wake: W, inhibit: I, health: H, open: O) -> Result<(), String>
     where
         W: Fn() -> Result<(), String> + Send + Sync + 'static,
         I: Fn() -> IdleGuard + Send + Sync + 'static,
+        H: Fn(&ScreenCapture) -> bool + Send + Sync + 'static,
         O: Fn(Arc<ScreenCapture>, Arc<AtomicBool>) -> Result<Arc<ScreenCapture>, PortalError> + Send + Sync + 'static,
     {
         let wake = Arc::new(wake);
         let inhibit = Arc::new(inhibit);
+        let health = Arc::new(health);
         let open = Arc::new(open);
         let mut locked = self.locked.clone();
         let allow_locked = self.capture_while_locked;
@@ -288,7 +299,7 @@ impl PortalDesktop {
                 let outcome = tokio::select! {
                     biased;
                     _ = wait_for_lock(&mut locked, allow_locked) => AttemptOutcome::Cancelled,
-                    outcome = self.portal_attempt(&owner, &mut attempt_locked, allow_locked, retry_at, force_wake, wake.clone(), inhibit.clone(), open.clone()) => outcome,
+                    outcome = self.portal_attempt(&owner, &mut attempt_locked, allow_locked, retry_at, force_wake, wake.clone(), inhibit.clone(), health.clone(), open.clone()) => outcome,
                 };
                 match outcome {
                     AttemptOutcome::Ready(screen, guard) => {
@@ -319,12 +330,13 @@ impl PortalDesktop {
         }
     }
 
-    async fn portal_attempt<W, I, O>(&self, owner: &Arc<DesktopInputSession>,
+    async fn portal_attempt<W, I, H, O>(&self, owner: &Arc<DesktopInputSession>,
         locked: &mut watch::Receiver<Option<bool>>, allow_locked: bool, retry_at: Instant, force_wake: bool,
-        wake: Arc<W>, inhibit: Arc<I>, open: Arc<O>) -> AttemptOutcome
+        wake: Arc<W>, inhibit: Arc<I>, health: Arc<H>, open: Arc<O>) -> AttemptOutcome
     where
         W: Fn() -> Result<(), String> + Send + Sync + 'static,
         I: Fn() -> IdleGuard + Send + Sync + 'static,
+        H: Fn(&ScreenCapture) -> bool + Send + Sync + 'static,
         O: Fn(Arc<ScreenCapture>, Arc<AtomicBool>) -> Result<Arc<ScreenCapture>, PortalError> + Send + Sync + 'static,
     {
         if !owner.is_current() || !attempt_allowed(*locked.borrow(), allow_locked) || Instant::now() < retry_at {
@@ -337,7 +349,7 @@ impl PortalDesktop {
             return AttemptOutcome::Cancelled;
         }
         let screen = self.snapshot().screen;
-        let healthy = screen.portal.as_ref().is_some_and(|portal| portal.is_alive());
+        let healthy = health(screen.as_ref());
         if !should_prepare_power(healthy, force_wake) {
             return AttemptOutcome::Cancelled;
         }
@@ -653,6 +665,7 @@ mod tests {
                 host.maintain_with(owner,
                     || Ok(()),
                     move || IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone())))),
+                    |_screen| false,
                     move |screen, cancel| {
                         let _ = started.send(());
                         while !worker_release.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
@@ -698,6 +711,7 @@ mod tests {
                         Ok(())
                     },
                     move || IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone())))),
+                    |_screen| false,
                     move |_screen, cancel| {
                         let _ = started.send(());
                         while !cancel.load(Ordering::Acquire) {
@@ -742,6 +756,7 @@ mod tests {
                 host.maintain_with(owner,
                     || Ok(()),
                     move || IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone())))),
+                    |_screen| false,
                     move |screen, _cancel| {
                         let _ = started.send(());
                         while !worker_release.load(Ordering::Acquire) {
@@ -784,6 +799,7 @@ mod tests {
             async move {
                 host.maintain_with(owner, || Ok(()),
                     move || IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone())))),
+                    |_screen| false,
                     |screen, _cancel| Ok(screen)).await
             }
         });
@@ -813,6 +829,7 @@ mod tests {
             async move {
                 host.maintain_with(owner, || Ok(()),
                     move || IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone())))),
+                    |_screen| false,
                     |screen, _cancel| Ok(screen)).await
             }
         });
@@ -831,5 +848,62 @@ mod tests {
         let _ = task.await;
         // Dropped exactly once at the lock transition and not replaced while locked.
         assert_eq!(releases.load(Ordering::Relaxed), 1);
+    }
+    /// A GNOME session can stop delivering frames without any lock event: after a display mode
+    /// change the PipeWire stream runs past its interrupt deadline while `uu_portal_alive` keeps
+    /// reporting true, the pair `tests/portal_engine.c` covers. The supervisor must judge the
+    /// stream rather than the session object and give up the inhibition it saved for a working one.
+    #[tokio::test]
+    async fn stalled_capture_releases_the_saved_inhibitor_without_a_lock() {
+        let (_lock, locked) = watch::channel(Some(false));
+        let host = Arc::new(PortalDesktop::with_lock_state(
+            Arc::new(ScreenCapture::unavailable("pending".into())), locked));
+        let input = Arc::new(crate::input::InputInjector::without_desktop());
+        let owner = input.desktop_session();
+        let releases = Arc::new(AtomicUsize::new(0));
+        // Frames are absent until the first open, then flow until the test stalls them.
+        let flowing = Arc::new(AtomicBool::new(false));
+        let opens = Arc::new(AtomicUsize::new(0));
+        let (flowing_health, opens_health) = (flowing.clone(), opens.clone());
+        let (flowing_open, opens_open) = (flowing.clone(), opens.clone());
+        let task = tokio::spawn({
+            let host = host.clone();
+            let owner = owner.clone();
+            let releases = releases.clone();
+            async move {
+                host.maintain_with(owner, || Ok(()),
+                    move || IdleGuard(Some(Inhibitor::Fake(DropSignal(releases.clone())))),
+                    move |_screen| opens_health.load(Ordering::Relaxed) > 0
+                        && flowing_health.load(Ordering::Relaxed),
+                    move |screen, _cancel| {
+                        // Only the reopen fails: the stream stays interrupted, which is how a
+                        // recovery the compositor cannot honour reaches this loop.
+                        if opens_open.fetch_add(1, Ordering::Relaxed) == 0 {
+                            flowing_open.store(true, Ordering::Release);
+                            Ok(screen)
+                        } else {
+                            Err(PortalError { code: 3 })
+                        }
+                    }).await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while host.snapshot().waiting {
+            assert!(tokio::time::Instant::now() < deadline, "Portal desktop was never published");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(releases.load(Ordering::Relaxed), 0, "a session with flowing frames gave up its inhibitor");
+        // Frames stop on their own. The reopen cannot bring them back, so the attempt must not
+        // hold the host awake over an outage the viewer cannot see through.
+        flowing.store(false, Ordering::Release);
+        let stalled = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        // The failed reopen drops its own guard and Retry drops the session's saved one.
+        while releases.load(Ordering::Relaxed) < 2 {
+            assert!(tokio::time::Instant::now() < stalled, "a stalled capture kept the host awake");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        assert_eq!(releases.load(Ordering::Relaxed), 2, "each guard was released exactly once");
     }
 }

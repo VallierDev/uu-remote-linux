@@ -204,6 +204,20 @@ mod native {
         pub fn is_alive(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 })
         }
+        /// True only while frames actually flow. `uu_portal_alive` stays true after the PipeWire
+        /// stream has been interrupted past its deadline, and a failed reopen is held back for a
+        /// few seconds by `recovery`; both mean no picture, so a caller that keeps the host awake
+        /// or schedules a reopen must not read them as healthy.
+        pub fn capture_healthy(&self) -> bool {
+            let alive = self.handle.lock().is_ok_and(|handle| unsafe {
+                uu_portal_alive(handle.0.as_ptr()) != 0 && uu_portal_capture_alive(handle.0.as_ptr()) != 0
+            });
+            alive && !self.recovery_failed()
+        }
+        fn recovery_failed(&self) -> bool {
+            self.recovery.lock().ok().is_some_and(|recovery|
+                recovery.failed_until.is_some_and(|until| std::time::Instant::now() < until))
+        }
         /// Opens a session for `monitor` (a Mutter connector) with that monitor's saved consent;
         /// None means the screen currently selected, or the only monitor.
         /// `fresh` asks the host again instead of restoring the saved consent (which stays saved).
@@ -1115,6 +1129,7 @@ impl PortalSession {
     pub fn clipboard_set(&self, _: &str) -> Result<(), String> { Err(error(15)) }
     pub fn clipboard_poll(&self) -> Option<String> { None }
     pub fn is_alive(&self) -> bool { false }
+    pub fn capture_healthy(&self) -> bool { false }
     pub fn open() -> Result<Self, String> { Err("Portal backend requires Linux and --features portal".into()) }
     pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, PortalError> {
         if cancelled.load(std::sync::atomic::Ordering::Acquire) { Err(PortalError { code: 13 }) }
