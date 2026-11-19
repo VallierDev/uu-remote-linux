@@ -470,8 +470,9 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     // continuation stream that carries no SPS/PPS/IDR, so the decoder can never start and
     // the screen stays black while every other part of the session works. Reconnecting gets
     // a new track, so give up on the picture after a grace period and let the caller retry.
-    // The counters are process-global, so remember this attempt's baseline: only what happened
-    // after the session started counts towards showing a picture.
+    // The counters are process-global, so mark where this attempt starts: only what happens
+    // after it counts towards showing a picture and towards asking for a key frame.
+    super::desktop::begin_session();
     let presented_at_start=super::desktop::STATS[1].load(std::sync::atomic::Ordering::Relaxed);
     let keys_at_start=super::desktop::KEY_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
     let video_at_start=session.peer.observed.video_received.load(std::sync::atomic::Ordering::Relaxed);

@@ -659,6 +659,18 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
   Logs and `--dry-run` report lengths/event counts only. When reusing a session, about one second after sending, a PNG frame is saved (default under `$XDG_RUNTIME_DIR/uu-viewer-type/`, mode 0600); the path is logged and printed as `snapshot=…`.
 - Ctrl+Alt+F in the desktop window opens the files window on the same connection. `UU_VIEWER_AUDIO=0` disables sound,
   `UU_VIEWER_CLIPBOARD=0` the clipboard, `UU_VIEWER_VIEW_ONLY=1` input; `UU_VIEWER_FFMPEG` selects the ffmpeg binary.
+- **Automatic reconnect on a black picture**: some hosts (observed with the official macOS 4.44 host) answer a
+  session with a continuation stream that carries no SPS/PPS/IDR, so the decoder cannot start and the window
+  stays black without any error. The viewer gives up on such a session and reconnects: it drops the session and
+  **re-joins the room**, because a fresh room is what makes the host start a new video track.
+  `UU_VIEWER_RECONNECT_ATTEMPTS` bounds the attempts (default 10), `UU_VIEWER_CONTROL_WAIT_MS` how long to wait
+  for the CONTROL channel to open (default 30000), `UU_VIEWER_BLACK_GRACE_MS` how long the decoder may stay idle
+  after a key frame arrived (default 6000), and `UU_VIEWER_ECHO_TIMEOUT_MS` how long to wait for the echo
+  handshake (default 45000).
+  The official macOS host can open the CONTROL channel after ten seconds or more, and **the picture appears
+  right after it opens**, so a short timeout would kill working sessions. The window shows "Reconnecting…" while
+  it retries. The log records the reason (`control channel not open` / `no key frame`) and the counts only; no
+  room, token or address is logged.
 - Desktop offers H.264 / H.265; the host chooses the codec. `UU_VIEWER_CODEC=h264` limits both SDP and decoder capabilities to H.264.
   The default request stays 4:2:0; `UU_VIEWER_CHROMA=444` requests true color (4:4:4) after CONTROL opens. The host may fall back to
   4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
