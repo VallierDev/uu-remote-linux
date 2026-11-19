@@ -19,7 +19,8 @@
 //! unlock-session sent, LockedHint still set 10 s later, viewer sees black plus its own cursor).
 //! Killing that greeter delivers `finished`, and with `s_logindExit` set ksld unlocks.
 //!
-//! Only greeters of the logind session whose unlock was observed (`User.Display`) are touched:
+//! Only greeters of the logind session whose unlock was observed are touched (the id is read in
+//! the same snapshot as its `LockedHint` and handed over, never looked up again):
 //! the same user can have a second graphical session that is still locked, and its greeter is
 //! healthy. A greeter whose session cannot be determined is left alone.
 
@@ -107,14 +108,14 @@ fn greeters(session: &str, unlocked_at: u64) -> Vec<Greeter> {
     }).collect()
 }
 
-/// Call when the display session changes from locked to unlocked. Its greeters started before
+/// Call when `session` was observed to change from locked to unlocked. Its greeters started before
 /// that moment belong to the lock that just ended; any still running after `GRACE` is stuck and
-/// is killed. The moment is taken here, on the caller's thread: the session query and the /proc
-/// scan run later, and by then the session may be locked again with a new, healthy greeter.
-pub(super) fn reap_after_unlock() {
+/// is killed. Both the session and the moment come from the caller: the /proc scan runs later, and
+/// by then the session may be locked again with a new, healthy greeter, or the display may belong
+/// to another session that is still locked.
+pub(super) fn reap_after_unlock(session: String) {
     let Some(unlocked_at) = boot_ticks() else { return };
     let spawned = std::thread::Builder::new().name("uu-greeter-reap".into()).spawn(move || {
-        let Some(session) = super::display_session() else { return };
         let seen = greeters(&session, unlocked_at);
         if seen.is_empty() { return; }
         std::thread::sleep(GRACE);
