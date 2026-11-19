@@ -1321,6 +1321,13 @@ impl WebRtcSession {
                                 }
                             }
                         }
+                        // Protobuf RPC that routes nowhere: the 4.44.1 viewer opens file transfers
+                        // with such messages (its field 13 handshake and field 26 download dir,
+                        // #208). Field numbers only, and the clipboard budget below is spent by
+                        // ordinary input traffic long before a transfer is attempted.
+                        if let Some(fields) = proto_fields.as_deref() {
+                            crate::file_trans::note_shape(&format!("unhandled on {channel_name}"), fields);
+                        }
                         // Temporary bounded clipboard routing diagnostics: schema only,
                         // never text values, payload bytes, key values or clipboard content.
                         if channel_name == "TEXT_DATA_CHANNEL" || channel_name == "BINARY_DATA_CHANNEL" || channel_name == "FILE_DATA_CHANNEL" {
