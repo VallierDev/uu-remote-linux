@@ -269,6 +269,13 @@ started a second full host server instead, so check that a subcommand exists in 
   a private `dbus-run-session` bus does not bring them onto a virtual display.
 - GTK windows stop repainting while GNOME is locked or the monitor is off; test UI on Xvfb or after unlock.
 - logind `unlock-session` by the session owner clears the GNOME shield in ~3 s.
+- KDE X11 with `pam_fprintd.so timeout=-1`: after a password unlock `kscreenlocker_greet` stays alive waiting for a
+  finger, the next lock cannot start a greeter (input grabbed, desktop visible) and the old greeter's exit unlocks.
+  `session_lock/stale_greeter.rs` kills a greeter started before the unlock in that logind session (cgroup
+  `session-<id>.scope`, else `XDG_SESSION_ID` of the greeter or, as the greeter is non-dumpable, of its parent;
+  unknown = untouched) still running 3 s after the session unlocks. Auto unlock hits the same hang: ksld answers
+  logind's Unlock by SIGTERMing the greeter and unlocks when it exits, so the session stays locked behind a black
+  lock window; `unlock_with` kills such a greeter when the session is still locked 2 s after `unlock-session`.
 - GNOME closes the portal session on lock; capture/input must share one portal session and be rebuilt after
   unlock. Portal input/clipboard permissions are persisted per desktop (0600 file); a revoked permission asks again.
 

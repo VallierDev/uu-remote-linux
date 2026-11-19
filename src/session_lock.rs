@@ -19,6 +19,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 mod logind;
+#[cfg_attr(test, allow(dead_code))] // not called from tests: it kills real processes
+mod stale_greeter;
 
 /// Official UnlockResult cases (LockScreenManager).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +81,14 @@ fn display_session() -> Option<String> {
     loginctl(&["show-user", &uid, "-p", "Display", "--value"])
 }
 
-pub fn locked_now() -> Option<bool> { display_session().as_deref().and_then(session_locked) }
+pub fn locked_now() -> Option<bool> { observed_now().map(|(_, locked)| locked) }
+
+/// The display session and its lock state, read together (loginctl fallback).
+fn observed_now() -> Option<Observed> {
+    let session = display_session()?;
+    let locked = session_locked(&session)?;
+    Some((session, locked))
+}
 
 fn session_locked(session: &str) -> Option<bool> {
     loginctl(&["show-session", session, "-p", "LockedHint", "--value"]).and_then(|v| match v.as_str() { "yes" => Some(true), "no" => Some(false), _ => None })
@@ -121,21 +130,47 @@ pub fn watch_locked() -> watch::Receiver<Option<bool>> {
     static STATE: OnceLock<watch::Sender<Option<bool>>> = OnceLock::new();
     STATE.get_or_init(|| {
         let (tx, _) = watch::channel(None);
-        let sender = tx.clone();
+        let mut state = LockState::new(tx.clone());
         std::thread::Builder::new().name("uu-lock-state".into()).spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build()
-                .expect("lock monitor runtime").block_on(logind::monitor(sender));
+                .expect("lock monitor runtime").block_on(logind::monitor(&mut state));
         }).expect("spawn lock state thread");
         tx
     }).subscribe()
 }
 
-fn publish_lock_state(sender: &watch::Sender<Option<bool>>, locked: Option<bool>) {
-    sender.send_if_modified(|current| if *current != locked {
-        log::info!("Desktop lock state: {}", match locked { Some(true) => "locked", Some(false) => "unlocked", None => "unknown" });
-        if locked == Some(true) { log::info!("Desktop is locked; capture continues while the compositor supplies frames"); }
-        *current = locked; true
-    } else { false });
+/// A logind session id and its `LockedHint`, read in one snapshot.
+type Observed = (String, bool);
+
+/// An unlock is a session seen locked and then seen unlocked. `User.Display` moving from a locked
+/// session to another, unlocked one is not: nothing was unlocked, and neither session's greeter
+/// is stale.
+fn same_session_unlocked(before: Option<(&str, bool)>, after: Option<(&str, bool)>) -> bool {
+    matches!((before, after), (Some((was, true)), Some((now, false))) if was == now)
+}
+
+/// Publishes the display session's lock state and remembers which session it was read from, so an
+/// unlock is acted on for the session that produced it and not for whichever owns the display later.
+struct LockState { sender: watch::Sender<Option<bool>>, observed: Option<Observed> }
+
+impl LockState {
+    fn new(sender: watch::Sender<Option<bool>>) -> Self { Self { sender, observed: None } }
+
+    fn publish(&mut self, observed: Option<Observed>) {
+        fn view(observed: &Option<Observed>) -> Option<(&str, bool)> { observed.as_ref().map(|(session, locked)| (session.as_str(), *locked)) }
+        let unlocked = same_session_unlocked(view(&self.observed), view(&observed));
+        let locked = observed.as_ref().map(|(_, locked)| *locked);
+        self.sender.send_if_modified(|current| if *current != locked {
+            log::info!("Desktop lock state: {}", match locked { Some(true) => "locked", Some(false) => "unlocked", None => "unknown" });
+            if locked == Some(true) { log::info!("Desktop is locked; capture continues while the compositor supplies frames"); }
+            *current = locked; true
+        } else { false });
+        #[cfg(not(test))]
+        if unlocked { if let Some((session, _)) = &observed { stale_greeter::reap_after_unlock(session.clone()); } }
+        #[cfg(test)]
+        let _ = unlocked;
+        self.observed = observed;
+    }
 }
 
 /// Verifies the session user's password and unlocks the display session. Blocking (PAM may
@@ -147,12 +182,17 @@ pub fn unlock(password: String) -> UnlockResult {
     result
 }
 
+/// 100 ms polls (2 s) the lock screen greeter gets to exit after logind's Unlock.
+#[cfg_attr(test, allow(dead_code))]
+const GREETER_EXIT_POLLS: u32 = 20;
+
 fn unlock_with(password: &str) -> UnlockResult {
     let Some(session) = display_session() else { return UnlockResult::NoLoggedInUser };
     if session_locked(&session) == Some(false) { return UnlockResult::Success; }
     let Some(user) = user_name() else { return UnlockResult::NoLoggedInUser };
     if password.is_empty() || password.contains('\0') { return UnlockResult::WrongPassword; }
     match pam_check(&user, password) { 0 => {}, 1 => return UnlockResult::WrongPassword, _ => return UnlockResult::Failed }
+    let requested_at = stale_greeter::boot_ticks();
     if loginctl_path().and_then(|path| bounded_command(path, &["unlock-session", &session], Duration::from_secs(3))).is_none() {
         return UnlockResult::NoPermission;
     }
@@ -160,8 +200,13 @@ fn unlock_with(password: &str) -> UnlockResult {
         log::warn!("Display wake after auto unlock failed: {error}");
     }
     // Post-unlock confirmation like the official host: the lock screen must actually go away.
-    for _ in 0..100 { // GNOME takes ~3 s to drop the shield after logind's Unlock
+    for attempt in 0..100 { // GNOME takes ~3 s to drop the shield after logind's Unlock
         if session_locked(&session) == Some(false) { return UnlockResult::Success; }
+        // KDE unlocks only once its greeter has exited; a healthy one is gone within milliseconds.
+        #[cfg(not(test))]
+        if attempt == GREETER_EXIT_POLLS { if let Some(at) = requested_at { stale_greeter::kill_ignoring_unlock(&session, at); } }
+        #[cfg(test)]
+        let _ = (attempt, requested_at);
         std::thread::sleep(Duration::from_millis(100));
     }
     UnlockResult::Failed
@@ -243,13 +288,32 @@ mod tests {
     #[test]
     fn unknown_state_is_preserved_and_repeated_states_do_not_notify() {
         let (tx, mut rx) = watch::channel(Some(true));
-        publish_lock_state(&tx, None);
+        let mut state = LockState::new(tx);
+        state.publish(None);
         assert_eq!(*rx.borrow_and_update(), None);
-        publish_lock_state(&tx, None);
+        state.publish(None);
         assert!(!rx.has_changed().unwrap());
-        publish_lock_state(&tx, Some(false));
+        state.publish(Some(("3".into(), false)));
         assert!(rx.has_changed().unwrap());
         assert_eq!(*rx.borrow_and_update(), Some(false));
+        // The same state read from another session does not notify, but the session is remembered.
+        state.publish(Some(("7".into(), false)));
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(state.observed, Some(("7".into(), false)));
+    }
+
+    #[test]
+    fn only_the_session_seen_locked_and_then_unlocked_counts_as_unlocked() {
+        assert!(same_session_unlocked(Some(("3", true)), Some(("3", false))));
+        // Session 3 logs out while locked and the display moves to session 7: no unlock, and a
+        // later lock state of 7 must never be taken for 3's.
+        assert!(!same_session_unlocked(Some(("3", true)), Some(("7", false))));
+        assert!(!same_session_unlocked(Some(("3", true)), Some(("7", true))));
+        assert!(!same_session_unlocked(Some(("3", true)), Some(("31", false))));
+        // No lock was seen, or the state in between was unknown.
+        assert!(!same_session_unlocked(Some(("3", false)), Some(("3", false))));
+        assert!(!same_session_unlocked(None, Some(("3", false))));
+        assert!(!same_session_unlocked(Some(("3", true)), None));
     }
 
     #[test]
