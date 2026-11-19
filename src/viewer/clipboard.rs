@@ -98,7 +98,8 @@ impl CommandBackend {
 // target_mac: Some(true) official Mac host, Some(false) Windows-type host (official or this project), None unknown.
 // assembly reassembles the field-17 ClipboardChange stream, rpc_assembly the field-21 case-10 one;
 // a host may interleave the two, and one shared buffer would splice fragments across them.
-struct SyncState {last:Option<String>,assembly:text::Assembly,rpc_assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
+// fresh: the case-10/17 text just applied, only for dropping the immediate rich replay.
+struct SyncState {last:Option<String>,fresh:Option<String>,assembly:text::Assembly,rpc_assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
 impl SyncState {
     async fn apply(&mut self,backend:&Backend,value:String)->Result<(),()>{
         if backend.write(&value).await? {
@@ -125,18 +126,18 @@ impl SyncState {
     fn receive(&mut self,data:&[u8])->Result<(Vec<Vec<u8>>,Option<String>),&'static str>{
         if data.len()>MAX_TEXT*2+1024{return Err("clipboard message exceeds limit")}
         let fields=decode_wire(data).map_err(|_|"invalid clipboard envelope")?;
-        let mut replies=Vec::new();let mut value=None;
+        let mut replies=Vec::new();let mut value=None;let mut plain=false;
         for field in fields {
             let WireValue::Bytes(payload)=field.value else{continue};
             match field.number {
-                17=>if let Some(text)=self.assembly.accept(payload)?{value=Some(text)},
+                17=>if let Some(text)=self.assembly.accept(payload)?{plain=true;value=Some(text)},
                 21=>{
                     let seq=&mut self.seq;
                     let result=self.rich.request(payload,&mut ||{*seq=seq.wrapping_add(1).max(100);*seq})?;
-                    if result.text.is_some(){value=result.text;}
+                    if result.text.is_some(){plain=false;value=result.text;}
                     for (kind,body) in result.messages {replies.push(wire::envelope(self.next(),kind,&body));}
                     if let Some((header,text))=text::read_text_request(&mut self.rpc_assembly,payload)?{
-                        value=Some(text);replies.push(wire::envelope(self.next(),22,&text::text_response(&header)));
+                        plain=true;value=Some(text);replies.push(wire::envelope(self.next(),22,&text::text_response(&header)));
                     }
                 },
                 22=>{
@@ -145,16 +146,23 @@ impl SyncState {
                         let err=decode_wire(&status).ok().and_then(|f|f.into_iter().find_map(|x|match (x.number,x.value){(1,WireValue::Varint(v))=>Some(v),_=>None})).unwrap_or(0);
                         log::info!("Viewer clipboard text change acknowledged: err={err}");
                     }
-                    if let Some(text)=self.rich.response(payload)?{value=Some(text)}
+                    if let Some(text)=self.rich.response(payload)?{plain=false;value=Some(text)}
                 },
                 _=>{},
             }
         }
         if value.as_ref().is_some_and(|text|text.contains('\0')){return Err("clipboard text contains NUL")}
-        // One copy can reach us twice, as case-10 text and again inside the rich answer. Writing
-        // it twice would announce a second local clipboard ownership change for a single copy.
-        let value=value.filter(|text|self.last.as_ref()!=Some(text));
+        let value=value.and_then(|text|self.accept_transfer(text,plain));
         Ok((replies,value))
+    }
+    /// One copy can reach us twice, as case-10 text and again inside the rich answer. Only
+    /// that immediate replay is dropped: text we applied once may lawfully arrive again after
+    /// a local non-text copy replaced the selection, and must then be written, so `last`
+    /// (which also feeds the send path) must not veto receive-side text.
+    fn accept_transfer(&mut self,text:String,plain:bool)->Option<String>{
+        let replay=!plain&&self.fresh.as_deref()==Some(text.as_str());
+        self.fresh=plain.then_some(text.clone());
+        (!replay).then_some(text)
     }
 }
 async fn send(channel:&RTCDataChannel,message:Vec<u8>)->Result<(),()>{
@@ -383,7 +391,23 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         }
         state.last=Some(value.clone());
         let(replies,repeated)=state.receive(&wire::envelope(2,21,&text::text_request(210,&value))).unwrap();
-        assert_eq!(repeated,None);assert_eq!(replies.len(),1,"the host still gets its acknowledgement");
+        assert_eq!(repeated.as_deref(),Some(value.as_str()),"a fresh case-10 notification is authoritative even if the text repeats");
+        assert_eq!(replies.len(),1,"the host still gets its acknowledgement");
+        // The same copy answered again through the rich path is the only replay dropped.
+        assert_eq!(state.accept_transfer("x".into(),true),Some("x".into()));
+        assert_eq!(state.accept_transfer("x".into(),false),None,"rich replay of the just-applied text is dropped");
+        assert_eq!(state.accept_transfer("x".into(),false),Some("x".into()),"only the immediate replay is dropped");
+    }
+    #[test] fn re_offered_text_is_written_after_the_local_clipboard_turned_non_text(){
+        let mut state=SyncState::default();
+        let (_,first)=state.receive(&wire::envelope(1,21,&text::text_request(200,"同一文本"))).unwrap();
+        assert_eq!(first.as_deref(),Some("同一文本"));
+        // The copy was applied, then a local image (no text MIME) replaced the selection: the
+        // poll cannot observe it and last/fresh keep the old text. A host copy of the same text
+        // arrives as a fresh case-10 notification and must be written again.
+        state.last=Some("同一文本".into());state.fresh=None;
+        let (_,again)=state.receive(&wire::envelope(2,21,&text::text_request(210,"同一文本"))).unwrap();
+        assert_eq!(again.as_deref(),Some("同一文本"));
     }
     #[test] fn control_clipboard_reproduces_native_host_failures(){
         assert_eq!(native_host_exchange(0,false),(None,false)); // Complete transfer, no CONTROL desktop sink.

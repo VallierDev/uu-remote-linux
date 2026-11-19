@@ -1389,7 +1389,7 @@ impl WebRtcSession {
                                         }
                                         let update=rich_incoming.lock().unwrap().response(payload);
                                         match update {
-                                            Ok(Some(text))=>{if let Some(sink)=clipboard_sink.lock().unwrap().0.as_ref(){log::info!("Native desktop clipboard text received: bytes={}",text.len());sink.send_replace(Some(text));}},
+                                            Ok(Some(text))=>crate::clipboard::deliver_or_hold(&clipboard_sink,text),
                                             Err(reason)=>log::warn!("Clipboard desktop response rejected: {}",reason),
                                             _=>{},
                                         }
@@ -1419,7 +1419,7 @@ impl WebRtcSession {
                                         };
                                         match rich_result {
                                             Ok(result)=>{
-                                                if let Some(text)=result.text {if let Some(sink)=clipboard_sink.lock().unwrap().0.as_ref(){log::info!("Native desktop clipboard text received: bytes={}",text.len());sink.send_replace(Some(text));}}
+                                                if let Some(text)=result.text {crate::clipboard::deliver_or_hold(&clipboard_sink,text);}
                                                 let count=result.messages.len();
                                                 for (kind,payload) in result.messages {
                                                     let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -1433,20 +1433,11 @@ impl WebRtcSession {
                                         let received={ let mut assembly=clipboard_rpc_assembly.lock().unwrap(); crate::clipboard_protocol::read_text_request(&mut assembly,payload) };
                                         match received {
                                             Ok(Some((header,text))) => {
-                                                // Deliver or hold under one lock, so text arriving while the
-                                                // bridge starts cannot be overtaken by an older held copy.
-                                                let sink={ let mut state=clipboard_sink.lock().unwrap(); match state.0.clone() {
-                                                    Some(sink)=>Some(sink),
-                                                    None=>{ log::info!("Native clipboard text held for bridge: bytes={}",text.len()); state.1=Some(text.clone()); None }
-                                                } };
-                                                if let Some(sink)=sink {
-                                                    log::info!("Native clipboard RPC text received: bytes={}",text.len());
-                                                    sink.send_replace(Some(text));
-                                                    let payload=crate::clipboard_protocol::text_response(&header);
-                                                    let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                                    let message=crate::initialization::envelope(out_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),timestamp,22,&payload);
-                                                    let _=reply_chan.send(&bytes::Bytes::from(message)).await;
-                                                }
+                                                crate::clipboard::deliver_or_hold(&clipboard_sink,text);
+                                                let payload=crate::clipboard_protocol::text_response(&header);
+                                                let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                let message=crate::initialization::envelope(out_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),timestamp,22,&payload);
+                                                let _=reply_chan.send(&bytes::Bytes::from(message)).await;
                                             }
                                             Ok(None)=> {if let Ok(nested)=crate::protocol::decode_wire(payload){log::info!("Clipboard RPC request schema: fields={:?}",nested.iter().map(|f|f.number).collect::<Vec<_>>());}},
                                             Err(reason)=>log::warn!("Clipboard RPC rejected: {}",reason),
@@ -1454,13 +1445,7 @@ impl WebRtcSession {
                                     }
                                     if let (17, WireValue::Bytes(payload)) = (field.number, &field.value) {
                                         match clipboard_assembly.lock().unwrap().accept(payload) {
-                                            Ok(Some(text)) => {
-                                                let sink = clipboard_sink.lock().unwrap().0.clone();
-                                                if let Some(sink) = sink {
-                                                    log::info!("Native clipboard text received: bytes={}",text.len());
-                                                    sink.send_replace(Some(text));
-                                                }
-                                            }
+                                            Ok(Some(text)) => crate::clipboard::deliver_or_hold(&clipboard_sink,text),
                                             Ok(None) => {},
                                             Err(reason) => log::warn!("Native clipboard message rejected: {}",reason),
                                         }
