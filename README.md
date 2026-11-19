@@ -576,6 +576,10 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
   日志与 `--dry-run` 输出只含长度/事件数，不含明文。复用会话时，发送约 1 秒后会保存一帧 PNG（默认写在 `$XDG_RUNTIME_DIR/uu-viewer-type/`，权限 0600），路径打在日志并打印 `snapshot=…`。
 - 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。Ctrl+Alt+M 打开控制中心，Ctrl+Alt+G 切换网络状态，Ctrl+Alt+K 切换向被控端发送系统快捷键（键盘捕获）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
   `UU_VIEWER_VIEW_ONLY=1` 只看不控，`UU_VIEWER_FFMPEG` 指定 ffmpeg 路径。
+- **走中继还是直连**（`UU_VIEWER_FORCE_RELAY`）：默认跟随云端下发的 `force_relay`。设为 `1` 时改为只走云端的
+  TURN 中继，不再让直连候选参与竞争——双方都在 NAT 后时，直连路径可能远慢于中继。实测连官方 macOS 主机，
+  直连的往返是 350～1570 ms，走中继只有 18～24 ms。云端没有提供 TURN 服务器时该请求无效，
+  会保留云端的 ICE 策略并记一行警告。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
