@@ -295,7 +295,10 @@ jobs:
               fi
               dpkg-deb -I "$deb" | sed -n '1,12p'
 
-              name=uu-remote-linux-${VERSION}-loongarch64-linux
+              # Same layout as release.yml: the tarball is named after the tag
+              # (v<version>) and each asset gets its own .sha256 next to it, so the
+              # loong64 assets are indistinguishable in shape from the other arches.
+              name=uu-remote-linux-v${VERSION}-loongarch64-linux
               stage=/work/out/$name
               mkdir -p "$stage"
               cp "$CARGO_TARGET_DIR"/release/uuremote-server LICENSE README.md README.en.md \
@@ -307,7 +310,10 @@ jobs:
               cp -r contrib "$stage/"
               tar czf "/work/out/$name.tar.gz" -C /work/out "$name" || fail "tar failed"
               rm -rf "$stage"
-              (cd /work/out && sha256sum ./*.deb ./*.tar.gz > SHA256SUMS && cat SHA256SUMS)
+              for f in /work/out/*.deb /work/out/*.tar.gz; do
+                [ -f "$f" ] && (cd /work/out && sha256sum "$(basename "$f")" > "$(basename "$f").sha256")
+              done
+              ls -l /work/out
             else
               fail "packaging/deb/build-deb.sh failed"
             fi
@@ -340,8 +346,9 @@ jobs:
           name: uu-remote-linux-${{ steps.ver.outputs.version }}-linux-loongarch64
           path: |
             ${{ runner.temp }}/loongarch/out/*.deb
+            ${{ runner.temp }}/loongarch/out/*.deb.sha256
             ${{ runner.temp }}/loongarch/out/*.tar.gz
-            ${{ runner.temp }}/loongarch/out/SHA256SUMS
+            ${{ runner.temp }}/loongarch/out/*.tar.gz.sha256
           # The build step already failed the job in that case; a second red step here
           # would only bury the real error.
           if-no-files-found: warn
@@ -361,6 +368,7 @@ jobs:
           set -euo pipefail
           gh release upload "$TAG" \
             "$RUNNER_TEMP"/loongarch/out/*.deb \
+            "$RUNNER_TEMP"/loongarch/out/*.deb.sha256 \
             "$RUNNER_TEMP"/loongarch/out/*.tar.gz \
-            "$RUNNER_TEMP"/loongarch/out/SHA256SUMS \
+            "$RUNNER_TEMP"/loongarch/out/*.tar.gz.sha256 \
             --clobber
