@@ -32,6 +32,18 @@
             default = config.packages.uu-remote-linux;
           };
 
+          checks = {
+            nixos = pkgs.testers.runNixOSTest (
+              import ./packaging/nix/test.nix {
+                inherit self;
+                inprocAvPackage = config.packages.uu-remote-linux.override {
+                  withInprocAv = true;
+                  withViewer = false;
+                };
+              }
+            );
+          };
+
           overlayAttrs = { inherit (config.packages) uu-remote-linux; };
 
           devShells.default = pkgs.mkShell {
