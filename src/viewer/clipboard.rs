@@ -98,11 +98,17 @@ impl CommandBackend {
 // target_mac: Some(true) official Mac host, Some(false) Windows-type host (official or this project), None unknown.
 // assembly reassembles the field-17 ClipboardChange stream, rpc_assembly the field-21 case-10 one;
 // a host may interleave the two, and one shared buffer would splice fragments across them.
-// fresh: the case-10/17 text just applied, only for dropping the immediate rich replay.
-struct SyncState {last:Option<String>,fresh:Option<String>,assembly:text::Assembly,rpc_assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
+// fresh: the case-10/17 text actually applied, only for dropping the immediate rich replay;
+// pending_plain is its text while the write is still pending (apply arms fresh on success).
+struct SyncState {last:Option<String>,fresh:Option<String>,pending_plain:Option<String>,assembly:text::Assembly,rpc_assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
 impl SyncState {
     async fn apply(&mut self,backend:&Backend,value:String)->Result<(),()>{
-        if backend.write(&value).await? {
+        let written=backend.write(&value).await;
+        // The replay marker arms only on a real write: a focus-skipped or failed write must
+        // leave the rich replay of this copy alive so it can still land once possible.
+        self.fresh=if written.is_ok_and(|ok|ok){self.pending_plain.take()}else{None};
+        self.pending_plain=None;
+        if written? {
             log::info!("Viewer remote clipboard applied: bytes={}",value.len());
             self.last=Some(value);
         }
@@ -161,7 +167,8 @@ impl SyncState {
     /// (which also feeds the send path) must not veto receive-side text.
     fn accept_transfer(&mut self,text:String,plain:bool)->Option<String>{
         let replay=!plain&&self.fresh.as_deref()==Some(text.as_str());
-        self.fresh=plain.then_some(text.clone());
+        if replay{self.fresh=None;}
+        self.pending_plain=plain.then_some(text.clone());
         (!replay).then_some(text)
     }
 }
@@ -283,15 +290,22 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         assert!(matches!(sdl_backend(false,true,tx,find),Some(Backend::Sdl(_))));
     }
     #[cfg(feature="viewer-sdl")]
-    #[tokio::test] async fn unfocused_write_does_not_mark_remote_text_as_applied(){
+    #[tokio::test] async fn unfocused_write_does_not_swallow_the_following_rich_replay(){
         let(tx,mut rx)=mpsc::channel(8);let backend=Backend::Sdl(tx);
         let ui=tokio::spawn(async move{
             let Some(ClipboardRequest::Write(_,reply))=rx.recv().await else{panic!()};
             reply.send(Ok(false)).unwrap();
         });
         let mut state=SyncState::default();state.last=Some("local".into());
+        let (_,received)=state.receive(&wire::envelope(1,21,&text::text_request(200,"remote"))).unwrap();
+        assert_eq!(received.as_deref(),Some("remote"));
         state.apply(&backend,"remote".into()).await.unwrap();
-        assert_eq!(state.last.as_deref(),Some("local"));ui.await.unwrap();
+        assert_eq!(state.last.as_deref(),Some("local"));
+        // The skipped write must not arm the replay marker: the rich answer for the same
+        // copy still gets its chance to apply once the window has focus again.
+        assert!(state.fresh.is_none()&&state.pending_plain.is_none());
+        assert_eq!(state.accept_transfer("remote".into(),false),Some("remote".into()));
+        ui.await.unwrap();
     }
     #[test] fn limits_match_host_and_unchanged_or_remote_text_is_not_reoffered(){
         assert!(include_str!("../clipboard.rs").contains("pub const MAX_TEXT: usize = 30 * 1024;"));
@@ -395,6 +409,7 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         assert_eq!(replies.len(),1,"the host still gets its acknowledgement");
         // The same copy answered again through the rich path is the only replay dropped.
         assert_eq!(state.accept_transfer("x".into(),true),Some("x".into()));
+        state.fresh=state.pending_plain.take(); // what apply does once the write really lands
         assert_eq!(state.accept_transfer("x".into(),false),None,"rich replay of the just-applied text is dropped");
         assert_eq!(state.accept_transfer("x".into(),false),Some("x".into()),"only the immediate replay is dropped");
     }
