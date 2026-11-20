@@ -46,6 +46,13 @@
 #![cfg_attr(test, deny(warnings))]
 #![recursion_limit = "500"]
 #![deny(unused)]
+// Only part of the crate is reachable through this project's feature selection, and which
+// items are live differs per target: the socket-option helpers (GetOsString, SetOsString)
+// are used on Linux but not on macOS. A registry dependency is compiled with
+// `--cap-lints allow`, so this deny never fired upstream; as a path dependency it does, and
+// the dead_code half of it turns into a hard error. Keep deny(unused) for the rest and
+// exempt only dead_code.
+#![allow(dead_code)]
 #![allow(unused_macros)]
 #![cfg_attr(not(feature = "default"), allow(unused_imports))]
 #![deny(unstable_features)]
