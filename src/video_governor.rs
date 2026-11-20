@@ -112,26 +112,33 @@ impl Governor {
                     return Decision { fps: Some(Some(step)), ..Default::default() };
                 }
             }
-            Decision::default()
-        } else if clean {
+            return Decision::default();
+        }
+        if clean {
             if let Some(cap) = self.apply((current + (current / 4).max(MIN_STEP_KBPS)).min(aim.max(current)),
                 current, INCREASE_AFTER, now) {
                 return Decision { cap: Some(cap), ..Default::default() };
             }
-            // Frames only climb once the bitrate is fully back at the viewer's ceiling:
-            // raising them into a still-throttled path just restarts the encoder in a circle.
-            if adapt.enabled && self.fps.is_some() && current >= ceiling_kbps {
-                if current_fps >= ceiling_fps { self.fps = None; return Decision { fps: Some(None), ..Default::default() }; }
-                let up = FPS_LADDER.iter().find(|&&s| s > current_fps).map(|&s| s.min(ceiling_fps));
-                if let Some(step) = self.step_fps(up, INCREASE_AFTER, now) {
-                    return Decision { fps: Some(Some(step)), ..Default::default() };
-                }
-            }
-            Decision::default()
-        } else {
-            // Between the knee and the cliff: hold, so a marginal path does not flap.
-            Decision::default()
         }
+        // Frames climb after a quiet probe window even when the report is not "clean", and
+        // not only once the bitrate is back at the ceiling: a relay path that has recovered
+        // keeps a 1-8% loss or 150-300 ms RTT baseline that never reads clean (measured:
+        // frames pinned at 5 fps for minutes on a path quietly streaming a megabyte; a
+        // healthy 300 ms line pins the cap at 800-2000k for an hour with 0% loss), starving
+        // exactly the links this feature rescues. Bitrate still climbs only on clean
+        // reports — every cap step is a keyframe burst into a marginal path — but a frame
+        // raise adds no load (the cap holds the total) and a mis-timed one costs only the
+        // next congested report stepping back down; that, plus the window a fresh
+        // congestion report restarts, is the anti-flap.
+        let quiet = self.broken_at.map_or(true, |(_, at)| now.duration_since(at) >= PROBE_AFTER);
+        if adapt.enabled && self.fps.is_some() && quiet {
+            if current_fps >= ceiling_fps { self.fps = None; return Decision { fps: Some(None), ..Default::default() }; }
+            let up = FPS_LADDER.iter().find(|&&s| s > current_fps).map(|&s| s.min(ceiling_fps));
+            if let Some(step) = self.step_fps(up, INCREASE_AFTER, now) {
+                return Decision { fps: Some(Some(step)), ..Default::default() };
+            }
+        }
+        Decision::default()
     }
 
     /// Move the frame rate to a ladder step unless there is none or a restart gate is still
@@ -345,26 +352,52 @@ mod tests {
     }
 
     #[test]
-    fn frames_climb_back_only_after_the_bitrate_is_fully_recovered() {
+    fn frames_climb_back_after_a_quiet_probe_window() {
         let mut governor = Governor::default();
         let start = Instant::now();
         assert_eq!(governor.observe(20.0, Some(20.0), 1_500, 60, 60, &adapt(), start).cap, Some(FLOOR_KBPS));
         assert_eq!(governor.observe(20.0, Some(20.0), 1_500, 60, 60, &adapt(), start + DECREASE_AFTER).fps, Some(Some(45)));
-        // Clean reports lift the bitrate first; frames wait out every throttled step.
+        // Clean reports lift the bitrate first, and no frame climbs inside the probe window
+        // of the last congestion (a relay at 300 ms+ never lifts the cap to its ceiling).
         let mut at = start + DECREASE_AFTER + RECOVERY_AFTER_DECREASE;
         let mut cap = FLOOR_KBPS;
-        while cap < 1_500 {
+        while at < start + DECREASE_AFTER + PROBE_AFTER {
             let d = governor.observe(0.0, Some(20.0), 1_500, 45, 60, &adapt(), at);
-            assert_eq!(d.fps, None, "frames must not climb under a bitrate cap");
+            assert_eq!(d.fps, None, "frames must not climb before the probe window passed");
             if let Some(c) = d.cap { cap = c; }
             at += INCREASE_AFTER;
         }
-        // At the ceiling the next step climbs frames, capped by the viewer's nominal rate…
+        assert_eq!(cap, FLOOR_KBPS, "the broken path must not lift its cap above the aim yet");
+        // Past the window the bitrate resumes its climb to the ceiling…
+        assert_eq!(governor.observe(0.0, Some(20.0), 1_500, 45, 60, &adapt(), at).cap, Some(1_300));
+        at += INCREASE_AFTER;
+        assert_eq!(governor.observe(0.0, Some(20.0), 1_500, 45, 60, &adapt(), at).cap, Some(1_500));
+        // …and once the cap has no step left, frames climb, capped by the viewer's nominal rate.
+        at += INCREASE_AFTER;
         assert_eq!(governor.observe(0.0, Some(20.0), 1_500, 45, 60, &adapt(), at).fps, Some(Some(60)));
         // …and once the stream runs at the viewer's rate again the floor is lifted outright,
         // so a later viewer raise to 90 fps is not clamped by a stale governor step.
         let later = at + DECREASE_AFTER * 2;
         assert_eq!(governor.observe(0.0, Some(20.0), 1_500, 60, 60, &adapt(), later).fps, Some(None));
         assert_eq!(governor.fps, None);
+    }
+
+    #[test]
+    fn frames_climb_back_on_a_marginal_path_that_never_reads_clean() {
+        let mut governor = Governor::default();
+        let start = Instant::now();
+        assert_eq!(governor.observe(20.0, Some(20.0), 1_500, 60, 60, &adapt(), start).cap, Some(FLOOR_KBPS));
+        assert_eq!(governor.observe(20.0, Some(20.0), 1_500, 60, 60, &adapt(), start + DECREASE_AFTER).fps, Some(Some(45)));
+        // 3% loss over 200 ms never reads clean: it holds the bitrate exactly as before…
+        let mut at = start + DECREASE_AFTER + RECOVERY_AFTER_DECREASE;
+        while at < start + DECREASE_AFTER + PROBE_AFTER {
+            assert_eq!(governor.observe(3.0, Some(200.0), 1_500, 45, 60, &adapt(), at), Decision::default(),
+                "a marginal report must neither lift the cap nor climb frames early");
+            at += INCREASE_AFTER;
+        }
+        // …but past the quiet window the path has demonstrably stopped collapsing, and the
+        // frames that a real relay path recovers to matter more than the last cap step.
+        assert_eq!(governor.observe(3.0, Some(200.0), 1_500, 45, 60, &adapt(), at).fps, Some(Some(60)));
+        assert_eq!(governor.cap, Some(FLOOR_KBPS), "the marginal path keeps its bitrate floor");
     }
 }
