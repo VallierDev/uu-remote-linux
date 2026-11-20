@@ -40,9 +40,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Debian trixie is the current loong64 port: apt works, and it carries GTK3,
-  # Wayland, PipeWire and libei >= 1.1.
-  IMAGE: ghcr.io/loong64/debian:trixie-slim
+  # Build on the distribution we target instead of the newest loong64 port.
+  # Debian trixie ships glibc 2.41, and linking there binds the weak libc symbols
+  # pidfd_spawnp/pidfd_getpid to GLIBC_2.39; the resulting binary then refuses to
+  # start on Deepin 23 (glibc 2.38) with "version `GLIBC_2.39' not found", even
+  # though those symbols are never called. Deepin 25 (crimson) is loong64-native
+  # and pins glibc 2.38, the same ABI generation as Deepin 23, so linking here
+  # keeps the binary loadable on both. Its apt source also carries GTK3, Wayland,
+  # PipeWire and libei >= 1.1, so no feature is lost.
+  IMAGE: linuxdeepin/deepin:crimson-loong64
 
 jobs:
   build:
@@ -263,6 +269,25 @@ jobs:
             file "$CARGO_TARGET_DIR/release/uuremote-server"
             if ! readelf -d "$CARGO_TARGET_DIR/release/uuremote-server" | grep -q 'libgtk-3'; then
               fail "uuremote-server is not linked against GTK3; the login window would be missing"
+            fi
+
+            # glibc symbols are versioned and only forward compatible: a binary that
+            # asks for GLIBC_2.39 will not load on a 2.38 system even when the symbol
+            # is a weak one that is never called (libc's pidfd_spawnp/pidfd_getpid are
+            # exactly that). The base image pins the ABI we target, but a dependency
+            # bump could silently raise the floor again, so assert it here rather than
+            # shipping a package that dies with "version `GLIBC_2.39' not found".
+            GLIBC_MAX=${GLIBC_MAX:-2.38}
+            highest=$(readelf --version-info "$CARGO_TARGET_DIR/release/uuremote-server" \
+              | grep -oE 'Name: GLIBC_2\.[0-9]+(\.[0-9]+)?' \
+              | sed 's/Name: GLIBC_//' | sort -V | tail -1)
+            if [ -z "$highest" ]; then
+              fail "could not determine the glibc symbol version of uuremote-server"
+            else
+              echo "highest required glibc symbol version: $highest (allowed: <= $GLIBC_MAX)"
+              if [ "$(printf '%s\n%s\n' "$GLIBC_MAX" "$highest" | sort -V | tail -1)" != "$GLIBC_MAX" ]; then
+                fail "uuremote-server needs GLIBC_$highest but the target (Deepin 23) ships $GLIBC_MAX"
+              fi
             fi
             echo "::endgroup::"
 
