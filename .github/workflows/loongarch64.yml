@@ -155,7 +155,7 @@ jobs:
 
           # Hard requirements: without these there is no build at all.
           REQUIRED="build-essential pkg-config ca-certificates curl xz-utils git file dpkg-dev
-          libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev"
+          clang libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev"
           # Optional: each one only enables a feature; build.rs already tolerates the
           # absence, and the pkg-config probes below decide what gets compiled.
           OPTIONAL="fonts-dejavu-core libsdl2-dev libwayland-dev libwayland-bin libxkbcommon-dev
@@ -194,6 +194,38 @@ jobs:
           cargo --version || fail "cargo is not runnable"
           rustc -vV || fail "rustc is not runnable"
           command -v cc >/dev/null || fail "no C compiler in PATH"
+
+          # rustc 1.100 passes -Wl,--no-rosegment by default, but GNU ld only
+          # learned that option in binutils 2.43 and Deepin crimson ships 2.41,
+          # so the plain `cc` link dies with "unrecognized option
+          # '--no-rosegment'". Use the LLD bundled in the rustc sysroot instead:
+          # it is 23.1.5, understands every flag rustc emits, and needs no extra
+          # package. clang stays the driver because it supplies the library
+          # search paths; pointing rustc straight at rust-lld loses them, so
+          # ld.lld is exposed on PATH and selected with -fuse-ld=lld. The
+          # distribution's own lld (17.x) is not an option: it predates
+          # --rosegment entirely.
+          sysroot=$(rustc --print sysroot)
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          rust_lld="$sysroot/lib/rustlib/$host/bin/rust-lld"
+          if [ -x "$rust_lld" ]; then
+            mkdir -p /usr/local/lib/rustc-lld
+            ln -sf "$rust_lld" /usr/local/lib/rustc-lld/ld.lld
+            export PATH="/usr/local/lib/rustc-lld:$PATH"
+            # A dedicated linker wrapper rather than RUSTFLAGS: RUSTFLAGS would
+            # replace any flags a future step sets, and cargo only needs the
+            # driver to pick LLD up. clang resolves -fuse-ld=lld through PATH,
+            # which is why ld.lld was symlinked above.
+            cat > /usr/local/bin/uu-clang <<'WRAPPER'
+          #!/bin/sh
+          exec clang -fuse-ld=lld "$@"
+          WRAPPER
+            chmod +x /usr/local/bin/uu-clang
+            export CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER=uu-clang
+            echo "linking with rustc's bundled LLD: $rust_lld"
+          else
+            note "no bundled rust-lld in the sysroot; the system linker needs binutils >= 2.43"
+          fi
           echo "::endgroup::"
 
           echo "::group::environment report"
