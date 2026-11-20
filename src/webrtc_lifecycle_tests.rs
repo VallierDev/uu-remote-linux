@@ -27,7 +27,8 @@ async fn connect_channels(desktop: bool, portal: Option<Arc<crate::desktop_sessi
     let (host_setting, viewer_setting, router) = crate::test_network::virtual_network().await;
     let screen = Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into()));
     let host = WebRtcSession::new(screen, input, crate::signaling::SignalingClient::disconnected(),
-        desktop, crate::session_ice::SessionIce::virtual_net(host_setting), portal).await.unwrap();
+        desktop, crate::session_ice::SessionIce::virtual_net(host_setting), portal,
+        crate::input::Controller::Other).await.unwrap();
     let pc = Arc::new(APIBuilder::new().with_setting_engine(viewer_setting).build().new_peer_connection(RTCConfiguration::default()).await.unwrap());
     let (tx, messages) = mpsc::unbounded_channel();
     let mut channels = HashMap::new();

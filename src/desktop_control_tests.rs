@@ -17,7 +17,8 @@ async fn connect(input: Arc<InputInjector>, desktop: bool,
     let (host_setting, viewer_setting, router) = crate::test_network::virtual_network().await;
     let screen = Arc::new(ScreenCapture::unavailable("synthetic locked desktop".into()));
     let host = WebRtcSession::new(screen, input, crate::signaling::SignalingClient::disconnected(),
-        desktop, crate::session_ice::SessionIce::virtual_net(host_setting), portal).await.unwrap();
+        desktop, crate::session_ice::SessionIce::virtual_net(host_setting), portal,
+        crate::input::Controller::Other).await.unwrap();
     let pc = Arc::new(APIBuilder::new().with_setting_engine(viewer_setting).build().new_peer_connection(RTCConfiguration::default()).await.unwrap());
     let (tx, messages) = mpsc::unbounded_channel();
     let mut channels = HashMap::new();
@@ -187,7 +188,8 @@ async fn closing_unnegotiated_peers_releases_callback_state() {
         let capture = Arc::new(ScreenCapture::unavailable("synthetic desktop".into()));
         let peer = WebRtcSession::new(capture, input,
             crate::signaling::SignalingClient::disconnected(), desktop,
-            crate::session_ice::SessionIce::local(), None).await.unwrap();
+            crate::session_ice::SessionIce::local(), None,
+            crate::input::Controller::Other).await.unwrap();
         let weak = Arc::downgrade(&peer.pc);
         peer.pc.close().await.unwrap();
         drop(peer);
