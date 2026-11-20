@@ -54,8 +54,13 @@ fn start_time(pid: libc::pid_t) -> Option<u64> { greeter_stat(pid).map(|(_, star
 
 /// Time since boot in the unit of stat field 22 (`sysconf(_SC_CLK_TCK)` ticks of CLOCK_BOOTTIME).
 pub(super) fn boot_ticks() -> Option<u64> {
+    // CLOCK_BOOTTIME is Linux-only; the fallback only lets the crate build for tests on other hosts.
+    #[cfg(target_os = "linux")]
+    const CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+    #[cfg(not(target_os = "linux"))]
+    const CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
     let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 { return None; }
+    if unsafe { libc::clock_gettime(CLOCK, &mut now) } != 0 { return None; }
     let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok().filter(|&hz| hz > 0)?;
     Some(u64::try_from(now.tv_sec).ok()? * hz + u64::try_from(now.tv_nsec).ok()? * hz / 1_000_000_000)
 }
@@ -195,6 +200,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // reads /proc
     fn unlock_time_uses_the_clock_of_stat_start_times() {
         // This process started before now and a moment from now is later still, in the same unit.
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
