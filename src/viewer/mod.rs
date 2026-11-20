@@ -28,6 +28,25 @@ pub mod clipboard;
 pub mod cursor;
 pub mod power;
 pub mod secure_input;
+
+/// Why a desktop session ended without a picture, so the caller can log the reason
+/// and retry. The host answered with a session that carries no key frame: the media
+/// channel works but the decoder can never start, so the screen stays black.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub enum NoPicture {
+    /// The CONTROL data channel never opened, so the echo handshake and the
+    /// sendVideoTrack RPC never happened and the host cannot show a picture.
+    ControlNotOpen,
+    /// CONTROL is open but no frame was ever presented.
+    NoKeyFrame,
+}
+impl NoPicture {
+    /// Short reason for the retry log.
+    pub fn reason(self)->&'static str { match self {
+        NoPicture::ControlNotOpen=>"control channel not open",
+        NoPicture::NoKeyFrame=>"no key frame",
+    }}
+}
 pub mod type_ipc;
 
 fn device_label(name:Option<&str>)->&str{

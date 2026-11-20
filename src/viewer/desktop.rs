@@ -14,6 +14,9 @@ pub trait Decoder { fn set_codec(&mut self,codec:super::media::Codec)->Result<()
 pub trait FrameSink { fn present(&mut self,frame:&Frame)->Result<(),String>; }
 /// Counts only (access units, presented frames, decode errors) for the periodic stats line.
 pub static STATS:[std::sync::atomic::AtomicU64;3]=[std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0)];
+/// Key frames received. A session that decodes no picture keeps receiving access units without
+/// a single key frame: it joined a track that was already encoded for another viewer (#124).
+pub static KEY_FRAMES:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
 fn wants_key_frame(units:u64,presented:u64)->bool {presented==0 && units%30==0}
 /// True when an Annex-B access unit carries a picture the decoder can restart from: an IDR/IRAP,
 /// an H.264 recovery-point SEI or an H.264 I slice (some hosts answer PLI without an IDR, #136).
@@ -59,12 +62,14 @@ fn present(sink:&mut dyn FrameSink,frame:&Frame)->Result<(),String> {
     }}
     Ok(())
 }
-fn decode(decoder:&mut dyn Decoder,au:&[u8],codec:super::media::Codec,pli:&AtomicBool)->Vec<Frame> {
+fn decode(decoder:&mut dyn Decoder,au:&[u8],codec:super::media::Codec,pli:&AtomicBool,units_base:u64,presented_base:u64)->Vec<Frame> {
     let units=STATS[0].fetch_add(1,Ordering::Relaxed)+1;
     // A later session can join a clean stream with no IDR in flight (#124): keep asking until a frame shows.
-    if wants_key_frame(units,STATS[1].load(Ordering::Relaxed)) {
+    // The counters are process-global, so compare against this attempt's baseline: a frame shown in
+    // an earlier attempt must not stop the new session from asking for a key frame.
+    if wants_key_frame(units.saturating_sub(units_base),STATS[1].load(Ordering::Relaxed).saturating_sub(presented_base)) {
         pli.store(true,Ordering::Release);
-        if units==300 { log::warn!("Viewer desktop: no decodable frame after {units} access units; requesting key frames (another session may hold the host)"); }
+        if units.saturating_sub(units_base)==300 { log::warn!("Viewer desktop: no decodable frame after {units} access units; requesting key frames (another session may hold the host)"); }
     }
     // Local diagnostic: UU_VIEWER_DUMP_H264=path appends the first 300 access units (owner's own stream).
     if codec==super::media::Codec::H264 && STATS[0].load(Ordering::Relaxed)<=300 { if let Some(path)=std::env::var_os("UU_VIEWER_DUMP_H264") {
@@ -75,6 +80,14 @@ fn decode(decoder:&mut dyn Decoder,au:&[u8],codec:super::media::Codec,pli:&Atomi
         Err(_)=>{STATS[2].fetch_add(1,Ordering::Relaxed);decoder.reset();pli.store(true,Ordering::Release);Vec::new()},
     }
 }
+/// Baseline of the counters for the current session, so a reconnect starts from zero again.
+static SESSION_BASE:[std::sync::atomic::AtomicU64;2]=[std::sync::atomic::AtomicU64::new(0),std::sync::atomic::AtomicU64::new(0)];
+/// Start a new session: the counters keep running for the whole process, but the key frame
+/// request and the black-screen check must only look at this session.
+pub fn begin_session(){
+    SESSION_BASE[0].store(STATS[0].load(Ordering::Relaxed),Ordering::Relaxed);
+    SESSION_BASE[1].store(STATS[1].load(Ordering::Relaxed),Ordering::Relaxed);
+}
 /// Feed reference-dependent units in FIFO order, but present only the newest decoded picture.
 pub fn pump(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn FrameSink,gate:&mut KeyGate)->Result<Option<super::media::Codec>,String> {
     let started=std::time::Instant::now();
@@ -82,13 +95,16 @@ pub fn pump(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn FrameSink,ga
 }
 fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn FrameSink,gate:&mut KeyGate,mut elapsed:impl FnMut()->std::time::Duration)->Result<Option<super::media::Codec>,String> {
     let mut newest=None;let mut codec=None;
+    let units_base=SESSION_BASE[0].load(Ordering::Relaxed);
+    let presented_base=SESSION_BASE[1].load(Ordering::Relaxed);
     for _ in 0..8 {
         let Some(au)=desktop.units.pop() else {break};
         if desktop.reset.swap(false,Ordering::AcqRel) {decoder.reset();gate.arm();}
         if !gate.admit(au.codec,&au.data) {desktop.pli.store(true,Ordering::Release);}
         else {
+            if is_key_frame(au.codec,&au.data) {KEY_FRAMES.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}
             decoder.set_codec(au.codec)?;codec=Some(au.codec);
-            if let Some(frame)=decode(decoder,&au.data,au.codec,&desktop.pli).pop() {newest=Some(frame);}
+            if let Some(frame)=decode(decoder,&au.data,au.codec,&desktop.pli,units_base,presented_base).pop() {newest=Some(frame);}
         }
         // A soft budget between calls: an in-progress decoder call cannot be interrupted.
         if elapsed()>=std::time::Duration::from_millis(4) {break}
@@ -125,6 +141,22 @@ fn pump_with_elapsed(desktop:&Desktop,decoder:&mut dyn Decoder,sink:&mut dyn Fra
     #[test] fn requests_key_frames_until_the_first_frame(){
         assert_eq!((1..=90).filter(|&n|wants_key_frame(n,0)).count(),3);
         assert!(!(1..=90).any(|n|wants_key_frame(n,1)));
+    }
+    #[test] fn a_new_session_asks_for_key_frames_again(){
+        // The counters are process-global: a frame shown in an earlier session must not stop the
+        // next one from asking for a key frame, or it stays black on a stream without an IDR.
+        let desktop=Desktop::default();let mut d=Mock(false);let mut s=Sink(0);let mut gate=KeyGate::new();
+        // A first session that shows a frame.
+        enqueue(&desktop,unit(0,false));
+        pump_with_elapsed(&desktop,&mut d,&mut s,&mut gate,||Duration::ZERO).unwrap();
+        assert_eq!(s.0,1);
+        // The next session starts here and gets a stream without a key frame.
+        super::begin_session();
+        let before=super::STATS[1].load(Ordering::Relaxed);
+        assert!(before>0,"the previous session presented a frame");
+        for _ in 0..30 {enqueue(&desktop,unit(0,false));}
+        pump_with_elapsed(&desktop,&mut d,&mut s,&mut gate,||Duration::ZERO).unwrap();
+        assert!(desktop.pli.load(Ordering::Acquire),"the new session must ask for a key frame");
     }
     #[test] fn decode_error_requests_pli_and_recovers(){
         let desktop=Desktop::default();let mut d=Mock(true);let mut s=Sink(0);let mut gate=KeyGate::new();

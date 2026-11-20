@@ -295,6 +295,10 @@ impl Peer {
                 let candidate=if let Some(s)=value.as_str() {
                     RTCIceCandidateInit {candidate:s.into(),sdp_mid:body.get("sdp_mid").and_then(Value::as_str).map(str::to_owned),sdp_mline_index:body.get("sdp_mline_index").and_then(Value::as_u64).and_then(|v|u16::try_from(v).ok()),..Default::default()}
                 } else {serde_json::from_value(value.clone()).map_err(|_|"Invalid candidate")?};
+                // Diagnostic: the candidate type only, no address.
+                let line=candidate.candidate.clone();
+                let kind=if line.contains("typ relay"){"relay"}else if line.contains("typ srflx"){"srflx"}else if line.contains("typ host"){"host"}else if line.contains("typ prflx"){"prflx"}else{"?"};
+                log::info!("Viewer remote ICE candidate: type={kind}");
                 if self.answered {self.pc.add_ice_candidate(candidate).await.map_err(|_|"ICE candidate failed")?;}
                 else {if self.early.len()>=256{return Err("Too many early ICE candidates".into())}self.early.push(candidate);}
             }

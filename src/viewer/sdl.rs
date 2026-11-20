@@ -1,6 +1,32 @@
 use super::{desktop::{Frame,FrameSink},input::{Input,Viewport},session::Session};
 use sdl2::{event::{Event,WindowEvent},mouse::MouseButton,pixels::PixelFormatEnum,rect::Rect};
 #[derive(Debug)] enum Command { Files, Type }
+/// Command channel for the session loop. The reader that fills it is started once by the
+/// caller and lives across reconnect attempts: a reader per attempt would keep several
+/// threads blocked on stdin and swallow each other's commands.
+#[derive(Clone)]
+pub struct CommandChannel{pub tx:tokio::sync::mpsc::Sender<Command>,pub rx:std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Command>>>}
+/// Start the stdin command reader once. Returns a channel whose receiver is closed when the
+/// reader ends.
+pub fn command_channel()->CommandChannel{
+    let(tx,rx)=tokio::sync::mpsc::channel::<Command>(8);
+    let sender=tx.clone();
+    if std::env::var("UU_VIEWER_COMMANDS").as_deref()==Ok("1") {
+        std::thread::spawn(move||{
+            use std::io::Read;
+            let mut input=std::io::stdin().lock();let mut line=Vec::new();let mut byte=[0];
+            while input.read(&mut byte).ok()==Some(1){
+                if byte[0]==b'\n'{
+                    let cmd=match line.as_slice(){b"files"=>Some(Command::Files),b"type"=>Some(Command::Type),_=>None};
+                    line.clear();
+                    if let Some(cmd)=cmd { if sender.blocking_send(cmd).is_err(){break} }
+                }
+                else if line.len()<32{line.push(byte[0]);}else{break}
+            }
+        });
+    }
+    CommandChannel{tx,rx:std::sync::Arc::new(tokio::sync::Mutex::new(rx))}
+}
 pub struct Window {cursor:super::cursor::Display,canvas:sdl2::render::Canvas<sdl2::video::Window>, events:sdl2::EventPump, _sdl:sdl2::Sdl, frame:(u32,u32), focused:bool, files:bool, mac:bool,
     clipboard:sdl2::clipboard::ClipboardUtil, clipboard_dirty:bool, clipboard_tx:tokio::sync::mpsc::Sender<super::clipboard::ClipboardRequest>, clipboard_requests:tokio::sync::mpsc::Receiver<super::clipboard::ClipboardRequest>,
     pub last_frame:Option<Frame>, chrome:Chrome }
@@ -412,24 +438,10 @@ impl FrameSink for Window {
         self.draw(frame)
     }
 }
-pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super::desktop::Decoder,view_only:bool,device:&str)->Result<(),String>{
+pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super::desktop::Decoder,view_only:bool,device:&str,commands:CommandChannel)->Result<(),String>{
     #[cfg(uu_gtk)]
     let mut files:Option<tokio::task::JoinHandle<Result<(),String>>>=None;
-    let(tx,mut commands)=tokio::sync::mpsc::channel::<Command>(8);
-    if std::env::var("UU_VIEWER_COMMANDS").as_deref()==Ok("1") {
-        std::thread::spawn(move||{
-            use std::io::Read;
-            let mut input=std::io::stdin().lock();let mut line=Vec::new();let mut byte=[0];
-            while input.read(&mut byte).ok()==Some(1){
-                if byte[0]==b'\n'{
-                    let cmd=match line.as_slice(){b"files"=>Some(Command::Files),b"type"=>Some(Command::Type),_=>None};
-                    line.clear();
-                    if let Some(cmd)=cmd { if tx.blocking_send(cmd).is_err(){break} }
-                }
-                else if line.len()<32{line.push(byte[0]);}else{break}
-            }
-        });
-    }else{drop(tx);}
+    let mut commands=commands.rx.lock().await;
     let(type_tx,mut type_rx)=tokio::sync::mpsc::channel::<super::type_ipc::PendingType>(4);
     let type_ipc=match super::type_ipc::Server::bind(device).await {
         Ok(server)=>{
@@ -446,10 +458,15 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let mut type_job:Option<TypeJob>=None;
     let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
     let mut audio=super::audio::Playback::new(&window._sdl,session.peer.audio.clone());
-    let mut input=Input::new(view_only);input.set_mac(window.mac);input.set_follow_natural_scroll(window.state().follow_natural_scroll);
+    // The window keeps its Watch mode across a reconnect, so the input must start from it too:
+    // otherwise a retry would forward keys and mouse again while the menu still shows Watch.
+    let mut input=Input::new(view_only||window.state().watch);input.set_mac(window.mac);input.set_follow_natural_scroll(window.state().follow_natural_scroll);
     let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
     let mut heartbeat=tokio::time::interval(std::time::Duration::from_secs(1));
-    let deadline=tokio::time::sleep(std::time::Duration::from_secs(30));tokio::pin!(deadline);
+    // The echo handshake can be slow: the official macOS host opens the CONTROL channel late,
+    // and the echo follows it. Give it the same budget as the CONTROL wait.
+    let echo_deadline=std::env::var("UU_VIEWER_ECHO_TIMEOUT_MS").ok().and_then(|v|v.parse().ok()).unwrap_or(45_000u64);
+    let deadline=tokio::time::sleep(std::time::Duration::from_millis(echo_deadline));tokio::pin!(deadline);
     window.set_stage(crate::i18n::s("正在传输画面…","Waiting for the remote picture…"));
     if let Some(playback)=audio.as_mut(){playback.volume=window.state().volume;}
     if window.state().grab_keys {window.canvas.window_mut().set_keyboard_grab(true);}
@@ -459,6 +476,23 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     // After a local drop the decoder has no reference picture; P-frames would only smear blocks.
     let mut key_gate=super::desktop::KeyGate::new();
     let mut next_thumb=std::time::Instant::now()+std::time::Duration::from_secs(5);
+    // Some hosts (observed with the official macOS host) answer a fresh session with a
+    // continuation stream that carries no SPS/PPS/IDR, so the decoder can never start and
+    // the screen stays black while every other part of the session works. Reconnecting gets
+    // a new track, so give up on the picture after a grace period and let the caller retry.
+    // The counters are process-global, so mark where this attempt starts: only what happens
+    // after it counts towards showing a picture and towards asking for a key frame.
+    super::desktop::begin_session();
+    let presented_at_start=super::desktop::STATS[1].load(std::sync::atomic::Ordering::Relaxed);
+    let keys_at_start=super::desktop::KEY_FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    let video_at_start=session.peer.observed.video_received.load(std::sync::atomic::Ordering::Relaxed);
+    // UU_VIEWER_BLACK_GRACE_MS: how long the decoder may stay idle after a key frame arrived
+    // before the session counts as black.
+    let black_grace=std::env::var("UU_VIEWER_BLACK_GRACE_MS").ok().and_then(|v|v.parse().ok()).unwrap_or(8_000u64);
+    // UU_VIEWER_CONTROL_WAIT_MS: how long to wait for the CONTROL channel to open. Measured with
+    // the official macOS host it can take 10-20 s, and the picture appears right after it opens.
+    let control_wait=std::env::var("UU_VIEWER_CONTROL_WAIT_MS").ok().and_then(|v|v.parse().ok()).unwrap_or(30_000u64);
+    let mut black_since:Option<std::time::Instant>=None;
     let result=async {
         loop {tokio::select!{
             command=commands.recv(),if command_open=>{
@@ -490,12 +524,34 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
             _=terminate.recv()=>return Ok(()),
             _=tokio::signal::ctrl_c()=>return Ok(()),
             result=session.step()=>result?,
-            _=&mut deadline,if !session.peer.observed.echo_received.load(std::sync::atomic::Ordering::Acquire)=>return Err("CONTROL echo timed out".into()),
+            _=&mut deadline,if !session.peer.observed.echo_received.load(std::sync::atomic::Ordering::Acquire)=>return Err(super::NoPicture::ControlNotOpen.reason().to_owned()),
             _=heartbeat.tick()=>{
                 if input.enabled() && session.peer.ready(super::rtc::ReadyPolicy::EchoOnly,false){session.peer.send_input(&Input::heartbeat()).await?;}
                 let o=&session.peer.observed;let s=&super::desktop::STATS;let r=std::sync::atomic::Ordering::Relaxed;
                 log::info!("Viewer desktop stats: control_open={} echo={} media_packets={} access_units={} presented={} decode_errors={}",
                     o.control_open.load(r),o.echo_received.load(r),o.media_packets.load(r),s[0].load(r),s[1].load(r),s[2].load(r));
+                // The picture appears once the host sends a key frame: without SPS/PPS/IDR the
+                // decoder cannot start, so a session that never receives one stays black while
+                // access units keep arriving. Measured with the official macOS host, a key frame
+                // can arrive 60 s or more after the CONTROL channel opened, so a wall-clock limit
+                // would kill working sessions. Only give up once a key frame was seen and the
+                // decoder still produced nothing.
+                if o.control_open.load(r)&&s[1].load(r)==presented_at_start&&o.video_received.load(r)>video_at_start {
+                    let keys=super::desktop::KEY_FRAMES.load(r);
+                    if keys>keys_at_start {
+                        let since=*black_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed()>=std::time::Duration::from_millis(black_grace) {
+                            log::warn!("No picture {black_grace} ms after a key frame (control open)");
+                            return Err(super::NoPicture::NoKeyFrame.reason().to_owned());
+                        }
+                    }
+                } else if s[1].load(r)>presented_at_start {black_since=None;}
+                // The CONTROL channel never opened at all: the echo handshake and the
+                // sendVideoTrack RPC never happened, so the host cannot show a picture either.
+                if !o.control_open.load(r)&&started.elapsed()>=std::time::Duration::from_millis(control_wait) {
+                    log::warn!("CONTROL channel still closed after {control_wait} ms");
+                    return Err(super::NoPicture::ControlNotOpen.reason().to_owned());
+                }
                 // Network-status panel: per-second deltas of local counters plus the selected ICE pair.
                 let now=(s[1].load(r),o.media_bytes.load(r),o.video_received.load(r),o.video_expected.load(r),std::time::Instant::now());
                 let secs=now.4.duration_since(last.4).as_secs_f64().max(0.2);
