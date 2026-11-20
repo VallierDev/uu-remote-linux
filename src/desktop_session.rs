@@ -281,7 +281,10 @@ impl PortalDesktop {
         // that locking or a failed initialization releases the inhibition.
         let mut _inhibitor: Option<IdleGuard> = None;
         loop {
-            if !owner.is_current() { return Ok(()); }
+            if !owner.is_current() {
+                log::info!("Portal maintain stopped: superseded by a newer desktop connection");
+                return Ok(());
+            }
             let state = *locked.borrow_and_update();
             if state == Some(false) { defer_until_unlock = false; }
             if state != Some(false) && previous == Some(Some(false)) { self.pause(&owner); }
@@ -294,7 +297,13 @@ impl PortalDesktop {
             if attempt_allowed(state, allow_locked) && !defer_until_unlock {
                 // A fresh transition into an attempted state gets an immediate wake/recovery attempt.
                 let force_wake = fresh_state(previous, state);
-                if force_wake { retry_at = Instant::now(); }
+                if force_wake {
+                    retry_at = Instant::now();
+                    // One line per lock-state transition: connects that start locked only become
+                    // picture-capable after the auto unlock, and this is the marker that the
+                    // supervisor actually reacted to the unlock (its absence means the loop is dead).
+                    log::info!("Portal desktop lock transition: state={state:?} defer={defer_until_unlock}");
+                }
                 let mut attempt_locked = locked.clone();
                 let outcome = tokio::select! {
                     biased;
@@ -394,6 +403,9 @@ impl PortalDesktop {
         // A new controller can arrive while the cached Portal handle is alive
         // but the display has gone to sleep without a lock transition.
         if healthy { return AttemptOutcome::Ready(screen, inhibitor); }
+        // Marks every real reopen: paired with the lock-transition log, the absence of an
+        // outcome after this line pins a stall to the blocking open/recovery worker below.
+        log::info!("Portal attempt: reopening the capture session (force_wake={force_wake})");
         let worker_cancel = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
             // The worker owns the gate until its real cleanup completes; a

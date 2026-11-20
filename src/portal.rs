@@ -547,11 +547,19 @@ mod native {
             use std::sync::atomic::Ordering;
             if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
             // Serialize with the encoder's stream-loss recovery: two openers would ask for consent twice.
+            // The wait is bounded: another opener (encoder reopen, consent rebuild) can hold this lock
+            // for as long as a consent dialog waits, and an unbounded spin here would leave the desktop
+            // supervisor's attempt silently running with no log and no frames until the viewer times out.
+            let lock_wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             let mut recovery = loop {
                 match self.recovery.try_lock() {
                     Ok(recovery) => break recovery,
                     Err(TryLockError::WouldBlock) => {
                         if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+                        if std::time::Instant::now() >= lock_wait_deadline {
+                            log::warn!("Portal recovery lock held by another opener for 15s; retrying later");
+                            return Err(super::PortalError { code: 3 });
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
                     Err(TryLockError::Poisoned(_)) => return Err(super::PortalError { code: 3 }),
