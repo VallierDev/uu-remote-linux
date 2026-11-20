@@ -99,7 +99,7 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
    WantedBy=graphical-session.target
    ```
 
-   Same as packaging/deb. GNOME/KDE import DISPLAY / WAYLAND_DISPLAY and start graphical-session.target; do not hard-code
+   Same as packaging/common. GNOME/KDE import DISPLAY / WAYLAND_DISPLAY and start graphical-session.target; do not hard-code
    DISPLAY there (it overrides the session's real one, XWayland is often :1); under default.target the unit can
    start before WAYLAND_DISPLAY is imported and fall back to X11. Desktops without that target (Xfce, i3) and the Xvfb
    virtual desktop need `WantedBy=default.target` plus an explicit `Environment=DISPLAY=...`; headless

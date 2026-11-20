@@ -371,7 +371,7 @@ static void build_tray(void) {
 static void build_window(void) {
     uu_theme_init();
 
-    gtk_window_set_default_icon_name("uu-remote-linux"); // contrib/desktop icon, when installed
+    gtk_window_set_default_icon_name("uu-remote-linux"); // packaging/common/desktop icon, when installed
     window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(window), L("UU 远程 Linux 主机（非官方）", "UU Remote Linux host (unofficial)"));
     gtk_window_set_default_size(GTK_WINDOW(window), 760, -1);

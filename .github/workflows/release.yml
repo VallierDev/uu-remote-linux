@@ -66,6 +66,8 @@ jobs:
           mkdir -p "$name"
           cp target/release/uuremote-server target/release/uuremote-viewer target/release/libuu-wayland.so target/release/libuu-portal.so \
             packaging/tarball/install.sh LICENSE README.md README.en.md config.example.json "$name/"
+          mkdir -p "$name/packaging"
+          cp -r packaging/common "$name/packaging/"
           cp -r contrib "$name/"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"

@@ -3,7 +3,7 @@
 # usage: packaging/deb/build-deb.sh VERSION BIN_DIR OUT_DIR   (VERSION without the leading v)
 set -eu
 version=$1 bin=$2 out=$3
-here=$(cd "$(dirname "$0")" && pwd) root=$(cd "$here/../.." && pwd)
+here=$(cd "$(dirname "$0")" && pwd) root=$(cd "$here/../.." && pwd) common=$root/packaging/common
 case $(uname -m) in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "unsupported arch" >&2; exit 1 ;; esac
 pkg=$(mktemp -d)
 trap 'rm -rf "$pkg"' EXIT
@@ -12,14 +12,14 @@ install -Dm755 "$bin/uuremote-server" "$pkg/usr/bin/uuremote-server"
 for lib in libuu-wayland.so libuu-portal.so; do
   [ -f "$bin/$lib" ] && install -Dm644 "$bin/$lib" "$pkg/usr/lib/uu-remote-linux/$lib"
 done
-install -Dm644 "$here/uuremote-native.service" "$pkg/usr/lib/systemd/user/uuremote-native.service"
-install -Dm644 "$root/contrib/desktop/uu-remote-linux.desktop" "$pkg/usr/share/applications/uu-remote-linux.desktop"
-[ -f "$pkg/usr/bin/uuremote-viewer" ] && install -Dm644 "$root/contrib/desktop/uu-remote-linux-viewer.desktop" "$pkg/usr/share/applications/uu-remote-linux-viewer.desktop"
-install -Dm644 "$root/contrib/desktop/uu-remote-linux.svg" "$pkg/usr/share/icons/hicolor/scalable/apps/uu-remote-linux.svg"
+install -Dm644 "$common/systemd/uuremote-native.service.in" "$pkg/usr/lib/systemd/user/uuremote-native.service"
+sed -i 's|@EXEC_START@|/usr/bin/uuremote-server|g' "$pkg/usr/lib/systemd/user/uuremote-native.service"
+install -Dm644 "$common/desktop/uu-remote-linux.desktop" "$pkg/usr/share/applications/uu-remote-linux.desktop"
+[ -f "$pkg/usr/bin/uuremote-viewer" ] && install -Dm644 "$common/desktop/uu-remote-linux-viewer.desktop" "$pkg/usr/share/applications/uu-remote-linux-viewer.desktop"
+install -Dm644 "$common/desktop/uu-remote-linux.svg" "$pkg/usr/share/icons/hicolor/scalable/apps/uu-remote-linux.svg"
 install -Dm644 "$root/LICENSE" "$pkg/usr/share/doc/uu-remote-linux/copyright"
 # uinput access is opt-in: it lets the service inject input into the whole seat.
-printf '%s\n' 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"' \
-  > "$pkg/usr/share/doc/uu-remote-linux/60-uu-remote-linux-uinput.rules"
+install -Dm644 "$common/udev/60-uu-remote-linux-uinput.rules" "$pkg/usr/share/doc/uu-remote-linux/60-uu-remote-linux-uinput.rules"
 size=$(du -sk "$pkg/usr" | cut -f1)
 # Library dependencies from the binaries themselves (the server hard, the viewer recommended).
 shlibdeps() {
