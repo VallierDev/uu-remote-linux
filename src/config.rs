@@ -67,3 +67,109 @@ pub fn version_code() -> String {
         .unwrap_or_else(|| "4318".into())
 }
 
+/// Why no base URL can be used. `Display` is the English log text; `localized` is for windows.
+/// Neither echoes the value: it may carry userinfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseUrlError { InvalidEnv, InvalidConfig, EnvNotUtf8, ConfigNotString, ConfigFile(String) }
+
+impl std::fmt::Display for BaseUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidEnv => "UU_BASE_URL must be an http(s) URL with a host and no query or fragment",
+            Self::InvalidConfig => "config base_url must be an http(s) URL with a host and no query or fragment",
+            Self::EnvNotUtf8 => "UU_BASE_URL is not valid UTF-8",
+            Self::ConfigNotString => "config base_url must be a string",
+            Self::ConfigFile(e) => e,
+        })
+    }
+}
+
+impl From<BaseUrlError> for String { fn from(e: BaseUrlError) -> Self { e.to_string() } }
+
+impl BaseUrlError {
+    pub fn localized(&self) -> String {
+        use crate::i18n::s;
+        match self {
+            Self::InvalidEnv => s("UU_BASE_URL 必须是带主机名的 http(s) 地址，且不能带查询参数或片段", "UU_BASE_URL must be an http(s) URL with a host and no query or fragment").into(),
+            Self::InvalidConfig => s("配置文件中的 base_url 必须是带主机名的 http(s) 地址，且不能带查询参数或片段", "config base_url must be an http(s) URL with a host and no query or fragment").into(),
+            Self::EnvNotUtf8 => s("UU_BASE_URL 不是有效的 UTF-8 文本", "UU_BASE_URL is not valid UTF-8").into(),
+            Self::ConfigNotString => s("配置文件中的 base_url 必须是字符串", "config base_url must be a string").into(),
+            Self::ConfigFile(e) => e.clone(),
+        }
+    }
+}
+
+/// Blank = unset.
+fn parse_base_url(raw: &str, invalid: BaseUrlError) -> Result<Option<String>, BaseUrlError> {
+    let raw = raw.trim();
+    if raw.is_empty() { return Ok(None); }
+    let url = reqwest::Url::parse(raw).map_err(|_| invalid.clone())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
+        return Err(invalid);
+    }
+    Ok(Some(url.as_str().trim_end_matches('/').to_owned()))
+}
+
+fn custom_base_url_from(env: Option<&std::ffi::OsStr>, cfg: Result<Option<&serde_json::Value>, String>) -> Result<Option<String>, BaseUrlError> {
+    if let Some(env) = env {
+        let env = env.to_str().ok_or(BaseUrlError::EnvNotUtf8)?;
+        if let Some(url) = parse_base_url(env, BaseUrlError::InvalidEnv)? { return Ok(Some(url)); }
+    }
+    match cfg.map_err(BaseUrlError::ConfigFile)?.and_then(|f| f.get("base_url")) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => parse_base_url(s, BaseUrlError::InvalidConfig),
+        Some(_) => Err(BaseUrlError::ConfigNotString),
+    }
+}
+
+/// Explicit cloud API base URL override (`UU_BASE_URL` or config `"base_url"`), without a trailing slash.
+/// A set but invalid value is an error, never the default: the signed requests carry the account token,
+/// which must not reach NetEase when it belongs to a self-hosted server.
+pub fn custom_base_url() -> Result<Option<String>, BaseUrlError> {
+    custom_base_url_from(std::env::var_os("UU_BASE_URL").as_deref(), file())
+}
+
+/// Same as `custom_base_url`, resolved against the given config contents instead of the startup snapshot.
+pub fn custom_base_url_in(file: Option<&serde_json::Value>) -> Result<Option<String>, BaseUrlError> {
+    custom_base_url_from(std::env::var_os("UU_BASE_URL").as_deref(), Ok(file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve(env: Option<&str>, cfg: Option<&serde_json::Value>) -> Result<Option<String>, BaseUrlError> {
+        custom_base_url_from(env.map(std::ffi::OsStr::new), Ok(cfg))
+    }
+
+    #[test]
+    fn custom_base_url_resolves_precedence_and_sanitizes() {
+        let cfg = serde_json::json!({ "base_url": " https://cfg.example.test/// " });
+        assert_eq!(resolve(None, None), Ok(None));
+        assert_eq!(resolve(None, Some(&cfg)).unwrap().as_deref(), Some("https://cfg.example.test"));
+        assert_eq!(resolve(Some(" http://127.0.0.1:8080/ "), Some(&cfg)).unwrap().as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(resolve(Some("https://remora.example.test/api/"), None).unwrap().as_deref(), Some("https://remora.example.test/api"));
+        assert_eq!(resolve(Some("  "), Some(&cfg)).unwrap().as_deref(), Some("https://cfg.example.test"));
+        assert_eq!(resolve(None, Some(&serde_json::json!({ "base_url": null }))), Ok(None));
+        assert_eq!(resolve(None, Some(&serde_json::json!({ "base_url": "" }))), Ok(None));
+    }
+
+    #[test]
+    fn invalid_custom_base_url_fails_closed() {
+        let cfg = serde_json::json!({ "base_url": "https://cfg.example.test" });
+        for bad in ["remora.example.test", "localhost:8080", "ftp://bad.example", "https://", " /// ", "https://a.test/?x=1", "https://a.test/#x"] {
+            assert!(resolve(Some(bad), Some(&cfg)).is_err(), "env {bad:?}");
+            assert!(resolve(None, Some(&serde_json::json!({ "base_url": bad }))).is_err(), "config {bad:?}");
+        }
+        assert_eq!(resolve(Some("remora.example.test"), None), Err(BaseUrlError::InvalidEnv));
+        assert_eq!(resolve(None, Some(&serde_json::json!({ "base_url": "remora.example.test" }))), Err(BaseUrlError::InvalidConfig));
+        assert_eq!(resolve(None, Some(&serde_json::json!({ "base_url": 8080 }))), Err(BaseUrlError::ConfigNotString));
+        #[cfg(unix)] {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(custom_base_url_from(Some(std::ffi::OsStr::from_bytes(b"\xff")), Ok(None)), Err(BaseUrlError::EnvNotUtf8));
+        }
+        assert!(custom_base_url_from(None, Err("invalid config".into())).is_err());
+        assert_eq!(custom_base_url_from(Some(std::ffi::OsStr::new("https://env.test")), Err("invalid config".into())), Ok(Some("https://env.test".into())));
+    }
+}
+
