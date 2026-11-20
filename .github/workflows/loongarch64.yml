@@ -49,6 +49,8 @@ env:
   # keeps the binary loadable on both. Its apt source also carries GTK3, Wayland,
   # PipeWire and libei >= 1.1, so no feature is lost.
   IMAGE: linuxdeepin/deepin:crimson-loong64
+  # actions/cache keys cannot carry the '/' and ':' in an image reference.
+  IMAGE_TAG: deepin-crimson-loong64
 
 jobs:
   build:
@@ -98,10 +100,13 @@ jobs:
           path: |
             ${{ runner.temp }}/loongarch/cache
             ${{ runner.temp }}/loongarch/target
-          key: loongarch64-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          # The image is part of the key: the target dir holds objects linked
+          # against that image's glibc, so reusing it across a base-image change
+          # would mix ABIs and silently defeat the reason for pinning the image.
+          key: loongarch64-${{ env.IMAGE_TAG }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
-            loongarch64-${{ hashFiles('Cargo.lock') }}-
-            loongarch64-
+            loongarch64-${{ env.IMAGE_TAG }}-${{ hashFiles('Cargo.lock') }}-
+            loongarch64-${{ env.IMAGE_TAG }}-
 
       - name: Build inside the loong64 container
         shell: bash
