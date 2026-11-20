@@ -173,9 +173,9 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 
 ## Installation
 
-### 0. Prebuilt release package (recommended, x86_64 / aarch64)
+### 0. Prebuilt release package (recommended, x86_64 / aarch64 / loongarch64)
 
-**Ubuntu / Debian (v0.2.18+)**: download `uu-remote-linux_<version>_amd64.deb` (ARM64: `arm64`), then:
+**Ubuntu / Debian (v0.2.18+)**: download `uu-remote-linux_<version>_amd64.deb` (ARM64: `arm64`, LoongArch: `loong64`), then:
 
 ```sh
 sudo apt install ./uu-remote-linux_<version>_amd64.deb
@@ -186,7 +186,7 @@ systemctl --user enable --now uuremote-native.service   # start with the graphic
 The deb installs the binaries, plugins, a systemd user unit and menu entries, and pulls in FFmpeg as a dependency; uinput access stays opt-in (step 5).
 GNOME and KDE pass the display environment to the unit; on desktops that don't (e.g. Xfce) add `DISPLAY` as in step 4.
 
-**Other distributions**: download `uu-remote-linux-<version>-x86_64-linux.tar.gz` (ARM64: `aarch64-linux`) from [Releases](../../releases/latest), extract it, then run as your desktop user (not root):
+**Other distributions**: download `uu-remote-linux-<version>-x86_64-linux.tar.gz` (ARM64: `aarch64-linux`, LoongArch: `loongarch64-linux`) from [Releases](../../releases/latest), extract it, then run as your desktop user (not root):
 
 ```sh
 cd uu-remote-linux-<version>-x86_64-linux
@@ -206,6 +206,16 @@ running session at startup, and the matching `libuu-*.so` is loaded only on Wayl
 | X11 | glibc >= 2.35 (Ubuntu 22.04, Debian 12 and newer) |
 | wlroots (Hyprland / Sway / niri) | the same, plus `libwayland-client` and `libxkbcommon` (present on Wayland desktops) |
 | GNOME / KDE Wayland | glibc >= 2.39 (Ubuntu 24.04, Fedora 40, Debian 13 and newer), libei >= 1.1 and PipeWire |
+
+**LoongArch (LoongArch64)**: every release also publishes `uu-remote-linux_<version>_loong64.deb` and
+`uu-remote-linux-<version>-loongarch64-linux.tar.gz`, used exactly like the packages above. They are linked against
+glibc 2.38 and were verified on Deepin 23.1 on a 3A6000. Two caveats:
+
+- **The architecture name is not portable**: Debian derivatives use `loong64`, AOSC and others use `loongarch64`. The deb
+  here is always `loong64`; on non-Debian distributions use the tarball.
+- **The GNOME/KDE portal backend is unavailable**: `libuu-portal.so` is built (against Deepin 25's libei-dev), but Deepin 23's
+  repositories carry no `libei1`, so the plugin fails to load and GNOME/KDE Wayland sessions fall back to an X11 session on that
+  system. X11 and wlroots (Hyprland etc.) are fully supported.
 
 Plugins are found next to `uuremote-server`, in `../lib/uu-remote-linux/`, `~/.local/lib/uu-remote-linux/` or
 `/usr/lib/uu-remote-linux/` (`UU_ENGINE_DIR` overrides); a missing library or too old glibc is reported in the log.

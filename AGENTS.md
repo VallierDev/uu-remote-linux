@@ -66,14 +66,15 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
   login window only when `pkg-config gtk+-3.0` succeeds (`UU_NO_GTK=1` forces it off).
 - The portal feature panics in `build.rs` if GIO/PipeWire development packages are missing.
 - `vendor/webrtc-dtls` is a patched copy of the upstream crate (MIT/Apache); keep it as a path dependency.
-- `vendor/rcgen` (ring 0.17) and `vendor/nix` (loongarch64 ioctl table) are patched copies too; see their
-  `PATCHES.md`. Both are needed only for loongarch64 and leave the x86_64/aarch64 code path unchanged.
+- `vendor/rcgen` (ring 0.17) and `vendor/nix` (loongarch64 ioctl table, plus a dead_code exemption for
+  its `#![deny(unused)]`, which a path dependency no longer gets `--cap-lints allow` for) are patched
+  copies too; see their `PATCHES.md`. Neither changes the x86_64/aarch64 code path.
 - CI (`.github/workflows/ci.yml`) runs `cargo test --locked` on ubuntu-22.04. Pushing a `v*` tag runs
   `.github/workflows/release.yml`, which builds and publishes the x86_64 tarball; release notes come from
   `docs/release-notes/<tag>.md`.
 - `.github/workflows/loongarch64.yml` builds the loong64 deb/tarball by running the normal native build
-  inside a `linuxdeepin/deepin:crimson-loong64` container under qemu-user (there is no loongarch64 runner),
-  because its glibc 2.38 matches the Deepin 23 target. Nothing in
+  inside a `linuxdeepin/deepin:crimson-loong64@sha256:995e1233...` container under qemu-user (there is no
+  loongarch64 runner), because its glibc 2.38 matches the Deepin 23 target; pin the digest, not the tag. Nothing in
   the tree is cross-compiled, so the only loongarch64-specific code is the vendored `nix`/`rcgen` patches.
 
 ## 4. Install on a user's machine (step by step)
