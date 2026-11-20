@@ -4,6 +4,7 @@
   pkg-config,
   wayland-scanner,
   makeBinaryWrapper,
+  addDriverRunpath,
   libx11,
   libxext,
   libxtst,
@@ -23,6 +24,7 @@
   libxcb,
   libva,
   ffmpeg-full,
+  wl-clipboard,
   writableTmpDirAsHomeHook,
   withWayland ? true,
   withPortal ? true,
@@ -66,7 +68,8 @@ rustPlatform.buildRustPackage (finalAttrs: {
     pkg-config
     makeBinaryWrapper
   ]
-  ++ lib.optional withWayland wayland-scanner;
+  ++ lib.optional withWayland wayland-scanner
+  ++ lib.optional withInprocAv addDriverRunpath;
 
   buildInputs = [
     libx11
@@ -90,6 +93,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
     libopus
     libgbm
     libxcb
+    libva
   ];
 
   # Viewer audio tests decode through the ffmpeg CLI.
@@ -120,17 +124,26 @@ rustPlatform.buildRustPackage (finalAttrs: {
   # Libraries the engines dlopen at runtime; added after patchelf shrinks the RUNPATH.
   # Keep the unwrapped host binary named `uuremote-server` in libexec so `/proc/<pid>/exe`
   # still matches what `doctor`, `show`, and `set-encoder`/`set-codec` expect.
-  postFixup = ''
-    patchelf --add-rpath ${lib.makeLibraryPath finalAttrs.passthru.dlopenLibs} $out/bin/uuremote-server
-    mkdir -p $out/libexec/uu-remote-linux
-    mv $out/bin/uuremote-server $out/libexec/uu-remote-linux/uuremote-server
-    makeWrapper $out/libexec/uu-remote-linux/uuremote-server $out/bin/uuremote-server \
-      --suffix PATH : ${lib.makeBinPath [ ffmpeg-full ]}
-  ''
-  + lib.optionalString withViewer ''
-    patchelf --add-rpath ${lib.makeLibraryPath finalAttrs.passthru.dlopenLibs} $out/bin/uuremote-viewer
-    wrapProgram $out/bin/uuremote-viewer --suffix PATH : ${lib.makeBinPath [ ffmpeg-full ]}
-  '';
+  postFixup =
+    let
+      runtimeBinPath = lib.makeBinPath ([ ffmpeg-full ] ++ lib.optional withWayland wl-clipboard);
+    in
+    ''
+      patchelf --add-rpath ${lib.makeLibraryPath finalAttrs.passthru.dlopenLibs} $out/bin/uuremote-server
+    ''
+    + lib.optionalString withInprocAv ''
+      addDriverRunpath $out/bin/uuremote-server
+    ''
+    + ''
+      mkdir -p $out/libexec/uu-remote-linux
+      mv $out/bin/uuremote-server $out/libexec/uu-remote-linux/uuremote-server
+      makeWrapper $out/libexec/uu-remote-linux/uuremote-server $out/bin/uuremote-server \
+        --suffix PATH : ${runtimeBinPath}
+    ''
+    + lib.optionalString withViewer ''
+      patchelf --add-rpath ${lib.makeLibraryPath finalAttrs.passthru.dlopenLibs} $out/bin/uuremote-viewer
+      wrapProgram $out/bin/uuremote-viewer --suffix PATH : ${runtimeBinPath}
+    '';
 
   passthru = {
     cargoToml = lib.importTOML ../../Cargo.toml;
