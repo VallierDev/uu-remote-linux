@@ -2,17 +2,22 @@ name: Build linux-loongarch64 (qemu)
 
 # GitHub has no loongarch64 runners, so the host is built natively inside a
 # Deepin/loong64 container made runnable by qemu-user (docker/setup-qemu-action).
-# Same idea as the .NET cross container in UotanStudio's loongarch-publish.yml,
-# with one difference: a Rust build has no cross toolchain to drive. rustc, cc,
-# GTK3, Wayland and SDL2 all exist for loong64, so rather than cross-compiling we
-# install the loong64 toolchain in the guest and run the ordinary build there;
-# qemu only has to make the foreign binaries executable. Expect hours, not
-# minutes, so the registry and target dir are cached and the container script is
-# written to report every problem in one run instead of dying on the first.
+# rustc, cc, GTK3, Wayland and SDL2 all exist for loong64, so rather than
+# cross-compiling we install the loong64 toolchain in the guest and run the
+# ordinary build there; qemu only has to make the foreign binaries executable.
+# Expect hours, not minutes, so the registry and target dir are cached and the
+# container script reports every problem in one run instead of dying on the first.
 #
 # The loongarch64-only dependency patches this build needs live in vendor/nix and
 # vendor/rcgen (see their PATCHES.md) and are wired up through [patch.crates-io]
 # in Cargo.toml, so a plain checkout builds here with no extra flags.
+#
+# Triggered by Release finishing rather than by the tag itself: the release must
+# already exist before the packages are attached, and waiting for it inside this
+# job would either need a polling loop or race action-gh-release. The cost is
+# that loong64 packages appear an hour after the x86_64/aarch64 ones instead of
+# alongside them, which is preferable to making every user wait for the emulated
+# build. workflow_dispatch stays available for building a branch by hand.
 
 on:
   workflow_dispatch:
@@ -21,22 +26,17 @@ on:
         description: "Package version (empty = version from Cargo.toml)"
         required: false
         default: ""
-      diagnose_only:
-        description: "Only probe the loong64 environment (apt, pkg-config, rustc); skip the build"
-        type: boolean
-        default: false
-      run_tests:
-        description: "Also run cargo test (roughly doubles the emulated build time)"
-        type: boolean
-        default: false
-  push:
-    tags: ['v*']
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 permissions:
   contents: write
 
 concurrency:
-  group: loongarch64-${{ github.ref }}
+  # head_sha is always present on workflow_run; head_branch is not guaranteed for
+  # tag pushes, so it cannot be used to identify the run.
+  group: loongarch64-${{ github.event.workflow_run.head_sha || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -55,13 +55,21 @@ env:
 jobs:
   build:
     name: linux-loongarch64
+    # workflow_run fires for failed runs too, and a Release that died before its
+    # publisher job left no release to attach to: skip those without a runner.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     # 360 min is the platform ceiling for a single job, so this is already the
     # maximum and cannot be raised further; an emulated release build is the one
     # thing here that could plausibly need all of it.
     timeout-minutes: 360
     steps:
+      # workflow_run runs in the context of the default branch, so the released
+      # commit has to be checked out explicitly. head_sha is the exact commit the
+      # tag pointed at; on workflow_dispatch github.ref is already right.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Resolve version
         id: ver
@@ -69,11 +77,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ github.event.inputs.version }}"
-          # A tag push has no inputs: the tag is the version, matching release.yml.
-          if [ -z "$version" ] && [ "${{ github.ref_type }}" = "tag" ]; then
-            version="${{ github.ref_name }}"
-          fi
           if [ -z "$version" ]; then
+            # A release commit bumps Cargo.toml, and the tag is v<that version>
+            # (release.yml uses github.ref_name for the same value), so the
+            # checked-out tree is the authority. workflow_run.head_branch is not
+            # relied on: it is documented as a branch and is only incidentally the
+            # tag name for tag pushes.
             version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
           fi
           version="${version#v}"
@@ -83,6 +92,24 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Resolved version: $version"
+
+      # Fail in seconds rather than after an hour of emulated compilation if the
+      # release this run was triggered for does not exist (Release died before its
+      # publisher job, or Cargo.toml and the tag disagree). No polling: the
+      # triggering workflow has already completed, so the release exists or never
+      # will.
+      - name: Check the release exists
+        if: github.event_name == 'workflow_run'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null || {
+            echo "::error::release $TAG does not exist; nothing to attach the loong64 packages to"
+            exit 1
+          }
 
       # binfmt registration comes from tonistiigi/binfmt; `all` is used because the
       # action's platform list is not guaranteed to know the loong64 alias.
@@ -112,8 +139,6 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ steps.ver.outputs.version }}
-          RUN_TESTS: ${{ github.event.inputs.run_tests }}
-          DIAGNOSE_ONLY: ${{ github.event.inputs.diagnose_only }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/loongarch"
@@ -121,7 +146,7 @@ jobs:
           cat > "$work/container.sh" <<'CONTAINER'
           # Deliberately no `set -e`: every phase records its own failure and the
           # script reports all of them at the end. A run costs hours under qemu, so
-          # dying on the first missing package would mean one fix per run.
+          # dying on the first error would mean one fix per run.
           set -uo pipefail
 
           FAILED=()
@@ -137,63 +162,27 @@ jobs:
           cd /work/src || { echo "::error::the checkout is not mounted at /work/src"; exit 1; }
 
           echo "::group::apt"
-          # apt writes to a log so a failing package shows only its tail, but the log
-          # is also dumped when the group closes: a 7-minute silent apt phase is
-          # impossible to audit otherwise, and a diagnose run is worthless if it does
-          # not say what it actually fetched.
-          : > /tmp/apt.log
-          apt-get update >>/tmp/apt.log 2>&1 || {
-            echo "--- apt-get update failed:"
-            tail -20 /tmp/apt.log | sed 's/^/    /'
-            fail "apt-get update failed (no usable loong64 mirror?)"
-          }
-          # apt_install returns 1 and shows the tail of the log, so a missing package
-          # is reported without aborting the phase.
-          apt_install() {
-            if apt-get install -y --no-install-recommends "$1" >>/tmp/apt.log 2>&1; then
-              return 0
-            fi
-            echo "--- apt-get install $1 failed:"
-            tail -5 /tmp/apt.log | sed 's/^/    /'
-            return 1
-          }
-
-          # Hard requirements: without these there is no build at all.
-          REQUIRED="build-essential pkg-config ca-certificates curl xz-utils git file dpkg-dev
-          clang libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev"
-          # Optional: each one only enables a feature; build.rs already tolerates the
-          # absence, and the pkg-config probes below decide what gets compiled.
-          OPTIONAL="fonts-dejavu-core libsdl2-dev libwayland-dev libwayland-bin libxkbcommon-dev
-          libglib2.0-dev libpipewire-0.3-dev libei-dev libeis-dev"
-
-          missing_required=""
-          for pkg in $REQUIRED; do
-            apt_install "$pkg" || missing_required="$missing_required $pkg"
-          done
-          missing_optional=""
-          for pkg in $OPTIONAL; do
-            apt_install "$pkg" || missing_optional="$missing_optional $pkg"
-          done
-          if [ -n "$missing_required" ]; then
-            fail "required packages unavailable on this port:$missing_required"
-          fi
-          if [ -n "$missing_optional" ]; then
-            note "optional packages unavailable on this port:$missing_optional"
-          fi
-          echo "--- apt log (tail):"
-          tail -40 /tmp/apt.log | sed 's/^/    /'
+          apt-get update || fail "apt-get update failed (no usable loong64 mirror?)"
+          # One list rather than required/optional: the image is pinned, so a package
+          # that disappeared from it is a regression worth failing on instead of
+          # silently shipping a package without that feature. The feature probes
+          # further down still degrade gracefully if this list ever has to change.
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates curl xz-utils git file dpkg-dev clang \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libgtk-3-dev fonts-dejavu-core \
+            libsdl2-dev libwayland-dev libwayland-bin libxkbcommon-dev \
+            libglib2.0-dev libpipewire-0.3-dev libei-dev libeis-dev \
+            || fail "installing the build dependencies failed"
           echo "::endgroup::"
 
           echo "::group::toolchain"
           # rustup ships loongarch64-unknown-linux-gnu host builds, so the guest gets
           # current stable instead of the distribution's older rustc.
-          if curl -fsSL --retry 3 https://sh.rustup.rs -o /tmp/rustup.sh \
-            && sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable --no-modify-path; then
-            :
-          else
+          if ! (curl -fsSL --retry 3 https://sh.rustup.rs -o /tmp/rustup.sh \
+            && sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable --no-modify-path); then
             note "rustup failed on loong64; falling back to the distribution toolchain."
-            apt_install rustc || fail "neither rustup nor the distribution rustc is available"
-            apt_install cargo || fail "neither rustup nor the distribution cargo is available"
+            apt-get install -y --no-install-recommends rustc cargo \
+              || fail "neither rustup nor the distribution toolchain is available"
           fi
           export PATH="$CARGO_HOME/bin:$PATH"
           cargo --version || fail "cargo is not runnable"
@@ -233,47 +222,19 @@ jobs:
           fi
           echo "::endgroup::"
 
-          echo "::group::environment report"
-          echo "uname: $(uname -m) $(uname -r)"
-          echo "dpkg arch: $(dpkg --print-architecture)"
-          probe() {
-            label=$1; shift
-            if pkg-config --exists "$@" 2>/dev/null; then
-              printf '  %-24s ok\n' "$label"; return 0
-            fi
-            printf '  %-24s MISSING\n' "$label"; return 1
-          }
-          probe "gtk+-3.0"            gtk+-3.0
-          probe "wayland-client"      wayland-client
-          probe "xkbcommon"           xkbcommon
-          probe "sdl2"                sdl2
-          probe "gio-2.0"             gio-2.0 gio-unix-2.0
-          probe "libpipewire-0.3"     libpipewire-0.3
-          probe "libei >= 1.1"        "libei-1.0 >= 1.1"
-          probe "libeis"              libeis-1.0
-          # build.rs shells out to wayland-scanner (libwayland-bin) to generate the
-          # protocol bindings; pkg-config does not cover it, so check the binary.
-          if command -v wayland-scanner >/dev/null; then
-            printf '  %-24s ok (%s)\n' "wayland-scanner" "$(command -v wayland-scanner)"
-          else
-            printf '  %-24s MISSING\n' "wayland-scanner"
-          fi
           # GTK is mandatory: the deb is expected to ship the GTK login window.
           pkg-config --exists gtk+-3.0 || fail "gtk+-3.0 development files are missing: the package would have no GUI"
-          echo "::endgroup::"
-
-          if [ "${DIAGNOSE_ONLY:-false}" = "true" ]; then
-            echo "diagnose_only: stopping before the build."
-          else
 
           # Release feature set, minus whatever this port is missing. build.rs only
           # warns about a missing libei or GTK, but a missing wayland-client would
           # break the link, so decide up front instead of discovering it at link time.
+          # build.rs also shells out to wayland-scanner (libwayland-bin) to generate
+          # the protocol bindings; pkg-config does not cover that binary.
           feats=engine-plugins
-          if pkg-config --exists wayland-client xkbcommon; then
+          if pkg-config --exists wayland-client xkbcommon && command -v wayland-scanner >/dev/null; then
             feats="wayland,$feats"
           else
-            note "wayland-client/xkbcommon missing: building without the wlroots engine."
+            note "wayland-client/xkbcommon/wayland-scanner missing: building without the wlroots engine."
           fi
           if pkg-config --exists gio-2.0 gio-unix-2.0 libpipewire-0.3 "libei-1.0 >= 1.1"; then
             feats="portal,$feats"
@@ -283,9 +244,6 @@ jobs:
           echo "Features: $feats"
 
           echo "::group::build"
-          if [ "${RUN_TESTS:-false}" = "true" ]; then
-            cargo test --release --locked || fail "cargo test failed"
-          fi
           # Continue past the host build so a viewer failure is reported in the same
           # run; the packaging step below is guarded on the host binary existing.
           host_ok=1
@@ -356,8 +314,6 @@ jobs:
             echo "::endgroup::"
           fi
 
-          fi  # diagnose_only
-
           echo "::group::summary"
           if [ ${#FAILED[@]} -gt 0 ]; then
             echo "${#FAILED[@]} problem(s) found in this run:"
@@ -376,17 +332,10 @@ jobs:
             -v "$work/target:/work/target" \
             -v "$work/container.sh:/work/container.sh:ro" \
             -w /work/src \
-            -e VERSION="$VERSION" -e RUN_TESTS="$RUN_TESTS" -e DIAGNOSE_ONLY="$DIAGNOSE_ONLY" \
+            -e VERSION="$VERSION" \
             "$IMAGE" bash /work/container.sh
 
-      - name: Show the produced packages
-        if: always()
-        shell: bash
-        run: |
-          ls -l "$RUNNER_TEMP/loongarch/out" || echo "no output was produced (see the container log above)"
-
       - uses: actions/upload-artifact@v4
-        if: ${{ !inputs.diagnose_only }}
         with:
           name: uu-remote-linux-${{ steps.ver.outputs.version }}-linux-loongarch64
           path: |
@@ -398,22 +347,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      # On a tag, release.yml is creating the GitHub release from the other matrix
-      # legs at the same time, so upload into the existing release with --clobber
-      # instead of letting action-gh-release race to create a second one.
+      # The release was created by the Release workflow before this run started, so
+      # no waiting is needed; --clobber keeps a re-run idempotent. The tag is built
+      # from the resolved version rather than read from head_branch, which
+      # workflow_run does not guarantee to carry the tag name.
       - name: Attach to the release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'workflow_run'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: v${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          for _ in $(seq 1 60); do
-            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
-            sleep 15
-          done
-          gh release view "$TAG" >/dev/null
           gh release upload "$TAG" \
             "$RUNNER_TEMP"/loongarch/out/*.deb \
             "$RUNNER_TEMP"/loongarch/out/*.tar.gz \
