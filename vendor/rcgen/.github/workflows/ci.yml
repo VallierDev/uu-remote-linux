@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  merge_group:
+  schedule:
+    - cron: '0 18 * * *'
+
+env:
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rustfmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-features
+      - run: cargo clippy --no-default-features
+
+  rustdoc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, beta, nightly, stable 7 months ago]
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: cargo doc (all features)
+        run: cargo doc --all --all-features --document-private-items
+        env:
+          RUSTDOCFLAGS: ${{ matrix.rust_channel == 'nightly' && '-Dwarnings --cfg=docsrs' || '-Dwarnings' }}
+
+  build-windows:
+    runs-on: windows-latest
+    env:
+      # botan doesn't build on windows if the source is
+      # on a different drive than the artifacts
+      # https://github.com/randombit/botan-rs/issues/82
+      BOTAN_CONFIGURE_LINK_METHOD: copy
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - uses: egor-tensin/vs-shell@v2
+      with:
+        arch: amd64
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+    - run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+    - run: vcpkg install openssl:x64-windows-static-md
+    - name: Run cargo check --all
+      run: cargo check --all
+    - name: Run the tests
+      run: cargo test --all
+    - name: Run the tests with x509-parser enabled
+      run: cargo test --verbose --features x509-parser
+    - name: Run the tests with no default features enabled
+      run: cargo test --verbose --no-default-features
+
+  build:
+    strategy:
+      matrix:
+        os: [macOS-latest, ubuntu-latest]
+        toolchain: [stable, beta, nightly, stable 7 months ago]
+        exclude:
+          - os: macOS-latest
+            toolchain: beta
+          - os: macOS-latest
+            toolchain: nightly
+          - os: macOS-latest
+            toolchain: stable 7 months ago
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.toolchain }}
+    - name: Run cargo check --all
+      run: cargo check --all
+    - name: Run the tests
+      run: cargo test --all
+    - name: Run the tests with x509-parser enabled
+      run: cargo test --verbose --features x509-parser
+    - name: Run the tests with no default features enabled
+      run: cargo test --verbose --no-default-features
+
+  coverage:
+    name: Measure coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+      - name: Measure coverage
+        run: cargo llvm-cov --all-features --lcov --output-path ./lcov.info
+      - name: Report to codecov.io
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./lcov.info
+          fail_ci_if_error: false
+          verbose: true

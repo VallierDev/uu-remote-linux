@@ -154,9 +154,9 @@ niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通
 
 ## 安装
 
-### 0. 直接用 Release 预编译包（推荐，x86_64 / aarch64）
+### 0. 直接用 Release 预编译包（推荐，x86_64 / aarch64 / loongarch64）
 
-**Ubuntu / Debian（v0.2.18 起）**：下载 `uu-remote-linux_<版本>_amd64.deb`（ARM64 选 `arm64`）后：
+**Ubuntu / Debian（v0.2.18 起）**：下载 `uu-remote-linux_<版本>_amd64.deb`（ARM64 选 `arm64`，龙芯选 `loong64`）后：
 
 ```sh
 sudo apt install ./uu-remote-linux_<版本>_amd64.deb
@@ -167,7 +167,7 @@ systemctl --user enable --now uuremote-native.service   # 随图形会话启动
 deb 会安装程序、插件、用户级 systemd 服务和应用菜单图标，并通过依赖自动装上 FFmpeg；uinput 权限不会自动开启（见第 5 步）。
 GNOME / KDE 会把显示环境自动传给服务；Xfce 等不传的桌面需按第 4 步补 `DISPLAY`。
 
-**其他发行版**：从 [Releases](../../releases/latest) 下载 `uu-remote-linux-<版本>-x86_64-linux.tar.gz`（ARM64 选 `aarch64-linux`），解压后用普通桌面用户（不要 root）运行：
+**其他发行版**：从 [Releases](../../releases/latest) 下载 `uu-remote-linux-<版本>-x86_64-linux.tar.gz`（ARM64 选 `aarch64-linux`，龙芯选 `loongarch64-linux`），解压后用普通桌面用户（不要 root）运行：
 
 ```sh
 cd uu-remote-linux-<版本>-x86_64-linux
@@ -186,6 +186,14 @@ cd uu-remote-linux-<版本>-x86_64-linux
 | X11 | glibc ≥ 2.35（Ubuntu 22.04、Debian 12 及更新） |
 | Hyprland / Sway / niri 等 wlroots | 同上，另需 `libwayland-client`、`libxkbcommon`（Wayland 桌面自带） |
 | GNOME / KDE Wayland | glibc ≥ 2.39（Ubuntu 24.04、Fedora 40、Debian 13 及更新），以及 libei ≥ 1.1、PipeWire |
+
+**龙芯（LoongArch64）**：每次发版都会构建 `uu-remote-linux_<版本>_loong64.deb` 和 `uu-remote-linux-<版本>-loongarch64-linux.tar.gz`，
+用法和上面完全一样。产物按 glibc 2.38 链接，已在 Deepin 23.1 的 3A6000 上实测可用。
+注意两点：
+
+- **架构名不通用**：Debian 系用 `loong64`，AOSC 等发行版用 `loongarch64`；本项目的 deb 固定为 `loong64`，非 Debian 系发行版请用 tar.gz。
+- **GNOME/KDE portal 不可用**：`libuu-portal.so` 能编出来（编译期用的是 Deepin 25 的 libei-dev），但 Deepin 23 的软件源里没有
+  `libei1`，插件加载失败，因此 GNOME/KDE Wayland 会话在这个系统上只能退到 X11 会话。X11 和 wlroots（Hyprland 等）路径完整可用。
 
 插件放在 `uuremote-server` 同目录、`../lib/uu-remote-linux/`、`~/.local/lib/uu-remote-linux/` 或 `/usr/lib/uu-remote-linux/` 都能找到
 （`UU_ENGINE_DIR` 可指定）。缺库或版本太旧时日志会写明原因。之后从第 3 步「登录」继续；其他架构请按下面源码编译。
