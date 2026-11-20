@@ -139,7 +139,10 @@ jobs:
           # The image is part of the key: the target dir holds objects linked
           # against that image's glibc, so reusing it across a base-image change
           # would mix ABIs and silently defeat the reason for pinning the image.
-          key: loongarch64-${{ env.IMAGE_TAG }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          # run_attempt is what distinguishes "Re-run jobs" attempts of the same
+          # run -- run_id does not change there -- so attempt 2 gets a key of its
+          # own and, with the prefixes below, still restores attempt 1's progress.
+          key: loongarch64-${{ env.IMAGE_TAG }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             loongarch64-${{ env.IMAGE_TAG }}-${{ hashFiles('Cargo.lock') }}-
             loongarch64-${{ env.IMAGE_TAG }}-
@@ -402,11 +405,12 @@ jobs:
             --clobber
 
       # Runs even when the build above failed, so a compile error still leaves the
-      # partially built target dir behind for the next attempt. The key carries the run id
-      # because it must be unique per save, so this entry is never a cache hit itself; the
-      # restore-keys prefix above is what picks it up on the next run. Best-effort: if the
-      # container never got far enough to create the directories there is nothing to save,
-      # and that must not turn into a second red step hiding the real error.
+      # partially built target dir behind for the next attempt. The key carries run_id and
+      # run_attempt because it must be unique per save: with run_id alone a "Re-run jobs"
+      # attempt would restore attempt 1's entry as an exact hit, cache-hit would be 'true',
+      # this step would skip, and the finished build would never be published. Best-effort:
+      # if the container never got far enough to create the directories there is nothing to
+      # save, and that must not turn into a second red step hiding the real error.
       - name: Save cargo registry and target dir
         if: always() && steps.cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -415,4 +419,4 @@ jobs:
           path: |
             ${{ runner.temp }}/loongarch/cache
             ${{ runner.temp }}/loongarch/target
-          key: loongarch64-${{ env.IMAGE_TAG }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: loongarch64-${{ env.IMAGE_TAG }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
