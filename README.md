@@ -190,6 +190,49 @@ cd uu-remote-linux-<版本>-x86_64-linux
 插件放在 `uuremote-server` 同目录、`../lib/uu-remote-linux/`、`~/.local/lib/uu-remote-linux/` 或 `/usr/lib/uu-remote-linux/` 都能找到
 （`UU_ENGINE_DIR` 可指定）。缺库或版本太旧时日志会写明原因。之后从第 3 步「登录」继续；其他架构请按下面源码编译。
 
+### NixOS / Nix（Flake）
+
+仓库根目录提供了 `flake.nix`（包 `uu-remote-linux` 与 NixOS 模块 `nixosModules.default`），包装脚本会为 `uuremote-server` 与 `uuremote-viewer` 自动附带可用的 `ffmpeg`。
+
+**NixOS（推荐）**：在系统 flake 中引入本仓库并导入模块（模块已自带 overlay，无需手动配置 `nixpkgs.overlays`）：
+
+```nix
+# flake.nix
+{
+  inputs.uu-remote-linux.url = "github:VallierDev/uu-remote-linux";
+
+  outputs = { nixpkgs, uu-remote-linux, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      modules = [
+        uu-remote-linux.nixosModules.default
+        {
+          services.uu-remote-linux = {
+            enable = true;
+            # 可选（大多数 Wayland 桌面建议开启）：授予当前座位用户 /dev/uinput 权限。
+            # 注意：该权限允许向整个 seat 注入输入（含锁屏与登录界面）。
+            uinput.enable = true;
+            # 可选：需要进程内 NVENC / VAAPI 时启用 inproc-av
+            # package = pkgs.uu-remote-linux.override { withInprocAv = true; };
+            # 可选：写入 systemd 用户服务的环境变量
+            # settings.UU_DESKTOP_BACKEND = "wayland";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+重建系统后，在图形会话里运行 `uuremote-server login` 扫码，再确认用户服务状态与诊断输出：
+
+```sh
+uuremote-server login
+systemctl --user status uuremote-native.service
+uuremote-server doctor
+```
+
+**独立包（非 NixOS 模块）**：可直接用 `nix run github:VallierDev/uu-remote-linux` 试跑，或 `nix profile install github:VallierDev/uu-remote-linux` 安装到用户环境，然后按第 3、4 步登录并启用用户服务。
+
 ### 1. 依赖（Ubuntu / Debian）
 
 ```sh
