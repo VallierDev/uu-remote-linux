@@ -105,7 +105,7 @@ jobs:
             uu-remote-linux_*.deb
             uu-remote-linux_*.deb.sha256
 
-  # Headless NAS image (docker/), built from the release tarball published by the job above.
+  # Headless NAS image (packaging/docker/), built from the release tarball published by the job above.
   docker:
     needs: release
     runs-on: ubuntu-22.04
@@ -118,7 +118,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
         with:
-          context: docker
+          context: packaging/docker
           build-args: VERSION=${{ github.ref_name }}
           push: true
           tags: |
