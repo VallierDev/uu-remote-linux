@@ -331,14 +331,10 @@ jobs:
               done
               cp -r contrib "$stage/"
               # install.sh reads the desktop entries and the systemd unit template from
-              # packaging/common, while contrib/desktop still holds them on the current
-              # main. Ship both and let whichever one install.sh looks at win, so the
-              # tarball stays correct before and after packaging/common lands; the copy is
-              # skipped while the directory does not exist.
-              if [ -d packaging/common ]; then
-                mkdir -p "$stage/packaging"
-                cp -r packaging/common "$stage/packaging/" || fail "staging packaging/common failed"
-              fi
+              # packaging/common, so it has to travel inside the tarball. Same two lines as
+              # release.yml, which builds the x86_64/aarch64 tarballs.
+              mkdir -p "$stage/packaging"
+              cp -r packaging/common "$stage/packaging/" || fail "staging packaging/common failed"
               tar czf "/work/out/$name.tar.gz" -C /work/out "$name" || fail "tar failed"
               rm -rf "$stage"
               for f in /work/out/*.deb /work/out/*.tar.gz; do
