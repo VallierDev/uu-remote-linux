@@ -69,6 +69,9 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
 - CI (`.github/workflows/ci.yml`) runs `cargo test --locked` on ubuntu-22.04. Pushing a `v*` tag runs
   `.github/workflows/release.yml`, which builds and publishes the x86_64 tarball; release notes come from
   `docs/release-notes/<tag>.md`.
+- Nix flake (`flake.nix`, `packaging/nix/`): `nix build` builds the package, `nix develop` opens a dev shell,
+  and `nix flake check --no-build` verifies evaluation. Periodically refresh `flake.lock` with `nix flake update`
+  (there is no automated lockfile-update workflow).
 
 ## 4. Install on a user's machine (step by step)
 
@@ -296,6 +299,8 @@ started a second full host server instead, so check that a subcommand exists in 
 - New protocol behavior: cite the evidence (observed field numbers, official log strings) in a comment.
 - Update README.md / README.en.md when user-visible features or limitations change, and add
   `docs/release-notes/<tag>.md` before tagging a release.
+- Refresh `flake.lock` periodically (e.g. before a release or when packaging files change) with
+  `nix flake update` and verify with `nix flake check` (plus `nix fmt -- --check flake.nix packaging/nix/*.nix`).
 
 ### VAAPI
 
