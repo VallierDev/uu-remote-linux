@@ -1,7 +1,7 @@
 name: Build linux-loongarch64 (qemu)
 
 # GitHub has no loongarch64 runners, so the host is built natively inside a
-# Debian/loong64 container made runnable by qemu-user (docker/setup-qemu-action).
+# Deepin/loong64 container made runnable by qemu-user (docker/setup-qemu-action).
 # Same idea as the .NET cross container in UotanStudio's loongarch-publish.yml,
 # with one difference: a Rust build has no cross toolchain to drive. rustc, cc,
 # GTK3, Wayland and SDL2 all exist for loong64, so rather than cross-compiling we
