@@ -443,6 +443,8 @@ systemctl --user restart uuremote-native.service
 
 「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto（有 NVIDIA 时 NVENC 优先，失败再 CPU；没有 NVIDIA 时就是 CPU，不探测；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。成功结果缓存到进程退出，但 NVIDIA 是否存在（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）与报告不一致时，下一次桌面连接会在后台再探测一次（`warm_auto_probe`），这一路仍用缓存的编码器，直到新结果写入。NVENC 失败只缓存 10 分钟，到期后的桌面连接同样在后台再探测一次，这一路仍用当前结果。`set-encoder` 和 `set-codec` 写完后若 `host.pid` 指向正在运行的本程序，都会发 `SIGUSR2`：编码器变化时进行中的桌面流立刻换编码器（不断开，沿用本会话已协商的 codec；新编码器起不来时按进程内 → FFmpeg 进程 → CPU 回退）。手改文件后可 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。`SIGUSR2` 不重新探测。codec 偏好仍在下次建立桌面连接时生效（运行中的 host 只记日志，不重开编码）。显式 `vaapi` 请求真彩时仍用 VAAPI、编码 4:2:0，并在 CaptureSettingSync 的 field 3 回报 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。VAAPI 进入 auto 要等 #33。
 
+上表的环境变量也可以统一写进 `~/.config/uuremote/env.conf`（与 `config.json` 同目录）：每行一条 `KEY=VALUE`，行首 `#` 为整行注释（值里可以含 `#`），只接受 `UU_` 开头的大写设置名（`UU_CONFIG` 除外——它会把配置文件指向别处，只认真实环境）；真实环境里已存在的变量优先（unit 里的 `Environment=` 仍是覆盖层），文件只在启动时读取，改完重启服务生效。账号凭据（`UU_TOKEN` / `UU_CSRF` / `UU_USER_ID` / `UU_SIGN_KEY` / `UU_SYSTEM_ID`）不允许写在这里，凭据仍归 `config.json` 或真实环境，非法行会记日志（只记行号和设置名，不记值）。适合把重装 systemd unit 后会丢的调优项（如 `UU_FT_BLOCK`、`UU_DESKTOP_BACKEND`）固定下来。
+
 自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 
 选择码率档（原画 / 超清 / 高清 / 自定义）时，外部 FFmpeg 的 CPU 编码以平均码率（ABR）为目标，避免 4K 低码率下关键帧发灰；「自动」档仍使用恒定质量（CRF）。

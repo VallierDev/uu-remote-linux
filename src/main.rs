@@ -17,6 +17,7 @@ mod wayland;
 mod auth;
 mod assist;
 mod config;
+mod env_conf;
 mod i18n;
 mod login;
 mod login_ui;
@@ -399,6 +400,7 @@ fn show_running_host() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let env_problems = env_conf::load();
     // Not signed in, with a desktop: one window offers remote assistance (guest identity) and the QR
     // login together; signing in restarts the host in account mode (assistance continues there).
     let unified = std::env::args().nth(1).is_none() && display_present()
@@ -412,6 +414,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_logger::Builder::new().filter_level(log::LevelFilter::Off)
             .filter_module("uuremote_server", log::LevelFilter::Info).init();
     } else { env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init(); }
+    // Key names only: an env.conf value could still carry a secret.
+    for problem in env_problems { log::warn!("env.conf: {problem}"); }
     // An unknown argument must never fall through to starting a second full host server.
     let arg1 = std::env::args().nth(1);
     let value_ok = match arg1.as_deref() {
