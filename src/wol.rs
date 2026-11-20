@@ -88,6 +88,8 @@ fn report_body(mac: &str, ip: &str, subnet_mask: &str) -> serde_json::Value {
     serde_json::json!({ "mac": mac, "inner_ip": ip, "ip": ip, "subnet_mask": subnet_mask })
 }
 
+const DEFAULT_WOL_BASE_URL: &str = "https://api-ipv4.nrd.nie.163.com";
+
 /// Report this host's LAN identity like the official host after sign-in.
 /// The server rejects the report (HTTP 422, code 1001) unless `inner_ip` is present; the official macOS
 /// client sends `inner_ip`, `ip`, `mac` and `subnet_mask`. Verified live: with `inner_ip` the helper is
@@ -95,7 +97,8 @@ fn report_body(mac: &str, ip: &str, subnet_mask: &str) -> serde_json::Value {
 pub async fn report(auth: &crate::auth::UUAuthClient) {
     let Some((mac, ip, subnet_mask)) = lan_info() else { log::warn!("WOL helper: no IPv4 default-route interface"); return; };
     let body = report_body(&mac, &ip, &subnet_mask);
-    match auth.post_json_url("https://api-ipv4.nrd.nie.163.com", "/api/v1/device/wake_on_lan/info", &body).await {
+    let base = auth.creds.base_url.as_deref().unwrap_or(DEFAULT_WOL_BASE_URL);
+    match auth.post_json_url(base, "/api/v1/device/wake_on_lan/info", &body).await {
         Ok((status, value)) => log::info!("WOL helper: LAN info reported: status={status} code={:?} turn_on_wol={:?}",
             value.get("code").and_then(serde_json::Value::as_i64),
             value.get("data").and_then(|d| d.get("turn_on_wol")).or_else(|| value.get("turn_on_wol"))),

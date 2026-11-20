@@ -120,6 +120,7 @@ impl State{
                     .take(8).map(|format|(number(format,1).unwrap_or(u64::MAX),decode_wire(format).ok().and_then(|x|x.into_iter().find_map(|y|match (y.number,y.value){(n,WireValue::Bytes(s)) if n!=1=>std::str::from_utf8(s).ok().map(|s|s.chars().take(48).collect()),_=>None})).unwrap_or_default())).collect();
                 log::info!("Clipboard offer without a supported text format: formats={formats:?}");
             }
+            log::info!("Clipboard format list acked: text supported={supports_text}");
             if let Some(format)=chosen{
                 let id=next();
                 let epoch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as u32;
@@ -136,6 +137,7 @@ impl State{
             let mut confirm=Vec::new();int(1,if data.is_some(){1}else{2},&mut confirm);string(2,key,&mut confirm);
             if let Some(data)=&data{int(3,data.chunks(BLOCK_BYTES).len() as u64,&mut confirm);}
             out.messages.push((22,response(h,2,&confirm)));
+            log::info!("Clipboard data request: format id={} blocks={}",number(ask,1).unwrap_or(0),data.as_ref().map_or(0,|d|d.chunks(BLOCK_BYTES).len()));
             if let Some(data)=data{
                 for (index,part) in data.chunks(BLOCK_BYTES).enumerate(){
                     let mut block=Vec::new();string(1,key,&mut block);int(2,index as u64,&mut block);nested(3,part,&mut block);
