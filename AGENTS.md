@@ -72,7 +72,8 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
   `.github/workflows/release.yml`, which builds and publishes the x86_64 tarball; release notes come from
   `docs/release-notes/<tag>.md`.
 - `.github/workflows/loongarch64.yml` builds the loong64 deb/tarball by running the normal native build
-  inside a `ghcr.io/loong64/debian` container under qemu-user (there is no loongarch64 runner). Nothing in
+  inside a `linuxdeepin/deepin:crimson-loong64` container under qemu-user (there is no loongarch64 runner),
+  because its glibc 2.38 matches the Deepin 23 target. Nothing in
   the tree is cross-compiled, so the only loongarch64-specific code is the vendored `nix`/`rcgen` patches.
 
 ## 4. Install on a user's machine (step by step)
