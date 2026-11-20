@@ -60,6 +60,8 @@ jobs:
           if command -v ffmpeg; then echo "ffmpeg still present"; exit 1; fi
           pkg=$(mktemp -d)
           cp target/debug/uuremote-server target/debug/libuu-wayland.so packaging/tarball/install.sh "$pkg/"
+          mkdir -p "$pkg/packaging"
+          cp -r packaging/common "$pkg/packaging/"
           cp -r contrib "$pkg/"
           home=$(mktemp -d)
           HOME=$home XDG_CONFIG_HOME=$home/.config "$pkg/install.sh" --yes

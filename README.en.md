@@ -211,6 +211,55 @@ Plugins are found next to `uuremote-server`, in `../lib/uu-remote-linux/`, `~/.l
 `/usr/lib/uu-remote-linux/` (`UU_ENGINE_DIR` overrides); a missing library or too old glibc is reported in the log.
 Continue with step 3 (login). Other architectures: build from source below.
 
+### NixOS / Nix (Flake)
+
+The repository includes a `flake.nix` providing the `uu-remote-linux` package and `nixosModules.default`. Both `uuremote-server` and `uuremote-viewer` are wrapped with a capture-capable `ffmpeg` on `PATH`.
+
+**NixOS (recommended)**: add this flake as an input and import `nixosModules.default` (the module applies the overlay automatically):
+
+```nix
+# flake.nix
+{
+  inputs.uu-remote-linux.url = "github:VallierDev/uu-remote-linux";
+
+  outputs = { nixpkgs, uu-remote-linux, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      modules = [
+        uu-remote-linux.nixosModules.default
+        {
+          services.uu-remote-linux = {
+            enable = true;
+            # Optional (recommended on most Wayland sessions): grant the active seat user access to /dev/uinput.
+            # Security note: this permission can inject input into the whole seat, including lock and greeter screens.
+            uinput.enable = true;
+            # Optional: enable inproc-av for in-process NVENC / VAAPI encoding
+            # package = pkgs.uu-remote-linux.override { withInprocAv = true; };
+            # Optional: environment variables passed to the uuremote-native user unit
+            # settings.UU_DESKTOP_BACKEND = "wayland";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+After rebuilding, sign in inside your graphical session and check the user service:
+
+```sh
+uuremote-server login
+systemctl --user status uuremote-native.service
+uuremote-server doctor
+```
+
+**Standalone package (without the NixOS module)**: run with `nix run github:VallierDev/uu-remote-linux` or install with `nix profile install github:VallierDev/uu-remote-linux`. After installing, log in inside your graphical session and create `~/.config/systemd/user/uuremote-native.service` from step 4 with `ExecStart=%h/.nix-profile/bin/uuremote-server`:
+
+```sh
+uuremote-server login
+systemctl --user daemon-reload
+systemctl --user enable --now uuremote-native.service
+```
+
 ### 1. Dependencies (Ubuntu / Debian)
 
 ```sh
@@ -336,9 +385,9 @@ connect from 开始协助 (remote assistance) in UU Remote.
 Optional launcher icon:
 
 ```sh
-install -Dm644 contrib/desktop/uu-remote-linux.svg ~/.local/share/icons/hicolor/scalable/apps/uu-remote-linux.svg
-install -Dm644 contrib/desktop/uu-remote-linux.desktop ~/.local/share/applications/uu-remote-linux.desktop
-install -Dm644 contrib/desktop/uu-remote-linux-viewer.desktop ~/.local/share/applications/uu-remote-linux-viewer.desktop
+install -Dm644 packaging/common/desktop/uu-remote-linux.svg ~/.local/share/icons/hicolor/scalable/apps/uu-remote-linux.svg
+install -Dm644 packaging/common/desktop/uu-remote-linux.desktop ~/.local/share/applications/uu-remote-linux.desktop
+install -Dm644 packaging/common/desktop/uu-remote-linux-viewer.desktop ~/.local/share/applications/uu-remote-linux-viewer.desktop
 ```
 
 Verified with the official Mac viewer: guest connections, wrong-code rejection, code rotation, switching assistance off,

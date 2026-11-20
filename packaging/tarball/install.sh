@@ -34,33 +34,22 @@ put 755 "$src/uuremote-server" "$bin/uuremote-server"
 for so in libuu-wayland.so libuu-portal.so; do
   [ -f "$src/$so" ] && put 644 "$src/$so" "$lib/$so"
 done
-if [ -d "$src/contrib/desktop" ]; then
-  put 644 "$src/contrib/desktop/uu-remote-linux.svg" "$share/icons/hicolor/scalable/apps/uu-remote-linux.svg"
-  put 644 "$src/contrib/desktop/uu-remote-linux.desktop" "$share/applications/uu-remote-linux.desktop"
-  [ -f "$bin/uuremote-viewer" ] && put 644 "$src/contrib/desktop/uu-remote-linux-viewer.desktop" "$share/applications/uu-remote-linux-viewer.desktop"
+common=$src/packaging/common
+if [ -d "$common/desktop" ]; then
+  put 644 "$common/desktop/uu-remote-linux.svg" "$share/icons/hicolor/scalable/apps/uu-remote-linux.svg"
+  put 644 "$common/desktop/uu-remote-linux.desktop" "$share/applications/uu-remote-linux.desktop"
+  [ -f "$bin/uuremote-viewer" ] && put 644 "$common/desktop/uu-remote-linux-viewer.desktop" "$share/applications/uu-remote-linux-viewer.desktop"
 fi
 echo "Installed uuremote-server to $bin"
 
-# Same unit as the .deb, pointing at ~/.local/bin. An existing unit is the user's: leave it alone.
+# Same unit as packaging/common, pointing at ~/.local/bin. An existing unit is the user's: leave it alone.
 if [ -f "$unit_dir/uuremote-native.service" ]; then
   echo "Kept existing $unit_dir/uuremote-native.service"
 else
+  [ -f "$common/systemd/uuremote-native.service.in" ] || { echo "uuremote-native.service.in not found under $common/systemd" >&2; exit 1; }
   mkdir -p "$unit_dir"
-  cat > "$unit_dir/uuremote-native.service" <<'UNIT'
-[Unit]
-Description=UU Remote Linux host (unofficial)
-After=graphical-session.target
-PartOf=graphical-session.target
-
-[Service]
-Environment=RUST_LOG=info
-ExecStart=%h/.local/bin/uuremote-server
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=graphical-session.target
-UNIT
+  sed 's|@EXEC_START@|%h/.local/bin/uuremote-server|g' "$common/systemd/uuremote-native.service.in" > "$unit_dir/uuremote-native.service"
+  chmod 644 "$unit_dir/uuremote-native.service"
   echo "Created $unit_dir/uuremote-native.service"
 fi
 if command -v systemctl >/dev/null 2>&1; then systemctl --user daemon-reload 2>/dev/null || true; fi
