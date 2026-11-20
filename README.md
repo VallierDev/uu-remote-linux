@@ -231,7 +231,13 @@ systemctl --user status uuremote-native.service
 uuremote-server doctor
 ```
 
-**独立包（非 NixOS 模块）**：可直接用 `nix run github:VallierDev/uu-remote-linux` 试跑，或 `nix profile install github:VallierDev/uu-remote-linux` 安装到用户环境，然后按第 3、4 步登录并启用用户服务。
+**独立包（非 NixOS 模块）**：可直接 `nix run github:VallierDev/uu-remote-linux` 试跑，或 `nix profile install github:VallierDev/uu-remote-linux` 安装。安装后在图形会话里登录，并按第 4 步模板创建 `~/.config/systemd/user/uuremote-native.service`（将 `ExecStart` 改为 `%h/.nix-profile/bin/uuremote-server`）：
+
+```sh
+uuremote-server login
+systemctl --user daemon-reload
+systemctl --user enable --now uuremote-native.service
+```
 
 ### 1. 依赖（Ubuntu / Debian）
 

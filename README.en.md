@@ -252,7 +252,13 @@ systemctl --user status uuremote-native.service
 uuremote-server doctor
 ```
 
-**Standalone package (without the NixOS module)**: run directly with `nix run github:VallierDev/uu-remote-linux` or install with `nix profile install github:VallierDev/uu-remote-linux`, then continue with steps 3 and 4 to log in and enable the user service.
+**Standalone package (without the NixOS module)**: run with `nix run github:VallierDev/uu-remote-linux` or install with `nix profile install github:VallierDev/uu-remote-linux`. After installing, log in inside your graphical session and create `~/.config/systemd/user/uuremote-native.service` from step 4 with `ExecStart=%h/.nix-profile/bin/uuremote-server`:
+
+```sh
+uuremote-server login
+systemctl --user daemon-reload
+systemctl --user enable --now uuremote-native.service
+```
 
 ### 1. Dependencies (Ubuntu / Debian)
 
