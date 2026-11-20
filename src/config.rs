@@ -129,9 +129,9 @@ pub fn custom_base_url() -> Result<Option<String>, BaseUrlError> {
     custom_base_url_from(std::env::var_os("UU_BASE_URL").as_deref(), file())
 }
 
-/// Cloud API base URL (`UU_BASE_URL` or config `"base_url"`), without a trailing slash.
-pub fn base_url() -> Result<String, String> {
-    Ok(custom_base_url()?.unwrap_or_else(|| crate::auth::DEFAULT_BASE_URL.into()))
+/// Same as `custom_base_url`, resolved against the given config contents instead of the startup snapshot.
+pub fn custom_base_url_in(file: Option<&serde_json::Value>) -> Result<Option<String>, BaseUrlError> {
+    custom_base_url_from(std::env::var_os("UU_BASE_URL").as_deref(), Ok(file))
 }
 
 #[cfg(test)]

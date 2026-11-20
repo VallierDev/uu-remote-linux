@@ -97,11 +97,8 @@ const DEFAULT_WOL_BASE_URL: &str = "https://api-ipv4.nrd.nie.163.com";
 pub async fn report(auth: &crate::auth::UUAuthClient) {
     let Some((mac, ip, subnet_mask)) = lan_info() else { log::warn!("WOL helper: no IPv4 default-route interface"); return; };
     let body = report_body(&mac, &ip, &subnet_mask);
-    let base = match crate::config::custom_base_url() {
-        Ok(base) => base.unwrap_or_else(|| DEFAULT_WOL_BASE_URL.into()),
-        Err(error) => { log::warn!("WOL helper: LAN info not reported: {error}"); return; }
-    };
-    match auth.post_json_url(&base, "/api/v1/device/wake_on_lan/info", &body).await {
+    let base = auth.creds.base_url.as_deref().unwrap_or(DEFAULT_WOL_BASE_URL);
+    match auth.post_json_url(base, "/api/v1/device/wake_on_lan/info", &body).await {
         Ok((status, value)) => log::info!("WOL helper: LAN info reported: status={status} code={:?} turn_on_wol={:?}",
             value.get("code").and_then(serde_json::Value::as_i64),
             value.get("data").and_then(|d| d.get("turn_on_wol")).or_else(|| value.get("turn_on_wol"))),

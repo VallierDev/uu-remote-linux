@@ -88,7 +88,6 @@ pub fn device_rows(devices: &[Value], current: Option<&str>) -> String {
 }
 
 pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, String>) -> Result<(), String> {
-    let base = crate::auth::base_url()?;
     if unsafe { uu_viewer_ui_start() } != 0 { return Err("Cannot open the window (GTK3 and a graphical session are required)".into()); }
     let exe = std::env::current_exe().map_err(|_| "Cannot locate executable")?;
     let qr = std::env::temp_dir().join(format!("uu-viewer-qr-{}.png", std::process::id()));
@@ -102,7 +101,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
     let mut just_logged_in = false;
     unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
     let refresh = |creds: &crate::auth::Credentials| {
-        let api = super::api::Api::new(crate::auth::UUAuthClient::new(creds.clone()), &base);
+        let api = super::api::Api::new(crate::auth::UUAuthClient::new(creds.clone()), creds.api_base());
         async move { api.device_list().await }
     };
     loop {
@@ -230,7 +229,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                 ["connect", id, "unbind"] => {
                     if let Some(s)=sessions.remove(*id){s.stop().await;}
                     let result=match credentials(){
-                        Ok(creds)=>super::api::Api::new(crate::auth::UUAuthClient::new(creds),&base).unbind(id,false).await.map_err(|e|e.to_string()),
+                        Ok(creds)=>super::api::Api::new(crate::auth::UUAuthClient::new(creds.clone()),creds.api_base()).unbind(id,false).await.map_err(|e|e.to_string()),
                         Err(e)=>Err(e),
                     };
                     match result {Ok(())=>toast(crate::i18n::s("设备已从账号删除","Device removed from the account")),Err(e)=>toast(&crate::tr!("删除设备失败：{e}","Removing the device failed: {e}"))}

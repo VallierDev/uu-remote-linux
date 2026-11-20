@@ -25,10 +25,6 @@ impl std::fmt::Display for RoomError {
 
 pub const DEFAULT_BASE_URL: &str = "https://api.nrd.nie.163.com";
 
-pub fn base_url() -> Result<String, String> {
-    crate::config::base_url()
-}
-
 /// Account binding and request-signing key. Never committed: loaded at startup from
 /// a private config file or environment variables (see config.example.json).
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -41,6 +37,8 @@ pub struct Credentials {
     pub csrf: String,
     /// HMAC-SHA256 key for x-param-sign.
     pub sign_key: String,
+    /// Custom cloud API base URL, read with the token so it always goes to the server that issued it.
+    pub base_url: Option<String>,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -62,12 +60,15 @@ impl Credentials {
             user_id: get("user_id"), device_id: get("device_id"), client_id: get("client_id"),
             system_id: get("system_id"), token: get("token"), csrf: get("csrf"),
             sign_key: Some(get("sign_key")).filter(|k| !k.is_empty()).unwrap_or_else(|| DEFAULT_SIGN_KEY.into()),
+            base_url: crate::config::custom_base_url_in(file)?,
         };
         let missing: Vec<&str> = [("user_id", &creds.user_id), ("device_id", &creds.device_id), ("client_id", &creds.client_id),
             ("system_id", &creds.system_id), ("token", &creds.token), ("csrf", &creds.csrf), ("sign_key", &creds.sign_key)]
             .iter().filter(|(_, v)| v.is_empty()).map(|(k, _)| *k).collect();
         if missing.is_empty() { Ok(creds) } else { Err(format!("missing credential settings: {}", missing.join(", "))) }
     }
+
+    pub fn api_base(&self) -> &str { self.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL) }
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,7 +299,7 @@ impl UUAuthClient {
     /// Signed JSON POST; returns (HTTP status, decoded body).
     pub async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<(u16, serde_json::Value), String> {
         let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
-        let resp = self.http.post(format!("{}{}", base_url()?, path))
+        let resp = self.http.post(format!("{}{}", self.creds.api_base(), path))
             .headers(self.build_headers("POST", path, &body_str)).body(body_str)
             .send().await.map_err(|e| format!("HTTP post {path} failed: {}", transport_error(&e)))?;
         let status = resp.status().as_u16();
@@ -312,8 +313,7 @@ impl UUAuthClient {
         let started = std::time::Instant::now();
         let body_str = body.map(serde_json::to_string).transpose()
             .map_err(|_| QrRequestError::new(QrRequestErrorKind::Request, "encode", started, None))?.unwrap_or_default();
-        let base = base_url().map_err(|_| QrRequestError::new(QrRequestErrorKind::Request, "base_url", started, None))?;
-        let request = self.http.post(format!("{base}{path}")).timeout(timeout)
+        let request = self.http.post(format!("{}{path}", self.creds.api_base())).timeout(timeout)
             .headers(self.build_headers("POST", path, &body_str)).body(body_str);
         send_qr_request(request, started).await
     }
@@ -335,7 +335,7 @@ impl UUAuthClient {
     }
     /// Account share info is a GET (POST answers 405, verified live).
     pub async fn assist_get(&self, path: &str) -> Result<(u16, serde_json::Value), String> {
-        let request = self.http.get(format!("{}{path}", base_url()?)).headers(self.build_headers("GET", path, "")).build()
+        let request = self.http.get(format!("{}{path}", self.creds.api_base())).headers(self.build_headers("GET", path, "")).build()
             .map_err(|_| "assist request construction failed")?;
         self.assist_send(request).await
     }
@@ -351,7 +351,7 @@ impl UUAuthClient {
 
     fn assist_request(&self, path: &str, body: Option<&serde_json::Value>) -> Result<reqwest::Request, String> {
         let body = body.map(serde_json::to_string).transpose().map_err(|_| "assist request encoding failed")?.unwrap_or_default();
-        self.http.post(format!("{}{path}", base_url()?))
+        self.http.post(format!("{}{path}", self.creds.api_base()))
             .headers(self.build_headers("POST", path, &body)).body(body).build()
             .map_err(|_| "assist request construction failed".into())
     }

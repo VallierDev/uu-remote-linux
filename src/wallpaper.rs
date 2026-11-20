@@ -224,7 +224,7 @@ fn api_data(status: u16, body: &serde_json::Value) -> Result<&serde_json::Value,
 
 async fn publish(auth: &UUAuthClient, image: Vec<u8>) -> Result<(), &'static str> {
     let http = crate::auth::http_client_builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "http-client")?;
-    publish_to(auth, image, &crate::auth::base_url().map_err(|_| "base-url")?, &http).await
+    publish_to(auth, image, auth.creds.api_base(), &http).await
 }
 
 async fn json(request: reqwest::RequestBuilder) -> Result<(u16, serde_json::Value), ()> {

@@ -275,7 +275,8 @@ pub fn prepare_identity() -> Result<(Value, Credentials), String> {
     for (key, make) in [("client_id", random_uuid as fn() -> String), ("system_id", || random_uuid().to_uppercase()), ("machine_guid", machine_guid)] {
         if get(&cfg, key).is_empty() { cfg[key] = json!(make()); }
     }
-    let creds = Credentials { client_id: get(&cfg, "client_id"), system_id: get(&cfg, "system_id"), device_id: get(&cfg, "device_id"), sign_key, ..Default::default() };
+    let creds = Credentials { client_id: get(&cfg, "client_id"), system_id: get(&cfg, "system_id"), device_id: get(&cfg, "device_id"), sign_key,
+        base_url: crate::config::custom_base_url_in(Some(&cfg))?, ..Default::default() };
 
     write_config(&cfg)?;
     Ok((cfg, creds))
@@ -416,7 +417,8 @@ pub(crate) async fn flow(ui: &LoginUi) -> Result<String, String> {
                     if !nickname.is_empty() { cfg["account_name"] = json!(nickname); }
                     // The token belongs to the server that issued it: processes started without UU_BASE_URL
                     // (the host service the viewer restarts) must send it there, not to the default.
-                    if let Some(base) = crate::config::custom_base_url()? { cfg["base_url"] = json!(base); }
+                    // null (NetEase) is written too, so the merge below cannot bring back another server's address.
+                    cfg["base_url"] = json!(creds.base_url);
                     // Keep settings saved meanwhile (e.g. from the assist card): merge into the fresh file.
                     if let Ok(Some(Value::Object(fresh))) = crate::config::read_fresh() {
                         for (k, v) in fresh { if cfg.get(&k).is_none() { cfg[k] = v; } }
@@ -513,14 +515,19 @@ mod tests {
         let creds = |token: &str| json!({"user_id": "u", "device_id": "d", "client_id": "c", "system_id": "s", "token": token, "csrf": "x"});
         std::fs::write(&path, creds("old").to_string()).unwrap();
         std::env::set_var("UU_CONFIG", &path);
+        std::env::remove_var("UU_BASE_URL");
         std::env::set_var("UU_LOGIN_WINDOW", "0");
         let writer = path.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(2500)).await;
-            std::fs::write(&writer, creds("new").to_string()).unwrap();
+            let mut new = creds("new");
+            new["base_url"] = json!("https://remora.example.test/");
+            std::fs::write(&writer, new.to_string()).unwrap();
         });
         let got = tokio::time::timeout(Duration::from_secs(10), wait_for_credentials(Some("old".into()))).await.unwrap();
         assert_eq!(got.token, "new"); // the expired token in the file is not accepted
+        // The new token goes to the server saved with it, not the one cached at startup.
+        assert_eq!(got.api_base(), "https://remora.example.test");
         let _ = std::fs::remove_dir_all(&dir);
         });
     }
