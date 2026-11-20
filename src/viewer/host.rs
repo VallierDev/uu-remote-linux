@@ -15,10 +15,10 @@ fn systemctl(args: &[&str]) -> bool {
 pub fn active() -> bool { systemctl(&["is-active", "--quiet", UNIT]) }
 fn installed() -> bool { systemctl(&["cat", UNIT]) }
 
-/// Same unit as packaging/deb and README (graphical-session.target imports DISPLAY / WAYLAND_DISPLAY).
+/// Same unit as packaging/common and README (graphical-session.target imports DISPLAY / WAYLAND_DISPLAY).
 fn unit_text(server: &std::path::Path) -> String {
-    format!("[Unit]\nDescription=UU Remote Linux host (unofficial)\nAfter=graphical-session.target\nPartOf=graphical-session.target\n\n\
-[Service]\nEnvironment=RUST_LOG=info\nExecStart={}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=graphical-session.target\n", server.display())
+    include_str!("../../packaging/common/systemd/uuremote-native.service.in")
+        .replace("@EXEC_START@", &server.display().to_string())
 }
 fn install(server: &std::path::Path) -> Result<(), String> {
     let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).filter(|p| p.is_absolute())
