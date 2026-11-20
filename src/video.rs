@@ -857,27 +857,27 @@ async fn read_encoder_with(
         let max_kbps = settings.max_kbps().unwrap_or(30_000) as i64;
         let config = crate::inproc_encoder::Config {
             portal: portal.clone(),
-            display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
-            gop: gop_frames(settings.fps, true) as u32, cq: settings.cq() as u32,
+            display: display.clone(), input: size, output: settings.output, fps: settings.effective_fps(),
+            gop: gop_frames(settings.effective_fps(), true) as u32, cq: settings.cq() as u32,
             target_bps: settings.max_kbps().map_or(16_000, |k| i64::from(k) * 3 / 4) * 1000,
             max_bps: max_kbps * 1000, buffer_bits: i64::from(buffer_for(&settings, encoder)) * 1000, codec: settings.codec, chroma: settings.chroma,
             vaapi: encoder == Encoder::Vaapi,
         };
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} source={} pipeline=in-process",
-            display,size.0,size.1,settings.output,settings.fps,config.cq,max_kbps,encoder.name_for(settings.codec),
+            display,size.0,size.1,settings.output,settings.effective_fps(),config.cq,max_kbps,encoder.name_for(settings.codec),
             crate::video_select::encoder_source_label(selection.encoder_source));
         return read_inprocess(config, latest, sequence, idr, budget, (settings.source_id, settings.source_generation)).await;
     }
     let source_size = size;
     let size = format!("{}x{}", size.0, size.1);
-    let fps = settings.fps.to_string();
+    let fps = settings.effective_fps().to_string();
     // Keep the IDR interval at 2 s whatever the frame rate.
-    let gop = gop_frames(settings.fps, false).to_string();
+    let gop = gop_frames(settings.effective_fps(), false).to_string();
     let (maxrate, _) = rate_args(&settings, encoder);
     let cq = settings.cq().to_string();
     // x11grab delivers bgr0; the Wayland/portal/KMS pipe is bgra.
     let rgb = nvenc_rgb_input(&settings, encoder, if wayland { "bgra" } else { "bgr0" });
-    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.fps,cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(selection.encoder_source),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
+    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.effective_fps(),cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(selection.encoder_source),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
     // A bundled FFmpeg prefix (config ffmpeg_root / UU_FFMPEG_ROOT) or `ffmpeg` on PATH.
     let ffmpeg = ffmpeg_spec();
     let mut command = ffmpeg.command();
@@ -910,7 +910,7 @@ async fn read_encoder_with(
         let executable=std::path::PathBuf::from("/proc/self/exe");
         #[cfg(not(target_os="linux"))]
         let executable=std::env::current_exe().map_err(|e|format!("Capture executable: {e}"))?;
-        let mut capture_command=wayland_capture_command(&executable,settings.fps);
+        let mut capture_command=wayland_capture_command(&executable,settings.effective_fps());
         if let Some(output)=selected_output {capture_command.env("UU_WAYLAND_OUTPUT",&output.name);}
         let mut capture=capture_command
             .env("UU_WAYLAND_DEMAND","1")
@@ -921,7 +921,7 @@ async fn read_encoder_with(
         command.stdin(source);
         native_capture=Some(capture);
     } else if wayland { command.stdin(std::process::Stdio::piped()); }
-    let timing = timing_args(ffmpeg_timing_mode(&ffmpeg).await, settings.fps);
+    let timing = timing_args(ffmpeg_timing_mode(&ffmpeg).await, settings.effective_fps());
     let mut output_args = timing;
     output_args.extend(["-f".into(), if settings.codec == VideoCodec::H265 { "hevc".into() } else { "h264".into() }, "pipe:1".into()]);
     let mut child=command.args(output_args)
@@ -934,7 +934,7 @@ async fn read_encoder_with(
         let mut sink=child.stdin.take().ok_or("Encoder stdin missing")?;
         Some(EncoderTask(tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.fps)));
+            let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.effective_fps())));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut bytes=vec![0;capture.width as usize*capture.height as usize*4];
             loop {
@@ -952,7 +952,7 @@ async fn read_encoder_with(
         let mut sink=child.stdin.take().ok_or("Encoder stdin missing")?;
         Some(EncoderTask(tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            let interval=Duration::from_nanos(1_000_000_000/u64::from(settings.fps));
+            let interval=Duration::from_nanos(1_000_000_000/u64::from(settings.effective_fps()));
             let mut tick=tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let (width,height)=session.size();
@@ -986,7 +986,7 @@ async fn read_encoder_with(
             use tokio::io::AsyncWriteExt;
             tokio::select! {
                 result=async {
-                    let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.fps)));
+                    let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.effective_fps())));
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
@@ -1234,7 +1234,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
     // The privacy screen swaps the portal stream to a virtual output that can have another size.
     let mut portal_size = portal.as_ref().map(|p| p.size());
     let mut previous = None;
-    let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
+    let mut timeline = RtpTimeline { fps: u64::from(current.effective_fps()), ..Default::default() };
     let mut settings_open = true;
     let mut frames = 0u64;
     let mut skipped = 0u64;
@@ -1288,7 +1288,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         if next != current || send_interrupted {
             let discard = next.codec != current.codec || next.source_generation != current.source_generation || next.source_id != current.source_id || send_interrupted;
             current = next;
-            timeline.fps = u64::from(next.fps);
+            timeline.fps = u64::from(next.effective_fps());
             // A viewer resolution choice may have changed the X11 display mode (desktop_mode).
             if let Some(resized) = x11_resized(&display, portal_stream, size) { size = resized; }
             if discard {

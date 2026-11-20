@@ -407,6 +407,9 @@ impl WebRtcSession {
             let mut reports = 0usize;
             let mut feedback_counts = FeedbackCounts::default();
             let mut governor = crate::video_governor::Governor::default();
+            let fps_adapt = crate::video_governor::FpsAdapt {
+                enabled: std::env::var("UU_VIDEO_FPS_ADAPT").map(|v| v.trim() == "1").unwrap_or(false),
+            };
             while let Ok((packets, _)) = sender.read(&mut feedback).await {
                 for packet in packets {
                     feedback_counts.observe(packet.as_any());
@@ -431,12 +434,24 @@ impl WebRtcSession {
                             }
                             // The viewer's own 自动清晰度 preset stays the ceiling; a real loss burst
                             // or a swollen round trip is the only thing that lowers it.
-                            let ceiling=governor_settings.borrow().ceiling_kbps();
+                            let (ceiling,fps,nominal_fps)={let s=governor_settings.borrow();(s.ceiling_kbps(),s.effective_fps(),s.fps)};
                             let loss=f32::from(r.fraction_lost)*100./256.;
-                            if let Some(cap)=governor.observe(loss,rtt,ceiling,std::time::Instant::now()) {
-                                log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
-                                // Restarts the encoder at the new cap through the settings watch.
-                                governor_settings.send_modify(|value| value.net_kbps=Some(cap));
+                            let decision=governor.observe(loss,rtt,ceiling,fps,nominal_fps,&fps_adapt,std::time::Instant::now());
+                            if decision.cap.is_some()||decision.fps.is_some() {
+                                if let Some(cap)=decision.cap {
+                                    log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
+                                }
+                                match decision.fps {
+                                    Some(Some(step))=>log::info!("Video frame rate step {}fps: loss={:.1}% nack={} rtcp_rtt_ms={:?}",step,loss,feedback_counts.nack_packets,rtt),
+                                    Some(None)=>log::info!("Video frame rate released back to the viewer's setting"),
+                                    None=>{},
+                                }
+                                // Restarts the encoder at the new values through the settings watch;
+                                // one write so a bitrate+frame step reopens the pipeline exactly once.
+                                governor_settings.send_modify(|value| {
+                                    if let Some(cap)=decision.cap { value.net_kbps=Some(cap); }
+                                    if let Some(fps)=decision.fps { value.net_fps=fps; }
+                                });
                             }
                         }
                         if log_now {
@@ -766,10 +781,10 @@ impl WebRtcSession {
                                     if let Some(owner)=&switch_owner {owner.with_current(|| {
                                         if crate::wayland::selection()==target && crate::wayland::select(source_before).is_ok() {
                                             let (source_id,source_generation)=crate::wayland::selection();
-                                            // The feedback loop owns net_kbps; a rollback of the
-                                            // switch must not replay its snapshot over the cap.
-                                            let net_kbps=settings.borrow().net_kbps;
-                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,net_kbps,..settings_before});
+                                            // The feedback loop owns net_kbps/net_fps; a rollback of
+                                            // the switch must not replay its snapshot over them.
+                                            let (net_kbps,net_fps)=(settings.borrow().net_kbps,settings.borrow().net_fps);
+                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,net_kbps,net_fps,..settings_before});
                                         }
                                     });}
                                     log::warn!("Screen switch failed; previous source requested");
