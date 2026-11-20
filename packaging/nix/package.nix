@@ -22,7 +22,7 @@
   libayatana-appindicator,
   libxcb,
   libva,
-  ffmpeg-headless,
+  ffmpeg-full,
   writableTmpDirAsHomeHook,
   withWayland ? true,
   withPortal ? true,
@@ -64,9 +64,9 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   nativeBuildInputs = [
     pkg-config
+    makeBinaryWrapper
   ]
-  ++ lib.optional withWayland wayland-scanner
-  ++ lib.optional withViewer makeBinaryWrapper;
+  ++ lib.optional withWayland wayland-scanner;
 
   buildInputs = [
     libx11
@@ -97,7 +97,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
   nativeCheckInputs = [
     writableTmpDirAsHomeHook
   ]
-  ++ lib.optional withViewer ffmpeg-headless;
+  ++ lib.optional withViewer ffmpeg-full;
 
   postInstall = ''
     install -Dm644 packaging/common/systemd/uuremote-native.service.in \
@@ -118,13 +118,18 @@ rustPlatform.buildRustPackage (finalAttrs: {
   '';
 
   # Libraries the engines dlopen at runtime; added after patchelf shrinks the RUNPATH.
-  # The host is not wrapped: `doctor` recognises host processes by the executable's file name.
+  # Keep the unwrapped host binary named `uuremote-server` in libexec so `/proc/<pid>/exe`
+  # still matches what `doctor`, `show`, and `set-encoder`/`set-codec` expect.
   postFixup = ''
     patchelf --add-rpath ${lib.makeLibraryPath finalAttrs.passthru.dlopenLibs} $out/bin/uuremote-server
+    mkdir -p $out/libexec/uu-remote-linux
+    mv $out/bin/uuremote-server $out/libexec/uu-remote-linux/uuremote-server
+    makeWrapper $out/libexec/uu-remote-linux/uuremote-server $out/bin/uuremote-server \
+      --suffix PATH : ${lib.makeBinPath [ ffmpeg-full ]}
   ''
   + lib.optionalString withViewer ''
     patchelf --add-rpath ${lib.makeLibraryPath finalAttrs.passthru.dlopenLibs} $out/bin/uuremote-viewer
-    wrapProgram $out/bin/uuremote-viewer --suffix PATH : ${lib.makeBinPath [ ffmpeg-headless ]}
+    wrapProgram $out/bin/uuremote-viewer --suffix PATH : ${lib.makeBinPath [ ffmpeg-full ]}
   '';
 
   passthru = {

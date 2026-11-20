@@ -32,9 +32,11 @@ in
         options = {
           UU_FFMPEG_ROOT = lib.mkOption {
             type = envValueType;
-            default = lib.getBin pkgs.ffmpeg-full;
-            defaultText = lib.literalExpression "lib.getBin pkgs.ffmpeg-full";
-            description = "FFmpeg prefix passed to {command}`uuremote-server` (must provide x11grab, libx264, and libx265).";
+            default = null;
+            description = ''
+              Optional FFmpeg prefix passed to {command}`uuremote-server` (must provide x11grab, libx264, and libx265).
+              Leave null to use the FFmpeg provided via PATH; setting this disables `inproc-av` native encoding.
+            '';
           };
         };
       };
@@ -60,7 +62,7 @@ in
         systemd.user.services.uuremote-native = {
           wantedBy = [ "graphical-session.target" ];
           # Setting `path` would replace the user manager's PATH (hyprctl, pactl, gsettings, ...).
-          environment = cfg.settings;
+          environment = lib.filterAttrs (_: value: value != null) cfg.settings;
         };
       }
       (lib.mkIf cfg.uinput.enable {
