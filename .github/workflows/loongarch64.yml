@@ -48,8 +48,15 @@ env:
   # and pins glibc 2.38, the same ABI generation as Deepin 23, so linking here
   # keeps the binary loadable on both. Its apt source also carries GTK3, Wayland,
   # PipeWire and libei >= 1.1, so no feature is lost.
-  IMAGE: linuxdeepin/deepin:crimson-loong64
-  # actions/cache keys cannot carry the '/' and ':' in an image reference.
+  # Pinned by digest, not by tag: crimson-loong64 is a moving tag, and both the cache key
+  # and the glibc floor this job asserts depend on the image contents. A silent retag would
+  # invalidate neither, so the ABI check could pass against a different image than the one
+  # it was written for. Bump the digest (and IMAGE_TAG) together, on purpose.
+  IMAGE: linuxdeepin/deepin:crimson-loong64@sha256:995e1233c6261c1e119f3663277cc55e666050be29aee6c90ba7547899556189
+  # Cache-key fragment: actions/cache keys cannot carry the '/' and ':' of an image
+  # reference. Kept as the plain tag name on purpose -- the warm cache built from this same
+  # image stays usable -- so bumping the digest above means bumping this string too,
+  # otherwise the new image would silently reuse the old target dir.
   IMAGE_TAG: deepin-crimson-loong64
 
 jobs:
@@ -117,12 +124,14 @@ jobs:
         with:
           platforms: all
 
-      # The registry is small and saves the crate downloads; the target dir is ~2 GB
-      # and is what makes a failed run cheap to retry, since a rebuild of ~370
-      # emulated crates costs hours. Both are saved even when the job fails, so a
-      # compile error does not throw the work away.
-      - name: Cache cargo registry and target dir
-        uses: actions/cache@v4
+      # The registry is small and saves the crate downloads; the target dir is ~2 GB and is
+      # what makes a failed run cheap to retry, since a rebuild of ~370 emulated crates
+      # costs hours. Restore and save are split because actions/cache's own save runs in a
+      # post step that is skipped when the job fails -- exactly the run whose target dir is
+      # worth keeping -- so the save is a separate step that always runs.
+      - name: Restore cargo registry and target dir
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ${{ runner.temp }}/loongarch/cache
@@ -178,13 +187,23 @@ jobs:
           echo "::group::toolchain"
           # rustup ships loongarch64-unknown-linux-gnu host builds, so the guest gets
           # current stable instead of the distribution's older rustc.
-          if ! (curl -fsSL --retry 3 https://sh.rustup.rs -o /tmp/rustup.sh \
-            && sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable --no-modify-path); then
+          if curl -fsSL --retry 3 https://sh.rustup.rs -o /tmp/rustup.sh \
+            && sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable --no-modify-path; then
+            export PATH="$CARGO_HOME/bin:$PATH"
+          else
             note "rustup failed on loong64; falling back to the distribution toolchain."
+            # CARGO_HOME lives on the mounted cache, so an earlier run may have left
+            # rustup's proxies (cargo, rustc, rustup, ...) in $CARGO_HOME/bin. They are
+            # symlinks to the rustup binary and, with no toolchain installed, answer every
+            # invocation with "error: no default toolchain is configured" -- shadowing the
+            # distribution binaries even though those are fine. Remove them and keep
+            # $CARGO_HOME/bin off PATH in this branch (the success branch adds it).
+            rm -rf "$CARGO_HOME/bin"
+            unset RUSTUP_TOOLCHAIN
+            export PATH="${PATH//$CARGO_HOME\/bin:/}"
             apt-get install -y --no-install-recommends rustc cargo \
               || fail "neither rustup nor the distribution toolchain is available"
           fi
-          export PATH="$CARGO_HOME/bin:$PATH"
           cargo --version || fail "cargo is not runnable"
           rustc -vV || fail "rustc is not runnable"
           command -v cc >/dev/null || fail "no C compiler in PATH"
@@ -372,3 +391,19 @@ jobs:
             "$RUNNER_TEMP"/loongarch/out/*.tar.gz \
             "$RUNNER_TEMP"/loongarch/out/*.tar.gz.sha256 \
             --clobber
+
+      # Runs even when the build above failed, so a compile error still leaves the
+      # partially built target dir behind for the next attempt. The key carries the run id
+      # because it must be unique per save, so this entry is never a cache hit itself; the
+      # restore-keys prefix above is what picks it up on the next run. Best-effort: if the
+      # container never got far enough to create the directories there is nothing to save,
+      # and that must not turn into a second red step hiding the real error.
+      - name: Save cargo registry and target dir
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/loongarch/cache
+            ${{ runner.temp }}/loongarch/target
+          key: loongarch64-${{ env.IMAGE_TAG }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
