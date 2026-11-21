@@ -614,10 +614,16 @@ static void save_restore_token(struct uu_portal *p, void (*save_token)(const cha
     if (save_token) save_token(p->restore_token, save_data);
     if (save_detailed) save_detailed(p->restore_token, save_data, p->has_position, p->position_x, p->position_y);
 }
+/* Whether the last open_persist() on this thread submitted the restore token to the portal
+ * (SelectDevices). CreateSession can fail with code 5/3 before anything carried the token, and
+ * error codes alone cannot tell "spent" from "never sent"; the host reads this after a failed
+ * open to decide whether discarding the cached grant is justified. open_persist runs entirely
+ * on the calling thread, so a thread-local suffices. */
+static _Thread_local int g_restore_sent;
 static struct uu_portal *open_persist(const char *restore, void (*save_token)(const char *, void *),
     uu_portal_save_detailed_fn save_detailed, void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
     int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height, uint32_t source_types) {
-    *error = 0; *width = *height = 0;
+    *error = 0; *width = *height = 0; g_restore_sent = 0;
     struct uu_portal *p = calloc(1, sizeof(*p));
     if (!p) { *error = 8; return NULL; }
     p->cancelled = cancelled;
@@ -662,7 +668,10 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     guint version = remote_property(p, "version");
     if (version >= 2) {
         g_variant_builder_add(&options, "{sv}", "persist_mode", g_variant_new_uint32(2));
-        if (restore && *restore) g_variant_builder_add(&options, "{sv}", "restore_token", g_variant_new_string(restore));
+        if (restore && *restore) {
+            g_variant_builder_add(&options, "{sv}", "restore_token", g_variant_new_string(restore));
+            g_restore_sent = 1;
+        }
     }
 
     results = request(p, REMOTE, "SelectDevices", &options, 1, error);
@@ -778,6 +787,7 @@ struct uu_portal *uu_portal_open(int *error, uint32_t *width, uint32_t *height) 
     return uu_portal_open_restore(NULL, error, width, height);
 }
 const char *uu_portal_restore_token(struct uu_portal *p) { return p ? p->restore_token : NULL; }
+int uu_portal_restore_sent(void) { return g_restore_sent; }
 static gboolean quit_dbus_loop(gpointer data) { g_main_loop_quit(data); return G_SOURCE_REMOVE; }
 void uu_portal_close(struct uu_portal *p) {
     if (!p) return;
