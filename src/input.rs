@@ -603,9 +603,17 @@ impl InputInjector {
                 let (w,h) = *self.screen.lock().unwrap();
                 if w > 1 && h > 1 {
                     let (ax, ay) = self.privacy_absolute(x, y, (w, h)).unwrap_or_else(|| {
-                        let scale = |v: i32, extent: u32| (i64::from(v).clamp(0, i64::from(extent - 1))
-                            * i64::from(crate::uinput::ABS_MAX) / i64::from(extent - 1)) as i32;
-                        (scale(x, w), scale(y, h))
+                        // uinput ABS axes span the whole compositor desktop, while the viewer
+                        // sends the captured monitor's own pixel space. Shift by that monitor's
+                        // placement before normalizing, or multi-monitor setups land elsewhere.
+                        let (ox, oy, mw, mh, vw, vh) = crate::wayland::portal_desktop_bounds()
+                            .unwrap_or((0, 0, w, h, w, h));
+                        let scale = |v: i32, offset: i32, extent: u32, monitor: u32, total: u32| {
+                            let pos = i64::from(v) * i64::from(monitor) / i64::from(extent.max(1)) + i64::from(offset);
+                            (pos.clamp(0, i64::from(total.saturating_sub(1)))
+                                * i64::from(crate::uinput::ABS_MAX) / i64::from(total.saturating_sub(1).max(1))) as i32
+                        };
+                        (scale(x, ox, w, mw, vw), scale(y, oy, h, mh, vh))
                     });
                     return Self::uinput_result(uinput.move_absolute(ax, ay));
                 }
