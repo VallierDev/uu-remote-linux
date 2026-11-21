@@ -1,0 +1,403 @@
+#!/usr/bin/python3
+"""Open stock UU Remote sessions independently of the device-list window."""
+import ctypes
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def viewer_path(entry=None):
+    candidate = (entry or {}).get("viewer") or os.environ.get("UU_VIEWER_EXECUTABLE")
+    candidate = candidate or shutil.which("uuremote-viewer")
+    if not candidate or not Path(candidate).is_file() or not os.access(candidate, os.X_OK):
+        raise ValueError("Cannot locate uuremote-viewer")
+    return str(Path(candidate).resolve())
+
+
+def private_write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=".uu-entry-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            output.write(value)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def default_font():
+    try:
+        result = subprocess.run(
+            ["fc-match", "-f", "%{file}", "WenQuanYi Micro Hei,Noto Sans CJK SC,sans-serif:lang=zh-cn"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and Path(result.stdout).is_file():
+            return result.stdout
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def setup(device, name, platform):
+    if not device or "\0" in device or len(device) > 512:
+        raise ValueError("Invalid device identifier")
+    key = hashlib.sha256(device.encode()).hexdigest()[:16]
+    path, _, _ = paths(key)
+    if path.exists() or path.is_symlink():
+        entry, _, _ = read_entry(key)
+        if entry["device_id"] != device:
+            raise ValueError("Device entry collision")
+    else:
+        entry = {"device_id": device, "key": key, "UU_VIEWER_FONT": default_font()}
+    entry.update(name=" ".join(name.replace("\0", "").split()) or "Remote device",
+                 platform=int(platform), viewer=viewer_path(entry))
+    save_entry(key, entry)
+    return key, entry
+
+
+def save_entry(key, entry):
+    path, app_id, _ = paths(key)
+    private_write(path, json.dumps(entry, ensure_ascii=False, indent=2) + "\n")
+    desktop_dir = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "applications"
+    desktop_dir.mkdir(parents=True, exist_ok=True)
+
+    def escaped(value):
+        return value.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+
+    def argument(value):
+        return '"' + str(value).replace("\\", "\\\\\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$").replace("%", "%%") + '"'
+
+    helper = Path(__file__).resolve()
+    text = ("[Desktop Entry]\nType=Application\nName=" + escaped(entry["name"]) + " · UU 独立远控\n"
+            "Name[en]=" + escaped(entry["name"]) + " · UU Independent remote\n"
+            "Comment=独立远控窗口 / Independent remote window\n"
+            "Exec=/usr/bin/python3 " + argument(helper) + " " + key + "\n"
+            "Icon=computer\nTerminal=false\nCategories=Network;RemoteAccess;\n"
+            "Keywords=UU;remote;远控;独立;\nStartupNotify=true\nStartupWMClass=" + app_id + "\n")
+    target = desktop_dir / (app_id + ".desktop")
+    private_write(target, text)
+    target.chmod(0o644)
+
+
+def ui_text(chinese, english):
+    language = os.environ.get("UU_LANG", "").lower()
+    if language not in {"zh", "en"}:
+        try:
+            with (paths("0" * 16)[0].parent.parent / "language").open() as source:
+                language = source.read(16).strip()
+        except OSError:
+            language = ""
+    if language not in {"zh", "en"}:
+        language = os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG", "")
+    return chinese if language.startswith("zh") else english
+
+
+def configure(device, name, platform):
+    key, entry = setup(device, name, platform)
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import Gtk, Gdk
+    try:
+        mode = (paths(key)[0].parent.parent / "theme").read_text().strip()
+    except OSError:
+        mode = "system"
+    if mode in {"light", "dark"}:
+        settings = Gtk.Settings.get_default()
+        settings.set_property("gtk-theme-name", "Adwaita")
+        settings.set_property("gtk-application-prefer-dark-theme", mode == "dark")
+    css = Gtk.CssProvider()
+    css.load_from_data(b".uu-setting-card { background-color: @theme_base_color; border: 1px solid alpha(@theme_fg_color, 0.12); border-radius: 12px; padding: 16px; } .uu-setting-title { font-size: 15px; font-weight: 600; } .uu-setting-note { color: alpha(@theme_fg_color, 0.65); font-size: 12px; } .uu-settings-heading { font-size: 21px; font-weight: 700; } .uu-setting-error { color: #c01c28; }")
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    dialog = Gtk.Dialog(title=entry["name"] + " · " + ui_text("独立会话设置", "Session settings"), use_header_bar=True)
+    dialog.set_default_size(580, 520)
+    dialog.add_button(ui_text("取消", "Cancel"), Gtk.ResponseType.CANCEL)
+    save = dialog.add_button(ui_text("保存设置", "Save settings"), Gtk.ResponseType.OK)
+    save.get_style_context().add_class("suggested-action")
+    box = dialog.get_content_area()
+    box.set_border_width(24)
+    box.set_spacing(16)
+
+    def label(text, style):
+        widget = Gtk.Label(label=text, xalign=0)
+        widget.set_line_wrap(True)
+        widget.set_max_width_chars(60)
+        widget.get_style_context().add_class(style)
+        return widget
+
+    box.pack_start(label(ui_text("让远控更顺手", "Make the session yours"), "uu-settings-heading"), False, False, 0)
+    box.pack_start(label(ui_text("只为这台设备保存偏好。关闭主窗口后，独立会话仍会保持连接。", "Preferences apply to this device. Its independent session stays connected after closing the launcher."), "uu-setting-note"), False, False, 0)
+    card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+    card.get_style_context().add_class("uu-setting-card")
+    box.pack_start(card, False, False, 0)
+
+    def switch_row(title, description, active, sensitive=True):
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        text.pack_start(label(title, "uu-setting-title"), False, False, 0)
+        text.pack_start(label(description, "uu-setting-note"), False, False, 0)
+        row.pack_start(text, True, True, 0)
+        control = Gtk.Switch()
+        control.set_active(active)
+        control.set_sensitive(sensitive)
+        control.set_valign(Gtk.Align.CENTER)
+        row.pack_end(control, False, False, 0)
+        card.pack_start(row, False, False, 0)
+        return control
+
+    controls = {}
+    for field, title, description in [
+        ("force_join", ui_text("接管已连接的设备", "Take over an occupied device"), ui_text("连接时允许接管另一台电脑或手机正在远控的设备。", "Allow connecting when another computer or phone is controlling this device.")),
+    ]:
+        controls[field] = switch_row(title, description, bool(entry.get(field, False)))
+    size = switch_row(ui_text("画面兼容模式", "Video compatibility"), ui_text("固定 1920×1080 画布，用于部分加载或显示异常。", "Use a fixed 1920×1080 canvas for loading/display issues."), entry.get("UU_VIEWER_SIZE") == "1920x1080")
+    fonts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    fonts.get_style_context().add_class("uu-setting-card")
+    fonts.pack_start(label(ui_text("中文显示字体", "CJK display font"), "uu-setting-title"), False, False, 0)
+    font_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    font = Gtk.Entry()
+    font.set_text(entry.get("UU_VIEWER_FONT", ""))
+    font.set_placeholder_text(ui_text("留空使用默认字体", "Leave empty for the default font"))
+    font_row.pack_start(font, True, True, 0)
+    browse = Gtk.Button.new_from_icon_name("document-open-symbolic", Gtk.IconSize.BUTTON)
+    browse.set_tooltip_text(ui_text("选择字体文件", "Choose a font file"))
+
+    def choose_font(_button):
+        chooser = Gtk.FileChooserDialog(title=ui_text("选择字体文件", "Choose a font file"), transient_for=dialog, action=Gtk.FileChooserAction.OPEN)
+        chooser.add_buttons(ui_text("取消", "Cancel"), Gtk.ResponseType.CANCEL, ui_text("选择", "Select"), Gtk.ResponseType.OK)
+        file_filter = Gtk.FileFilter()
+        file_filter.set_name(ui_text("字体文件", "Font files"))
+        for pattern in ["*.ttf", "*.ttc", "*.otf"]:
+            file_filter.add_pattern(pattern)
+        chooser.add_filter(file_filter)
+        if chooser.run() == Gtk.ResponseType.OK:
+            font.set_text(chooser.get_filename())
+        chooser.destroy()
+
+    browse.connect("clicked", choose_font)
+    font_row.pack_end(browse, False, False, 0)
+    fonts.pack_start(font_row, False, False, 0)
+    box.pack_start(fonts, False, False, 0)
+    box.pack_start(label(ui_text("重新连接后应用新设置。", "Reconnect to apply changes."), "uu-setting-note"), False, False, 0)
+    error = label("", "uu-setting-error")
+    box.pack_start(error, False, False, 0)
+    dialog.show_all()
+    while dialog.run() == Gtk.ResponseType.OK:
+        value = font.get_text().strip()
+        if value and not Path(value).is_file():
+            error.set_text(ui_text("请选择存在的字体文件，或留空使用默认值。", "Choose an existing font file, or leave the field empty."))
+            continue
+        for field, check in controls.items():
+            entry[field] = check.get_active()
+        entry["UU_VIEWER_SIZE"] = "1920x1080" if size.get_active() else ""
+        entry["UU_VIEWER_FONT"] = value
+        save_entry(key, entry)
+        break
+    dialog.destroy()
+    return 0
+
+
+def paths(key):
+    if not re.fullmatch(r"[a-f0-9]{16}", key):
+        raise ValueError("Invalid device entry")
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return (
+        config_home / "uuremote" / "independent" / (key + ".json"),
+        "uu-remote-linux-session-" + key,
+        "uuremote-independent-" + key + ".service",
+    )
+
+
+def read_entry(key):
+    path, app_id, unit = paths(key)
+    stat = path.lstat()
+    if path.is_symlink() or stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+        raise ValueError("Device entry must be a private file owned by this user")
+    entry = json.loads(path.read_text())
+    device = entry.get("device_id")
+    if not isinstance(device, str) or not device or "\0" in device or len(device) > 512:
+        raise ValueError("Invalid device identifier")
+    return entry, app_id, unit
+
+
+def active(unit):
+    result = subprocess.run(
+        ["systemctl", "--user", "show", unit, "--property=ActiveState", "--value"],
+        capture_output=True, text=True, timeout=5,
+    )
+    return result.returncode == 0 and result.stdout.strip() in {"active", "activating", "reloading"}
+
+
+def focus_x11(app_id, unit):
+    """Restore this service's existing window through the window manager."""
+    if not os.environ.get("DISPLAY"):
+        return False
+    result = subprocess.run(
+        ["systemctl", "--user", "show", unit, "--property=MainPID", "--value"],
+        capture_output=True, text=True, timeout=5,
+    )
+    pid = result.stdout.strip()
+    if not pid.isdigit() or pid == "0":
+        return False
+    clients = subprocess.run(
+        ["xprop", "-root", "_NET_CLIENT_LIST"],
+        capture_output=True, text=True, timeout=5,
+    )
+    window = None
+    for xid in re.findall(r"0x[0-9a-fA-F]+", clients.stdout):
+        properties = subprocess.run(
+            ["xprop", "-id", xid, "WM_CLASS", "_NET_WM_PID"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        if ('"' + app_id + '"') in properties and re.search(
+            r"_NET_WM_PID\(CARDINAL\) = " + pid + r"\b", properties
+        ):
+            window = int(xid, 16)
+            break
+    if window is None:
+        return False
+
+    class MessageData(ctypes.Union):
+        _fields_ = [("bytes", ctypes.c_char * 20), ("shorts", ctypes.c_short * 10),
+                    ("longs", ctypes.c_long * 5)]
+
+    class ClientMessage(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                    ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                    ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                    ("format", ctypes.c_int), ("data", MessageData)]
+
+    class Event(ctypes.Union):
+        _fields_ = [("client", ClientMessage), ("pad", ctypes.c_long * 24)]
+
+    x11 = ctypes.CDLL("libX11.so.6")
+    signatures = {
+        "XOpenDisplay": ([ctypes.c_char_p], ctypes.c_void_p),
+        "XDefaultRootWindow": ([ctypes.c_void_p], ctypes.c_ulong),
+        "XInternAtom": ([ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int], ctypes.c_ulong),
+        "XMapRaised": ([ctypes.c_void_p, ctypes.c_ulong], ctypes.c_int),
+        "XSendEvent": ([ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                        ctypes.c_long, ctypes.POINTER(Event)], ctypes.c_int),
+        "XSync": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_int),
+        "XSetErrorHandler": ([ctypes.c_void_p], ctypes.c_void_p),
+        "XCloseDisplay": ([ctypes.c_void_p], ctypes.c_int),
+    }
+    for name, (arguments, result_type) in signatures.items():
+        function = getattr(x11, name)
+        function.argtypes, function.restype = arguments, result_type
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return False
+    errors = []
+
+    @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    def on_error(_display, _event):
+        errors.append(True)
+        return 0
+
+    previous_handler = x11.XSetErrorHandler(ctypes.cast(on_error, ctypes.c_void_p))
+    try:
+        event = Event()
+        event.client.type = 33  # ClientMessage
+        event.client.send_event = 1
+        event.client.display = display
+        event.client.window = window
+        event.client.message_type = x11.XInternAtom(display, b"_NET_ACTIVE_WINDOW", 0)
+        event.client.format = 32
+        event.client.data.longs[0] = 2  # Desktop launcher/pager request.
+        x11.XMapRaised(display, window)
+        sent = x11.XSendEvent(display, x11.XDefaultRootWindow(display), 0,
+                             (1 << 20) | (1 << 19), ctypes.byref(event))
+        x11.XSync(display, 0)
+        return bool(sent) and not errors
+    finally:
+        x11.XCloseDisplay(display)
+        x11.XSetErrorHandler(previous_handler)
+
+
+def focus(app_id, unit):
+    try:
+        if focus_x11(app_id, unit):
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    result = subprocess.run(
+        ["gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+         "--object-path", "/org/gnome/Shell", "--method", "org.gnome.Shell.FocusApp",
+         app_id + ".desktop"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+    )
+    return result.returncode == 0
+
+
+def launch(key):
+    _, app_id, unit = read_entry(key)
+    if active(unit):
+        focus(app_id, unit)
+        return 0
+    command = ["systemd-run", "--user", "--collect", "--quiet", "--unit=" + unit]
+    for variable in ("XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "UU_CONFIG", "UU_LANG"):
+        if os.environ.get(variable):
+            command.append("--setenv=" + variable + "=" + os.environ[variable])
+    command += ["/usr/bin/python3", str(Path(__file__).resolve()), "--run", key]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+    if result.returncode and active(unit):
+        focus(app_id, unit)
+        return 0
+    if result.returncode:
+        print("无法打开独立远控窗口 / Could not open the independent remote window", file=sys.stderr)
+    return result.returncode
+
+
+def run(key):
+    entry, app_id, _ = read_entry(key)
+    environment = os.environ.copy()
+    environment["SDL_VIDEO_WAYLAND_WMCLASS"] = app_id
+    environment["SDL_VIDEO_X11_WMCLASS"] = app_id
+    environment["UU_VIEWER_DEVICE_NAME"] = entry.get("name") or "Remote device"
+    for variable in ("UU_VIEWER_FONT", "UU_VIEWER_SIZE"):
+        if variable in entry:
+            if entry[variable]:
+                environment[variable] = entry[variable]
+            else:
+                environment.pop(variable, None)
+    environment.pop("UU_VIEWER_COMMANDS", None)
+    environment.pop("UU_VIEWER_DUMP_FRAME", None)
+    environment.pop("UU_VIEWER_DUMP_FRAME_INDEX", None)
+    os.umask(0o077)
+    executable = viewer_path(entry)
+    force = "true" if entry.get("force_join", False) is True else "false"
+    arguments = [executable, "connect", entry["device_id"], force, "-", "echo", "legacy"]
+    os.execve(executable, arguments, environment)
+
+
+def main():
+    if sys.argv[1:] == ["--stop-all"]:
+        return subprocess.run(["systemctl", "--user", "stop", "uuremote-independent-*.service"], timeout=15).returncode
+    if len(sys.argv) == 5 and sys.argv[1] in {"open", "configure"}:
+        if sys.argv[1] == "configure":
+            return configure(*sys.argv[2:])
+        key, _ = setup(*sys.argv[2:])
+        return launch(key)
+    if len(sys.argv) == 2:
+        return launch(sys.argv[1])
+    if len(sys.argv) == 3 and sys.argv[1] == "--run":
+        run(sys.argv[2])
+    if len(sys.argv) == 3 and sys.argv[1] == "--stop":
+        _, _, unit = paths(sys.argv[2])
+        return subprocess.run(["systemctl", "--user", "stop", unit]).returncode
+    raise ValueError("Expected a device entry")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, subprocess.SubprocessError):
+        print("无法打开独立远控入口，请检查 UU 登录状态。 / Could not open the independent entry; check UU sign-in.", file=sys.stderr)
+        sys.exit(1)
