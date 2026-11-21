@@ -204,6 +204,27 @@ mod native {
         pub fn is_alive(&self) -> bool {
             self.handle.lock().is_ok_and(|handle| unsafe { uu_portal_alive(handle.0.as_ptr()) != 0 })
         }
+        /// True only while frames actually flow. `uu_portal_alive` stays true after the PipeWire
+        /// stream has been interrupted past its deadline, and a failed reopen is held back for a
+        /// few seconds by `recovery`; both mean no picture, so a caller that keeps the host awake
+        /// or schedules a reopen must not read them as healthy.
+        pub fn capture_healthy(&self) -> bool {
+            let alive = self.handle.lock().is_ok_and(|handle| unsafe {
+                uu_portal_alive(handle.0.as_ptr()) != 0 && uu_portal_capture_alive(handle.0.as_ptr()) != 0
+            });
+            alive && !self.recovery_failed()
+        }
+        fn recovery_failed(&self) -> bool {
+            // Called from async health checks: a blocking lock here would stall the whole
+            // supervisor for as long as an in-progress consent dialog can wait (upgrade_touch
+            // holds this mutex across its open). A held lock means an open or recovery is
+            // running, not that recovery failed - the stream aliveness read beside it stays
+            // the judge of health until that operation reports its outcome.
+            match self.recovery.try_lock() {
+                Ok(recovery) => recovery.failed_until.is_some_and(|until| std::time::Instant::now() < until),
+                Err(TryLockError::WouldBlock | TryLockError::Poisoned(_)) => false,
+            }
+        }
         /// Opens a session for `monitor` (a Mutter connector) with that monitor's saved consent;
         /// None means the screen currently selected, or the only monitor.
         /// `fresh` asks the host again instead of restoring the saved consent (which stays saved).
@@ -526,11 +547,19 @@ mod native {
             use std::sync::atomic::Ordering;
             if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
             // Serialize with the encoder's stream-loss recovery: two openers would ask for consent twice.
+            // The wait is bounded: another opener (encoder reopen, consent rebuild) can hold this lock
+            // for as long as a consent dialog waits, and an unbounded spin here would leave the desktop
+            // supervisor's attempt silently running with no log and no frames until the viewer times out.
+            let lock_wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             let mut recovery = loop {
                 match self.recovery.try_lock() {
                     Ok(recovery) => break recovery,
                     Err(TryLockError::WouldBlock) => {
                         if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
+                        if std::time::Instant::now() >= lock_wait_deadline {
+                            log::warn!("Portal recovery lock held by another opener for 15s; retrying later");
+                            return Err(super::PortalError { code: 3 });
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(20));
                     }
                     Err(TryLockError::Poisoned(_)) => return Err(super::PortalError { code: 3 }),
@@ -836,6 +865,30 @@ mod native {
             assert!(original.session().check_geometry(height_changed.session()).is_err());
         }
 
+        /// upgrade_touch() holds the recovery mutex for as long as its consent dialog can wait
+        /// (up to the consent timeout), and the desktop supervisor reads `capture_healthy()` from
+        /// an async task. The health check must read around the held lock instead of stalling the
+        /// whole supervisor; a held lock is an open in progress, not a failed recovery.
+        #[test]
+        fn health_check_reads_around_a_recovery_lock_held_by_an_open_in_progress() {
+            let fixture = Fixture::new((1920, 1080));
+            let session = fixture.session();
+            let held = session.recovery.lock().unwrap();
+            assert!(!session.recovery_failed(), "an in-progress open is not a failed recovery");
+            drop(held);
+            assert!(!session.recovery_failed());
+        }
+
+        #[test]
+        fn health_check_still_reports_a_recorded_recovery_backoff() {
+            let fixture = Fixture::new((1920, 1080));
+            let session = fixture.session();
+            session.recovery.lock().unwrap().failed(std::time::Instant::now(), 3);
+            assert!(session.recovery_failed());
+            session.recovery.lock().unwrap().succeeded();
+            assert!(!session.recovery_failed());
+        }
+
         struct TestHandle {
             generation: u8,
             key_held: bool,
@@ -1115,6 +1168,7 @@ impl PortalSession {
     pub fn clipboard_set(&self, _: &str) -> Result<(), String> { Err(error(15)) }
     pub fn clipboard_poll(&self) -> Option<String> { None }
     pub fn is_alive(&self) -> bool { false }
+    pub fn capture_healthy(&self) -> bool { false }
     pub fn open() -> Result<Self, String> { Err("Portal backend requires Linux and --features portal".into()) }
     pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, PortalError> {
         if cancelled.load(std::sync::atomic::Ordering::Acquire) { Err(PortalError { code: 13 }) }

@@ -96,10 +96,19 @@ impl CommandBackend {
 }
 #[derive(Default)]
 // target_mac: Some(true) official Mac host, Some(false) Windows-type host (official or this project), None unknown.
-struct SyncState {last:Option<String>,assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
+// assembly reassembles the field-17 ClipboardChange stream, rpc_assembly the field-21 case-10 one;
+// a host may interleave the two, and one shared buffer would splice fragments across them.
+// fresh: the case-10/17 text actually applied, only for dropping the immediate rich replay;
+// pending_plain is its text while the write is still pending (apply arms fresh on success).
+struct SyncState {last:Option<String>,fresh:Option<String>,pending_plain:Option<String>,assembly:text::Assembly,rpc_assembly:text::Assembly,rich:rich::State,seq:u64,target_mac:Option<bool>}
 impl SyncState {
     async fn apply(&mut self,backend:&Backend,value:String)->Result<(),()>{
-        if backend.write(&value).await? {
+        let written=backend.write(&value).await;
+        // The replay marker arms only on a real write: a focus-skipped or failed write must
+        // leave the rich replay of this copy alive so it can still land once possible.
+        self.fresh=if written.is_ok_and(|ok|ok){self.pending_plain.take()}else{None};
+        self.pending_plain=None;
+        if written? {
             log::info!("Viewer remote clipboard applied: bytes={}",value.len());
             self.last=Some(value);
         }
@@ -123,18 +132,18 @@ impl SyncState {
     fn receive(&mut self,data:&[u8])->Result<(Vec<Vec<u8>>,Option<String>),&'static str>{
         if data.len()>MAX_TEXT*2+1024{return Err("clipboard message exceeds limit")}
         let fields=decode_wire(data).map_err(|_|"invalid clipboard envelope")?;
-        let mut replies=Vec::new();let mut value=None;
+        let mut replies=Vec::new();let mut value=None;let mut plain=false;
         for field in fields {
             let WireValue::Bytes(payload)=field.value else{continue};
             match field.number {
-                17=>if let Some(text)=self.assembly.accept(payload)?{value=Some(text)},
+                17=>if let Some(text)=self.assembly.accept(payload)?{plain=true;value=Some(text)},
                 21=>{
                     let seq=&mut self.seq;
                     let result=self.rich.request(payload,&mut ||{*seq=seq.wrapping_add(1).max(100);*seq})?;
-                    if result.text.is_some(){value=result.text;}
+                    if result.text.is_some(){plain=false;value=result.text;}
                     for (kind,body) in result.messages {replies.push(wire::envelope(self.next(),kind,&body));}
-                    if let Some((header,text))=text::read_text_request(payload)?{
-                        value=Some(text);replies.push(wire::envelope(self.next(),22,&text::text_response(&header)));
+                    if let Some((header,text))=text::read_text_request(&mut self.rpc_assembly,payload)?{
+                        plain=true;value=Some(text);replies.push(wire::envelope(self.next(),22,&text::text_response(&header)));
                     }
                 },
                 22=>{
@@ -143,13 +152,24 @@ impl SyncState {
                         let err=decode_wire(&status).ok().and_then(|f|f.into_iter().find_map(|x|match (x.number,x.value){(1,WireValue::Varint(v))=>Some(v),_=>None})).unwrap_or(0);
                         log::info!("Viewer clipboard text change acknowledged: err={err}");
                     }
-                    if let Some(text)=self.rich.response(payload)?{value=Some(text)}
+                    if let Some(text)=self.rich.response(payload)?{plain=false;value=Some(text)}
                 },
                 _=>{},
             }
         }
         if value.as_ref().is_some_and(|text|text.contains('\0')){return Err("clipboard text contains NUL")}
+        let value=value.and_then(|text|self.accept_transfer(text,plain));
         Ok((replies,value))
+    }
+    /// One copy can reach us twice, as case-10 text and again inside the rich answer. Only
+    /// that immediate replay is dropped: text we applied once may lawfully arrive again after
+    /// a local non-text copy replaced the selection, and must then be written, so `last`
+    /// (which also feeds the send path) must not veto receive-side text.
+    fn accept_transfer(&mut self,text:String,plain:bool)->Option<String>{
+        let replay=!plain&&self.fresh.as_deref()==Some(text.as_str());
+        if replay{self.fresh=None;}
+        self.pending_plain=plain.then_some(text.clone());
+        (!replay).then_some(text)
     }
 }
 async fn send(channel:&RTCDataChannel,message:Vec<u8>)->Result<(),()>{
@@ -270,15 +290,22 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         assert!(matches!(sdl_backend(false,true,tx,find),Some(Backend::Sdl(_))));
     }
     #[cfg(feature="viewer-sdl")]
-    #[tokio::test] async fn unfocused_write_does_not_mark_remote_text_as_applied(){
+    #[tokio::test] async fn unfocused_write_does_not_swallow_the_following_rich_replay(){
         let(tx,mut rx)=mpsc::channel(8);let backend=Backend::Sdl(tx);
         let ui=tokio::spawn(async move{
             let Some(ClipboardRequest::Write(_,reply))=rx.recv().await else{panic!()};
             reply.send(Ok(false)).unwrap();
         });
         let mut state=SyncState::default();state.last=Some("local".into());
+        let (_,received)=state.receive(&wire::envelope(1,21,&text::text_request(200,"remote"))).unwrap();
+        assert_eq!(received.as_deref(),Some("remote"));
         state.apply(&backend,"remote".into()).await.unwrap();
-        assert_eq!(state.last.as_deref(),Some("local"));ui.await.unwrap();
+        assert_eq!(state.last.as_deref(),Some("local"));
+        // The skipped write must not arm the replay marker: the rich answer for the same
+        // copy still gets its chance to apply once the window has focus again.
+        assert!(state.fresh.is_none()&&state.pending_plain.is_none());
+        assert_eq!(state.accept_transfer("remote".into(),false),Some("remote".into()));
+        ui.await.unwrap();
     }
     #[test] fn limits_match_host_and_unchanged_or_remote_text_is_not_reoffered(){
         assert!(include_str!("../clipboard.rs").contains("pub const MAX_TEXT: usize = 30 * 1024;"));
@@ -365,7 +392,37 @@ impl Drop for Bridge{fn drop(&mut self){self.stop();}}
         let mut viewer=SyncState::default();
         let messages=viewer.local("windows 中文".into()).unwrap().unwrap();assert_eq!(messages.len(),2);
         let rpc=decode_wire(&messages[1]).unwrap().into_iter().find_map(|f|match (f.number,f.value){(21,WireValue::Bytes(b))=>Some(b.to_vec()),_=>None}).unwrap();
-        let (_,text)=crate::clipboard_protocol::read_text_request(&rpc).unwrap().unwrap();assert_eq!(text,"windows 中文");
+        let mut assembly=crate::clipboard_protocol::Assembly::default();
+        let (_,text)=crate::clipboard_protocol::read_text_request(&mut assembly,&rpc).unwrap().unwrap();assert_eq!(text,"windows 中文");
+    }
+    #[test] fn case10_chunks_reassemble_and_a_repeat_of_the_applied_text_is_dropped(){
+        let mut state=SyncState::default();let value="中文🙂".repeat(3000);
+        let parts=text::chunks(&value).unwrap();assert!(parts.len()>1);
+        for (i,part) in parts.iter().enumerate(){
+            let (replies,received)=state.receive(&wire::envelope(1,21,&text::text_chunk_request(200+i as u64,part,i+1<parts.len()))).unwrap();
+            if i+1==parts.len(){assert_eq!(received.as_deref(),Some(value.as_str()));assert_eq!(replies.len(),1,"only the final chunk acknowledges");}
+            else{assert!(received.is_none(),"chunk {} was applied as a whole copy",i);assert!(replies.is_empty());}
+        }
+        state.last=Some(value.clone());
+        let(replies,repeated)=state.receive(&wire::envelope(2,21,&text::text_request(210,&value))).unwrap();
+        assert_eq!(repeated.as_deref(),Some(value.as_str()),"a fresh case-10 notification is authoritative even if the text repeats");
+        assert_eq!(replies.len(),1,"the host still gets its acknowledgement");
+        // The same copy answered again through the rich path is the only replay dropped.
+        assert_eq!(state.accept_transfer("x".into(),true),Some("x".into()));
+        state.fresh=state.pending_plain.take(); // what apply does once the write really lands
+        assert_eq!(state.accept_transfer("x".into(),false),None,"rich replay of the just-applied text is dropped");
+        assert_eq!(state.accept_transfer("x".into(),false),Some("x".into()),"only the immediate replay is dropped");
+    }
+    #[test] fn re_offered_text_is_written_after_the_local_clipboard_turned_non_text(){
+        let mut state=SyncState::default();
+        let (_,first)=state.receive(&wire::envelope(1,21,&text::text_request(200,"同一文本"))).unwrap();
+        assert_eq!(first.as_deref(),Some("同一文本"));
+        // The copy was applied, then a local image (no text MIME) replaced the selection: the
+        // poll cannot observe it and last/fresh keep the old text. A host copy of the same text
+        // arrives as a fresh case-10 notification and must be written again.
+        state.last=Some("同一文本".into());state.fresh=None;
+        let (_,again)=state.receive(&wire::envelope(2,21,&text::text_request(210,"同一文本"))).unwrap();
+        assert_eq!(again.as_deref(),Some("同一文本"));
     }
     #[test] fn control_clipboard_reproduces_native_host_failures(){
         assert_eq!(native_host_exchange(0,false),(None,false)); // Complete transfer, no CONTROL desktop sink.

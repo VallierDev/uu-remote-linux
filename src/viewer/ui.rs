@@ -101,7 +101,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
     let mut just_logged_in = false;
     unsafe { uu_viewer_ui_set_host(super::host::active().into()) }
     let refresh = |creds: &crate::auth::Credentials| {
-        let api = super::api::Api::new(crate::auth::UUAuthClient::new(creds.clone()), crate::auth::BASE_URL);
+        let api = super::api::Api::new(crate::auth::UUAuthClient::new(creds.clone()), creds.api_base());
         async move { api.device_list().await }
     };
     loop {
@@ -229,7 +229,7 @@ pub async fn run(credentials: impl Fn() -> Result<crate::auth::Credentials, Stri
                 ["connect", id, "unbind"] => {
                     if let Some(s)=sessions.remove(*id){s.stop().await;}
                     let result=match credentials(){
-                        Ok(creds)=>super::api::Api::new(crate::auth::UUAuthClient::new(creds),crate::auth::BASE_URL).unbind(id,false).await.map_err(|e|e.to_string()),
+                        Ok(creds)=>super::api::Api::new(crate::auth::UUAuthClient::new(creds.clone()),creds.api_base()).unbind(id,false).await.map_err(|e|e.to_string()),
                         Err(e)=>Err(e),
                     };
                     match result {Ok(())=>toast(crate::i18n::s("设备已从账号删除","Device removed from the account")),Err(e)=>toast(&crate::tr!("删除设备失败：{e}","Removing the device failed: {e}"))}

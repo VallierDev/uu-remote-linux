@@ -1,4 +1,4 @@
-# Installed by the uu-remote-linux .deb as a systemd *user* unit; enable it per user:
+# systemd *user* unit for uu-remote-linux; enable it per user:
 #   systemctl --user enable --now uuremote-native.service
 # GNOME and KDE import DISPLAY / WAYLAND_DISPLAY into the user manager when the graphical session
 # starts. Desktops that do not (e.g. Xfce) can add a drop-in with Environment=DISPLAY=:0.
@@ -9,7 +9,7 @@ PartOf=graphical-session.target
 
 [Service]
 Environment=RUST_LOG=info
-ExecStart=/usr/bin/uuremote-server
+ExecStart=@EXEC_START@
 Restart=always
 RestartSec=5
 

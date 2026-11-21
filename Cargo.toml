@@ -1,6 +1,6 @@
 [package]
 name = "uu-remote-linux"
-version = "0.2.60"
+version = "0.2.64"
 edition = "2021"
 default-run = "uuremote-server"
 authors = ["uu-remote-linux contributors"]
@@ -80,6 +80,12 @@ webrtc-dtls = { path = "vendor/webrtc-dtls" }
 webrtc = { path = "vendor/webrtc" }
 # TURN over TCP/TLS through an HTTP CONNECT proxy (vendor/webrtc-ice/PATCHES.md).
 webrtc-ice = { path = "vendor/webrtc-ice" }
+# ring 0.17 for loongarch64 (vendor/rcgen/PATCHES.md); ring 0.16 has no P-256 code outside
+# x86/arm assembly, so rcgen 0.11 could not be built on that target.
+rcgen = { path = "vendor/rcgen" }
+# loongarch64 ioctl constants (vendor/nix/PATCHES.md); the ioctl table in 0.26.4 has no
+# fallback for unknown architectures and fails to compile there.
+nix = { path = "vendor/nix" }
 
 [[bench]]
 name = "nvenc_pipeline_bench"

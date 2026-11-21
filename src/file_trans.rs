@@ -6,11 +6,11 @@
 //! Logs carry counts and sizes only, never file names, paths or contents.
 
 use crate::protocol::{decode_wire, WireField, WireValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, oneshot};
 
 // FileTransferError
@@ -31,8 +31,16 @@ const FOS_DUPLICATE: u64 = 2;
 const FOS_SKIP: u64 = 3;
 const FOS_RESUME: u64 = 4;
 
+/// Proven values: an 18 MB download moved 505 KB/s with every block acknowledged. 128 KiB x 64
+/// (8 MiB in flight) lost block acknowledgements instead of going faster, which truncated files,
+/// so these stay the default and both are overridable to probe the ceiling without a rebuild.
 const DOWNLOAD_BLOCK: usize = 32 * 1024;
 const DOWNLOAD_WINDOW: usize = 16;
+
+/// One environment override, ignored unless it is a positive number.
+fn env_size(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).filter(|v| *v > 0).unwrap_or(default)
+}
 
 // ---------- protobuf helpers ----------
 fn varint(mut v: u64, out: &mut Vec<u8>) {
@@ -121,6 +129,22 @@ fn list_data(files: &[FileInfo]) -> Vec<u8> {
     let mut list = Enc::default();
     for f in files { list = list.msg(1, f.enc()); }
     zlib(&list.0)
+}
+
+/// Field numbers of a decoded message, schema only — never values, names or paths.
+fn numbers(fields: &[WireField]) -> String {
+    fields.iter().map(|f| f.number.to_string()).collect::<Vec<_>>().join(" ")
+}
+
+/// Record a message shape once per distinct shape, capped. The 4.44.1 viewer drives file
+/// transfers with messages this host has no handler for (#208), so the shapes are the
+/// evidence for what it expects; the payloads are not ours to keep.
+pub fn note_shape(what: &str, fields: &[WireField]) {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let shape = format!("{what} [{}]", numbers(fields));
+    let seen = SEEN.get_or_init(Default::default);
+    let mut seen = seen.lock().unwrap();
+    if seen.len() < 64 && seen.insert(shape.clone()) { log::info!("File transfer shape: {shape}"); }
 }
 
 fn zlib(data: &[u8]) -> Vec<u8> {
@@ -265,6 +289,7 @@ fn unique_path(p: &Path) -> PathBuf {
 
 struct UploadTask { target: PathBuf, folder: String, strategy: u64, files: Vec<FileInfo>, open: HashMap<u64, (std::fs::File, PathBuf, u64)> }
 
+
 /// Per-connection file-transfer state. Outgoing messages are fully framed `Message`s.
 pub struct FileSession {
     out: mpsc::UnboundedSender<Vec<u8>>,
@@ -274,10 +299,18 @@ pub struct FileSession {
     /// (response case, task, file index, block id) because the viewer's RpcResponse header
     /// does not echo the host's request_id (observed 0).
     pending: Mutex<HashMap<(u32, u64, u64, u64), oneshot::Sender<Vec<u8>>>>,
+    /// Our 1-based index of the file currently being sent, the third slot of a pending key. The
+    /// viewer answers with its own 0-based index, which cannot be matched against ours, so the
+    /// host records which file its blocks belong to. Zero between downloads.
+    current_file: AtomicU64,
     uploads: Mutex<HashMap<u64, UploadTask>>,
     /// Downloads run one at a time, in request order (the viewer may ask for several at once).
     downloading: Arc<tokio::sync::Mutex<()>>,
     first_upload_block: Mutex<Option<u64>>,
+    /// Download block size and how many blocks may be in flight, from the environment once per
+    /// session so a test can drive a whole transfer with tiny blocks.
+    block_size: usize,
+    block_window: usize,
 }
 
 fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() }
@@ -285,7 +318,9 @@ fn now() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EP
 impl FileSession {
     pub fn new(out: mpsc::UnboundedSender<Vec<u8>>, seq: Arc<AtomicU64>) -> Arc<Self> {
         Arc::new(Self { out, seq, next_request: AtomicU64::new(1 << 32), pending: Mutex::new(HashMap::new()),
-            uploads: Mutex::new(HashMap::new()), downloading: Arc::new(Default::default()), first_upload_block: Mutex::new(None) })
+            current_file: AtomicU64::new(0),
+            uploads: Mutex::new(HashMap::new()), downloading: Arc::new(Default::default()), first_upload_block: Mutex::new(None),
+            block_size: env_size("UU_FT_BLOCK", DOWNLOAD_BLOCK), block_window: env_size("UU_FT_WINDOW", DOWNLOAD_WINDOW) })
     }
 
     fn send(&self, which: u32, body: Enc) {
@@ -297,28 +332,70 @@ impl FileSession {
         let header = Enc::default().uint(1, request_id);
         self.send(22, Enc::default().msg(1, header).msg(4, Enc::default().msg(case, body)));
     }
-    /// Host-initiated RpcRequest{1 header, 8 ftp{case}}; resolves with the response's ftp payload.
-    async fn request(&self, case: u32, body: Enc, key: (u32, u64, u64, u64)) -> Option<Vec<u8>> {
+    /// Puts one request on the channel and hands back the slot its reply arrives in. Putting it on
+    /// the channel and waiting for it are separate steps because a download must decide the order
+    /// its blocks go out: on an ordered channel the wire order is the order of these calls, and a
+    /// reply awaited straight away lets whichever task got polled first jump the queue.
+    fn dispatch(&self, case: u32, body: Enc, key: (u32, u64, u64, u64)) -> oneshot::Receiver<Vec<u8>> {
         let id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(key, tx);
         let header = Enc::default().uint(1, id);
         self.send(21, Enc::default().msg(1, header).msg(8, Enc::default().msg(case, body)));
-        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        rx
+    }
+
+    /// Waits for the reply to a dispatched request, dropping its slot if it never arrives.
+    async fn await_reply(&self, key: (u32, u64, u64, u64), reply: oneshot::Receiver<Vec<u8>>) -> Option<Vec<u8>> {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), reply).await {
             Ok(Ok(v)) => Some(v),
             _ => { self.pending.lock().unwrap().remove(&key); None }
         }
     }
 
+    /// The viewer's verdict on one dispatched block.
+    async fn reap(&self, key: (u32, u64, u64, u64), reply: oneshot::Receiver<Vec<u8>>) -> Result<(), u64> {
+        match self.await_reply(key, reply).await {
+            Some(reply) => { let [err] = case_uints(&reply, 4, [3]); if err == 0 || err == FT_SUCCEEDED { Ok(()) } else { Err(err) } }
+            None => Err(FT_IO),
+        }
+    }
+
+    /// Host-initiated RpcRequest{1 header, 8 ftp{case}}; resolves with the response's ftp payload.
+    async fn request(&self, case: u32, body: Enc, key: (u32, u64, u64, u64)) -> Option<Vec<u8>> {
+        let reply = self.dispatch(case, body, key);
+        self.await_reply(key, reply).await
+    }
+
+    /// Sends a request the viewer does not answer. Used for the file result notice: waiting for a
+    /// response that never comes would stall the transfer by a full timeout per file.
+    fn notify(&self, case: u32, body: Enc) {
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let header = Enc::default().uint(1, id);
+        self.send(21, Enc::default().msg(1, header).msg(8, Enc::default().msg(case, body)));
+    }
+
+    /// Key of an outstanding request. The viewer answers every case with a 0-based file_index
+    /// while our own request carries a 1-based one, so the *viewer's* index can never be part of
+    /// the key: doing so left all sixteen blocks of a download unmatched, and each stalled to the
+    /// timeout. The third slot is ours instead - send_file restates current_file per file, and one
+    /// download holds the `downloading` lock for its whole run, so at most one (file, block) pair
+    /// per case is ever in flight. Block ids restart at the resume offset for every file, so
+    /// without that slot two files of one task would answer to the same key.
+    fn pending_key(case: u32, task: u64, file: u64, block: u64) -> (u32, u64, u64, u64) {
+        (case, task, file, block)
+    }
+
     /// Key of a FileTransferFtpResponse: 3 file_confirm{id}, 4 block_confirm{id, block_id}, 6 result{id}.
-    fn response_key(ftp: &[u8]) -> Option<(u32, u64, u64, u64)> {
+    /// A reply carries no usable file index, so it is keyed to whichever file we are sending.
+    fn response_key(&self, ftp: &[u8]) -> Option<(u32, u64, u64, u64)> {
         let fields = decode_wire(ftp).ok()?;
         let case = fields.iter().find(|f| matches!(f.value, WireValue::Bytes(_)))?;
         let WireValue::Bytes(inner) = case.value else { return None };
         let inner = decode_wire(inner).ok()?;
         let id = TaskId::parse(&inner);
         let block = if case.number == 4 { get_uint(&inner, 2) } else { 0 };
-        Some((case.number, id.task, id.index, block))
+        Some(Self::pending_key(case.number, id.task, self.current_file.load(Ordering::Relaxed), block))
     }
 
     /// Handles one decoded Message. Returns true when it carried file-transfer RPC.
@@ -331,13 +408,17 @@ impl FileSession {
                     let Some(ftp) = get_bytes(&rpc, 8) else { continue };
                     let request_id = get_bytes(&rpc, 1).and_then(|h| decode_wire(h).ok()).map(|h| get_uint(&h, 1)).unwrap_or(0);
                     handled = true;
-                    if let Ok(ftp) = decode_wire(ftp) { self.on_request(request_id, &ftp); }
+                    match decode_wire(ftp) {
+                        Ok(ftp) => self.on_request(request_id, &ftp),
+                        Err(error) => log::info!("File transfer request undecodable: request_id={} bytes={} error={:?}", request_id, ftp.len(), error),
+                    }
                 }
                 (22, WireValue::Bytes(rpc)) => {
                     let Ok(rpc) = decode_wire(rpc) else { continue };
                     let Some(ftp) = get_bytes(&rpc, 4) else { continue };
                     handled = true;
-                    match Self::response_key(ftp) {
+                    if let Ok(response) = decode_wire(ftp) { note_shape("response", &response); }
+                    match self.response_key(ftp) {
                         Some(key) => match self.pending.lock().unwrap().remove(&key) {
                             Some(tx) => { let _ = tx.send(ftp.to_vec()); }
                             None => log::info!("File transfer response without pending request: case={} task={} index={} block={}", key.0, key.1, key.2, key.3),
@@ -358,6 +439,7 @@ impl FileSession {
         };
         let WireValue::Bytes(body) = case.value else { return };
         let Ok(f) = decode_wire(body) else { log::warn!("File transfer request {} undecodable", case.number); return };
+        if case.number != 4 { note_shape(&format!("request case {}", case.number), &f); } // 4 streams thousands of identical blocks per upload
         match case.number {
             10 => self.read_dir(rid, &f),
             1 => self.receive_request(rid, &f),
@@ -571,7 +653,14 @@ impl FileSession {
         // Newer viewers (Windows 4.44.1, #208) send only the task id here; an empty path must not
         // become "/" and walk the whole filesystem into a misleading permission error.
         if raw.trim().is_empty() {
-            log::info!("File transfer send_request without path: task={} fields={:?}", id.task, f.iter().map(|x| x.number).collect::<Vec<_>>());
+            log::info!("File transfer send_request without path: task={} index={} fields={}", id.task, id.index, numbers(f));
+            // #208 experiment: answer the id-only request with a well-formed empty listing and
+            // watch what the viewer sends next. Off unless UU_FT_EMPTY_LIST is set; the viewer
+            // never delivers a file list on any channel, so there is nothing to offer yet.
+            if std::env::var_os("UU_FT_EMPTY_LIST").is_some_and(|v| v != "0") {
+                self.respond(rid, 2, Enc::default().msg(1, id.enc()).uint(2, FT_SUCCEEDED).bytes(5, &list_data(&[])));
+                return;
+            }
             self.respond(rid, 2, Enc::default().msg(1, id.enc()).uint(2, FT_PROTOCOL));
             return;
         }
@@ -617,7 +706,10 @@ impl FileSession {
         for (index, (info, path)) in files.iter().enumerate() {
             let index = index + 1;
             let id = TaskId { task, index: index as u64 };
-            let Some(confirm) = self.request(3, Enc::default().msg(1, id.enc()).uint(2, info.modified).uint(3, info.size), (3, id.task, id.index, 0)).await else {
+            // Replies carry no file index we can trust, and block ids restart per file, so every
+            // key from here on is attributed to this file until the next one starts.
+            self.current_file.store(id.index, Ordering::Relaxed);
+            let Some(confirm) = self.request(3, Enc::default().msg(1, id.enc()).uint(2, info.modified).uint(3, info.size), Self::pending_key(3, id.task, id.index, 0)).await else {
                 log::warn!("File transfer download: no file_confirm task={} index={}", task, index); return false;
             };
             let [skip, err, resume] = case_uints(&confirm, 3, [2, 3, 4]);
@@ -627,40 +719,64 @@ impl FileSession {
             if skip || (err != FT_SUCCEEDED && err != 0) { continue; }
             let result = self.send_file(id, path, resume.min(info.size), first_block).await;
             let code = match result { Ok(()) => FT_SUCCEEDED, Err(c) => c };
-            let reply = self.request(9, Enc::default().msg(1, id.enc()).uint(2, code), (6, id.task, id.index, 0)).await;
-            let r = reply.map(|r| case_uints(&r, 6, [2])[0]).unwrap_or(0);
-            log::info!("File transfer download file done: task={} index={} bytes={} result={} viewer_result={}", task, index, info.size, code, r);
-            if code == FT_CANCELED { return false; }
+            // The viewer acknowledges blocks and file_confirm but never answers this notice.
+            self.notify(9, Enc::default().msg(1, id.enc()).uint(2, code));
+            log::info!("File transfer download file done: task={} index={} bytes={} result={}", task, index, info.size, code);
+            // A file that did not finish must fail the task: run_download reports the task result to
+            // the viewer, and claiming success handed it a truncated file as a completed download.
+            if code != FT_SUCCEEDED { return false; }
         }
+        self.current_file.store(0, Ordering::Relaxed);
         true
     }
 
     async fn send_file(self: &Arc<Self>, id: TaskId, path: &Path, resume: u64, first_block: u64) -> Result<(), u64> {
         let mut file = std::fs::File::open(path).map_err(|e| io_error(&e))?;
         file.seek(SeekFrom::Start(resume)).map_err(|e| io_error(&e))?;
-        let mut block_id = first_block + resume / DOWNLOAD_BLOCK as u64;
-        let mut inflight = tokio::task::JoinSet::new();
+        let (block, window) = (self.block_size, self.block_window);
+        let mut block_id = first_block + resume / block as u64;
+        // Only this loop puts blocks on the ordered channel, so they leave in block order: awaiting
+        // a reply used to happen in the task that sent its block, and whichever task got polled
+        // first jumped the queue, which an 18 MB file arrived as - complete, acknowledged, contents
+        // shuffled (result=1 and an APK that would not open).
+        let (replied, mut replies) = mpsc::unbounded_channel();
+        let mut inflight = 0usize;
         loop {
-            let mut buf = vec![0u8; DOWNLOAD_BLOCK];
-            let n = file.read(&mut buf).map_err(|e| io_error(&e))?;
-            if n == 0 { break; }
-            buf.truncate(n);
-            while inflight.len() >= DOWNLOAD_WINDOW {
-                if let Some(Ok(code)) = inflight.join_next().await { if code != FT_SUCCEEDED { return Err(code); } }
-            }
-            let me = self.clone();
-            let body = Enc::default().msg(1, id.enc()).uint(2, block_id).bytes(3, &buf);
-            let key = (4, id.task, id.index, block_id);
-            inflight.spawn(async move {
-                match me.request(4, body, key).await {
-                    Some(r) => { let [e] = case_uints(&r, 4, [3]); if e == 0 { FT_SUCCEEDED } else { e } }
-                    None => FT_IO,
+            // Fill a whole block: a short read in the middle would leave one block short and shift
+            // every later block off the offset the viewer derives from its block id.
+            let mut buf = vec![0u8; block];
+            let mut filled = 0;
+            while filled < block {
+                match file.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(io_error(&e)),
                 }
-            });
+            }
+            if filled == 0 { break; }
+            buf.truncate(filled);
+            // The replies come back shuffled, so a slot frees on whichever reply lands first.
+            // Waiting for the oldest one instead idled the whole window behind a single slow block,
+            // which cost close to half the throughput.
+            while inflight >= window {
+                let Some(verdict) = replies.recv().await else { return Err(FT_IO) };
+                inflight -= 1;
+                verdict?;
+            }
+            let key = Self::pending_key(4, id.task, id.index, block_id);
+            let body = Enc::default().msg(1, id.enc()).uint(2, block_id).bytes(3, &buf);
+            let reply = self.dispatch(4, body, key);
+            let me = self.clone();
+            let replied = replied.clone();
+            inflight += 1;
+            tokio::spawn(async move { let _ = replied.send(me.reap(key, reply).await); });
             block_id += 1;
         }
-        while let Some(r) = inflight.join_next().await {
-            if let Ok(code) = r { if code != FT_SUCCEEDED { return Err(code); } }
+        while inflight > 0 {
+            let Some(verdict) = replies.recv().await else { return Err(FT_IO) };
+            inflight -= 1;
+            verdict?;
         }
         Ok(())
     }
@@ -675,6 +791,35 @@ fn case_uints<const N: usize>(ftp: &[u8], case: u32, numbers: [u32; N]) -> [u64;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_key_separates_cases_tasks_files_and_blocks() {
+        assert_ne!(FileSession::pending_key(3, 8, 1, 0), FileSession::pending_key(6, 8, 1, 0));
+        assert_ne!(FileSession::pending_key(3, 8, 1, 0), FileSession::pending_key(3, 9, 1, 0));
+        // Blocks of one file are confirmed concurrently, so case 4 must keep the block id.
+        assert_ne!(FileSession::pending_key(4, 8, 1, 2), FileSession::pending_key(4, 8, 1, 3));
+        assert_eq!(FileSession::pending_key(4, 8, 1, 2), FileSession::pending_key(4, 8, 1, 2));
+        // Block ids restart for the next file of the same task, so only the file slot keeps the
+        // two files of one task apart.
+        assert_ne!(FileSession::pending_key(4, 8, 1, 0), FileSession::pending_key(4, 8, 2, 0));
+        assert_ne!(FileSession::pending_key(3, 8, 1, 0), FileSession::pending_key(3, 8, 2, 0));
+    }
+
+    #[test]
+    fn block_confirm_matches_the_key_send_file_waits_on() {
+        // block_confirm{1 id, 2 block_id, 3 file_error} as the viewer actually sends it: with a
+        // 0-based file_index, which is not the index our request carried, so the key takes the
+        // file we are sending instead. Keying it on the reply's index left every block unmatched,
+        // and a download stopped after its sixteen in-flight blocks and burned their 30s timeouts (#208).
+        let id = TaskId { task: 8, index: 0 };
+        let ack = Enc::default().msg(4, Enc::default().msg(1, id.enc()).uint(2, 7).uint(3, 0));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = FileSession::new(tx, Arc::new(AtomicU64::new(1)));
+        session.current_file.store(1, Ordering::Relaxed);
+        assert_eq!(session.response_key(&ack.0).unwrap(), FileSession::pending_key(4, 8, 1, 7));
+        // Between downloads nothing is matchable at all.
+        session.current_file.store(0, Ordering::Relaxed);
+        assert_eq!(session.response_key(&ack.0).unwrap(), FileSession::pending_key(4, 8, 0, 7));
+    }
     #[test]
     fn normalizes_windows_and_relative_paths() {
         assert_eq!(normalize("C:\\..\\home\\a\\.\\b"), PathBuf::from("/home/a/b"));
@@ -809,6 +954,137 @@ mod tests {
         }
         assert_eq!(cases, vec![1, 3, 4, 4, 6]);
         assert_eq!(std::fs::read(dir.join("x.bin")).unwrap(), b"abcdef");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_file_that_did_not_finish_fails_the_task() {
+        // send_file gave up after losing a block acknowledgement, yet the task still ended with
+        // FT_SUCCEEDED, so the viewer presented the truncated file as a completed download (#208).
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let s = FileSession::new(tx, Arc::new(AtomicU64::new(1)));
+        let responder = s.clone();
+        tokio::spawn(async move {
+            // Accept the file once download_files is waiting for its file_confirm, so the run
+            // reaches send_file and fails there the way a lost block acknowledgement does.
+            for _ in 0..200 {
+                let reply = responder.pending.lock().unwrap().remove(&FileSession::pending_key(3, 9, 1, 0));
+                if let Some(reply) = reply {
+                    let id = TaskId { task: 9, index: 1 };
+                    let _ = reply.send(Enc::default().msg(3, Enc::default().msg(1, id.enc()).uint(3, FT_SUCCEEDED)).0);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        let missing = std::env::temp_dir().join(format!("uu-missing-{}", std::process::id()));
+        let files = vec![(FileInfo { rel_path: "gone.bin".into(), size: 4096, modified: 0 }, missing)];
+        assert!(!s.download_files(9, &files).await);
+    }
+
+    #[tokio::test]
+    async fn blocks_leave_in_block_order_whatever_order_replies_arrive() {
+        // Each block used to be awaited in its own task, and whichever of those tasks got polled
+        // first put the next block on the ordered channel. An 18 MB download arrived with every
+        // block acknowledged and the right byte count, contents shuffled (#208).
+        let dir = std::env::temp_dir().join(format!("uu-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.bin");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let (tx, mut frames) = mpsc::unbounded_channel();
+        let mut s = FileSession::new(tx, Arc::new(AtomicU64::new(1)));
+        { let session = Arc::get_mut(&mut s).unwrap(); session.block_size = 4; session.block_window = 3; }
+        let responder = s.clone();
+        tokio::spawn(async move {
+            let id = TaskId { task: 9, index: 1 };
+            let confirm = Enc::default().msg(3, Enc::default().msg(1, id.enc()).uint(3, FT_SUCCEEDED)).0;
+            for _ in 0..200 {
+                if let Some(reply) = responder.pending.lock().unwrap().remove(&FileSession::pending_key(3, 9, 1, 0)) {
+                    let _ = reply.send(confirm); break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            for block in [0u64, 1, 2] {
+                for _ in 0..200 {
+                    if responder.pending.lock().unwrap().contains_key(&FileSession::pending_key(4, 9, 1, block)) { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+            for block in [2u64, 1, 0] {
+                let reply = responder.pending.lock().unwrap().remove(&FileSession::pending_key(4, 9, 1, block));
+                if let Some(reply) = reply {
+                    let _ = reply.send(Enc::default().msg(4, Enc::default().msg(1, id.enc()).uint(3, 0)).0);
+                }
+            }
+        });
+        let files = vec![(FileInfo { rel_path: "f.bin".into(), size: 10, modified: 0 }, file)];
+        assert!(s.download_files(9, &files).await);
+        let mut order = Vec::new();
+        while let Ok(frame) = frames.try_recv() {
+            let message = decode_wire(&frame).unwrap();
+            let Some(rpc) = get_bytes(&message, 21) else { continue };
+            let rpc = decode_wire(rpc).unwrap();
+            let Some(ftp) = get_bytes(&rpc, 8) else { continue };
+            let Ok(ftp) = decode_wire(ftp) else { continue };
+            let Some(body) = get_bytes(&ftp, 4) else { continue };
+            order.push(get_uint(&decode_wire(body).unwrap(), 2));
+        }
+        assert_eq!(order, vec![0, 1, 2]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn files_of_one_task_answer_to_their_own_reply_keys() {
+        // send_file restarts block ids at the resume offset for every file, so the second file's
+        // block 0 used to land on the first file's pending slot. A reply only carries the viewer's
+        // own 0-based index, so the host has to remember which file it is sending.
+        let dir = std::env::temp_dir().join(format!("uu-two-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.bin", "b.bin"] { std::fs::write(dir.join(name), b"0123456789").unwrap(); }
+        let (tx, mut frames) = mpsc::unbounded_channel();
+        let mut s = FileSession::new(tx, Arc::new(AtomicU64::new(1)));
+        { let session = Arc::get_mut(&mut s).unwrap(); session.block_size = 4; session.block_window = 3; }
+        let responder = s.clone();
+        tokio::spawn(async move {
+            for index in [1u64, 2] {
+                let id = TaskId { task: 9, index };
+                let mut confirm = None;
+                for _ in 0..200 {
+                    confirm = responder.pending.lock().unwrap().remove(&FileSession::pending_key(3, 9, index, 0));
+                    if confirm.is_some() { break; }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                let Some(confirm) = confirm else { panic!("file {index} never reached its file_confirm"); };
+                let _ = confirm.send(Enc::default().msg(3, Enc::default().msg(1, id.enc()).uint(3, FT_SUCCEEDED)).0);
+                for block in 0..3u64 {
+                    let mut reply = None;
+                    for _ in 0..200 {
+                        reply = responder.pending.lock().unwrap().remove(&FileSession::pending_key(4, 9, index, block));
+                        if reply.is_some() { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    let Some(reply) = reply else { panic!("file {index} block {block} never reached the pending table"); };
+                    let _ = reply.send(Enc::default().msg(4, Enc::default().msg(1, id.enc()).uint(3, 0)).0);
+                }
+            }
+        });
+        let files = ["a.bin", "b.bin"].iter()
+            .map(|name| (FileInfo { rel_path: (*name).into(), size: 10, modified: 0 }, dir.join(name)))
+            .collect::<Vec<_>>();
+        assert!(s.download_files(9, &files).await);
+        let mut sent = Vec::new();
+        while let Ok(frame) = frames.try_recv() {
+            let message = decode_wire(&frame).unwrap();
+            let Some(rpc) = get_bytes(&message, 21) else { continue };
+            let rpc = decode_wire(rpc).unwrap();
+            let Some(ftp) = get_bytes(&rpc, 8) else { continue };
+            let Ok(ftp) = decode_wire(ftp) else { continue };
+            let Some(body) = get_bytes(&ftp, 4) else { continue };
+            let body = decode_wire(body).unwrap();
+            sent.push((TaskId::parse(&body).index, get_uint(&body, 2)));
+        }
+        // Both files start their blocks at the same id; only the file slot tells them apart.
+        assert_eq!(sent, vec![(1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

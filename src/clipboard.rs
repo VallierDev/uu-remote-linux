@@ -10,6 +10,39 @@ pub struct ClipboardBridge {
     pub ready: tokio::sync::oneshot::Receiver<bool>,
 }
 
+/// The inbound sink pair shared by every clipboard receive branch: the bridge sender once
+/// the worker is up, plus the newest text held while it is still starting.
+pub type SinkState = (Option<watch::Sender<Option<String>>>, Option<String>);
+
+/// Deliver inbound clipboard text to the bridge, or hold the newest copy under the same lock
+/// so text arriving before the bridge publishes its sink (rich offer answered early, first
+/// desktop copy while the worker starts) is replayed at ready instead of dropped.
+pub fn deliver_or_hold(state: &std::sync::Mutex<SinkState>, text: String) {
+    let mut state = state.lock().unwrap();
+    match state.0.clone() {
+        Some(sink) => {
+            log::info!("Native clipboard text received: bytes={}", text.len());
+            drop(state);
+            sink.send_replace(Some(text));
+        }
+        None => {
+            log::info!("Native clipboard text held for bridge: bytes={}", text.len());
+            state.1 = Some(text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::deliver_or_hold;
+    #[test] fn text_before_the_bridge_is_ready_is_held_and_newest_copy_wins() {
+        let state = std::sync::Mutex::new((None, None));
+        deliver_or_hold(&state, "older".into());
+        deliver_or_hold(&state, "newer".into());
+        assert_eq!(state.lock().unwrap().1.as_deref(), Some("newer"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 extern "C" {
     fn clipboard_open(display: *const libc::c_char) -> *mut libc::c_void;
@@ -184,13 +217,21 @@ pub fn start_portal(session: std::sync::Arc<crate::portal::PortalSession>) -> Cl
         }
         let available=session.clipboard_ready(); let _=ready_tx.send(available);
         if !available { return; }
-        let mut last=None; let mut pending=None;
+        let mut last=None; let mut pending=None; let mut deferred=false;
         while !output.is_closed() && input.has_changed().is_ok() {
             if input.has_changed().unwrap_or(false) {
                 pending=input.borrow_and_update().clone().filter(|text|text.len()<=MAX_TEXT);
+                deferred=false;
             }
             if let Some(text)=pending.as_ref() {
-                if session.clipboard_set(text).is_ok() { last=pending.take(); }
+                if session.clipboard_set(text).is_ok() {
+                    log::info!("Native clipboard text applied: bytes={}",text.len());
+                    last=pending.take(); deferred=false;
+                } else if !deferred {
+                    // Locked or mid-recovery: the loop retries every 100 ms, warn once per update.
+                    log::warn!("Native clipboard set deferred: portal session not ready");
+                    deferred=true;
+                }
             }
             if let Some(text)=session.clipboard_poll() {
                 if last.as_ref()!=Some(&text) { last=Some(text.clone()); output.send_replace(Some(text)); }
@@ -200,3 +241,5 @@ pub fn start_portal(session: std::sync::Arc<crate::portal::PortalSession>) -> Cl
     });
     ClipboardBridge {incoming,outgoing,ready}
 }
+
+

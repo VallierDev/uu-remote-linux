@@ -95,7 +95,7 @@ async fn desktop_command(args:&[String],code:Option<String>)->Result<(),String> 
         Some((viewer::sdl::Window::new()?,decoder))
     }else{None};
     let creds=credentials()?;
-    let api=Api::new(auth::UUAuthClient::new(creds.clone()),auth::BASE_URL);
+    let api=Api::new(auth::UUAuthClient::new(creds.clone()),creds.api_base());
     let account_connection=code.is_none();
     #[cfg(feature="viewer-sdl")]
     macro_rules! wait {($stage:expr,$fut:expr)=>{viewer::sdl::loading(desktop.as_mut().map(|d|&mut d.0),$stage,$fut).await?}}
@@ -190,7 +190,7 @@ async fn type_command(args:&[String])->Result<(),String>{
     }
     let mut shape:Shape=serde_json::from_str(DEFAULT_SHAPE).map_err(|_|"Invalid built-in type shape")?;
     shape.capture_type=1;
-    let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),auth::BASE_URL);
+    let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),creds.api_base());
     let room=api.join(device,false,true).await.map_err(|e|e.to_string())?;
     let mac=api.target_is_mac(&room,Some(device)).await.map_err(|e|e.to_string())?;
     let actions=viewer::secure_input::expand(secret.as_str(),mac)?;
@@ -207,7 +207,7 @@ async fn type_command(args:&[String])->Result<(),String>{
 }
 
 fn credentials()->Result<auth::Credentials,String> {auth::Credentials::load(config::read_fresh().map_err(|_|"Cannot read credential configuration")?.as_ref())}
-fn api()->Result<Api,String> {Ok(Api::new(auth::UUAuthClient::new(credentials()?),auth::BASE_URL))}
+fn api()->Result<Api,String> {let creds=credentials()?;Ok(Api::new(auth::UUAuthClient::new(creds.clone()),creds.api_base()))}
 
 async fn login_command(executable:&std::path::Path,options:&[String])->Result<(),String> {
     let status=tokio::process::Command::new(executable).arg("login").args(options).status().await.map_err(|_|"Build sibling uuremote-server to reuse QR login")?;
@@ -265,7 +265,7 @@ async fn tool_command(args:&[String])->Result<(),String>{
     let mut shape:Shape=serde_json::from_str(DEFAULT_SHAPE).map_err(|_|"Invalid built-in tool shape")?;
     shape.capture_type=capture;shape.feature_flag.clear();
     if capture!=5{shape.decoders.clear();shape.display_modes.clear();shape.displays.clear();shape.codecs.clear();}
-    let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),auth::BASE_URL);
+    let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),creds.api_base());
     let room=api.join(&args[1],false,true).await.map_err(|e|e.to_string())?;
     // Match the existing UI connection framing (9bb42d5); the host tolerates this prefix.
     let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly,clipboard:clipboard::Bridge::new(false)};
@@ -295,7 +295,7 @@ async fn power_command(args:&[String])->Result<(),String>{
     let mut shape:Shape=serde_json::from_str(DEFAULT_SHAPE).map_err(|_|"Invalid built-in power shape")?;
     // File-tool peers carry CONTROL without starting desktop capture or clipboard.
     shape.capture_type=5;shape.feature_flag.clear();
-    let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),auth::BASE_URL);
+    let creds=credentials()?;let api=Api::new(auth::UUAuthClient::new(creds.clone()),creds.api_base());
     let room=api.join(&args[1],false,true).await.map_err(|e|e.to_string())?;
     let options=Options{timeout:Duration::from_secs(12),legacy_prefix:true,ready_policy:ReadyPolicy::EchoOnly,clipboard:clipboard::Bridge::new(false)};
     let mut session=Session::open(&room,&shape,&creds.device_id,&creds.client_id,options,Default::default()).await?;

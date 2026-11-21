@@ -895,6 +895,20 @@ fn rate_args(settings: &VideoSettings, encoder: Encoder) -> (String, String) {
     (format!("{max_kbps}k"), format!("{}k", buffer_for(settings, encoder)))
 }
 
+#[cfg(feature = "inproc-av")]
+fn inproc_config(
+    settings: &VideoSettings, encoder: Encoder, size: (u32, u32), display: String,
+    portal: Option<Arc<crate::portal::PortalSession>>,
+) -> crate::inproc_encoder::Config {
+    let rate = inproc_rate_control(settings, encoder);
+    crate::inproc_encoder::Config {
+        portal, display, input: size, output: settings.output, fps: settings.effective_fps(),
+        gop: gop_frames(settings.effective_fps(), encoder != Encoder::Cpu) as u32, cq: settings.cq(),
+        abr: rate.abr, target_bps: rate.target_bps, max_bps: rate.max_bps, buffer_bits: rate.buffer_bits,
+        codec: settings.codec, chroma: settings.chroma, vaapi: encoder == Encoder::Vaapi, cpu: encoder == Encoder::Cpu,
+    }
+}
+
 async fn read_encoder_with(
     size: (u32,u32),display:String,portal:Option<Arc<crate::portal::PortalSession>>,latest:mpsc::Sender<Arc<CompleteFrame>>,encoder:Encoder,
     #[cfg_attr(not(feature = "inproc-av"), allow(unused_variables))] allow_inproc: bool,sequence:Arc<std::sync::atomic::AtomicU64>,
@@ -916,30 +930,22 @@ async fn read_encoder_with(
     } else { None };
     #[cfg(feature = "inproc-av")]
     if allow_inproc && x11_region.is_none() && (native_inproc(&display, portal.is_some(), encoder) || cpu_inproc(&display, portal.is_some(), encoder, &settings)) {
-        let rate = inproc_rate_control(&settings, encoder);
-        let config = crate::inproc_encoder::Config {
-            portal: portal.clone(),
-            display: display.clone(), input: size, output: settings.output, fps: u32::from(settings.fps),
-            gop: gop_frames(settings.fps, encoder != Encoder::Cpu) as u32, cq: settings.cq() as u32,
-            abr: rate.abr, target_bps: rate.target_bps, max_bps: rate.max_bps, buffer_bits: rate.buffer_bits, codec: settings.codec, chroma: settings.chroma,
-            vaapi: encoder == Encoder::Vaapi,
-            cpu: encoder == Encoder::Cpu,
-        };
+        let config = inproc_config(&settings, encoder, size, display.clone(), portal.clone());
         log::info!("Desktop encoder: display={} source={}x{} output={:?} fps={} cq={} maxrate={}k encoder={} source={} pipeline=in-process",
-            display,size.0,size.1,settings.output,settings.fps,config.cq,rate.max_bps / 1000,encoder.name_for(settings.codec),
+            display,size.0,size.1,settings.output,settings.effective_fps(),config.cq,config.max_bps / 1000,encoder.name_for(settings.codec),
             crate::video_select::encoder_source_label(selection.encoder_source));
         return read_inprocess(config, latest, sequence, idr, budget, (settings.source_id, settings.source_generation)).await;
     }
     let source_size = size;
     let size = format!("{}x{}", size.0, size.1);
-    let fps = settings.fps.to_string();
+    let fps = settings.effective_fps().to_string();
     // Keep the process pipeline IDR interval at the configured duration.
-    let gop = gop_frames(settings.fps, false).to_string();
+    let gop = gop_frames(settings.effective_fps(), false).to_string();
     let (maxrate, _) = rate_args(&settings, encoder);
     let cq = settings.cq().to_string();
     // x11grab delivers bgr0; the Wayland/portal/KMS pipe is bgra.
     let rgb = nvenc_rgb_input(&settings, encoder, if wayland { "bgra" } else { "bgr0" });
-    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.fps,cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(selection.encoder_source),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
+    log::info!("Desktop encoder: display={} source={} output={:?} fps={} cq={} maxrate={} encoder={} source={} pix_fmt={} low_latency=true",display,size,settings.output,settings.effective_fps(),cq,maxrate,encoder.name_for(settings.codec),crate::video_select::encoder_source_label(selection.encoder_source),if encoder == Encoder::Vaapi { "nv12" } else { rgb.unwrap_or(chroma_args(&settings, encoder).1) });
     // A bundled FFmpeg prefix (config ffmpeg_root / UU_FFMPEG_ROOT) or `ffmpeg` on PATH.
     let ffmpeg = ffmpeg_spec();
     let mut command = ffmpeg.command();
@@ -972,7 +978,7 @@ async fn read_encoder_with(
         let executable=std::path::PathBuf::from("/proc/self/exe");
         #[cfg(not(target_os="linux"))]
         let executable=std::env::current_exe().map_err(|e|format!("Capture executable: {e}"))?;
-        let mut capture_command=wayland_capture_command(&executable,settings.fps);
+        let mut capture_command=wayland_capture_command(&executable,settings.effective_fps());
         if let Some(output)=selected_output {capture_command.env("UU_WAYLAND_OUTPUT",&output.name);}
         let mut capture=capture_command
             .env("UU_WAYLAND_DEMAND","1")
@@ -983,7 +989,7 @@ async fn read_encoder_with(
         command.stdin(source);
         native_capture=Some(capture);
     } else if wayland { command.stdin(std::process::Stdio::piped()); }
-    let timing = timing_args(ffmpeg_timing_mode(&ffmpeg).await, settings.fps);
+    let timing = timing_args(ffmpeg_timing_mode(&ffmpeg).await, settings.effective_fps());
     let mut output_args = timing;
     output_args.extend(["-f".into(), if settings.codec == VideoCodec::H265 { "hevc".into() } else { "h264".into() }, "pipe:1".into()]);
     let mut child=command.args(output_args)
@@ -996,7 +1002,7 @@ async fn read_encoder_with(
         let mut sink=child.stdin.take().ok_or("Encoder stdin missing")?;
         Some(EncoderTask(tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.fps)));
+            let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.effective_fps())));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut bytes=vec![0;capture.width as usize*capture.height as usize*4];
             loop {
@@ -1014,7 +1020,7 @@ async fn read_encoder_with(
         let mut sink=child.stdin.take().ok_or("Encoder stdin missing")?;
         Some(EncoderTask(tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            let interval=Duration::from_nanos(1_000_000_000/u64::from(settings.fps));
+            let interval=Duration::from_nanos(1_000_000_000/u64::from(settings.effective_fps()));
             let mut tick=tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let (width,height)=session.size();
@@ -1048,7 +1054,7 @@ async fn read_encoder_with(
             use tokio::io::AsyncWriteExt;
             tokio::select! {
                 result=async {
-                    let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.fps)));
+                    let mut tick=tokio::time::interval(Duration::from_nanos(1_000_000_000/u64::from(settings.effective_fps())));
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         let permit=budget.clone().acquire_owned().await.map_err(|_|"Encoder stopped")?;
@@ -1296,7 +1302,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
     // The privacy screen swaps the portal stream to a virtual output that can have another size.
     let mut portal_size = portal.as_ref().map(|p| p.size());
     let mut previous = None;
-    let mut timeline = RtpTimeline { fps: u64::from(current.fps), ..Default::default() };
+    let mut timeline = RtpTimeline { fps: u64::from(current.effective_fps()), ..Default::default() };
     let mut settings_open = true;
     let mut frames = 0u64;
     let mut skipped = 0u64;
@@ -1350,7 +1356,7 @@ pub async fn stream_desktop_at(pc: Arc<RTCPeerConnection>, track: Arc<crate::vid
         if next != current || send_interrupted {
             let discard = next.codec != current.codec || next.source_generation != current.source_generation || next.source_id != current.source_id || send_interrupted;
             current = next;
-            timeline.fps = u64::from(next.fps);
+            timeline.fps = u64::from(next.effective_fps());
             // A viewer resolution choice may have changed the X11 display mode (desktop_mode).
             if let Some(resized) = x11_resized(&display, portal_stream, size) { size = resized; }
             if discard {
@@ -1977,6 +1983,22 @@ mod tests {
         assert!(!inproc_fallback_allowed(true, true, None));
         // A resized X11 root fails x11grab for every encoder; the stream restarts capture instead.
         assert!(!inproc_fallback_allowed(true, false, Some((1920, 1080))));
+    }
+    #[cfg(feature = "inproc-av")]
+    #[test]
+    fn inproc_config_tracks_network_fps_and_restores_nominal_rate() {
+        let mut settings = VideoSettings { fps: 60, ..Default::default() };
+        let override_seconds = std::env::var("UU_VIDEO_GOP_SECONDS").ok();
+        for (net_fps, fps) in [(None, 60), (Some(20), 20), (None, 60), (Some(90), 60)] {
+            settings.net_fps = net_fps;
+            for encoder in [Encoder::Cpu, Encoder::Nvenc, Encoder::Vaapi] {
+                let config = inproc_config(&settings, encoder, (1920, 1080), ":0".into(), None);
+                assert_eq!(config.fps, fps);
+                assert_eq!(config.gop, gop_frames_with_override(fps, encoder != Encoder::Cpu, override_seconds.as_deref()) as u32);
+                assert_eq!((config.cpu, config.vaapi), (encoder == Encoder::Cpu, encoder == Encoder::Vaapi));
+                assert_eq!(settings.fps, 60); // The viewer's nominal setting is never rewritten.
+            }
+        }
     }
     #[cfg(feature = "inproc-av")]
     #[test]

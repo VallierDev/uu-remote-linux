@@ -69,19 +69,35 @@ is aimed at the virtual output's region. Needs GTK3.
   child restores devices and outputs from the record whenever the host ends, including SIGKILL; the
   next start retries too. Devices plugged in during privacy are not blocked.
 - 自动开启：`UU_PRIVACY_AUTO=picture`（或 `2`）在第一个桌面控制端连上后自动启用隐私屏保，
-  `UU_PRIVACY_AUTO=screen-off`（或 `3`）自动关屏；默认关闭。远程协助（访客）的桌面会话同样适用。
+  `UU_PRIVACY_AUTO=screen-off`（或 `3`）自动关屏；默认关闭。主机同时记住控制端上一次的选择
+  （`host_settings.json` 的 `privacy_type`，含「不启用」），但默认不自动套用：设
+  `UU_PRIVACY_REMEMBER=1` 才在下一个桌面控制端连上时回放记忆值，`UU_PRIVACY_AUTO` 优先于记忆值。
+  远程协助（访客）的桌面会话同样适用。
   控制端自己的请求优先：一次会话里只要客户端发过隐私请求（包括连接刚建立、会话计数还没开始的
   那一刻），待执行的自动开启就不再触发；断开后照常恢复。主机不支持或依赖缺失时只记日志，不影响连接。
   自动开启后主机会向控制端推送一次 SystemMetrics 和 SystemStateChange，控制端菜单随之更新。支持的主机上，
   每次桌面连接也会先推送一次当前状态（关闭时为关闭），这是新增的主动上报。
   Auto: `UU_PRIVACY_AUTO=picture` (or `2`) enables picture mode when the first desktop controller
-  connects; `screen-off` (or `3`) turns the physical screens off. Off by default. Remote-assistance
+  connects; `screen-off` (or `3`) turns the physical screens off. Off by default. The host also
+  remembers the controller's last choice (`privacy_type` in `host_settings.json`, including "off")
+  and replays it on the next desktop connect only with `UU_PRIVACY_REMEMBER=1`; `UU_PRIVACY_AUTO`
+  wins over the remembered value. Remote-assistance
   (guest) desktop sessions are covered too. The viewer's own request wins for that session, including
   one that arrives right after the connection opens and before the session counter starts: a pending
   auto-enable then does not run, and a disconnect restores as usual. Unsupported hosts or missing
   tools only log; the connection is unaffected. After an auto-enable the host pushes SystemMetrics
   and SystemStateChange once, so the viewer's menu follows; on supported hosts every desktop
   connection also pushes the current state first (off when it is off), which is new outbound traffic.
+- 空闲抑制：portal 桌面会话期间主机全程持有 `org.gnome.SessionManager` 空闲抑制。只观看不动手时，
+  GNOME 到 `idle-delay` 会空闲锁屏，gnome-shell 随即关闭 ScreenCast/RemoteDesktop 会话，画面停在最后
+  一帧且注入输入失效；抑制在会话建立时取得、会话结束时释放。健康与否看帧是否真的在送达，不只看
+  Portal 会话对象是否存活：帧中断且重开失败时抑制随之释放，不在查看端看不见的故障期空占主机。
+  The host holds an `org.gnome.SessionManager` idle inhibitor for the whole portal desktop session:
+  watching without touching the host lets GNOME lock at `idle-delay`, gnome-shell then ends the
+  ScreenCast/RemoteDesktop sessions, and the picture freezes with input dead. The inhibitor is taken
+  when the session opens and released when it ends. Health means frames actually arriving, not just
+  a live Portal session object: when frames stop and the reopen fails the inhibitor goes with them,
+  instead of holding the host awake through an outage the viewer cannot see through.
 - 这是尽力而为的遮挡，不是保密边界。/ This is best-effort obscuring, not a confidentiality boundary.
 - 恢复记录保存在配置文件旁的 `privacy-power.json`（0600）；崩溃后下次启动重新启用记录的物理屏。
   若主机无法启动，可在本机终端执行 `kscreen-doctor output.<name>.enable`。

@@ -14,6 +14,10 @@ impl Window {
         // SDL's default nearest-neighbour scaling makes remote text uneven whenever the window size
         // differs from the stream; filter instead. Set before the renderer/textures exist.
         sdl2::hint::set_with_priority("SDL_RENDER_SCALE_QUALITY","linear",&sdl2::hint::Hint::Default);
+        // SDL sets _NET_WM_BYPASS_COMPOSITOR=1 on every X11 window (meant for fullscreen games). KWin
+        // then suspends compositing for the whole desktop while the viewer is open: no shadows or
+        // animations, opaque black where shadows were. Default priority keeps the env override.
+        sdl2::hint::set_with_priority("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR","0",&sdl2::hint::Hint::Default);
         #[cfg(uu_gtk)] cairo_decorations();
         let sdl=sdl2::init()?;let video=sdl.video()?;
         let name=super::device_label(std::env::var("UU_VIEWER_DEVICE_NAME").ok().as_deref()).to_owned();
@@ -99,7 +103,13 @@ impl Window {
         let tab_visible=self.tab_visible();
         if let Event::KeyDown{scancode:Some(code),keymod,repeat,..}=event {
             let chord=keymod.intersects(Mod::LCTRLMOD|Mod::RCTRLMOD)&&keymod.intersects(Mod::LALTMOD|Mod::RALTMOD);
-            let command=match code {Scancode::M=>Some(None),Scancode::G=>Some(Some(hud::Command::Stats(!self.chrome.state.stats))),Scancode::Return=>Some(Some(hud::Command::Fullscreen)),_=>None};
+            let command=match code {
+                Scancode::M=>Some(None),
+                Scancode::G=>Some(Some(hud::Command::Stats(!self.chrome.state.stats))),
+                Scancode::K=>Some(Some(hud::Command::GrabKeys(!self.chrome.state.grab_keys))),
+                Scancode::Return=>Some(Some(hud::Command::Fullscreen)),
+                _=>None
+            };
             if chord { if let Some(command)=command {
                 if !repeat { match command {None=>self.chrome.menu.open^=true,Some(c)=>self.command(c)} }
                 return (true,true)
@@ -157,7 +167,8 @@ impl Window {
             hud::Command::OneToOne(b)=>{st.one_to_one=b;hud::save_prefs(st)},
             hud::Command::Stats(b)=>{st.stats=b;hud::save_prefs(st)},
             hud::Command::HideTab(b)=>{st.hide_tab=b;hud::save_prefs(st)},
-            hud::Command::GrabKeys(b)=>{st.grab_keys=b;self.canvas.window_mut().set_keyboard_grab(b)},
+            hud::Command::GrabKeys(b)=>{st.grab_keys=b;self.canvas.window_mut().set_keyboard_grab(b);hud::save_prefs(st)},
+            hud::Command::FollowNaturalScroll(b)=>{st.follow_natural_scroll=b;hud::save_prefs(st)},
             hud::Command::Fullscreen=>{
                 st.fullscreen^=true;let mode=if st.fullscreen{sdl2::video::FullscreenType::Desktop}else{sdl2::video::FullscreenType::Off};
                 let _=self.canvas.window_mut().set_fullscreen(mode);
@@ -366,8 +377,7 @@ fn translate_actions(events:impl IntoIterator<Item=Event>,input:&mut Input,viewp
                 Event::MouseButtonUp{mouse_btn,..}=>button(mouse_btn).and_then(|b|input.button(b,false)),
                 Event::MouseWheel{x,y,precise_x,precise_y,direction,..}=>{
                     let(dx,dy)=if precise_x!=0.||precise_y!=0.{(f64::from(precise_x),f64::from(precise_y))}else{(f64::from(x),f64::from(y))};
-                    let(dx,dy)=match direction{sdl2::mouse::MouseWheelDirection::Flipped=>(-dx,-dy),_=>(dx,dy)};
-                    input.scroll(dx,dy)
+                    input.scroll(dx,dy,direction==sdl2::mouse::MouseWheelDirection::Flipped)
                 },
                 _=>None,
             };if let Some(m)=message{
@@ -436,7 +446,8 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
     let mut type_job:Option<TypeJob>=None;
     let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|"Cannot watch termination")?;
     let mut audio=super::audio::Playback::new(&window._sdl,session.peer.audio.clone());
-    let mut input=Input::new(view_only);input.set_mac(window.mac);let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
+    let mut input=Input::new(view_only);input.set_mac(window.mac);input.set_follow_natural_scroll(window.state().follow_natural_scroll);
+    let mut tick=tokio::time::interval(std::time::Duration::from_millis(8));
     let mut heartbeat=tokio::time::interval(std::time::Duration::from_secs(1));
     let deadline=tokio::time::sleep(std::time::Duration::from_secs(30));tokio::pin!(deadline);
     window.set_stage(crate::i18n::s("正在传输画面…","Waiting for the remote picture…"));
@@ -523,6 +534,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
                         hud::Command::HostMute(false)=>Some(super::wire::simple_action(seq,16,None)),
                         hud::Command::Volume(v)=>{if let Some(playback)=audio.as_mut(){playback.volume=v;}None},
                         hud::Command::Watch(on)=>{messages.extend(input.release_all());input.set_view_only(on||view_only);None},
+                        hud::Command::FollowNaturalScroll(on)=>{input.set_follow_natural_scroll(on);None},
                         hud::Command::Disconnect=>return Ok(()),
                         _=>None,
                     };
@@ -805,6 +817,57 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
 #[cfg(test)] mod tests {
     use super::*;
     #[cfg_attr(target_os="macos",ignore)]
+    #[test] fn readable_menus_render_and_click_at_multiple_scales(){
+        const CHILD:&str="UU_VIEWER_READABILITY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none(){
+            let dir=std::env::temp_dir().join(format!("uu-viewer-readability-{}-{}",std::process::id(),rand::random::<u64>()));
+            std::fs::create_dir(&dir).unwrap();
+            for lang in ["zh","en"] {for scale in ["1","1.5","2"] {
+                let output=std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","viewer::sdl::tests::readable_menus_render_and_click_at_multiple_scales","--test-threads=1"])
+                    .env(CHILD,"1").env("SDL_VIDEODRIVER","dummy").env("UU_LANG",lang).env("UU_VIEWER_UI_SCALE",scale)
+                    .env("UU_CONFIG",dir.join("config.json")).output().unwrap();
+                assert!(output.status.success(),"{lang} {scale}x: {}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            }}
+            std::fs::remove_dir_all(dir).unwrap();return
+        }
+        let mut window=Window::new().unwrap();let scale=window.chrome.scale;
+        window.canvas.window_mut().set_size((1280.*scale) as u32,(720.*scale) as u32).unwrap();
+        let frame=Frame{width:1280,height:720,rgb:[60,64,72].repeat(1280*720),content:None};
+        window.chrome.menu.open=true;window.chrome.menu.category=1;
+        window.draw(&frame).unwrap();
+        let (_,layout)=window.menu_layout();let origin=window.menu_origin(&layout);
+        let (row,_)=layout.items.iter().find(|(_,h)|matches!(h,hud::Hit::Option(1,1))).unwrap();
+        let event=Event::MouseButtonDown{timestamp:0,window_id:window.canvas.window().id(),which:0,mouse_btn:MouseButton::Left,clicks:1,
+            x:(origin.0+row.x+row.w/2.) as i32,y:(origin.1+row.y+row.h/2.) as i32};
+        window._sdl.event().unwrap().push_event(event).unwrap();
+        let (_,remote)=window.poll(&mut Input::new(false));
+        assert!(remote.is_empty());assert_eq!(window.state().quality,4);
+        assert!(window.take_commands().contains(&hud::Command::Quality(4)));
+        window.chrome.menu.category=3;
+        for volume in [0,50,100] {
+            let (_,layout)=window.menu_layout();let origin=window.menu_origin(&layout);
+            let (row,start,len)=layout.items.iter().find_map(|(r,h)|match h{hud::Hit::Slider(a,l)=>Some((r,*a,*l)),_=>None}).unwrap();
+            let x=(origin.0+start+len*volume as f32/100.).round() as i32;
+            let y=(origin.1+row.y+row.h/2.).round() as i32;
+            let id=window.canvas.window().id();
+            window._sdl.event().unwrap().push_event(Event::MouseButtonDown{timestamp:0,window_id:id,which:0,mouse_btn:MouseButton::Left,clicks:1,x,y}).unwrap();
+            window._sdl.event().unwrap().push_event(Event::MouseButtonUp{timestamp:0,window_id:id,which:0,mouse_btn:MouseButton::Left,clicks:1,x,y}).unwrap();
+            let (_,remote)=window.poll(&mut Input::new(false));
+            assert!(remote.is_empty());assert_eq!(window.state().volume,volume);
+            assert!(window.take_commands().contains(&hud::Command::Volume(volume)));
+        }
+        if let Some(dir)=std::env::var_os("UU_HUD_WINDOW_PREVIEW") {
+            for category in [1,3] {
+                window.chrome.menu.category=category;window.draw(&frame).unwrap();
+                let size=window.canvas.output_size().unwrap();
+                let rgb=window.canvas.read_pixels(None,PixelFormatEnum::RGB24).unwrap();
+                let name=crate::tr!("zh-{scale}x-menu{category}.png","en-{scale}x-menu{category}.png");
+                super::super::type_ipc::write_png_rgb(&std::path::PathBuf::from(&dir).join(name),size.0,size.1,&rgb,false).unwrap();
+            }
+        }
+    }
+    #[cfg_attr(target_os="macos",ignore)]
     #[test] fn remote_window_disables_local_text_input_and_forwards_shift(){
         if std::env::var_os("UU_VIEWER_IME_TEST_CHILD").is_none(){
             let output=std::process::Command::new(std::env::current_exe().unwrap())
@@ -919,6 +982,13 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         let precise=Event::MouseWheel{timestamp:0,window_id:1,which:0,mouse_x:0,mouse_y:0,x:0,y:0,precise_x:0.,precise_y:-0.25,direction:MouseWheelDirection::Normal};
         let(_,out)=translate([precise],&mut input,v,&mut focused);
         assert_eq!(out[0]["delta_y"],-30);
+        input.set_follow_natural_scroll(true);
+        let(_,out)=translate([wheel(MouseWheelDirection::Normal,1,2),wheel(MouseWheelDirection::Flipped,1,2)],&mut input,v,&mut focused);
+        assert_eq!((out[0]["delta_x"].as_i64(),out[0]["delta_y"].as_i64()),(Some(120),Some(240)));
+        assert_eq!((out[1]["delta_x"].as_i64(),out[1]["delta_y"].as_i64()),(Some(120),Some(240)));
+        let precise=Event::MouseWheel{timestamp:0,window_id:1,which:0,mouse_x:0,mouse_y:0,x:0,y:0,precise_x:0.5,precise_y:-0.25,direction:MouseWheelDirection::Flipped};
+        let(_,out)=translate([precise],&mut input,v,&mut focused);
+        assert_eq!((out[0]["delta_x"].as_i64(),out[0]["delta_y"].as_i64()),(Some(60),Some(-30)));
         let mut watch=Input::new(true);let mut watching=true;
         let(_,out)=translate([wheel(MouseWheelDirection::Normal,0,1)],&mut watch,v,&mut watching);
         assert!(out.is_empty());
@@ -957,5 +1027,48 @@ async fn pump_type_job(job: &mut TypeJob, session: &mut Session, window: &mut Wi
         assert!(!quit);assert_eq!(out.len(),2);assert!(input.release_all().is_empty());assert!(!focused);
         let (_,out)=translate([focus(WindowEvent::FocusGained),key,Event::Quit{timestamp:0}],&mut input,v,&mut focused);
         assert_eq!(out.len(),2);assert_eq!(out[0]["action"],"kbd_press");assert_eq!(out[1]["action"],"kbd_release");
+    }
+    // macOS: SDL video must start on the main thread, which the test harness does not use; CI runs it on Linux.
+    #[cfg_attr(target_os="macos",ignore)]
+    #[test] fn grab_keys_shortcut_toggles_state(){
+        if std::env::var_os("UU_VIEWER_GRAB_KEYS_TEST_CHILD").is_none(){
+            let dir=std::env::temp_dir().join(format!("uu-grab-keys-test-{}",std::process::id()));
+            let _=std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let cfg=dir.join("config.json");
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","viewer::sdl::tests::grab_keys_shortcut_toggles_state","--test-threads=1"])
+                .env("SDL_VIDEODRIVER","dummy")
+                .env("UU_CONFIG",&cfg)
+                .env("UU_VIEWER_GRAB_KEYS_TEST_CHILD","1")
+                .output().unwrap();
+            let _=std::fs::remove_dir_all(&dir);
+            assert!(output.status.success(),"{}{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return
+        }
+        let custom_dir=if std::env::var_os("UU_CONFIG").is_none(){
+            let dir=std::env::temp_dir().join(format!("uu-grab-keys-child-{}",std::process::id()));
+            let _=std::fs::create_dir_all(&dir);
+            std::env::set_var("UU_CONFIG",dir.join("config.json"));
+            Some(dir)
+        }else{None};
+        use sdl2::keyboard::{Scancode as S,Mod as M};
+        let mut window=Window::new().unwrap();
+        assert!(!window.state().grab_keys);
+        let key=Event::KeyDown{timestamp:0,window_id:1,keycode:None,scancode:Some(S::K),keymod:M::LCTRLMOD|M::LALTMOD,repeat:false};
+        let (consumed,changed)=window.chrome_event(&key);
+        assert!(consumed && changed);
+        assert!(window.state().grab_keys);
+        let mut reloaded=hud::State::default();
+        hud::load_prefs(&mut reloaded);
+        assert!(reloaded.grab_keys);
+        let (consumed,changed)=window.chrome_event(&key);
+        assert!(consumed && changed);
+        assert!(!window.state().grab_keys);
+        hud::load_prefs(&mut reloaded);
+        assert!(!reloaded.grab_keys);
+        if let Some(dir)=custom_dir{
+            let _=std::fs::remove_dir_all(&dir);
+            std::env::remove_var("UU_CONFIG");
+        }
     }
 }

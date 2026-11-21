@@ -224,6 +224,7 @@ impl WebRtcSession {
         desktop: bool,
         transport:crate::session_ice::SessionIce,
         portal_desktop: Option<Arc<crate::desktop_session::PortalDesktop>>,
+        controller: crate::input::Controller,
     ) -> Result<Self, String> {
         let mut m = MediaEngine::default();
         m.register_default_codecs()
@@ -406,6 +407,9 @@ impl WebRtcSession {
             let mut reports = 0usize;
             let mut feedback_counts = FeedbackCounts::default();
             let mut governor = crate::video_governor::Governor::default();
+            let fps_adapt = crate::video_governor::FpsAdapt {
+                enabled: std::env::var("UU_VIDEO_FPS_ADAPT").map(|v| v.trim() == "1").unwrap_or(false),
+            };
             while let Ok((packets, _)) = sender.read(&mut feedback).await {
                 for packet in packets {
                     feedback_counts.observe(packet.as_any());
@@ -430,12 +434,24 @@ impl WebRtcSession {
                             }
                             // The viewer's own 自动清晰度 preset stays the ceiling; a real loss burst
                             // or a swollen round trip is the only thing that lowers it.
-                            let ceiling=governor_settings.borrow().ceiling_kbps();
+                            let (ceiling,fps,nominal_fps)={let s=governor_settings.borrow();(s.ceiling_kbps(),s.effective_fps(),s.fps)};
                             let loss=f32::from(r.fraction_lost)*100./256.;
-                            if let Some(cap)=governor.observe(loss,rtt,ceiling,std::time::Instant::now()) {
-                                log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
-                                // Restarts the encoder at the new cap through the settings watch.
-                                governor_settings.send_modify(|value| value.net_kbps=Some(cap));
+                            let decision=governor.observe(loss,rtt,ceiling,fps,nominal_fps,&fps_adapt,std::time::Instant::now());
+                            if decision.cap.is_some()||decision.fps.is_some() {
+                                if let Some(cap)=decision.cap {
+                                    log::info!("Video bitrate cap {}k: loss={:.1}% nack={} rtcp_rtt_ms={:?}",cap,loss,feedback_counts.nack_packets,rtt);
+                                }
+                                match decision.fps {
+                                    Some(Some(step))=>log::info!("Video frame rate step {}fps: loss={:.1}% nack={} rtcp_rtt_ms={:?}",step,loss,feedback_counts.nack_packets,rtt),
+                                    Some(None)=>log::info!("Video frame rate released back to the viewer's setting"),
+                                    None=>{},
+                                }
+                                // Restarts the encoder at the new values through the settings watch;
+                                // one write so a bitrate+frame step reopens the pipeline exactly once.
+                                governor_settings.send_modify(|value| {
+                                    if let Some(cap)=decision.cap { value.net_kbps=Some(cap); }
+                                    if let Some(fps)=decision.fps { value.net_fps=fps; }
+                                });
                             }
                         }
                         if log_now {
@@ -585,8 +601,13 @@ impl WebRtcSession {
                 let reply_sequence = out_sequence.clone();
                 let channel_video_settings = peer_video_settings.clone();
                 let channel_actions = peer_actions.clone();
-                let clipboard_input = Arc::new(std::sync::Mutex::new(None::<tokio::sync::watch::Sender<Option<String>>>));
+                // Bridge sink plus the text that arrived before it existed. One mutex for both, so
+                // publishing the sink and handing the held text over cannot be split by a newer copy.
+                let clipboard_input = Arc::new(std::sync::Mutex::new((None::<tokio::sync::watch::Sender<Option<String>>>, None::<String>)));
                 let clipboard_assembly = Arc::new(std::sync::Mutex::new(crate::clipboard_protocol::Assembly::default()));
+                // Case-10 RPC text and the field-17 ClipboardChange stream each need their own
+                // reassembly window; one shared buffer would splice fragments across the two.
+                let clipboard_rpc_assembly = Arc::new(std::sync::Mutex::new(crate::clipboard_protocol::Assembly::default()));
                 let rich_state=Arc::new(std::sync::Mutex::new(crate::clipboard_rich::State::default()));
                 let clipboard_enabled = shared_clipboard_ready.clone();
                 if label=="CONTROL_DATA_CHANNEL" {
@@ -760,10 +781,10 @@ impl WebRtcSession {
                                     if let Some(owner)=&switch_owner {owner.with_current(|| {
                                         if crate::wayland::selection()==target && crate::wayland::select(source_before).is_ok() {
                                             let (source_id,source_generation)=crate::wayland::selection();
-                                            // The feedback loop owns net_kbps; a rollback of the
-                                            // switch must not replay its snapshot over the cap.
-                                            let net_kbps=settings.borrow().net_kbps;
-                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,net_kbps,..settings_before});
+                                            // The feedback loop owns net_kbps/net_fps; a rollback of
+                                            // the switch must not replay its snapshot over them.
+                                            let (net_kbps,net_fps)=(settings.borrow().net_kbps,settings.borrow().net_fps);
+                                            settings.send_replace(crate::capture_setting::VideoSettings {source_id,source_generation,net_kbps,net_fps,..settings_before});
                                         }
                                     });}
                                     log::warn!("Screen switch failed; previous source requested");
@@ -851,6 +872,7 @@ impl WebRtcSession {
                     let initial_sequence = out_sequence.clone();
                     let clipboard_sink = clipboard_input.clone();
                     let clipboard_ready = clipboard_enabled.clone();
+                    let clipboard_mobile = controller.is_mobile();
                     let last_echo_request = last_echo_request.clone();
                     let echo_seen = echo_seen.clone();
                     let rich_outgoing=rich_state.clone();
@@ -912,7 +934,6 @@ impl WebRtcSession {
                                   }
                               } else { role.screen_or(&screen) };
                               let bridge = if let Some(session)=screen.portal.clone() { crate::clipboard::start_portal(session) } else { crate::clipboard::start(screen.display.clone()) };
-                              *clipboard_sink.lock().unwrap() = Some(bridge.incoming);
                               let clipboard_channel = channel.clone();
                               let clipboard_sequence = sequence.clone();
                               let clipboard_cleanup = clipboard_sink.clone();
@@ -920,11 +941,20 @@ impl WebRtcSession {
                               let ready = bridge.ready.await.unwrap_or(false);
                               clipboard_ready.store(ready,std::sync::atomic::Ordering::Relaxed);
                               {
-                                  if !ready {
-                                      *clipboard_cleanup.lock().unwrap() = None;
-                                      log::warn!("Native text clipboard unavailable"); return;
-                                  }
+                                  if !ready { log::warn!("Native text clipboard unavailable"); return; }
                                   log::info!("Native text clipboard bridge ready");
+                                  // One locked transition: inbound text can reach the bridge as soon as
+                                  // the sink is visible, so the text held from before the bridge existed
+                                  // is handed over in the same step and can never beat a newer copy.
+                                  let (sink, held) = {
+                                      let mut state = clipboard_sink.lock().unwrap();
+                                      state.0 = Some(bridge.incoming);
+                                      (state.0.clone(), state.1.take())
+                                  };
+                                  if let (Some(sink), Some(text)) = (sink, held) {
+                                      log::info!("Held clipboard text applied: bytes={}",text.len());
+                                      sink.send_replace(Some(text));
+                                  }
                                   let mut updates = bridge.outgoing;
                                   let mut health = tokio::time::interval(std::time::Duration::from_millis(200));
                                   let mut active = role.active.subscribe();
@@ -937,7 +967,25 @@ impl WebRtcSession {
                                           changed = updates.changed() => {
                                               if changed.is_err() { break; }
                                               let text = updates.borrow_and_update().clone();
-                                              let Some(text) = text else { continue; };
+                                              // Reading an empty clipboard publishes Some(""); a zero-length offer means
+                                              // nothing to the viewer, so skip it rather than send one per connection.
+                                              let Some(text) = text.filter(|t| !t.is_empty()) else { continue; };
+                                              // Live-tested only against mobile viewers, which apply the case-10
+                                              // ClipboardChange form and ignore the rich format list. Desktop
+                                              // viewers take the rich offer below; sending both would write their
+                                              // clipboard twice, and the chunks below need a receiver that can
+                                              // reassemble one ClipboardChange split over several RPCs.
+                                              if clipboard_mobile {
+                                                let parts = crate::clipboard_protocol::chunks(&text).unwrap_or_default();
+                                                let mut delivered = true;
+                                                for (index,part) in parts.iter().enumerate() {
+                                                    let payload = crate::clipboard_protocol::text_chunk_request(clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),part,index+1<parts.len());
+                                                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                    let message = crate::initialization::envelope(clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),timestamp,21,&payload);
+                                                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(2),clipboard_channel.send(&bytes::Bytes::from(message))).await,Ok(Ok(_))) { delivered=false; break; }
+                                                }
+                                                if !delivered { log::warn!("Native clipboard RPC send failed"); break; }
+                                              }
                                               {
                                                   let request_id=clipboard_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
                                                   let payload = match rich_outgoing.lock().unwrap().offer(request_id,text.clone()) {
@@ -953,7 +1001,7 @@ impl WebRtcSession {
                                           }
                                       }
                                   }
-                                  *clipboard_cleanup.lock().unwrap() = None;
+                                  clipboard_cleanup.lock().unwrap().0=None;
                                   clipboard_ready.store(false,std::sync::atomic::Ordering::Relaxed);
                               }
                               if channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { return; }
@@ -1201,6 +1249,7 @@ impl WebRtcSession {
                     let out_sequence = reply_sequence.clone();
                     let clipboard_sink = clipboard_input.clone();
                     let clipboard_assembly = clipboard_assembly.clone();
+                    let clipboard_rpc_assembly = clipboard_rpc_assembly.clone();
                     let clipboard_ready = clipboard_enabled.clone();
                     let rich_incoming=rich_state.clone();
                     let file_worker = file_session.clone();
@@ -1273,7 +1322,8 @@ impl WebRtcSession {
                                 let supported = policy <= 1 && crate::microphone::available() && message_role.is_desktop();
                                 let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                 let next = || out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let response = crate::system_actions::session_rpc_response_with_error(rpc_fields.as_deref().unwrap(), u8::from(!supported)).unwrap();
+                                let error = audio_probe_error(crate::microphone::requested(), crate::microphone::available());
+                                let response = crate::system_actions::session_rpc_response_with_error(rpc_fields.as_deref().unwrap(), error).unwrap();
                                 let response = crate::initialization::envelope(next(), ts, 22, &response);
                                 // Windows NevaudioHelper completes the request on TEXT; mirror CONTROL
                                 // for viewers that dispatch responses there, as for privacy RPCs.
@@ -1290,7 +1340,7 @@ impl WebRtcSession {
                                         enqueue(crate::initialization::envelope(next(), ts, 3, &[8, action as u8]));
                                     });
                                 } else { enqueue(response); }
-                                log::info!("Remote microphone policy: value={policy} supported={supported}");
+                                log::info!("Remote microphone policy: value={policy} supported={supported} error={error}");
                                 return;
                             }
                             if let Some(response) = rpc_fields.as_deref().and_then(|r| crate::system_actions::plugin_response(r).or_else(|| crate::system_actions::session_rpc_response(r))) {
@@ -1317,6 +1367,13 @@ impl WebRtcSession {
                                     return;
                                 }
                             }
+                        }
+                        // Protobuf RPC that routes nowhere: the 4.44.1 viewer opens file transfers
+                        // with such messages (its field 13 handshake and field 26 download dir,
+                        // #208). Field numbers only, and the clipboard budget below is spent by
+                        // ordinary input traffic long before a transfer is attempted.
+                        if let Some(fields) = proto_fields.as_deref() {
+                            crate::file_trans::note_shape(&format!("unhandled on {channel_name}"), fields);
                         }
                         // Temporary bounded clipboard routing diagnostics: schema only,
                         // never text values, payload bytes, key values or clipboard content.
@@ -1346,9 +1403,15 @@ impl WebRtcSession {
                                 use crate::protocol::WireValue;
                                 for field in fields {
                                     if let (22,WireValue::Bytes(payload))=(field.number,&field.value) {
+                                        static CLIP_22_SHAPES:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+                                        if CLIP_22_SHAPES.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
+                                            if let Ok(inner)=crate::protocol::decode_wire(payload){
+                                                log::info!("Clipboard 22 RPC schema: fields={:?}",inner.iter().map(|f|f.number).collect::<Vec<_>>());
+                                            }
+                                        }
                                         let update=rich_incoming.lock().unwrap().response(payload);
                                         match update {
-                                            Ok(Some(text))=>{if let Some(sink)=clipboard_sink.lock().unwrap().as_ref(){log::info!("Native desktop clipboard text received: bytes={}",text.len());sink.send_replace(Some(text));}},
+                                            Ok(Some(text))=>crate::clipboard::deliver_or_hold(&clipboard_sink,text),
                                             Err(reason)=>log::warn!("Clipboard desktop response rejected: {}",reason),
                                             _=>{},
                                         }
@@ -1362,6 +1425,14 @@ impl WebRtcSession {
                                         }
                                     }
                                     if let (21, WireValue::Bytes(payload)) = (field.number,&field.value) {
+                                        // One-shot inner schema dump: the field numbers tell which
+                                        // clipboard dialect the viewer speaks before any handler runs.
+                                        static CLIP_21_SHAPES:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+                                        if CLIP_21_SHAPES.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
+                                            if let Ok(inner)=crate::protocol::decode_wire(payload){
+                                                log::info!("Clipboard 21 RPC schema: fields={:?}",inner.iter().map(|f|f.number).collect::<Vec<_>>());
+                                            }
+                                        }
                                         let ids=crate::clipboard_rich::format_ids(payload);
                                         if !ids.is_empty(){log::info!("Clipboard offered format IDs: {:?}",ids);}
                                         let rich_result={
@@ -1370,7 +1441,7 @@ impl WebRtcSession {
                                         };
                                         match rich_result {
                                             Ok(result)=>{
-                                                if let Some(text)=result.text {if let Some(sink)=clipboard_sink.lock().unwrap().as_ref(){log::info!("Native desktop clipboard text received: bytes={}",text.len());sink.send_replace(Some(text));}}
+                                                if let Some(text)=result.text {crate::clipboard::deliver_or_hold(&clipboard_sink,text);}
                                                 let count=result.messages.len();
                                                 for (kind,payload) in result.messages {
                                                     let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -1381,18 +1452,14 @@ impl WebRtcSession {
                                             }
                                             Err(reason)=>log::warn!("Clipboard desktop request rejected: {}",reason),
                                         }
-                                        let received=crate::clipboard_protocol::read_text_request(payload);
+                                        let received={ let mut assembly=clipboard_rpc_assembly.lock().unwrap(); crate::clipboard_protocol::read_text_request(&mut assembly,payload) };
                                         match received {
                                             Ok(Some((header,text))) => {
-                                                let sink=clipboard_sink.lock().unwrap().clone();
-                                                if let Some(sink)=sink {
-                                                    log::info!("Native clipboard RPC text received: bytes={}",text.len());
-                                                    sink.send_replace(Some(text));
-                                                    let payload=crate::clipboard_protocol::text_response(&header);
-                                                    let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                                                    let message=crate::initialization::envelope(out_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),timestamp,22,&payload);
-                                                    let _=reply_chan.send(&bytes::Bytes::from(message)).await;
-                                                }
+                                                crate::clipboard::deliver_or_hold(&clipboard_sink,text);
+                                                let payload=crate::clipboard_protocol::text_response(&header);
+                                                let timestamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                let message=crate::initialization::envelope(out_sequence.fetch_add(1,std::sync::atomic::Ordering::Relaxed),timestamp,22,&payload);
+                                                let _=reply_chan.send(&bytes::Bytes::from(message)).await;
                                             }
                                             Ok(None)=> {if let Ok(nested)=crate::protocol::decode_wire(payload){log::info!("Clipboard RPC request schema: fields={:?}",nested.iter().map(|f|f.number).collect::<Vec<_>>());}},
                                             Err(reason)=>log::warn!("Clipboard RPC rejected: {}",reason),
@@ -1400,12 +1467,7 @@ impl WebRtcSession {
                                     }
                                     if let (17, WireValue::Bytes(payload)) = (field.number, &field.value) {
                                         match clipboard_assembly.lock().unwrap().accept(payload) {
-                                            Ok(Some(text)) => {
-                                                if let Some(sink) = clipboard_sink.lock().unwrap().as_ref() {
-                                                    log::info!("Native clipboard text received: bytes={}",text.len());
-                                                    sink.send_replace(Some(text));
-                                                }
-                                            }
+                                            Ok(Some(text)) => crate::clipboard::deliver_or_hold(&clipboard_sink,text),
                                             Ok(None) => {},
                                             Err(reason) => log::warn!("Native clipboard message rejected: {}",reason),
                                         }
@@ -1645,7 +1707,7 @@ impl WebRtcSession {
             input,
             desktop,
             role,
-            controller: crate::input::Controller::Other,
+            controller,
             context,
             actions: session_actions,
         })
@@ -1837,6 +1899,11 @@ fn with_max_message_size(sdp: &str) -> String {
     out
 }
 
+/// Error code for the viewer's audio probe. The probe arrives on every connect, so only a
+/// microphone the host was asked to expose and cannot is a fault: an opt-in microphone that is
+/// simply left off must not make a healthy host look broken.
+fn audio_probe_error(requested: bool, available: bool) -> u8 { u8::from(requested && !available) }
+
 fn negotiated_bundle_media(sdp: &str) -> Option<(String, u16)> {
     let preferred: Vec<&str> = sdp.lines().find_map(|l| l.strip_prefix("a=group:BUNDLE "))?
         .split_whitespace().collect();
@@ -1887,6 +1954,13 @@ async fn take_outbound_once<T>(slot: &tokio::sync::Mutex<Option<T>>) -> Option<T
 #[cfg(test)]
 mod tests {
     use super::negotiated_bundle_media;
+    #[test]
+    fn only_a_requested_but_missing_microphone_is_an_audio_fault() {
+        use super::audio_probe_error;
+        assert_eq!(audio_probe_error(false, false), 0, "leaving the opt-in microphone off is not a fault");
+        assert_eq!(audio_probe_error(true, false), 1, "a microphone that was asked for and is missing is a fault");
+        assert_eq!(audio_probe_error(true, true), 0, "a working microphone is not a fault");
+    }
     #[test]
     fn advertises_max_message_size_once_in_the_data_channel_section() {
         use super::with_max_message_size;

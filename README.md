@@ -114,7 +114,7 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 
 KDE Plasma（KWin）的 Portal 采集在锁屏后仍会继续。主机默认在锁屏时也打开采集，冷连接可以直接看到真实锁屏界面，并用远程键盘输入密码，不再只发黑帧（[#227](../../issues/227)、[#229](../../pull/229)）。`UU_LOCKED_CAPTURE=0` 关闭这一行为，回到黑帧和自动解锁的路径。KDE 判断依赖 systemd 用户环境里的 `XDG_CURRENT_DESKTOP` 或 `XDG_SESSION_DESKTOP`，两者都没有时回落到黑帧行为，可以手动设 `UU_LOCKED_CAPTURE=1` 开启。锁屏时 Portal 指针输入仍会被拦截，键盘通过 uinput 注入，可以输入密码。GNOME 不适用这一段，Mutter 在锁屏时关闭 Portal 会话，仍走上面的黑帧和自动解锁。
 
-无需修改现有熄屏和锁屏设置。主机仅在会话已解锁的采集恢复期间临时申请 GNOME 的 idle 抑制，拿到首帧后立即释放；锁屏、断开或初始化失败也会释放。远控窗口空闲时仍按原策略熄屏和锁屏，手动锁屏也继续生效。锁屏时停止 Portal 输入。KDE 下继续传输真实锁屏画面，GNOME 下隐藏真实画面并发黑帧。独立终端、文件传输和端口映射连接不依赖画面初始化，也不会因桌面重连被关闭。这一恢复路径已覆盖自动化协议与生命周期回归测试，锁屏冷连接后的自动解锁与采集恢复已用官方 Mac 和 iPhone 4.42.0 客户端在 GNOME 实机验证，熄屏等其余场景仍待验收；不支持从整机挂起或休眠状态通过现有控制通道唤醒。
+无需修改现有熄屏和锁屏设置。桌面会话存活期间，主机全程持有 GNOME 的 idle 抑制：空闲熄屏锁屏会终止 Portal 会话、掐断画面和输入，所以抑制随会话一直持有，锁屏、断开、初始化失败，或画面中断且重开失败时释放（健康判定看帧是否真的在送达，不只看 Portal 会话对象是否存活）。没有桌面会话时仍按原策略熄屏和锁屏，手动锁屏也继续生效。锁屏时停止 Portal 输入。KDE 下继续传输真实锁屏画面，GNOME 下隐藏真实画面并发黑帧。独立终端、文件传输和端口映射连接不依赖画面初始化，也不会因桌面重连被关闭。这一恢复路径已覆盖自动化协议与生命周期回归测试，锁屏冷连接后的自动解锁与采集恢复已用官方 Mac 和 iPhone 4.42.0 客户端在 GNOME 实机验证，熄屏等其余场景仍待验收；不支持从整机挂起或休眠状态通过现有控制通道唤醒。
 
 锁屏状态优先通过系统 D-Bus 读取 logind 的 `LockedHint` 并监听变化，正常监测不按秒启动 `loginctl`。尚无图形会话时保持未知并继续监听，登录后由信号触发重新读取。每 30 秒通过 D-Bus 校验会话；D-Bus 异常时每 30 秒重试并使用带超时的 `loginctl` 回退查询，命令路径只解析一次。回退期间状态通知可能延迟；无法读取时保持未知。锁屏程序仍需正确上报 logind 状态，这不改变睡眠、锁屏或远程连接策略。
 
@@ -145,7 +145,7 @@ niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通
 | 真彩（4:4:4） | 支持（v0.1.15）：NVENC / libx264 的默认 FFmpeg 管线输出 H.264 High 4:4:4；`inproc-av` 原生 NVENC 输出 H.264 High 4:4:4 / HEVC FRExt；VAAPI 管线仍为 4:2:0，并如实回报给客户端 |
 | HDR | 未实现 |
 | 超级屏 / 虚拟显示器 | 未实现 |
-| 被控端防窥模式 | 实验性：KDE Plasma Wayland（portal）支持隐私屏保和关屏，Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显；`UU_PRIVACY_AUTO=picture` / `screen-off` 可在桌面连接时自动开启。GNOME Wayland（portal）仅支持通过 Mutter 关屏，被本机或远程输入点亮时主机会再次关屏，完整远控尚未验收；见 [docs/privacy-screen.md](docs/privacy-screen.md) |
+| 被控端防窥模式 | 实验性：KDE Plasma Wayland（portal）支持隐私屏保和关屏，Mac 4.43.0 已验证不启用、隐私屏保、关闭显示屏三种状态回显；`UU_PRIVACY_AUTO=picture` / `screen-off` 可在桌面连接时自动开启。GNOME Wayland（portal）仅支持通过 Mutter 关屏，被本机或远程输入点亮时主机会再次关屏，完整远控尚未验收。主机会记住控制端上次的选择，设 `UU_PRIVACY_REMEMBER=1` 后才在下次桌面连接时自动套用；见 [docs/privacy-screen.md](docs/privacy-screen.md) |
 | 麦克风（控制端声音传到被控端） | 实验性：Opus → 虚拟麦克风，需 `UU_MICROPHONE=1`；支持 PulseAudio / PipeWire-pulse，见 [说明](docs/remote-microphone.md) |
 | 魔兽世界排队提醒等插件 | 不支持，会明确告诉客户端「无插件」 |
 | Linux 系统登录界面 | 还不支持控制开机后的系统登录界面（还没有人登录 Linux 桌面时）；这种情况可以用无头模式或虚拟桌面（见下文）。注意：这里说的是 Linux 系统登录，**不登录 UU 账号**现在可以通过「远程协助」使用 |
@@ -154,9 +154,9 @@ niri 会话通过 `niri msg --json outputs` 枚举已启用的显示器。普通
 
 ## 安装
 
-### 0. 直接用 Release 预编译包（推荐，x86_64 / aarch64）
+### 0. 直接用 Release 预编译包（推荐，x86_64 / aarch64 / loongarch64）
 
-**Ubuntu / Debian（v0.2.18 起）**：下载 `uu-remote-linux_<版本>_amd64.deb`（ARM64 选 `arm64`）后：
+**Ubuntu / Debian（v0.2.18 起）**：下载 `uu-remote-linux_<版本>_amd64.deb`（ARM64 选 `arm64`，龙芯选 `loong64`）后：
 
 ```sh
 sudo apt install ./uu-remote-linux_<版本>_amd64.deb
@@ -167,7 +167,7 @@ systemctl --user enable --now uuremote-native.service   # 随图形会话启动
 deb 会安装程序、插件、用户级 systemd 服务和应用菜单图标，并通过依赖自动装上 FFmpeg；uinput 权限不会自动开启（见第 5 步）。
 GNOME / KDE 会把显示环境自动传给服务；Xfce 等不传的桌面需按第 4 步补 `DISPLAY`。
 
-**其他发行版**：从 [Releases](../../releases/latest) 下载 `uu-remote-linux-<版本>-x86_64-linux.tar.gz`（ARM64 选 `aarch64-linux`），解压后用普通桌面用户（不要 root）运行：
+**其他发行版**：从 [Releases](../../releases/latest) 下载 `uu-remote-linux-<版本>-x86_64-linux.tar.gz`（ARM64 选 `aarch64-linux`，龙芯选 `loongarch64-linux`），解压后用普通桌面用户（不要 root）运行：
 
 ```sh
 cd uu-remote-linux-<版本>-x86_64-linux
@@ -187,8 +187,65 @@ cd uu-remote-linux-<版本>-x86_64-linux
 | Hyprland / Sway / niri 等 wlroots | 同上，另需 `libwayland-client`、`libxkbcommon`（Wayland 桌面自带） |
 | GNOME / KDE Wayland | glibc ≥ 2.39（Ubuntu 24.04、Fedora 40、Debian 13 及更新），以及 libei ≥ 1.1、PipeWire |
 
+**龙芯（LoongArch64）**：每次发版都会构建 `uu-remote-linux_<版本>_loong64.deb` 和 `uu-remote-linux-<版本>-loongarch64-linux.tar.gz`，
+用法和上面完全一样。产物按 glibc 2.38 链接，已在 Deepin 23.1 的 3A6000 上实测可用。
+注意两点：
+
+- **架构名不通用**：Debian 系用 `loong64`，AOSC 等发行版用 `loongarch64`；本项目的 deb 固定为 `loong64`，非 Debian 系发行版请用 tar.gz。
+- **GNOME/KDE portal 不可用**：`libuu-portal.so` 能编出来（编译期用的是 Deepin 25 的 libei-dev），但 Deepin 23 的软件源里没有
+  `libei1`，插件加载失败，因此 GNOME/KDE Wayland 会话在这个系统上只能退到 X11 会话。X11 和 wlroots（Hyprland 等）路径完整可用。
+
 插件放在 `uuremote-server` 同目录、`../lib/uu-remote-linux/`、`~/.local/lib/uu-remote-linux/` 或 `/usr/lib/uu-remote-linux/` 都能找到
 （`UU_ENGINE_DIR` 可指定）。缺库或版本太旧时日志会写明原因。之后从第 3 步「登录」继续；其他架构请按下面源码编译。
+
+### NixOS / Nix（Flake）
+
+仓库根目录提供了 `flake.nix`（包 `uu-remote-linux` 与 NixOS 模块 `nixosModules.default`），包装脚本会为 `uuremote-server` 与 `uuremote-viewer` 自动附带可用的 `ffmpeg`。
+
+**NixOS（推荐）**：在系统 flake 中引入本仓库并导入模块（模块已自带 overlay，无需手动配置 `nixpkgs.overlays`）：
+
+```nix
+# flake.nix
+{
+  inputs.uu-remote-linux.url = "github:VallierDev/uu-remote-linux";
+
+  outputs = { nixpkgs, uu-remote-linux, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      modules = [
+        uu-remote-linux.nixosModules.default
+        {
+          services.uu-remote-linux = {
+            enable = true;
+            # 可选（大多数 Wayland 桌面建议开启）：授予当前座位用户 /dev/uinput 权限。
+            # 注意：该权限允许向整个 seat 注入输入（含锁屏与登录界面）。
+            uinput.enable = true;
+            # 可选：需要进程内 NVENC / VAAPI 时启用 inproc-av
+            # package = pkgs.uu-remote-linux.override { withInprocAv = true; };
+            # 可选：写入 systemd 用户服务的环境变量
+            # settings.UU_DESKTOP_BACKEND = "wayland";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+重建系统后，在图形会话里运行 `uuremote-server login` 扫码，再确认用户服务状态与诊断输出：
+
+```sh
+uuremote-server login
+systemctl --user status uuremote-native.service
+uuremote-server doctor
+```
+
+**独立包（非 NixOS 模块）**：可直接 `nix run github:VallierDev/uu-remote-linux` 试跑，或 `nix profile install github:VallierDev/uu-remote-linux` 安装。安装后在图形会话里登录，并按第 4 步模板创建 `~/.config/systemd/user/uuremote-native.service`（将 `ExecStart` 改为 `%h/.nix-profile/bin/uuremote-server`）：
+
+```sh
+uuremote-server login
+systemctl --user daemon-reload
+systemctl --user enable --now uuremote-native.service
+```
 
 ### 1. 依赖（Ubuntu / Debian）
 
@@ -305,9 +362,9 @@ uinput 的 ASCII 文本映射依赖 X11/XWayland XKB；不可映射的文字保�
 安装应用菜单图标（可选）：
 
 ```sh
-install -Dm644 contrib/desktop/uu-remote-linux.svg ~/.local/share/icons/hicolor/scalable/apps/uu-remote-linux.svg
-install -Dm644 contrib/desktop/uu-remote-linux.desktop ~/.local/share/applications/uu-remote-linux.desktop
-install -Dm644 contrib/desktop/uu-remote-linux-viewer.desktop ~/.local/share/applications/uu-remote-linux-viewer.desktop
+install -Dm644 packaging/common/desktop/uu-remote-linux.svg ~/.local/share/icons/hicolor/scalable/apps/uu-remote-linux.svg
+install -Dm644 packaging/common/desktop/uu-remote-linux.desktop ~/.local/share/applications/uu-remote-linux.desktop
+install -Dm644 packaging/common/desktop/uu-remote-linux-viewer.desktop ~/.local/share/applications/uu-remote-linux-viewer.desktop
 ```
 
 验证情况：访客身份下的连接、错误验证码拒绝、用完换码、关闭后不可连接、登录与退出登录的切换，已用官方 Mac 客户端实测通过。
@@ -355,6 +412,7 @@ systemctl --user restart uuremote-native.service
 | 变量 | 作用 |
 |---|---|
 | `UU_CONFIG` | 配置文件路径（默认 `~/.config/uuremote/config.json`） |
+| `UU_BASE_URL` | 云端 API 基础地址（默认 `https://api.nrd.nie.163.com`）；配置文件中对应 `base_url`，环境变量优先；已设置但无效（如缺少 `https://`）时报错；扫码登录成功后会把所用地址写入配置文件的 `base_url`，使不带该变量启动的被控端服务把凭据发往同一服务器。长期使用请只写配置文件的 `base_url`，不要在 systemd unit 里设置本变量：它会覆盖配置文件，若与登录时所用地址不同，凭据会被发往另一台服务器 |
 | `UU_CLIENT_VERSION` | 上报给网易云端的被控端版本号（`x-param-vn` 与 User-Agent），默认 `4.45.0.4318`；配置文件中对应 `client_version`，环境变量优先 |
 | `UU_VERSION_CODE` | 上报给网易云端的被控端版本代码（`x-param-vc`），默认 `4318`；配置文件中对应 `version_code`，环境变量优先 |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms`（实验性特性） / `none`（无头模式） |
@@ -386,6 +444,8 @@ systemctl --user restart uuremote-native.service
 开启后主机还会经 TCP/TLS 连接云端 TURN 中继（使用 `HTTPS_PROXY`/`ALL_PROXY` 里的无认证 `http://` 代理做 CONNECT，没有代理则直连），适用于 UDP 到不了 TURN 服务器、只有 TCP/代理能出网的主机；TURN 证书按 CA 链校验，云端下发的 TURN 地址是 IP 时容忍名称不匹配（媒体本身由 DTLS-SRTP 端到端加密）。默认（不开代理）只用 UDP 中继，行为不变。**这不创建任何新的网络出口**：登录、信令和媒体仍需各自有允许使用的网络路径。连接器只返回固定错误类别/HTTP 状态；不要为诊断开启会记录 URL/认证信息的依赖库 TRACE 日志。
 
 「远程结束后自动锁屏」「静音运行」等设置保存在 `~/.config/uuremote/host_settings.json`。同一文件里的 `video_encoder`（`auto`/`cpu`/`vaapi`/`nvenc`）和 `video_codec`（`auto`/`h264`/`h265`）用 `uuremote-server set-encoder`、`uuremote-server set-codec` 写入（非法参数退出码 2）。非 `auto` 的值优先于 `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`；`auto` 或留空则落到环境变量，再落到 auto（有 NVIDIA 时 NVENC 优先，失败再 CPU；没有 NVIDIA 时就是 CPU，不探测；codec 仍是硬件优先 H.265、CPU 用 H.264）。探测在启动时后台进行，不挡住第一路出图。成功结果缓存到进程退出，但 NVIDIA 是否存在（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）与报告不一致时，下一次桌面连接会在后台再探测一次（`warm_auto_probe`），这一路仍用缓存的编码器，直到新结果写入。NVENC 失败只缓存 10 分钟，到期后的桌面连接同样在后台再探测一次，这一路仍用当前结果。`set-encoder` 和 `set-codec` 写完后若 `host.pid` 指向正在运行的本程序，都会发 `SIGUSR2`：编码器变化时进行中的桌面流立刻换编码器（不断开，沿用本会话已协商的 codec；新编码器起不来时按进程内 → FFmpeg 进程 → CPU 回退）。手改文件后可 `kill -USR2 $(cat ~/.config/uuremote/host.pid)`。`SIGUSR2` 不重新探测。codec 偏好仍在下次建立桌面连接时生效（运行中的 host 只记日志，不重开编码）。显式 `vaapi` 请求真彩时仍用 VAAPI、编码 4:2:0，并在 CaptureSettingSync 的 field 3 回报 4:2:0。所选编码器在本机不可用时，建流回退 CPU 并记 warning。VAAPI 进入 auto 要等 #33。
+
+上表的环境变量也可以统一写进 `~/.config/uuremote/env.conf`（与 `config.json` 同目录）：每行一条 `KEY=VALUE`，行首 `#` 为整行注释（值里可以含 `#`），只接受 `UU_` 开头的大写设置名（`UU_CONFIG` 除外——它会把配置文件指向别处，只认真实环境）；真实环境里已存在的变量优先（unit 里的 `Environment=` 仍是覆盖层），文件只在启动时读取，改完重启服务生效。账号凭据（`UU_TOKEN` / `UU_CSRF` / `UU_USER_ID` / `UU_SIGN_KEY` / `UU_SYSTEM_ID`）不允许写在这里，凭据仍归 `config.json` 或真实环境，非法行会记日志（只记行号和设置名，不记值）。适合把重装 systemd unit 后会丢的调优项（如 `UU_FT_BLOCK`、`UU_DESKTOP_BACKEND`）固定下来。
 
 自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 
@@ -576,14 +636,22 @@ GNOME 与官方 Mac 被控端的双向剪贴板尚未验证通过；此修改不
   **布局**：字符按 **US QWERTY** 物理键位映射（非美式布局的符号/字母可能对不上）。
   **Windows 数字 PIN**：输满位数后系统常会自动提交，一般不必再发 `{Enter}`；若只想填入、不登录，用 `--omit-last N` 省略最后 N 个字符。
   日志与 `--dry-run` 输出只含长度/事件数，不含明文。复用会话时，发送约 1 秒后会保存一帧 PNG（默认写在 `$XDG_RUNTIME_DIR/uu-viewer-type/`，权限 0600），路径打在日志并打印 `snapshot=…`。
-- 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
+- 桌面窗口中按 Ctrl+Alt+F 打开文件窗口（复用同一连接）。Ctrl+Alt+M 打开控制中心，Ctrl+Alt+G 切换网络状态，Ctrl+Alt+K 切换向被控端发送系统快捷键（键盘捕获）。`UU_VIEWER_AUDIO=0` 关闭声音，`UU_VIEWER_CLIPBOARD=0` 关闭剪贴板，
   `UU_VIEWER_VIEW_ONLY=1` 只看不控，`UU_VIEWER_FFMPEG` 指定 ffmpeg 路径。
+- **走中继还是直连**（`UU_VIEWER_FORCE_RELAY`）：默认跟随云端下发的 `force_relay`。设为 `1` 时改为只走云端的
+  TURN 中继，不再让直连候选参与竞争——双方都在 NAT 后时，直连路径可能远慢于中继。实测连官方 macOS 主机，
+  直连的往返是 350～1570 ms，走中继只有 18～24 ms。云端没有提供 TURN 服务器时该请求无效，
+  会保留云端的 ICE 策略并记一行警告。
 - 桌面同时提供 H.264 / H.265，由主机协商选择；`UU_VIEWER_CODEC=h264` 将 SDP 和解码能力限制为 H.264。
   默认请求 4:2:0；`UU_VIEWER_CHROMA=444` 在 CONTROL 打开后请求真彩（4:4:4）。主机可能回落到 4:2:0，
   以 CaptureSettingSync 回报为准。两种色度均由 FFmpeg 转为 RGB24 显示。
 - 按被控端原始分辨率解码，窗口缩放使用线性过滤；被控端分辨率变化时自动重启解码器。`UU_VIEWER_SIZE=WxH` 可改为固定的留黑边画布。
+- 如果远控时触摸板自然滚动与本机方向相反，在远控窗口启用 **控制中心 → 外设 → 跟随本机自然滚动**。
+  普通鼠标滚轮方向保持不变；触摸板的纵向、横向及精细自然滚动立即生效。选择记在 `~/.config/uuremote/viewer.json` 的 `follow_natural_scroll` 中（默认 `false`），下次连接自动沿用。
 
 SDL 远程画面窗口关闭本地输入法的文本组合，按物理键转发；输入中文时请使用被控端的输入法及其中英切换键（例如 Shift）。
+
+控制中心按实际字体字号绘制，菜单正文默认 16 像素；中文字体也保持可读大小。需要进一步放大时，可用 `UU_VIEWER_UI_SCALE=1.5 uuremote-viewer ui`，同时放大菜单、控制按钮和点击区域。
 
 Mac 目标使用 macOS 原生键码，Windows / Linux 目标保留 Windows VK。键盘按物理键位置转发，不自动把 Ctrl 改成 Command；
 控制 Mac 时，PC 键盘的 Super / Win 键对应 Command。仅接受已验证的目标平台值 1（Windows / 本项目 Linux 主机）和 4（Mac），

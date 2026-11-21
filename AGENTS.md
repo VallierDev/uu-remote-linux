@@ -68,9 +68,19 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
   login window only when `pkg-config gtk+-3.0` succeeds (`UU_NO_GTK=1` forces it off).
 - The portal feature panics in `build.rs` if GIO/PipeWire development packages are missing.
 - `vendor/webrtc-dtls` is a patched copy of the upstream crate (MIT/Apache); keep it as a path dependency.
+- `vendor/rcgen` (ring 0.17) and `vendor/nix` (loongarch64 ioctl table, plus a dead_code exemption for
+  its `#![deny(unused)]`, which a path dependency no longer gets `--cap-lints allow` for) are patched
+  copies too; see their `PATCHES.md`. Neither changes the x86_64/aarch64 code path.
 - CI (`.github/workflows/ci.yml`) runs `cargo test --locked` on ubuntu-22.04. Pushing a `v*` tag runs
   `.github/workflows/release.yml`, which builds and publishes the x86_64 tarball; release notes come from
   `docs/release-notes/<tag>.md`.
+- `.github/workflows/loongarch64.yml` builds the loong64 deb/tarball by running the normal native build
+  inside a `linuxdeepin/deepin:crimson-loong64@sha256:995e1233...` container under qemu-user (there is no
+  loongarch64 runner), because its glibc 2.38 matches the Deepin 23 target; pin the digest, not the tag. Nothing in
+  the tree is cross-compiled, so the only loongarch64-specific code is the vendored `nix`/`rcgen` patches.
+- Nix flake (`flake.nix`, `packaging/nix/`): `nix build` builds the package, `nix develop` opens a dev shell,
+  and `nix flake check --no-build` verifies evaluation. Periodically refresh `flake.lock` with `nix flake update`
+  (there is no automated lockfile-update workflow).
 
 ## 4. Install on a user's machine (step by step)
 
@@ -101,7 +111,7 @@ cargo build --release --features native-viewer,viewer-sdl --bin uuremote-viewer 
    WantedBy=graphical-session.target
    ```
 
-   Same as packaging/deb. GNOME/KDE import DISPLAY / WAYLAND_DISPLAY and start graphical-session.target; do not hard-code
+   Same as packaging/common. GNOME/KDE import DISPLAY / WAYLAND_DISPLAY and start graphical-session.target; do not hard-code
    DISPLAY there (it overrides the session's real one, XWayland is often :1); under default.target the unit can
    start before WAYLAND_DISPLAY is imported and fall back to X11. Desktops without that target (Xfce, i3) and the Xvfb
    virtual desktop need `WantedBy=default.target` plus an explicit `Environment=DISPLAY=...`; headless
@@ -123,6 +133,7 @@ viewer does not reconnect them automatically.
 |---|---|
 | `~/.config/uuremote/config.json` | user_id, device_id, client_id, system_id, machine_guid, token, csrf; optional `sign_key`, `ffmpeg_root`. `$UU_CONFIG` overrides the path |
 | `~/.config/uuremote/host_settings.json` | persisted 安全 settings: auto_lock, keep_mute, mute_permanent; optional `video_encoder` (`auto`/`cpu`/`vaapi`/`nvenc`) and `video_codec` (`auto`/`h264`/`h265`), written by `set-encoder` / `set-codec` (0600, merge write). Non-`auto` beats `UU_VIDEO_ENCODER` / `UU_VIDEO_CODEC`. `set-encoder` and `set-codec` both send `SIGUSR2` to the pid in `host.pid` (same binary). Live desktop streams restart the encoder (`EncoderTask::restart`, sequence kept, first frame IDR) without dropping the peer. Codec preference is logged and applies on the next desktop stream. `SIGUSR2` does not re-probe. Hand edits: `kill -USR2 $(cat ~/.config/uuremote/host.pid)` |
+| `~/.config/uuremote/env.conf` | durable home for the `UU_*` knobs (`src/env_conf.rs`, loaded first in `main` before the unified/assist decision): one `KEY=VALUE` per line, `#` comments, only `UU_[A-Z0-9_]{1,}` names; a real-environment variable already set wins (unit env stays the override layer); credential keys (`UU_TOKEN`/`UU_CSRF`/`UU_USER_ID`/`UU_SIGN_KEY`/`UU_SECRET`) are refused; rejections are logged by line number and key, never by value; read once at startup (restart to apply) |
 | `UU_DESKTOP_BACKEND` | `auto` (default) / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless: no display; desktop offers ignored; tool peers get a nominal 1920x1080 screen + Allow permissions, which the port-mapping viewer requires) |
 | `UU_X11_MULTISCREEN=1`, `UU_X11_OUTPUT` | X11: advertise each RandR monitor (`xrandr --listmonitors`, read once at start; primary or `UU_X11_OUTPUT` is id 0) through the same screen-switch path as `UU_WAYLAND_MULTISCREEN` (`wayland::outputs`/`select`). x11grab reads `display+x,y` at the monitor size, XTest/uinput absolute input adds the monitor offset, the in-process engine and `desktop_mode` resize are skipped (分辨率 scales). Needs two or more monitors |
 | `UU_DESKTOP_RESIZE=0` | X11: the viewer's 分辨率 choice scales the encoded stream instead of changing the display mode. Default: `src/desktop_mode.rs` switches the primary output via xrandr (adds a CVT-RB mode when missing, re-applies once if mutter resets it), restores the original mode for resolution_type 3 and 2 s after the last desktop stream ends |
@@ -135,6 +146,7 @@ viewer does not reconnect them automatically.
 | `contrib/virtual-desktop/` | Xvfb + session (`UU_VIRTUAL_SESSION`, `UU_VIRTUAL_BUS=user|private`) for monitorless hosts; serve it with `DISPLAY=:99` |
 | `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: explicit Intel/AMD; `nvenc`: force; unset/`auto`: background probe, one synthetic IDR per candidate, 3 s each. While #33 is open, auto is NVENC then CPU when `/proc/driver/nvidia/version` or `/dev/nvidia0` exists; with no NVIDIA the only candidate is CPU and the probe is skipped. A session that starts before the probe finishes uses the legacy rule (NVENC if NVIDIA is present, else CPU). On `--features inproc-av`, a process-only failure of NVENC when the native engine would try it first on X11 is `native_unprobed` and keeps that legacy NVENC choice (Wayland, portal, and KMS fall back to CPU). The skipped CPU-only probe is logged `not probed (only candidate)`. A successful probe and that CPU-only skip stay cached while NVIDIA presence (`/proc/driver/nvidia/version` or `/dev/nvidia0`) matches the report. A later desktop connection whose presence differs treats the report as stale and starts one background re-probe (`warm_auto_probe`, non-blocking, one at a time) and still uses the cached encoder. A hardware-candidate failure (NVENC failed, chosen CPU) is cached for 10 minutes (`PROBE_FAILURE_TTL`); the next desktop connection after that starts the same re-probe and still uses the cached encoder. Explicit `cpu` / `vaapi` / `nvenc` (setting file or `UU_VIDEO_ENCODER`) does not start the probe. A later success selects NVENC again; another failure restarts the 10 minutes. `native_unprobed` is not a failure cache. Ignored when `host_settings.json` `video_encoder` is not `auto`. Explicit `vaapi` with 真彩 encodes 4:2:0 and reports that in CaptureSettingSync (field 3). VAAPI is not an auto candidate until #33 |
 | `UU_VIDEO_CODEC=h264` | force H.264 even when the viewer negotiated H.265 (default: H.265 when both sides support it and the encoder is hardware). Same precedence as the encoder: setting file, then this variable, then auto |
+| `UU_VIDEO_FPS_ADAPT=1` | adaptive frame rate under congestion (default off): once the governor's bitrate cap sits on `FLOOR_KBPS` and the path is still congested, the stream walks a frame ladder down to 5 fps instead of only dropping frames, and climbs back once the path has been congestion-free for a full probe window (60 s) — on marginal (hold-band) reports too, and not only after the bitrate cap is fully recovered: a recovered relay keeps a 1-8% loss or 150-300 ms RTT baseline that never reads clean and never fills the cap, so requiring either pinned frames down forever; a fresh congestion report restarts the window and halts the climb (then the viewer's nominal rate is released, so a later viewer raise is not clamped). The viewer keeps showing its own fps: CaptureSettingSync reports the nominal value, only the encoder runs lower. Ladder steps share the restart gate with bitrate steps, so cap+fps changes reopen the pipeline once |
 | `UU_FFMPEG_ROOT` | FFmpeg prefix (`bin/ffmpeg`, libs in `lib/x86_64-linux-gnu`) |
 | `UU_AUDIO=0`, `UU_AUDIO_SOURCE` | disable sound / choose the Pulse source (default `@DEFAULT_MONITOR@`) |
 | `UU_LOGIN_WINDOW=0` | don't auto-open the login window |
@@ -177,7 +189,7 @@ for a new QR login.
 | `src/assist.rs`, `c_engine/assist_window.c` | remote assistance (guest + account) and the unified GTK main window (assist + account/QR card) |
 | `src/viewer_main.rs`, `src/viewer/` | experimental viewer (`--features native-viewer,viewer-sdl`): cloud join, WebRTC offer side, SDL desktop window (ffmpeg CLI decode), files/terminal/portmap/power/assist tools, device removal (`POST /api/v1/device/{id}/unbind`, verified live; shared devices use `/api/v1/device/share/{id}/unbind`, strings only), GTK launcher |
 | `c_engine/viewer_window.c`, `c_engine/viewer_tools.c` | viewer GTK launcher and tool windows (files, port mapping, terminal list) |
-| `src/viewer/hud.rs` | in-window chrome drawn on the SDL canvas: loading screen, control center (Ctrl+Alt+M; capture settings RPC 2 and SimpleActions 14/16/18/19 as the official viewer sends them), network-status panel (Ctrl+Alt+G); fontconfig font via ab_glyph |
+| `src/viewer/hud.rs` | in-window chrome drawn on the SDL canvas: loading screen, control center (Ctrl+Alt+M; capture settings RPC 2 and SimpleActions 14/16/18/19 as the official viewer sends them), network-status panel (Ctrl+Alt+G), keyboard grab toggle (Ctrl+Alt+K); fontconfig font via ab_glyph |
 | `src/viewer/thumbs.rs`, `src/viewer/host.rs` | launcher device previews (last picture, local 0600 cache); viewer sign-in keeps the local host user service running so the machine joins the account's device list |
 
 Diagnostic subcommands: `doctor` (paste-safe report: session, selected backend, engine plugins, uinput, encoder and codec with source, sign-in/service state; booleans and names only), `set-encoder auto|cpu|vaapi|nvenc` and `set-codec auto|h264|h265` (both notify a running host with SIGUSR2; live encoder switch, negotiated codec unchanged, codec preference on the next desktop stream; illegal values exit 2), `login [--no-gui]`, `unlock-check` (password on stdin, prints only accepted/rejected),
@@ -271,6 +283,13 @@ started a second full host server instead, so check that a subcommand exists in 
   a private `dbus-run-session` bus does not bring them onto a virtual display.
 - GTK windows stop repainting while GNOME is locked or the monitor is off; test UI on Xvfb or after unlock.
 - logind `unlock-session` by the session owner clears the GNOME shield in ~3 s.
+- KDE X11 with `pam_fprintd.so timeout=-1`: after a password unlock `kscreenlocker_greet` stays alive waiting for a
+  finger, the next lock cannot start a greeter (input grabbed, desktop visible) and the old greeter's exit unlocks.
+  `session_lock/stale_greeter.rs` kills a greeter started before the unlock in that logind session (cgroup
+  `session-<id>.scope`, else `XDG_SESSION_ID` of the greeter or, as the greeter is non-dumpable, of its parent;
+  unknown = untouched) still running 3 s after the session unlocks. Auto unlock hits the same hang: ksld answers
+  logind's Unlock by SIGTERMing the greeter and unlocks when it exits, so the session stays locked behind a black
+  lock window; `unlock_with` kills such a greeter when the session is still locked 2 s after `unlock-session`.
 - GNOME closes the portal session on lock; capture/input must share one portal session and be rebuilt after
   unlock. Portal input/clipboard permissions are persisted per desktop (0600 file); a revoked permission asks again.
 
@@ -291,6 +310,8 @@ started a second full host server instead, so check that a subcommand exists in 
 - New protocol behavior: cite the evidence (observed field numbers, official log strings) in a comment.
 - Update README.md / README.en.md when user-visible features or limitations change, and add
   `docs/release-notes/<tag>.md` before tagging a release.
+- Refresh `flake.lock` periodically (e.g. before a release or when packaging files change) with
+  `nix flake update` and verify with `nix flake check` (plus `nix fmt -- --check flake.nix packaging/nix/*.nix`).
 
 ### VAAPI
 

@@ -1,7 +1,6 @@
 //! logind signals replace per-second process spawning; loginctl is a bounded fallback.
-use super::{publish_lock_state, Duration};
+use super::{Duration, LockState, Observed};
 use futures_util::StreamExt;
-use tokio::sync::watch;
 use zbus::{Connection, MatchRule, MessageStream, Proxy, proxy::CacheProperties};
 
 const SERVICE: &str = "org.freedesktop.login1";
@@ -9,7 +8,8 @@ const ROOT: &str = "/org/freedesktop/login1";
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(30);
 
-async fn locked(connection: &Connection) -> zbus::Result<Option<bool>> {
+/// The display session and its lock state; the session id travels with the state it was read for.
+async fn locked(connection: &Connection) -> zbus::Result<Option<Observed>> {
     let path = format!("{ROOT}/user/_{}", unsafe { libc::getuid() });
     let user = zbus::proxy::Builder::<Proxy<'_>>::new(connection).destination(SERVICE)?
         .path(path)?.interface("org.freedesktop.login1.User")?
@@ -20,15 +20,16 @@ async fn locked(connection: &Connection) -> zbus::Result<Option<bool>> {
     let session = zbus::proxy::Builder::<Proxy<'_>>::new(connection).destination(SERVICE)?
         .path(display.1)?.interface("org.freedesktop.login1.Session")?
         .cache_properties(CacheProperties::No).build().await?;
-    session.get_property("LockedHint").await.map(Some)
+    let locked: bool = session.get_property("LockedHint").await?;
+    Ok(Some((display.0, locked)))
 }
 
-async fn snapshot(connection: &Connection) -> zbus::Result<Option<bool>> {
+async fn snapshot(connection: &Connection) -> zbus::Result<Option<Observed>> {
     tokio::time::timeout(CALL_TIMEOUT, locked(connection)).await
         .map_err(|_| zbus::Error::Failure("lock query timed out".into()))?
 }
 
-async fn monitor_connection(connection: &Connection, sender: &watch::Sender<Option<bool>>) -> zbus::Result<()> {
+async fn monitor_connection(connection: &Connection, state: &mut LockState) -> zbus::Result<()> {
     // Subscribe before reading: any change during the first snapshot stays queued.
     // Watch all logind signals so User.Display, SessionNew/Removed and invalidated
     // properties also re-resolve the graphical session instead of trusting a stale path.
@@ -36,7 +37,7 @@ async fn monitor_connection(connection: &Connection, sender: &watch::Sender<Opti
         .sender(SERVICE)?.path_namespace(ROOT)?.build();
     let mut signals = tokio::time::timeout(CALL_TIMEOUT, MessageStream::for_match_rule(rule, connection, Some(64))).await
         .map_err(|_| zbus::Error::Failure("lock subscription timed out".into()))??;
-    publish_lock_state(sender, snapshot(connection).await?);
+    state.publish(snapshot(connection).await?);
     let mut reconcile = tokio::time::interval(RETRY);
     reconcile.tick().await;
     loop {
@@ -44,24 +45,24 @@ async fn monitor_connection(connection: &Connection, sender: &watch::Sender<Opti
             event = signals.next() => { event.ok_or_else(|| zbus::Error::Failure("system bus closed".into()))??; },
             _ = reconcile.tick() => {},
         }
-        publish_lock_state(sender, snapshot(connection).await?);
+        state.publish(snapshot(connection).await?);
     }
 }
 
-pub(super) async fn monitor(sender: watch::Sender<Option<bool>>) {
+pub(super) async fn monitor(state: &mut LockState) {
     let mut degraded = false;
     loop {
         let result = tokio::time::timeout(CALL_TIMEOUT, async { zbus::connection::Builder::system()?.method_timeout(CALL_TIMEOUT).build().await }).await;
         if let Ok(Ok(connection)) = result {
             if !degraded { log::debug!("Desktop lock monitor: logind D-Bus"); }
             // Recovery is announced only after a valid snapshot, via the state channel.
-            let _ = monitor_connection(&connection, &sender).await;
+            let _ = monitor_connection(&connection, state).await;
         }
-        publish_lock_state(&sender, None);
+        state.publish(None);
         if !degraded { log::warn!("Desktop lock monitor unavailable; retrying D-Bus with bounded loginctl fallback every 30s"); }
         degraded = true;
-        let fallback = tokio::task::spawn_blocking(super::locked_now).await.ok().flatten();
-        publish_lock_state(&sender, fallback);
+        let fallback = tokio::task::spawn_blocking(super::observed_now).await.ok().flatten();
+        state.publish(fallback);
         tokio::time::sleep(RETRY).await;
     }
 }
@@ -69,6 +70,7 @@ pub(super) async fn monitor(sender: watch::Sender<Option<bool>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::watch;
     use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
     use zbus::zvariant::{OwnedObjectPath, Value};
 
@@ -132,8 +134,9 @@ mod tests {
         let client = zbus::connection::Builder::address(address).unwrap().build().await.unwrap();
         let (tx, mut rx) = watch::channel(Some(false));
         let monitor = tokio::spawn(async move {
-            let result = monitor_connection(&client, &tx).await;
-            publish_lock_state(&tx, None);
+            let mut state = LockState::new(tx);
+            let result = monitor_connection(&client, &mut state).await;
+            state.publish(None);
             result
         });
         expect(&mut rx, None).await;
@@ -164,8 +167,9 @@ mod tests {
         let close = client.clone();
         let (tx, mut rx) = watch::channel(None);
         let monitor = tokio::spawn(async move {
-            let result = monitor_connection(&client, &tx).await;
-            publish_lock_state(&tx, None);
+            let mut state = LockState::new(tx);
+            let result = monitor_connection(&client, &mut state).await;
+            state.publish(None);
             result
         });
         expect(&mut rx, Some(true)).await;
@@ -202,7 +206,7 @@ mod tests {
     async fn live_logind_snapshot_matches_loginctl_without_changing_lock_state() {
         let connection = Connection::system().await.unwrap();
         let dbus = snapshot(&connection).await.unwrap();
-        let command = tokio::task::spawn_blocking(super::super::locked_now).await.unwrap();
+        let command = tokio::task::spawn_blocking(super::super::observed_now).await.unwrap();
         assert_eq!(dbus, command);
     }
 }

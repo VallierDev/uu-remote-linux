@@ -128,7 +128,7 @@ The host also accepts a desktop connection while GNOME is locked with no Portal 
 
 On KDE Plasma (KWin), the Portal screencast stays alive after the session locks. The host now opens capture while locked by default, so a cold connection shows the real lock screen and the password can be entered with the remote keyboard instead of receiving black video ([#227](../../issues/227), [#229](../../pull/229)). Set `UU_LOCKED_CAPTURE=0` to disable this and return to the black-video and auto-unlock path. Detection requires `XDG_CURRENT_DESKTOP` or `XDG_SESSION_DESKTOP` in the systemd user environment. Without either the host falls back to black video, and `UU_LOCKED_CAPTURE=1` forces the new behavior. Portal pointer input remains blocked while locked, and the keyboard uses uinput and can enter the password. This does not apply to GNOME: Mutter closes the Portal session on lock, so the black-video and auto-unlock behavior above is unchanged.
 
-Existing screen-off and lock settings remain unchanged. Only capture recovery in an unlocked session temporarily holds a GNOME idle inhibitor; the first frame, lock, disconnect or initialization failure releases it. An idle viewer still allows the normal screen-off and lock timeout, and manual lock remains effective. Portal input is blocked while locked. KDE keeps sending the real lock screen, while GNOME hides real video and uses black video. Independent terminal, file-transfer and port-mapping peers do not wait for video initialization and survive desktop reconnection. Automated protocol and lifecycle regression tests cover this path; auto unlock and capture recovery after a cold locked connection are verified on GNOME hardware with the official Mac and iPhone 4.42.0 viewers, while screen-off and the other scenarios still need acceptance testing. Waking a fully suspended or hibernating machine is outside this CONTROL path.
+Existing screen-off and lock settings remain unchanged. A live desktop session holds the GNOME idle inhibitor for its whole lifetime: an idle lock would end the Portal session and stop frames and input, so the inhibitor is released only on lock, disconnect, an initialization failure, or a capture interruption whose reopen fails (health is judged by whether frames actually arrive, not by whether the Portal session object is still alive). Without a desktop session the normal screen-off and lock timeouts still apply, and manual lock remains effective. Portal input is blocked while locked. KDE keeps sending the real lock screen, while GNOME hides real video and uses black video. Independent terminal, file-transfer and port-mapping peers do not wait for video initialization and survive desktop reconnection. Automated protocol and lifecycle regression tests cover this path; auto unlock and capture recovery after a cold locked connection are verified on GNOME hardware with the official Mac and iPhone 4.42.0 viewers, while screen-off and the other scenarios still need acceptance testing. Waking a fully suspended or hibernating machine is outside this CONTROL path.
 
 Lock monitoring reads logind `LockedHint` over the system D-Bus and subscribes to changes instead of spawning `loginctl` every second. Without a graphical session it stays subscribed with unknown state, so login signals trigger a fresh read. It reconciles the session over D-Bus every 30 seconds; if D-Bus fails, it retries with a bounded `loginctl` fallback every 30 seconds, resolving the executable path once. Notifications may be delayed during fallback; unreadable state remains unknown. The locker must still report its state to logind. Suspend, locking and remote connection policies are unchanged.
 
@@ -164,7 +164,7 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 | True color (4:4:4) | Supported (v0.1.15): the default FFmpeg pipeline with NVENC / libx264 encodes H.264 High 4:4:4; `inproc-av` native NVENC encodes H.264 High 4:4:4 / HEVC FRExt; VAAPI stays 4:2:0 and reports that to the client |
 | HDR | Not implemented |
 | Super screen / virtual display | Not implemented |
-| Privacy screen on the host | Experimental: KDE Plasma Wayland (portal) supports picture and screen-off, and Mac 4.43.0 was verified for the off, picture and screen-off labels; `UU_PRIVACY_AUTO=picture` / `screen-off` enables it automatically on desktop connect. GNOME Wayland (portal) supports Mutter screen-off only and turns the display off again after local or remote input wakes it; full remote-control behavior is unverified; see [docs/privacy-screen.md](docs/privacy-screen.md) |
+| Privacy screen on the host | Experimental: KDE Plasma Wayland (portal) supports picture and screen-off, and Mac 4.43.0 was verified for the off, picture and screen-off labels; `UU_PRIVACY_AUTO=picture` / `screen-off` enables it automatically on desktop connect. GNOME Wayland (portal) supports Mutter screen-off only and turns the display off again after local or remote input wakes it; full remote-control behavior is unverified. The host remembers the viewer's last mode and replays it on the next desktop connect only with `UU_PRIVACY_REMEMBER=1`; see [docs/privacy-screen.md](docs/privacy-screen.md) |
 | Microphone (viewer audio played on the host) | Experimental: Opus to a virtual input with `UU_MICROPHONE=1`; supports PulseAudio / PipeWire-pulse, see [notes](docs/remote-microphone.md) |
 | Plugins such as the WoW queue notifier | Not supported; the client is told that no plugins exist |
 | Linux login screen | The system login screen (before anyone logs in to the Linux desktop) cannot be controlled yet; use headless mode or a virtual desktop (see below). This is about the Linux login: **without a UU account** the host can now be used through remote assistance |
@@ -173,9 +173,9 @@ On niri, `niri msg --json outputs` enumerates enabled monitors. Normal and 90/18
 
 ## Installation
 
-### 0. Prebuilt release package (recommended, x86_64 / aarch64)
+### 0. Prebuilt release package (recommended, x86_64 / aarch64 / loongarch64)
 
-**Ubuntu / Debian (v0.2.18+)**: download `uu-remote-linux_<version>_amd64.deb` (ARM64: `arm64`), then:
+**Ubuntu / Debian (v0.2.18+)**: download `uu-remote-linux_<version>_amd64.deb` (ARM64: `arm64`, LoongArch: `loong64`), then:
 
 ```sh
 sudo apt install ./uu-remote-linux_<version>_amd64.deb
@@ -186,7 +186,7 @@ systemctl --user enable --now uuremote-native.service   # start with the graphic
 The deb installs the binaries, plugins, a systemd user unit and menu entries, and pulls in FFmpeg as a dependency; uinput access stays opt-in (step 5).
 GNOME and KDE pass the display environment to the unit; on desktops that don't (e.g. Xfce) add `DISPLAY` as in step 4.
 
-**Other distributions**: download `uu-remote-linux-<version>-x86_64-linux.tar.gz` (ARM64: `aarch64-linux`) from [Releases](../../releases/latest), extract it, then run as your desktop user (not root):
+**Other distributions**: download `uu-remote-linux-<version>-x86_64-linux.tar.gz` (ARM64: `aarch64-linux`, LoongArch: `loongarch64-linux`) from [Releases](../../releases/latest), extract it, then run as your desktop user (not root):
 
 ```sh
 cd uu-remote-linux-<version>-x86_64-linux
@@ -207,9 +207,68 @@ running session at startup, and the matching `libuu-*.so` is loaded only on Wayl
 | wlroots (Hyprland / Sway / niri) | the same, plus `libwayland-client` and `libxkbcommon` (present on Wayland desktops) |
 | GNOME / KDE Wayland | glibc >= 2.39 (Ubuntu 24.04, Fedora 40, Debian 13 and newer), libei >= 1.1 and PipeWire |
 
+**LoongArch (LoongArch64)**: every release also publishes `uu-remote-linux_<version>_loong64.deb` and
+`uu-remote-linux-<version>-loongarch64-linux.tar.gz`, used exactly like the packages above. They are linked against
+glibc 2.38 and were verified on Deepin 23.1 on a 3A6000. Two caveats:
+
+- **The architecture name is not portable**: Debian derivatives use `loong64`, AOSC and others use `loongarch64`. The deb
+  here is always `loong64`; on non-Debian distributions use the tarball.
+- **The GNOME/KDE portal backend is unavailable**: `libuu-portal.so` is built (against Deepin 25's libei-dev), but Deepin 23's
+  repositories carry no `libei1`, so the plugin fails to load and GNOME/KDE Wayland sessions fall back to an X11 session on that
+  system. X11 and wlroots (Hyprland etc.) are fully supported.
+
 Plugins are found next to `uuremote-server`, in `../lib/uu-remote-linux/`, `~/.local/lib/uu-remote-linux/` or
 `/usr/lib/uu-remote-linux/` (`UU_ENGINE_DIR` overrides); a missing library or too old glibc is reported in the log.
 Continue with step 3 (login). Other architectures: build from source below.
+
+### NixOS / Nix (Flake)
+
+The repository includes a `flake.nix` providing the `uu-remote-linux` package and `nixosModules.default`. Both `uuremote-server` and `uuremote-viewer` are wrapped with a capture-capable `ffmpeg` on `PATH`.
+
+**NixOS (recommended)**: add this flake as an input and import `nixosModules.default` (the module applies the overlay automatically):
+
+```nix
+# flake.nix
+{
+  inputs.uu-remote-linux.url = "github:VallierDev/uu-remote-linux";
+
+  outputs = { nixpkgs, uu-remote-linux, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      modules = [
+        uu-remote-linux.nixosModules.default
+        {
+          services.uu-remote-linux = {
+            enable = true;
+            # Optional (recommended on most Wayland sessions): grant the active seat user access to /dev/uinput.
+            # Security note: this permission can inject input into the whole seat, including lock and greeter screens.
+            uinput.enable = true;
+            # Optional: enable inproc-av for in-process NVENC / VAAPI encoding
+            # package = pkgs.uu-remote-linux.override { withInprocAv = true; };
+            # Optional: environment variables passed to the uuremote-native user unit
+            # settings.UU_DESKTOP_BACKEND = "wayland";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+After rebuilding, sign in inside your graphical session and check the user service:
+
+```sh
+uuremote-server login
+systemctl --user status uuremote-native.service
+uuremote-server doctor
+```
+
+**Standalone package (without the NixOS module)**: run with `nix run github:VallierDev/uu-remote-linux` or install with `nix profile install github:VallierDev/uu-remote-linux`. After installing, log in inside your graphical session and create `~/.config/systemd/user/uuremote-native.service` from step 4 with `ExecStart=%h/.nix-profile/bin/uuremote-server`:
+
+```sh
+uuremote-server login
+systemctl --user daemon-reload
+systemctl --user enable --now uuremote-native.service
+```
 
 ### 1. Dependencies (Ubuntu / Debian)
 
@@ -338,9 +397,9 @@ connect from 开始协助 (remote assistance) in UU Remote.
 Optional launcher icon:
 
 ```sh
-install -Dm644 contrib/desktop/uu-remote-linux.svg ~/.local/share/icons/hicolor/scalable/apps/uu-remote-linux.svg
-install -Dm644 contrib/desktop/uu-remote-linux.desktop ~/.local/share/applications/uu-remote-linux.desktop
-install -Dm644 contrib/desktop/uu-remote-linux-viewer.desktop ~/.local/share/applications/uu-remote-linux-viewer.desktop
+install -Dm644 packaging/common/desktop/uu-remote-linux.svg ~/.local/share/icons/hicolor/scalable/apps/uu-remote-linux.svg
+install -Dm644 packaging/common/desktop/uu-remote-linux.desktop ~/.local/share/applications/uu-remote-linux.desktop
+install -Dm644 packaging/common/desktop/uu-remote-linux-viewer.desktop ~/.local/share/applications/uu-remote-linux-viewer.desktop
 ```
 
 Verified with the official Mac viewer: guest connections, wrong-code rejection, code rotation, switching assistance off,
@@ -392,6 +451,7 @@ Common environment variables:
 | Variable | Purpose |
 |---|---|
 | `UU_CONFIG` | Config file path (default `~/.config/uuremote/config.json`) |
+| `UU_BASE_URL` | Cloud API base URL (default `https://api.nrd.nie.163.com`); corresponds to `base_url` in config file, environment variable takes precedence; a set but invalid value (e.g. missing `https://`) is an error; a successful QR login saves the address it used as `base_url` in the config file, so a host service started without the variable sends the credentials to the same server. For a lasting setup use only the config file `base_url` and do not set this variable in the systemd unit: it overrides the config file, and if it differs from the address used at login the credentials go to the other server |
 | `UU_CLIENT_VERSION` | Reported host client version (`x-param-vn` and User-Agent), default `4.45.0.4318`; corresponds to `client_version` in config file, environment variable takes precedence |
 | `UU_VERSION_CODE` | Reported host version code (`x-param-vc`), default `4318`; corresponds to `version_code` in config file, environment variable takes precedence |
 | `UU_DESKTOP_BACKEND` | `auto` / `x11` / `wayland` / `portal` / `kms` (experimental feature) / `none` (headless) |
@@ -444,6 +504,8 @@ connection starts; the running host only logs it. Explicit `vaapi` with 真彩 s
 encodes 4:2:0, and reports chroma 4:2:0 in CaptureSettingSync field 3. If the chosen encoder
 cannot start, the stream falls back to CPU and logs a warning. VAAPI is not an auto candidate
 until #33.
+
+The environment variables above can also live in one file: `~/.config/uuremote/env.conf` (next to `config.json`), one `KEY=VALUE` per line, a leading `#` comments the whole line (values may contain `#`), only uppercase `UU_` setting names are accepted — except `UU_CONFIG`, refused here because it would point the config file somewhere else than this file (real environment only). A variable already set in the real environment wins (the unit's `Environment=` stays the override layer); the file is read once at startup, so a restart is needed after an edit. Account credentials (`UU_TOKEN` / `UU_CSRF` / `UU_USER_ID` / `UU_SIGN_KEY` / `UU_SYSTEM_ID`) are refused there — they belong to `config.json` or the real environment. Rejected lines are logged by line number and key only, never by value. It is the durable home for tuning knobs (`UU_FT_BLOCK`, `UU_DESKTOP_BACKEND`, …) that a systemd unit reinstall would wipe.
 
 Custom bitrate follows the Mbps value selected in the client; for example, 1 Mbps sets an encoder cap of 1000 kbit/s.
 
@@ -626,6 +688,11 @@ terminal emulator (`TERMINAL` selects one). From source: `sudo apt install libsd
 
 Key combinations use the left/right modifier state attached to each SDL key event. Focus loss releases remote keys; after focus returns, the next non-modifier key restores any still-held Shift/Ctrl/Alt/Win (Command on Mac). This is built in, with no adapter or setting required.
 
+Control-center text uses actual font em sizes, with 16 px menu labels so CJK fonts remain readable. To enlarge the controls further, launch with `UU_VIEWER_UI_SCALE=1.5 uuremote-viewer ui`; menu geometry and hit targets scale together.
+
+If touchpad natural scrolling feels reversed remotely, enable **Control center → Peripherals → Follow local natural scrolling** in the remote window.
+Normal mouse wheel direction stays unchanged; the option takes effect immediately for both axes and precise natural scrolling. The `follow_natural_scroll` preference is saved in `~/.config/uuremote/viewer.json` (default `false`) and restored on the next connection.
+
 The viewer mirrors remote PNG pointer shapes (including text and window-resize cursors) with their hotspots. Leaving the remote picture or opening local controls restores the local arrow.
 
 SDL clipboard access reuses the desktop window to avoid temporary-window Dock churn on GNOME Wayland (#37).
@@ -656,8 +723,13 @@ GNOME-to-official-Mac bidirectional clipboard synchronization is still unverifie
   **Layout**: characters are mapped for **US QWERTY** only (non-US layouts may mistype symbols/letters).
   **Windows numeric PIN**: Windows often submits automatically once enough digits are entered — usually no `{Enter}` needed. Use `--omit-last N` to omit the last N characters when you want to fill without signing in.
   Logs and `--dry-run` report lengths/event counts only. When reusing a session, about one second after sending, a PNG frame is saved (default under `$XDG_RUNTIME_DIR/uu-viewer-type/`, mode 0600); the path is logged and printed as `snapshot=…`.
-- Ctrl+Alt+F in the desktop window opens the files window on the same connection. `UU_VIEWER_AUDIO=0` disables sound,
+- In the desktop window: Ctrl+Alt+F opens the files window on the same connection, Ctrl+Alt+M toggles the control center, Ctrl+Alt+G toggles the network-status HUD, and Ctrl+Alt+K toggles sending system shortcuts to the remote host (keyboard grab). `UU_VIEWER_AUDIO=0` disables sound,
   `UU_VIEWER_CLIPBOARD=0` the clipboard, `UU_VIEWER_VIEW_ONLY=1` input; `UU_VIEWER_FFMPEG` selects the ffmpeg binary.
+- **Relay or direct** (`UU_VIEWER_FORCE_RELAY`): the default follows the `force_relay` the cloud sent. Set it to
+  `1` to use only the cloud's TURN relay instead of letting a direct candidate compete — with both peers behind
+  NAT the direct path can be far slower than the relay. Measured against the official macOS host, the direct
+  round trip was 350–1570 ms while the relay gave 18–24 ms. The request has no effect when the cloud lists no
+  TURN server: the cloud's ICE policy is kept and a warning is logged.
 - Desktop offers H.264 / H.265; the host chooses the codec. `UU_VIEWER_CODEC=h264` limits both SDP and decoder capabilities to H.264.
   The default request stays 4:2:0; `UU_VIEWER_CHROMA=444` requests true color (4:4:4) after CONTROL opens. The host may fall back to
   4:2:0, as reported by CaptureSettingSync. FFmpeg converts either chroma format to RGB24 for display.
