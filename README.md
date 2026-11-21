@@ -258,7 +258,7 @@ sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # 可选：GNOME/KDE portal 后端
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
 # 可选：inproc-av 的 VAAPI/DRI3 引擎编译所需（libva 本体运行时加载）
-sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
+sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev libx264-dev
 # inproc-av 的进程内音频采集与 Opus 编码
 sudo apt install libpulse-dev libopus-dev
 ```
@@ -277,7 +277,9 @@ cargo build --release --features wayland,portal   # + GNOME/KDE Wayland
 ```
 
 控制端的 `viewer-ffmpeg` 只支持 **FFmpeg 6.x**（`pkg-config --modversion libavcodec` 为 60.x）；FFmpeg 7 及以上会在依赖 `ffmpeg-sys-next` 里报 `avfft.h file not found`（#63）。
-服务端可选的 `--features inproc-av` 是 X11 下的进程内硬件编码：不链接 FFmpeg 开发库，NVENC 运行时加载 NVIDIA 驱动库（`libcuda.so.1`、`libnvidia-encode.so.1`，需要支持 NVENC API 12.1 的驱动，530 及以上），VAAPI 运行时加载 `libva.so.2`/`libva-drm.so.2`。截屏与编码尺寸一致时 NVENC 直接读取 XShm 缓冲，省去一次主机到显存的拷贝；VAAPI 在同一特性下也进程内运行（DRI3 DMA-BUF 零拷贝，无 DRI3 时 XShm 上传，VPP 转 NV12 后送 VCN，支持 H.264/H.265）。CPU 编码或 `UU_CAPTURE=grab` 仍走外部 FFmpeg 进程；进程内硬件编码启动失败时先回退到对应的 FFmpeg 进程管线，再回退到 CPU。默认构建和预编译包都不需要该特性。
+服务端可选的 `--features inproc-av` 在 X11 下提供进程内编码：不链接 FFmpeg 开发库，NVENC 运行时加载 NVIDIA 驱动库（`libcuda.so.1`、`libnvidia-encode.so.1`，需要支持 NVENC API 12.1 的驱动，530 及以上），VAAPI 运行时加载 `libva.so.2`/`libva-drm.so.2`。截屏与编码尺寸一致时 NVENC 直接读取 XShm 缓冲，省去一次主机到显存的拷贝；VAAPI 在同一特性下也进程内运行（DRI3 DMA-BUF 零拷贝，无 DRI3 时 XShm 上传，VPP 转 NV12 后送 VCN，支持 H.264/H.265）。CPU H.264 编码（非 4:4:4，且未设置 `UU_CAPTURE=grab`）也使用进程内 libx264：编译需要 `libx264-dev`，运行时通过 dlopen 加载 libx264，初始化失败时回退到外部 FFmpeg 进程。其他 CPU 编码及 `UU_CAPTURE=grab` 仍走外部 FFmpeg 进程；进程内硬件编码启动失败时先回退到对应的 FFmpeg 进程管线，再回退到 CPU。默认构建和预编译包都不需要该特性。
+
+CPU H.264 默认 GOP 为 0.5 秒；`UU_VIDEO_GOP_SECONDS=2` 可选择 2 秒以减少关键帧开销，但可能延长丢包恢复等待。该变量覆盖所有编码路径，接受大于 0 且不超过 10 的有限秒数，非法值使用各路径默认值。
 
 GNOME/KDE Wayland 的进程内编码用 `cargo build --release --features wayland,portal,inproc-av` 配合 `set-encoder vaapi` 启用，目前仅支持 Portal + VAAPI。
 `UU_PORTAL_DMABUF=0` 禁用 DMA-BUF、改用进程内上传；`UU_VIDEO_PIPELINE=process` 恢复外部 FFmpeg 管线。
@@ -447,7 +449,7 @@ systemctl --user restart uuremote-native.service
 
 自定义码率按客户端选择的 Mbps 生效，例如 1 Mbps 对应 1000 kbit/s 的编码上限。
 
-选择码率档（原画 / 超清 / 高清 / 自定义）时，外部 FFmpeg 的 CPU 编码以平均码率（ABR）为目标，避免 4K 低码率下关键帧发灰；「自动」档仍使用恒定质量（CRF）。
+CPU H.264 的外部 FFmpeg 和进程内 libx264 使用相同的平均码率（ABR）策略：目标为有效编码上限的 3/4，VBV 缓冲为该上限的 500–8000 kbit 范围值。「自动」和无限制自定义档以 8 Mbit/s 为上限，其他档按客户端选择；拥塞治理器可进一步降低该上限，并通过重启编码器应用。
 
 本地编码诊断 `desktop-video-probe [output.h264]` 可设置 `UU_PROBE_FPS`、`UU_PROBE_FRAMES`（默认 5）和 `UU_PROBE_QUALITY`（1–5）；设置 `UU_PROBE_INPUT=clip.y4m`（也支持 `.mp4`、`frames/%05d.png`）可绕过桌面采集，以相同的生产 FFmpeg 编码参数测量固定输入并打印分辨率和编码统计，`UU_PROBE_LOOP=1` 循环到指定帧数，输入无法打开或帧数不足时以非零状态退出（固定输入始终使用外部 FFmpeg 管线）。
 

@@ -281,7 +281,7 @@ sudo apt install libwayland-dev libxkbcommon-dev wl-clipboard
 # optional: GNOME/KDE portal backend
 sudo apt install libglib2.0-dev libpipewire-0.3-dev libei-dev
 # optional: headers for the inproc-av VAAPI/DRI3 engines (libva itself is loaded at runtime)
-sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev
+sudo apt install libva-dev libgbm-dev libx11-xcb-dev libxcb-dri3-dev libxcb-damage0-dev libx264-dev
 # In-process audio capture and Opus encoding for inproc-av
 sudo apt install libpulse-dev libopus-dev
 ```
@@ -301,7 +301,9 @@ cargo build --release --features wayland,portal   # + GNOME/KDE on Wayland
 ```
 
 The viewer's `viewer-ffmpeg` feature supports **FFmpeg 6.x only** (`pkg-config --modversion libavcodec` = 60.x); FFmpeg 7+ fails inside `ffmpeg-sys-next` with `avfft.h file not found` (#63).
-The host's optional `--features inproc-av` encodes with hardware inside the process on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
+The host's optional `--features inproc-av` provides in-process encoding on X11. It does not link FFmpeg development libraries; it loads the NVIDIA driver libraries (`libcuda.so.1`, `libnvidia-encode.so.1`) at runtime for NVENC (needs a driver with NVENC API 12.1, 530 or newer) and `libva.so.2`/`libva-drm.so.2` for VAAPI. When the capture and encoder sizes match, NVENC reads the XShm buffer directly, saving one host-to-device copy; VAAPI runs in process under the same feature (DRI3 DMA-BUF zero copy, or XShm upload without DRI3, then VPP to NV12 and VCN; H.264/HEVC). CPU H.264 encoding (except 4:4:4 and `UU_CAPTURE=grab`) also uses in-process libx264: building requires `libx264-dev`, libx264 is loaded with dlopen at runtime, and initialization failure falls back to the FFmpeg process. Other CPU encoding and `UU_CAPTURE=grab` keep the FFmpeg process; if the in-process hardware session fails it falls back to the matching FFmpeg process pipeline, then to the CPU. The default build and the release packages need neither feature.
+
+CPU H.264 defaults to a 0.5-second GOP; `UU_VIDEO_GOP_SECONDS=2` selects 2 seconds to reduce keyframe overhead, with potentially slower packet-loss recovery. This variable overrides all encoder paths, accepts finite seconds greater than 0 and at most 10, and uses each path’s default for invalid values.
 
 On GNOME/KDE Wayland, enable in-process encoding with `cargo build --release --features wayland,portal,inproc-av` and `set-encoder vaapi`; support is limited to Portal + VAAPI.
 `UU_PORTAL_DMABUF=0` disables DMA-BUF in favor of in-process host upload; `UU_VIDEO_PIPELINE=process` restores external FFmpeg pipelines.
@@ -507,7 +509,7 @@ The environment variables above can also live in one file: `~/.config/uuremote/e
 
 Custom bitrate follows the Mbps value selected in the client; for example, 1 Mbps sets an encoder cap of 1000 kbit/s.
 
-With external FFmpeg CPU encoding, the bitrate presets (Original / Ultra / HD / custom) use average bitrate (ABR) to avoid gray keyframes at 4K and low bitrates; Auto keeps constant rate factor (CRF).
+FFmpeg and in-process libx264 CPU H.264 encoding use the same average bitrate (ABR) policy: target 3/4 of the effective cap, with a VBV buffer equal to the cap clamped to 500–8000 kbit. Auto and unlimited custom quality start with an 8 Mbit/s ceiling; other modes use the viewer’s selection. The congestion governor can lower this cap and applies changes by restarting the encoder.
 
 ## Let an AI agent install or develop it
 
