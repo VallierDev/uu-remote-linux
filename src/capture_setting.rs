@@ -54,10 +54,14 @@ pub struct VideoSettings {
     /// Send-side congestion cap in kbit/s (see video_governor): a bad path must not keep the
     /// stream above what it carries. Never comes from the protocol, only from our own feedback loop.
     pub net_kbps: Option<u32>,
+    /// Congestion frame-rate floor from the same feedback loop (UU_VIDEO_FPS_ADAPT): once the
+    /// bitrate cap alone cannot carry the stream, fewer complete frames beat dropped ones.
+    /// Never comes from the protocol; the viewer keeps showing its own nominal fps.
+    pub net_fps: Option<u32>,
 }
 
 impl Default for VideoSettings {
-    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None } }
+    fn default() -> Self { let (source_id,source_generation)=crate::wayland::selection(); Self { source_id,source_generation, codec: VideoCodec::H264, fps: 60, quality: QUALITY_AUTO, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None, net_fps: None } }
 }
 
 /// Selectable smaller stream sizes with the desktop's aspect ratio (even dimensions).
@@ -105,6 +109,10 @@ impl VideoSettings {
         let ceiling = self.ceiling_kbps();
         Some(self.net_kbps.map_or(ceiling, |net| ceiling.min(net)))
     }
+
+    /// Frame rate the encoder runs at: the viewer's choice, lowered by the congestion governor.
+    /// Protocol reports (Sync) keep the nominal `fps`; only the encoder consumes this.
+    pub fn effective_fps(&self) -> u32 { self.net_fps.map_or(self.fps, |net| self.fps.min(net)) }
 }
 
 fn varint(mut v: u64, out: &mut Vec<u8>) { while v >= 128 { out.push((v as u8 & 127) | 128); v >>= 7; } out.push(v as u8); }
@@ -234,8 +242,9 @@ fn apply_rpc(rpc: &[WireField], settings: &watch::Sender<VideoSettings>, native:
     }
     next.fps = next.fps.clamp(MIN_FPS, MAX_FPS);
     settings.send_if_modified(|current| {
-        // The feedback loop owns net_kbps; keep its newest value instead of replaying the snapshot.
+        // The feedback loop owns net_kbps/net_fps; keep their newest values instead of replaying the snapshot.
         next.net_kbps = current.net_kbps;
+        next.net_fps = current.net_fps;
         if *current == next { return false; }
         log::info!("Desktop video settings: fps={} quality={} max_kbps={:?} output={:?} chroma={}", next.fps, next.quality, next.max_kbps(), next.output, next.chroma);
         *current = next; true
@@ -342,7 +351,7 @@ mod tests {
         put_varint(18, 30, &mut body);
         let request = rpc(77, 2, &body);
         let response = handle_rpc(&decode_wire(&request).unwrap(), &tx, (1920, 1080)).unwrap();
-        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None });
+        assert_eq!(*rx.borrow(), VideoSettings { source_id:0,source_generation:0, codec: VideoCodec::H264, fps: 30, quality: QUALITY_GENERAL, custom_bps: 0, output: None, chroma: CHROMA_420, net_kbps: None, net_fps: None });
         assert_eq!(rx.borrow().max_kbps(), Some(2_000));
         let fields = decode_wire(&response).unwrap();
         assert_eq!(message(&fields, 1), Some(&[8u8, 77][..]));
@@ -535,9 +544,18 @@ mod tests {
     #[test]
     fn a_setting_rpc_keeps_the_governors_cap() {
         let (tx, rx) = watch::channel(VideoSettings::default());
-        tx.send_modify(|s| s.net_kbps = Some(1_500));
+        tx.send_modify(|s| { s.net_kbps = Some(1_500); s.net_fps = Some(20); });
         handle_rpc(&decode_wire(&rpc(9, 3, &[8, 30])).unwrap(), &tx, (1920, 1080)).unwrap();
-        assert_eq!((rx.borrow().fps, rx.borrow().net_kbps), (30, Some(1_500)));
+        assert_eq!((rx.borrow().fps, rx.borrow().net_kbps, rx.borrow().net_fps), (30, Some(1_500), Some(20)));
+        // The lowered frame rate is what the encoder runs at, below the viewer's nominal 30.
+        assert_eq!(rx.borrow().effective_fps(), 20);
+    }
+
+    #[test]
+    fn a_frame_rate_below_the_governors_step_still_bounds_the_stream() {
+        // The viewer's own lower choice wins over a governor step that has not caught up.
+        let settings = VideoSettings { fps: 15, net_fps: Some(30), ..VideoSettings::default() };
+        assert_eq!(settings.effective_fps(), 15);
     }
 
     #[test]
