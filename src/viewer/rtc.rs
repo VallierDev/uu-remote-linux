@@ -20,9 +20,17 @@ pub fn configuration(result:&Value)->Result<RTCConfiguration,String> {
             credential_type:webrtc::ice_transport::ice_credential_type::RTCIceCredentialType::Password });
     }
     let relay=match result.get("force_relay") {None=>false,Some(Value::Bool(b))=>*b,_=>return Err("Invalid relay policy".into())};
-    if relay && !servers.iter().any(|s|s.urls.iter().any(|u|u.starts_with("turn:")||u.starts_with("turns:"))) {return Err("Relay-only session without TURN".into())}
+    let has_turn=servers.iter().any(|s|s.urls.iter().any(|u|u.starts_with("turn:")||u.starts_with("turns:")));
+    if relay && !has_turn {return Err("Relay-only session without TURN".into())}
+    // Follow the cloud's force_relay by default. UU_VIEWER_FORCE_RELAY=1 asks for the cloud's
+    // TURN relay instead of a direct host candidate: with both peers behind NAT the direct path
+    // can be far slower (measured against the official macOS host: 350-1570 ms direct versus
+    // 18-24 ms relay). Without a TURN server the request falls back to the cloud's policy.
+    let requested=std::env::var("UU_VIEWER_FORCE_RELAY").is_ok_and(|v|v=="1");
+    let force_relay=relay||(requested&&has_turn);
+    if requested&&!has_turn {log::warn!("UU_VIEWER_FORCE_RELAY=1 but the cloud listed no TURN server: keeping the cloud's ICE policy");}
     // An empty cloud list means host candidates only. Never invent public STUN.
-    Ok(RTCConfiguration{ice_servers:servers,ice_transport_policy:if relay{RTCIceTransportPolicy::Relay}else{RTCIceTransportPolicy::All},..Default::default()})
+    Ok(RTCConfiguration{ice_servers:servers,ice_transport_policy:if force_relay{RTCIceTransportPolicy::Relay}else{RTCIceTransportPolicy::All},..Default::default()})
 }
 #[derive(Clone,Copy)]
 pub enum ReadyPolicy { EchoOnly, Explicit }
