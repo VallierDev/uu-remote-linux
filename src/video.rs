@@ -19,6 +19,7 @@ use crate::capture_setting::{VideoCodec, VideoSettings};
 /// Default frame rate; the viewer's 帧率 setting overrides it per connection.
 pub const FPS: u64 = 60;
 
+
 /// Refresh rate reported to the viewer (display_info / capability / codec negotiation), like the
 /// official hosts report the monitor's mode (official Mac capability: 120). `UU_DISPLAY_FPS` overrides;
 /// Hyprland from `hyprctl -j monitors`, X11 from the current `xrandr` mode, otherwise 60.

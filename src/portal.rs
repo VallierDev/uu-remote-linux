@@ -29,6 +29,14 @@ pub struct DmaFrame {
     pub modifier: u64,
 }
 pub enum DmaCapture<T> { Frame(T), Pending, Cpu, Blank, Unavailable(i32) }
+
+/// Fresh (changed) frames delivered by the current portal capture; reset when a capture
+/// session opens and bumped by both capture paths (CPU `capture_changed` and the native
+/// DMA-BUF one) so every encoder — libx264, VAAPI, NVENC — publishes readiness. Privacy
+/// auto waits for `> 0` as proof the capture produces content before hiding the screen.
+static FRESH_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Fresh frames of the current portal capture; see `FRESH_FRAMES`.
+pub fn fresh_frames() -> u64 { FRESH_FRAMES.load(std::sync::atomic::Ordering::Relaxed) }
 #[cfg(unix)]
 #[path = "portal_permissions.rs"]
 mod permissions;
@@ -357,6 +365,8 @@ mod native {
             let applied = unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) };
             if applied > 0 { super::CURSOR_MODE.store(if applied == 2 { 2 } else { 1 }, std::sync::atomic::Ordering::Release); }
             if available > 0 { super::CURSOR_EMBED.store(if available & 2 != 0 { 2 } else { 1 }, std::sync::atomic::Ordering::Release); }
+            // The counter describes one capture session: a new open restarts the fresh-frame proof.
+            super::FRESH_FRAMES.store(0, std::sync::atomic::Ordering::Relaxed);
             Ok(Self { handle: Mutex::new(handle), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()), end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
         }
         /// Frame pixels of the monitor the stream currently follows.
@@ -647,6 +657,7 @@ mod native {
                         fn drop(&mut self) { unsafe { uu_portal_dmabuf_release(self.0) }; }
                     }
                     let _lease = Lease(handle.0.as_ptr());
+                    if code == 0 { super::FRESH_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                     let encoded = encode(&frame, code == 0)?;
                     *version = Some(super::FrameVersion(identity, revision));
                     Ok(super::DmaCapture::Frame(encoded))
@@ -730,7 +741,11 @@ mod native {
             let mut revision = version.filter(|v| v.0 == identity).map_or(0, |v| v.1);
             let code = unsafe { uu_portal_capture_since(handle.0.as_ptr(), frame.as_mut_ptr(), frame.len(), &mut revision) };
             match code {
-                0 | 12 => { *version = Some(super::FrameVersion(identity, revision)); Ok(code == 0) }
+                0 | 12 => {
+                    *version = Some(super::FrameVersion(identity, revision));
+                    if code == 0 { super::FRESH_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    Ok(code == 0)
+                }
                 9 | 10 => Ok(blank_changed(frame, version)),
                 _ => Err(super::error(code)),
             }
