@@ -503,6 +503,8 @@ encodes 4:2:0, and reports chroma 4:2:0 in CaptureSettingSync field 3. If the ch
 cannot start, the stream falls back to CPU and logs a warning. VAAPI is not an auto candidate
 until #33.
 
+The environment variables above can also live in one file: `~/.config/uuremote/env.conf` (next to `config.json`), one `KEY=VALUE` per line, a leading `#` comments the whole line (values may contain `#`), only uppercase `UU_` setting names are accepted — except `UU_CONFIG`, refused here because it would point the config file somewhere else than this file (real environment only). A variable already set in the real environment wins (the unit's `Environment=` stays the override layer); the file is read once at startup, so a restart is needed after an edit. Account credentials (`UU_TOKEN` / `UU_CSRF` / `UU_USER_ID` / `UU_SIGN_KEY` / `UU_SYSTEM_ID`) are refused there — they belong to `config.json` or the real environment. Rejected lines are logged by line number and key only, never by value. It is the durable home for tuning knobs (`UU_FT_BLOCK`, `UU_DESKTOP_BACKEND`, …) that a systemd unit reinstall would wipe.
+
 Custom bitrate follows the Mbps value selected in the client; for example, 1 Mbps sets an encoder cap of 1000 kbit/s.
 
 With external FFmpeg CPU encoding, the bitrate presets (Original / Ultra / HD / custom) use average bitrate (ABR) to avoid gray keyframes at 4K and low bitrates; Auto keeps constant rate factor (CRF).
