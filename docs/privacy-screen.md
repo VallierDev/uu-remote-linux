@@ -14,6 +14,11 @@ KDE Plasma Wayland（portal 后端）开启后，采集和输入切换到 KWin �
 顺序参考 KRdp 虚拟显示器的 replace 策略和 Sunshine 的 KDE 方案：创建虚拟输出前记录物理屏，
 从不禁用虚拟输出本身（KWin bug 527747）。
 
+X11 会话（Xorg，或显式 `UU_DESKTOP_BACKEND=x11`）支持关屏：用 `xrandr --brightness 0` 把每个由 CRTC
+驱动的输出的 gamma/亮度归零，扫描输出变黑而帧缓冲不变，采集和远控画面不受影响。只支持关屏，不支持壁纸
+模式；会覆盖夜间模式等自定义 gamma；本地键鼠不会被禁用（这一点与 KDE 关屏不同）。进入前把各输出的
+gamma/亮度写进恢复记录，退出、服务停止或崩溃后由 guard 恢复（读到的亮度为 0 视为上次崩溃残留，恢复为 1.0）。
+
 壁纸模式：窗口随物理屏禁用迁到虚拟输出后，重新启用物理屏，把虚拟输出设为主屏、用 KWin 脚本把窗口
 留在虚拟输出上，再由 `privacy-wallpaper` 子进程在每块物理屏上全屏置顶显示 Plasma 当前桌面壁纸和
 “此设备正在被远程控制”。物理屏开着时 uinput 绝对坐标覆盖整个布局，主机按虚拟输出在布局中的位置换算。
@@ -34,6 +39,13 @@ remote-control flow has not been hardware-accepted.
 Measured on GNOME 50.1 / Mutter 50.1 (Intel HD 4600 + NVIDIA GTX 950M): the portal stream keeps
 producing frames while PowerSaveMode=3, and the frames are the live desktop, not black.
 GNOME, other Wayland desktops and X11 do not support picture mode.
+
+X11 sessions (Xorg, or an explicit `UU_DESKTOP_BACKEND=x11`) support screen-off by zeroing the gamma and
+brightness of every CRTC-driven output with `xrandr --brightness 0`: scanout turns black while the
+framebuffer stays untouched, so capture and the remote picture are unaffected. Screen-off only, no picture
+mode; it overrides custom gamma such as night light; local input is not disabled (unlike KDE screen-off).
+Each output's gamma and brightness is written to the recovery record first, and the guard restores it on
+exit, service stop or after a crash (a brightness read as 0 is a crash left-over restored to 1.0).
 
 Wallpaper mode: after the windows have moved to the virtual output, the physical outputs are turned
 back on as secondary outputs, a KWin script keeps the windows on the virtual one, and the
@@ -198,6 +210,7 @@ The module has a desktop-independent controller with shared parts, and one backe
 | `tool.rs` | 带超时的外部命令、gdbus、等待生效 / bounded tool calls, gdbus, wait-until |
 | `kde/` | KDE 后端：`outputs.rs` kscreen-doctor 布局，`input.rs` KWin 输入设备，`kwin.rs` KWin 脚本，`mod.rs` 编排 |
 | `gnome.rs` | GNOME 后端：Mutter PowerSaveMode 关屏，唤醒后重新关屏 / Mutter PowerSaveMode screen-off, re-off after a wake |
+| `x11.rs` | X11 后端：`xrandr` gamma/亮度归零关屏，崩溃后由 guard 恢复 / xrandr gamma screen-off, guard-restored after a crash |
 
 新增桌面（X11、GNOME…）只需实现 `Backend` 并在 `backend::detect` / `backend::named` 登记：
 `enter` 在每一步改动之前通过 `Journal::save` 写入足以撤销它的数据；`leave` 只依据这些数据撤销，

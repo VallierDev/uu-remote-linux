@@ -1,7 +1,7 @@
 //! Host privacy screen (防窥): the viewer's RPC 7 hides the local screen and blocks local input
 //! while it controls the desktop. This module is the desktop-independent controller: it counts
 //! desktop sessions, switches modes, rolls back failures, keeps the recovery record and the guard,
-//! and serves the protocol. Desktop work lives behind `backend::Backend` (only `kde` so far).
+//! and serves the protocol. Desktop work lives behind `backend::Backend` (kde, x11).
 mod backend;
 mod cover;
 mod guard;
@@ -11,8 +11,11 @@ mod mode;
 mod protocol;
 mod record;
 mod tool;
+mod x11;
 
 pub use mode::Mode;
+/// Backend name of the X11 implementation, for callers that must know it does not use the portal.
+pub use x11::NAME as X11_BACKEND;
 use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex};
 
 struct Active { mode: Mode, record: Option<record::Record> }
@@ -42,6 +45,11 @@ pub fn set_viewer_controller(controller: crate::input::Controller) {
     VIEWER_WINDOWS.store(controller == crate::input::Controller::Windows, Ordering::Relaxed);
 }
 pub fn active() -> bool { ACTIVE.load(Ordering::Relaxed) }
+/// Whether the running privacy backend is the X11 gamma one: it only recolors outputs, owning
+/// neither a portal idle inhibitor nor an input block, so idle keep-alive must keep running.
+pub fn x11_gamma_active() -> bool {
+    active() && backend::detect().is_some_and(|backend| backend.name() == X11_BACKEND)
+}
 /// The viewer's privacy_type now in effect.
 pub fn current_type() -> u8 {
     if !active() { mode::TYPE_OFF } else if PICTURE.load(Ordering::Relaxed) { Mode::Picture.wire_type() } else { Mode::ScreenOff.wire_type() }
@@ -236,6 +244,9 @@ fn auto_enable(mode: Mode, generation: u64) {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    // Only portal backends ride the capture's portal session; the X11 backend dims outputs on
+    // its own, so waiting for a portal on an Xorg session would stall the auto-enable forever.
+    let portal_backend = backend::detect().is_some_and(|backend| backend.name() != X11_BACKEND);
     for attempt in 1..=5 {
         if !current() { return; }
         if VIEWER_OVERRIDE.load(Ordering::Relaxed) {
@@ -244,7 +255,7 @@ fn auto_enable(mode: Mode, generation: u64) {
         }
         // Not a failure yet: the desktop capture opens its portal session a moment after the peer
         // connects, and entering without it would roll back and log a restore for nothing.
-        if !crate::portal::available() {
+        if portal_backend && !crate::portal::available() {
             log::info!("Privacy auto: waiting for the desktop capture (attempt {attempt})");
             std::thread::sleep(std::time::Duration::from_secs(1));
             continue;
@@ -314,6 +325,8 @@ pub fn probe(mode: Mode) -> Result<(), String> {
     result.and(restored)
 }
 pub use protocol::screensaver_response;
+/// The backend serving this desktop, for the probe's own requirements.
+pub fn backend_name() -> Option<&'static str> { backend::detect().map(backend::Backend::name) }
 pub fn guard_main() -> i32 { guard::main() }
 pub fn cover_main(args: &[String]) -> i32 { cover::main(args) }
 
