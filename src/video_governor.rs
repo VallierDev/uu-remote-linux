@@ -30,6 +30,11 @@ const CLEAN_LOSS_PERCENT: f32 = 1.0;
 /// Round trip above which the path is backed up, and below which it has room to grow.
 const CONGESTION_RTT_MS: f64 = 300.0;
 const CLEAN_RTT_MS: f64 = 150.0;
+/// A long path (China-US measured 160 ms base, 177 ms average, 295 ms peak with zero loss) never
+/// gets under the fixed knees, so after one loss burst the cap stayed at the floor for good. Both
+/// knees therefore also allow this much queueing above the lowest round trip of the session.
+const CONGESTION_QUEUE_MS: f64 = 250.0;
+const CLEAN_QUEUE_MS: f64 = 100.0;
 /// RTT is the noisy input: one session measured 52 ms, 127 ms, 321 ms, 94 ms, 72 ms and 1300 ms,
 /// all on a path that was working. Acting on one sample that crosses the knee halves the cap, the
 /// next clean report raises it again, and every step restarts the encoder - 25 rebuilds in four
@@ -54,6 +59,8 @@ pub struct Governor {
     /// 3 Mbit/s does not retry 3.1 Mbit/s every twenty seconds (each retry is a keyframe and a
     /// burst of loss).
     broken_at: Option<(u32, Instant)>,
+    /// Lowest round trip seen this session: the propagation delay the knees are measured above.
+    base_rtt_ms: Option<f64>,
 }
 
 impl Governor {
@@ -65,15 +72,20 @@ impl Governor {
         // had (a 500k custom stream capped below the floor looked like an applied 800k cap,
         // and after a raise to 6M congestion found "current == floor" and never stepped down).
         let current = self.effective(ceiling_kbps);
+        if let Some(rtt) = rtt_ms.filter(|rtt| rtt.is_finite() && *rtt > 0.0) {
+            self.base_rtt_ms = Some(self.base_rtt_ms.map_or(rtt, |base| base.min(rtt)));
+        }
+        let base = self.base_rtt_ms.unwrap_or(0.0);
+        let clean_rtt = CLEAN_RTT_MS.max(base + CLEAN_QUEUE_MS);
         let aim = self.broken_at
             .filter(|(_, at)| now.duration_since(*at) < PROBE_AFTER)
             .map_or(ceiling_kbps, |(broken, _)| (broken * 9 / 10).max(FLOOR_KBPS).min(ceiling_kbps));
         // Loss at that level only shows up when a path genuinely breaks, so one report is enough. A
         // round trip spike looks the same for a single report, so it has to hold across reports.
         let congested = loss_percent >= CONGESTION_LOSS_PERCENT
-            || self.note_rtt(rtt_ms) >= RTT_CONFIRMATIONS;
+            || self.note_rtt(rtt_ms, CONGESTION_RTT_MS.max(base + CONGESTION_QUEUE_MS)) >= RTT_CONFIRMATIONS;
         let clean = loss_percent < CLEAN_LOSS_PERCENT
-            && rtt_ms.is_none_or(|rtt| rtt < CLEAN_RTT_MS)
+            && rtt_ms.is_none_or(|rtt| rtt < clean_rtt)
             && self.settled(now);
         if congested {
             self.rtt_over = 0;
@@ -108,8 +120,8 @@ impl Governor {
     }
 
     /// How many reports in a row asked for the knee. A single spike is Wi-Fi, not a broken path.
-    fn note_rtt(&mut self, sample: Option<f64>) -> u8 {
-        self.rtt_over = if sample.is_some_and(|sample| sample >= CONGESTION_RTT_MS) {
+    fn note_rtt(&mut self, sample: Option<f64>, knee_ms: f64) -> u8 {
+        self.rtt_over = if sample.is_some_and(|sample| sample >= knee_ms) {
             self.rtt_over.saturating_add(1)
         } else {
             0
@@ -197,6 +209,26 @@ mod tests {
             at += INCREASE_AFTER;
         }
         assert_eq!(reached, Some(6_000));
+    }
+
+    #[test]
+    fn a_long_clean_path_recovers_above_the_fixed_round_trip_knee() {
+        // Issue #259: a loss burst on a 160 ms path, then zero loss at 160-295 ms round trips.
+        let mut governor = Governor::default();
+        let start = Instant::now();
+        assert_eq!(report(&mut governor, start, 43.0, Some(161.0)), Some(3_000));
+        let mut at = start + PROBE_AFTER;
+        let mut reached = None;
+        for rtt in [177.0, 165.0, 295.0, 180.0, 170.0, 190.0, 175.0, 168.0, 172.0, 185.0] {
+            if let Some(cap) = report(&mut governor, at, 0.0, Some(rtt)) {
+                reached = Some(cap);
+            }
+            at += INCREASE_AFTER;
+        }
+        assert_eq!(reached, Some(6_000));
+        // Queueing well above that base still counts as a backed-up path.
+        assert_eq!(report(&mut governor, at, 0.0, Some(450.0)), None);
+        assert_eq!(report(&mut governor, at + DECREASE_AFTER, 0.0, Some(450.0)), Some(3_000));
     }
 
     #[test]
