@@ -76,6 +76,9 @@ pub struct Governor {
     /// 3 Mbit/s does not retry 3.1 Mbit/s every twenty seconds (each retry is a keyframe and a
     /// burst of loss).
     broken_at: Option<(u32, Instant)>,
+    /// Only a loss burst re-arms the frame-rate probe window. Kept separate from `broken_at`
+    /// so RTT-only bufferbloat still caps recovery at 90% of the rate that broke the path.
+    loss_at: Option<Instant>,
     /// Lowest round trip seen this session: the propagation delay the knees are measured above.
     base_rtt_ms: Option<f64>,
 }
@@ -108,10 +111,12 @@ impl Governor {
             && self.settled(now);
         if congested {
             self.rtt_over = 0;
-            // The cooldown runs from the most recent congestion, not from the last applied
-            // decrease: at the floor no step is left to apply, and a stale timestamp let a
-            // brief recovery probe back into the rate that broke the path a moment earlier.
+            // Any congestion re-arms the bitrate probe: recovery must aim below the rate that
+            // caused the queue, RTT-only bufferbloat included. Only an actual loss burst,
+            // however, re-arms the frame-rate window: on a 0%-loss relay whose RTT oscillates
+            // 320-560 ms, refreshing it on every spike pinned frames at 5 fps for 13 minutes.
             self.broken_at = Some((current, now));
+            if loss_percent >= CONGESTION_LOSS_PERCENT { self.loss_at = Some(now); }
             self.decreased_at = Some(now);
             if let Some(cap) = self.apply((current / 2).max(FLOOR_KBPS).min(current), current, DECREASE_AFTER, now) {
                 return Decision { cap: Some(cap), ..Default::default() };
@@ -142,10 +147,12 @@ impl Governor {
         // raise adds no load (the cap holds the total) and a mis-timed one costs only the
         // next congested report stepping back down; that, plus the window a fresh
         // congestion report restarts, is the anti-flap.
-        let quiet = self.broken_at.map_or(true, |(_, at)| now.duration_since(at) >= PROBE_AFTER);
+        let quiet = self.loss_at.map_or(true, |at| now.duration_since(at) >= PROBE_AFTER);
         if adapt.enabled && self.fps.is_some() && quiet {
             if current_fps >= ceiling_fps { self.fps = None; return Decision { fps: Some(None), ..Default::default() }; }
-            let up = FPS_LADDER.iter().find(|&&s| s > current_fps).map(|&s| s.min(ceiling_fps));
+            // The ladder descends, so the next step up is the *smallest* entry above the
+            // current rate (a `find` would hit the 144 head and jump to the ceiling).
+            let up = FPS_LADDER.iter().filter(|&&s| s > current_fps).min().map(|&s| s.min(ceiling_fps));
             if let Some(step) = self.step_fps(up, INCREASE_AFTER, now) {
                 return Decision { fps: Some(Some(step)), ..Default::default() };
             }
@@ -415,6 +422,44 @@ mod tests {
     }
 
     #[test]
+    fn rtt_jitter_without_loss_does_not_pin_the_frame_ladder() {
+        // A relay link as measured: one loss burst walks the stream to the floor, then 0%
+        // loss while the round trip oscillates across the 300 ms knee with a spike every
+        // few reports. The spikes still hold the bitrate down, but they must not re-arm
+        // the probe clock: they used to pin the frames at 5 fps for as long as the
+        // session ran (measured: over thirteen minutes on a quietly streaming path).
+        let mut governor = Governor::default();
+        let start = Instant::now();
+        assert_eq!(governor.observe(20.0, Some(40.0), 1_500, 60, 60, &adapt(), start).cap, Some(FLOOR_KBPS));
+        let mut at = start;
+        let mut fps = 60;
+        while fps > 5 {
+            at += Duration::from_secs(4);
+            governor.observe(0.0, Some(320.0), 1_500, fps, 60, &adapt(), at);
+            at += Duration::from_secs(1);
+            let d = governor.observe(0.0, Some(340.0), 1_500, fps, 60, &adapt(), at);
+            assert_eq!(d.cap, None, "the floor holds");
+            fps = d.fps.flatten().expect("the ladder walks down on jitter alone");
+        }
+        // The clock was armed once, by the loss burst. Past its window the path lifts its
+        // cap back to the ceiling and the frames climb, spikes notwithstanding.
+        at += PROBE_AFTER;
+        let mut climbed = None;
+        for step in 0..4 {
+            let d = governor.observe(0.0, Some(40.0), 1_500, fps, 60, &adapt(), at + Duration::from_secs(4 * step));
+            if let Some(rate @ Some(_)) = d.fps { climbed = rate; break; }
+        }
+        assert_eq!(climbed, Some(8), "frames climb the ladder once the probe window passed without loss");
+        let d = governor.observe(0.0, Some(40.0), 1_500, 8, 60, &adapt(), at + Duration::from_secs(12));
+        assert_eq!(d.fps, Some(Some(10)), "the climb walks one rung at a time, never jumps to the ceiling");
+        // A confirmed round-trip spike pair still answers with the bitrate halving.
+        at += Duration::from_secs(24);
+        governor.observe(0.0, Some(330.0), 1_500, 8, 60, &adapt(), at);
+        assert_eq!(governor.observe(0.0, Some(330.0), 1_500, 8, 60, &adapt(), at + Duration::from_secs(1)).cap,
+            Some(FLOOR_KBPS), "real queueing still halves the risen cap");
+    }
+
+    #[test]
     fn frames_climb_back_on_a_marginal_path_that_never_reads_clean() {
         let mut governor = Governor::default();
         let start = Instant::now();
@@ -431,5 +476,25 @@ mod tests {
         // frames that a real relay path recovers to matter more than the last cap step.
         assert_eq!(governor.observe(3.0, Some(200.0), 1_500, 45, 60, &adapt(), at).fps, Some(Some(60)));
         assert_eq!(governor.cap, Some(FLOOR_KBPS), "the marginal path keeps its bitrate floor");
+    }
+
+    #[test]
+    fn rtt_only_congestion_keeps_the_ninety_percent_bitrate_ceiling() {
+        let mut governor = Governor::default();
+        let no_fps = FpsAdapt::default();
+        let base_at = Instant::now();
+        governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, base_at);
+        let start = base_at + Duration::from_secs(1);
+        assert_eq!(governor.observe(0.0, Some(330.0), 2_400, 30, 30, &no_fps, start), Decision::default());
+        assert_eq!(governor.observe(0.0, Some(340.0), 2_400, 30, 30, &no_fps, start + DECREASE_AFTER + Duration::from_secs(1)).cap,
+            Some(1_200), "a confirmed RTT spike halves the cap");
+        // Inside the probe window recovery must stop at 90% of the rate that broke the path.
+        assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + Duration::from_secs(15)).cap, Some(1_700));
+        assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + Duration::from_secs(19)).cap, Some(2_160));
+        assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + Duration::from_secs(23)).cap, None,
+            "2,400 * 0.9 is the ceiling until the probe window expires");
+        assert_eq!(governor.cap, Some(2_160));
+        assert_eq!(governor.observe(0.0, Some(40.0), 2_400, 30, 30, &no_fps, start + DECREASE_AFTER + PROBE_AFTER + Duration::from_secs(2)).cap,
+            Some(2_400), "the full viewer ceiling is available again after 60 s");
     }
 }
