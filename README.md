@@ -78,6 +78,7 @@ UU_LANG=en uuremote-server
 | 端口映射 | 官方「端口映射」工具：把控制端本地端口转发到 Linux 能访问到的地址（如 127.0.0.1:22）；`UU_PORT_MAPPING=0` 可关闭 |
 | 多次重连 | 每个工具窗口独立连接，互不影响 |
 | 无头服务器 | 没有显示器也能上线，提供终端、文件传输和端口映射；也可以用 Xvfb 虚拟桌面提供完整远程桌面（见下文） |
+| 虚拟手柄（实验性） | 官方手机端「虚拟手柄」与 SDL 控制端转发的实体手柄，注入为内核级 Xbox 360 手柄（uinput，最多 4 个，X11/Wayland 通用）；游戏震动经 `gpd_vibration` 回传控制端（见下文） |
 
 桌面连接建立、结束及服务启动时会清理遗留输入状态；旧连接的迟到事件不能影响新的桌面连接。
 X11 清理当前已认证显示上的按下状态（包括无法区分来源的实际按键）；uinput 仅清理本服务虚拟设备，
@@ -346,6 +347,10 @@ X11 默认继续用 XTest，因为它能正确处理网络延迟下按住不放�
 
 uinput 的 ASCII 文本映射依赖 X11/XWayland XKB；不可映射的文字保留原有文字输入/剪贴板路径。
 
+### 虚拟手柄（实验性）
+
+官方手机端的「虚拟手柄」，以及 SDL 控制端转发的实体手柄（`UU_VIEWER_NATIVE_GAMEPAD=1`），都通过现有桌面 CONTROL 通道发送 `gpd_*` 消息；被控端把它们注入为内核级 Xbox 360 手柄（udev 里显示为 "Microsoft X-Box 360 pad"，SDL2/Steam 按内置 xpad 映射识别）。最多 4 个手柄；X11 与 Wayland 桌面同样可用——键鼠后端不变，手柄独立走内核注入。游戏的双马达震动按官方 `gpd_vibration` 回传控制端。需要上文第 5 步的 /dev/uinput 权限；`UU_GAMEPAD=0` 整体关闭，`UU_GAMEPAD_RUMBLE=0` 只关震动。协议证据见 [docs/deckpad-native-gamepad.md](docs/deckpad-native-gamepad.md)。
+
 ## 远程协助与主窗口（实验性）
 
 和官方客户端的「远程协助」一样：本机显示**设备 ID** 和**验证码**，把它们发给信任的人，对方在 UU 远程的「开始协助」里输入即可控制本机。
@@ -422,6 +427,8 @@ systemctl --user restart uuremote-native.service
 | `UU_X11_OUTPUT` | X11 默认采集的显示器名称（`xrandr --listmonitors`），默认主显示器 |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | 原生 Wayland 不创建虚拟键盘（如 Denial 只把它给自己的输入法），键盘改走 uinput。合成器没有 wlr-virtual-pointer 时鼠标也自动改走 uinput（#72） |
 | `UU_INPUT_BACKEND` | `auto`（默认，Wayland 下可用时用 uinput）/ `uinput` / `native` |
+| `UU_GAMEPAD` | 被控端虚拟手柄：默认开启；`=0` 时丢弃 `gpd_*` 输入。需 /dev/uinput 权限（上文 uaccess 规则），X11 桌面同样可用 |
+| `UU_GAMEPAD_RUMBLE` | 手柄震动回传：默认开启；`=0` 时虚拟手柄不注册力反馈，游戏显示为无震动 |
 | `UU_PORTAL_CURSOR_MODE` | 启动时的光标模式：`embedded` 让合成器把指针画进抓屏流，默认隐藏。运行中按客户端发来的相对/绝对位移自动切换；每次切换重建一次 portal 会话，画面和输入短暂中断 |
 | `UU_TERMINAL_SHORTCUTS=0` | 关闭终端窗口里的 Ctrl+V 粘贴转换 |
 | `UU_VIDEO_ENCODER` | `cpu` 强制 CPU；`vaapi` 显式启用 Intel/AMD 硬编；`nvenc` 强制 NVENC；未设置或 `auto` 时后台探测（每个候选编码一帧，限时 3 秒）。有 NVIDIA 驱动时顺序是 NVENC → CPU；没有 NVIDIA 时只有 CPU，不探测。探测未完成就建流则沿用旧规则（有 NVIDIA 用 NVENC，否则 CPU）。自行编译的 `--features inproc-av` 上，仅 X11 会先走进程内引擎：外部 FFmpeg 探测失败时记为 `native_unprobed`，沿用旧规则（NVENC）；Wayland、portal、KMS 回退 CPU。只有 CPU 时跳过探测，记为 `not probed (only candidate)`。探测成功和这种只含 CPU 的跳过会缓存到 NVIDIA 是否存在发生变化为止（`/proc/driver/nvidia/version` 或 `/dev/nvidia0`）。之后的桌面连接在后台再探测一次（不挡住这一路，仍用缓存的编码器）。NVENC 探测失败、选用 CPU 时只缓存 10 分钟；到期后下一次桌面连接同样在后台再探测一次，再次失败则重新计 10 分钟。显式 `cpu` / `vaapi` / `nvenc` 不启动探测。`native_unprobed` 不算失败缓存。优先级低于 `host_settings.json` 里非 `auto` 的 `video_encoder`。VAAPI 要等 #33 解决后才会进入 auto |
@@ -675,7 +682,7 @@ Mac 目标使用 macOS 原生键码，Windows / Linux 目标保留 Windows VK。
 
 ### 原生手柄与震动（实验性）
 
-SDL 控制端可通过现有桌面 CONTROL 通道向 Windows 被控端转发一个映射手柄，并接收普通双路震动。
+SDL 控制端可通过现有桌面 CONTROL 通道向 Windows / 本项目 Linux 被控端转发一个映射手柄，并接收普通双路震动。
 默认关闭：`UU_VIEWER_NATIVE_GAMEPAD=1` 启用手柄，`UU_VIEWER_NATIVE_RUMBLE=0` 可独立关闭震动。
 不支持 Guide 键、多手柄和自适应扳机；休眠、强制退出及断网恢复尚未全面验证。
 一名报告用户在一组 Windows + Steam Deck 上测试了输入、手机热点、重连与震动。
