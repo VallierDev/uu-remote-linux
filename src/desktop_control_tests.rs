@@ -338,6 +338,46 @@ async fn locked_control_unlock_requests_and_tools_work_without_a_video_frame() {
 }
 
 #[tokio::test]
+async fn gamepad_control_input_is_fire_and_forget_and_keeps_keyboard_dispatch() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let input = Arc::new(InputInjector::without_desktop());
+        let mut screen = ScreenCapture::unavailable("synthetic gamepad desktop".into());
+        screen.backend = crate::desktop_backend::DesktopBackend::Portal;
+        screen.init_error = None;
+        let (_lock, locked) = tokio::sync::watch::channel(Some(true));
+        let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(Arc::new(screen), locked));
+        let (host, mut viewer) = connect(input.clone(), true, Some(portal), &["CONTROL_DATA_CHANNEL"]).await;
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        // Drain initialization traffic that may still be queued.
+        while tokio::time::timeout(Duration::from_millis(100), viewer.messages.recv()).await.is_ok() {}
+        for message in [
+            br#"{"action":"gpd_connect","index":0}"#.as_slice(),
+            br#"{"action":"gpd_update","index":0,"buttons":4096,"left_trigger":128,"right_trigger":255,"left_thumb_x":-32768,"left_thumb_y":32767,"right_thumb_x":100,"right_thumb_y":-100}"#.as_slice(),
+            br#"{"action":"gpd_disconnect","index":0}"#.as_slice(),
+        ] {
+            send(&viewer, "CONTROL_DATA_CHANNEL", message.to_vec()).await;
+        }
+        // Official clients blind-send gpd_*; none of it is acknowledged.
+        assert!(tokio::time::timeout(Duration::from_millis(300), viewer.messages.recv()).await.is_err(),
+            "gamepad input produced a reply");
+        // The same peer still dispatches keyboard input to the bound desktop path.
+        let before = input.portal_input_counts_for_test();
+        send(&viewer, "CONTROL_DATA_CHANNEL", br#"{"action":"kbd_press","key":65}"#.to_vec()).await;
+        send(&viewer, "CONTROL_DATA_CHANNEL", br#"{"action":"kbd_release","key":65}"#.to_vec()).await;
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(330, 0, 3, &[8, 0])).await;
+        loop {
+            let response = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
+            let args: serde_json::Value = serde_json::from_slice(body(body(&response, 3).unwrap(), 2).unwrap()).unwrap();
+            if args["seq"] == 330 { break; }
+        }
+        assert_eq!(input.portal_input_counts_for_test()[2] - before[2], 2, "keyboard input stopped after gamepad messages");
+        host.pc.close().await.unwrap();
+        viewer.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("gamepad CONTROL regression exceeded deadline");
+}
+
+#[tokio::test]
 async fn capture_desktop_on_a_port_mapping_peer_promotes_it_once() {
     tokio::time::timeout(Duration::from_secs(25), async {
         let input = Arc::new(InputInjector::without_desktop());

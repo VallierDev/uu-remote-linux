@@ -128,7 +128,7 @@ impl Controller {
 #[derive(Default)]
 struct CmdState { held: bool, pending: bool, passthrough: bool, combos: std::collections::BTreeMap<i32, bool> }
 
-pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag>, pointer_wake: tokio::sync::Notify }
+pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, gamepads: Option<crate::uinput::Gamepads>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag>, pointer_wake: tokio::sync::Notify }
 
 fn active_output_count(json: &[u8]) -> Option<usize> {
     let data: serde_json::Value = serde_json::from_slice(json).ok()?;
@@ -149,6 +149,9 @@ fn single_portal_output() -> bool {
 /// input on its virtual-output share, so without uinput nobody could operate the desktop.
 static UINPUT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn uinput_ready() -> bool { UINPUT_READY.load(std::sync::atomic::Ordering::Acquire) }
+/// The kernel gamepad backend opened /dev/uinput; without it gpd_* updates are dropped.
+static GAMEPAD_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn gamepad_ready() -> bool { GAMEPAD_READY.load(std::sync::atomic::Ordering::Acquire) }
 
 impl InputInjector {
     pub fn new() -> Self {
@@ -164,7 +167,19 @@ impl InputInjector {
             || (backend == crate::desktop_backend::DesktopBackend::Portal && single_portal_output()));
         if uinput_pointer { log::info!("Input pointer backend: uinput (motion, buttons and wheel)"); }
         else if backend == crate::desktop_backend::DesktopBackend::Portal { log::info!("Input pointer backend: portal (monitor-local coordinates)"); }
-        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
+        // Independent of uinput::wanted(): X11 keeps XTest for keyboard/pointer, but a gamepad is
+        // kernel-only and the official clients blind-send gpd_* with no negotiation.
+        let gamepads = if std::env::var("UU_GAMEPAD").as_deref() == Ok("0") { None } else {
+            match crate::uinput::Gamepads::new() {
+                Ok(gamepads) => { log::info!("Gamepad backend: uinput (kernel virtual gamepad)"); Some(gamepads) }
+                Err(e) => {
+                    log::warn!("Gamepad unavailable ({}): gamepad input will be dropped. The udev uinput rule enables it.", e.kind());
+                    None
+                }
+            }
+        };
+        if gamepads.is_some() { GAMEPAD_READY.store(true, std::sync::atomic::Ordering::Release); }
+        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, gamepads, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
     }
 
     pub fn bind_portal(&self,session:Option<std::sync::Arc<crate::portal::PortalSession>>) {
@@ -280,6 +295,23 @@ impl InputInjector {
                 log::warn!("Unsupported desktop wire mouse button: {}", button);
             }
         }
+    }
+    pub fn wire_gamepad_connect(&self, index: u8) {
+        if let Some(gamepads) = &self.gamepads { let _ = gamepads.ensure_slot(index); }
+    }
+    pub fn wire_gamepad_update(&self, index: u8, state: crate::uinput::GamepadState) {
+        if let Some(gamepads) = &self.gamepads { gamepads.emit_state(index, state); }
+        else {
+            static DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                log::info!("Gamepad update dropped: no uinput");
+            }
+        }
+    }
+    /// Release the slot but keep the kernel device: destroying it would give udev/SDL a hotplug
+    /// storm, and the official host's auto-connect keeps its targets too (RVA 0x5dfba0).
+    pub fn wire_gamepad_disconnect(&self, index: u8) {
+        if let Some(gamepads) = &self.gamepads { gamepads.neutral(index); }
     }
     pub fn mouse_button(&self, button: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
@@ -537,6 +569,9 @@ impl InputInjector {
             let keys_ok=buttons_ok && keys.into_iter().all(|key|self.inject_key(key,false)==0);
             if !keys_ok {log::warn!("Desktop input reset incomplete: backend unavailable");}
         }
+        // Kernel gamepads are independent of the keyboard/pointer backend and of the X11 relay.
+        // A hard viewer exit sends no disconnect, so this is the stuck-button backstop.
+        if let Some(gamepads)=&self.gamepads { gamepads.sweep(); }
         *held=HeldInput::default();
         // Inputs bound to the portal session are not covered by the uinput release above.
         let (portal_buttons, portal_keys) = {
@@ -1192,6 +1227,62 @@ mod kernel_pointer_tests {
         assert_eq!(active_output_count(br#"{}"#), None);
         assert_eq!(active_output_count(b"invalid"), None);
     }
+
+    #[test]
+    fn gamepad_update_auto_creates_the_slot_and_ignores_out_of_range_indices() {
+        let (gamepads, mut file) = crate::uinput::Gamepads::recording_for_test();
+        let mut input = InputInjector::without_desktop();
+        input.gamepads = Some(gamepads);
+        // No gpd_connect: RVA 0x5dfba0's missing target auto-connects.
+        input.wire_gamepad_update(0, crate::uinput::GamepadState { buttons: 0x1000, ..Default::default() });
+        input.wire_gamepad_update(4, crate::uinput::GamepadState { buttons: 0x2000, ..Default::default() });
+        input.wire_gamepad_connect(4);
+        input.wire_gamepad_disconnect(7);
+        assert_eq!(crate::uinput::Devices::recorded_events_for_test(&mut file),
+            [(1, 0x130, 1), (0, 0, 0)]);
+    }
+
+    #[test]
+    fn release_held_sweeps_open_gamepad_slots() {
+        let (gamepads, mut file) = crate::uinput::Gamepads::recording_for_test();
+        let mut input = InputInjector::without_desktop();
+        input.gamepads = Some(gamepads);
+        input.wire_gamepad_update(1, crate::uinput::GamepadState { buttons: 0x1000, lx: 500, ..Default::default() });
+        input.release_held();
+        let events = crate::uinput::Devices::recorded_events_for_test(&mut file);
+        assert_eq!(&events[..3], &[(1, 0x130, 1), (3, 0, 500), (0, 0, 0)]);
+        assert!(events[3..].contains(&(1, 0x130, 0)));
+        assert!(events[3..].contains(&(3, 0, 0)));
+    }
+
+    #[test]
+    fn decoded_gamepad_json_drives_the_kernel_device() {
+        use crate::control_protocol::{decode_control, ControlInput, ControlMessage};
+        let (gamepads, mut file) = crate::uinput::Gamepads::recording_for_test();
+        let mut input = InputInjector::without_desktop();
+        input.gamepads = Some(gamepads);
+        for json in [
+            br#"{"action":"gpd_connect","index":0}"#.as_slice(),
+            br#"{"action":"gpd_update","index":0,"buttons":4096,"left_trigger":128,"right_trigger":0,"left_thumb_x":-32768,"left_thumb_y":32767,"right_thumb_x":100,"right_thumb_y":-100}"#.as_slice(),
+            br#"{"action":"gpd_disconnect","index":0}"#.as_slice(),
+        ] {
+            match decode_control(json).unwrap() {
+                ControlMessage::Input(ControlInput::GamepadConnect { index }) => input.wire_gamepad_connect(index),
+                ControlMessage::Input(ControlInput::GamepadUpdate { index, buttons, lt, rt, lx, ly, rx, ry }) =>
+                    input.wire_gamepad_update(index, crate::uinput::GamepadState { buttons, lt, rt, lx, ly, rx, ry }),
+                ControlMessage::Input(ControlInput::GamepadDisconnect { index }) => input.wire_gamepad_disconnect(index),
+                other => panic!("unexpected CONTROL decode: {other:?}"),
+            }
+        }
+        let events = crate::uinput::Devices::recorded_events_for_test(&mut file);
+        assert_eq!(&events[..7], &[
+            (1, 0x130, 1), (3, 0, -32768), (3, 1, 32767), (3, 3, 100), (3, 4, -100), (3, 2, 128), (0, 0, 0),
+        ]);
+        // Disconnect releases without destroying the slot device.
+        assert!(events[7..].contains(&(1, 0x130, 0)));
+        assert!(events[7..].contains(&(3, 0, 0)));
+        assert_eq!(events[7..].iter().filter(|event| event.0 == 0).count(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1292,7 +1383,7 @@ impl InputInjector {
         Self { mac_controller:std::sync::atomic::AtomicBool::new(false),
             cmd:std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()),
             owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts:std::sync::Mutex::new(Shortcuts::default()),
-            uinput:None, uinput_pointer:false, screen:std::sync::Mutex::new((0,0)), portal_failures:std::sync::atomic::AtomicUsize::new(0),
+            uinput:None, gamepads:None, uinput_pointer:false, screen:std::sync::Mutex::new((0,0)), portal_failures:std::sync::atomic::AtomicUsize::new(0),
             portal_outcomes:std::array::from_fn(|_|std::sync::atomic::AtomicUsize::new(0)),
             portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::DesktopBackend::Portal,
             pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()),

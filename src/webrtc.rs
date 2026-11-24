@@ -1594,10 +1594,11 @@ impl WebRtcSession {
                                         if !crate::wayland::input_ready() {return;}
                                         use crate::control_protocol::ControlInput;
                                         // Separate receipt budgets keep motion floods from hiding clicks.
-                                        static RECEIPTS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+                                        static RECEIPTS: [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
                                         let (slot, kind) = match &event {
                                             ControlInput::MouseButton {..} | ControlInput::MouseClick {..} => (0, "button"),
                                             ControlInput::Keyboard {..} | ControlInput::KeyboardClick {..} | ControlInput::TextInput {..} => (1, "keyboard"),
+                                            ControlInput::GamepadConnect {..} | ControlInput::GamepadDisconnect {..} | ControlInput::GamepadUpdate {..} => (3, "gamepad"),
                                             _ => (2, "motion"),
                                         };
                                         if RECEIPTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
@@ -1625,6 +1626,9 @@ impl WebRtcSession {
                                                         ControlInput::KeyboardClick {key} => {input_worker.windows_key_event(*key, true);input_worker.windows_key_event(*key, false);},
                                                         ControlInput::MouseButton {button,pressed} => input_worker.wire_mouse_button(*button,*pressed),
                                                         ControlInput::MouseClick {button} => {input_worker.wire_mouse_button(*button,true);input_worker.wire_mouse_button(*button,false);},
+                                                        ControlInput::GamepadConnect {index} => input_worker.wire_gamepad_connect(*index),
+                                                        ControlInput::GamepadDisconnect {index} => input_worker.wire_gamepad_disconnect(*index),
+                                                        ControlInput::GamepadUpdate {index,buttons,lt,rt,lx,ly,rx,ry} => input_worker.wire_gamepad_update(*index, crate::uinput::GamepadState { buttons:*buttons, lt:*lt, rt:*rt, lx:*lx, ly:*ly, rx:*rx, ry:*ry }),
                                                         _ => {}
                                                     }
                                                 });
