@@ -1405,9 +1405,8 @@ impl WebRtcSession {
                                     if let (22,WireValue::Bytes(payload))=(field.number,&field.value) {
                                         static CLIP_22_SHAPES:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
                                         if CLIP_22_SHAPES.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
-                                            if let Ok(inner)=crate::protocol::decode_wire(payload){
-                                                log::info!("Clipboard 22 RPC schema: fields={:?}",inner.iter().map(|f|f.number).collect::<Vec<_>>());
-                                            }
+                                            // Structure only (field numbers, status/id varints, lengths), never bytes.
+                                            log::info!("Clipboard 22 RPC shape: {}",crate::clipboard_rich::shape(payload));
                                         }
                                         let update=rich_incoming.lock().unwrap().response(payload);
                                         match update {
@@ -1429,9 +1428,7 @@ impl WebRtcSession {
                                         // clipboard dialect the viewer speaks before any handler runs.
                                         static CLIP_21_SHAPES:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
                                         if CLIP_21_SHAPES.fetch_add(1,std::sync::atomic::Ordering::Relaxed)<24 {
-                                            if let Ok(inner)=crate::protocol::decode_wire(payload){
-                                                log::info!("Clipboard 21 RPC schema: fields={:?}",inner.iter().map(|f|f.number).collect::<Vec<_>>());
-                                            }
+                                            log::info!("Clipboard 21 RPC shape: {}",crate::clipboard_rich::shape(payload));
                                         }
                                         let ids=crate::clipboard_rich::format_ids(payload);
                                         if !ids.is_empty(){log::info!("Clipboard offered format IDs: {:?}",ids);}

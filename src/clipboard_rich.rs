@@ -48,6 +48,28 @@ pub fn format_ids(rpc:&[u8])->Vec<u64>{
     fields.iter().filter(|f|f.number==1).filter_map(|f|match f.value{WireValue::Bytes(format)=>number(format,1).ok(),_=>None}).take(32).collect()
 }
 
+/// Structure-only dump of a clipboard RPC for diagnostics (#211): field numbers, varint values
+/// (ids, status codes, counts) and byte lengths, nested up to three levels. Never prints bytes,
+/// so clipboard text cannot reach the log.
+pub fn shape(data:&[u8])->String{
+    fn walk(data:&[u8],depth:u8,out:&mut String){
+        let Ok(fields)=decode_wire(data) else{out.push('?');return;};
+        for (i,f) in fields.iter().take(16).enumerate(){
+            if i>0{out.push(' ');}
+            match f.value{
+                WireValue::Varint(v)=>out.push_str(&format!("{}=v{}",f.number,v)),
+                WireValue::Bytes(b)=>{
+                    out.push_str(&format!("{}:{}b",f.number,b.len()));
+                    if depth<3&&!b.is_empty()&&decode_wire(b).is_ok_and(|x|!x.is_empty()){out.push('{');walk(b,depth+1,out);out.push('}');}
+                }
+                _=>out.push_str(&format!("{}:other",f.number)),
+            }
+        }
+        if fields.len()>16{out.push_str(" ...");}
+    }
+    let mut out=String::new();walk(data,0,&mut out);out
+}
+
 fn int(field:u32,value:u64,out:&mut Vec<u8>){varint(u64::from(field)<<3,out);varint(value,out);}
 fn string(field:u32,value:&str,out:&mut Vec<u8>){nested(field,value.as_bytes(),out);}
 fn number(data:&[u8],field:u32)->Result<u64,&'static str>{
@@ -193,6 +215,14 @@ impl State{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn shape_reports_structure_without_bytes(){
+        let mut confirm=Vec::new();int(1,2,&mut confirm);string(2,"secret-key",&mut confirm);
+        let rpc=response(&[8,7],2,&confirm);
+        let s=shape(&rpc);
+        assert!(s.starts_with("1:2b{1=v7} 5:"),"{s}");
+        assert!(s.contains("1=v2")&&!s.contains("secret"),"{s}");
+    }
     #[test]
     fn windows_format_offer_omits_name_field_entirely(){
         for offer in [State::default().offer(42,"hi".into()).unwrap(),State::default().offer_any_host(42,"hi".into()).unwrap()]{
