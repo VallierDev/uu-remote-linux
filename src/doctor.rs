@@ -39,6 +39,17 @@ fn writable(path: &str) -> &'static str {
     else if unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } == 0 { "writable" } else { "no permission" }
 }
 
+/// Gamepad backend for doctor: a fresh process probes /dev/uinput directly instead of the
+/// InputInjector state. Names, booleans and error kinds only.
+fn gamepad_state() -> String {
+    if std::env::var("UU_GAMEPAD").as_deref() == Ok("0") { return "disabled (UU_GAMEPAD=0)".into(); }
+    match std::fs::OpenOptions::new().read(true).write(true).open("/dev/uinput") {
+        Ok(_) if crate::uinput::rumble_enabled() => "uinput (rumble on)".into(),
+        Ok(_) => "uinput (rumble off)".into(),
+        Err(e) => format!("unavailable ({})", e.kind()),
+    }
+}
+
 async fn command_output(program: &str, args: &[&str]) -> Option<String> {
     let output = tokio::time::timeout(std::time::Duration::from_secs(5),
         tokio::process::Command::new(program).args(args).kill_on_drop(true).output()).await.ok()?.ok()?;
@@ -97,6 +108,7 @@ pub async fn run() -> Result<(), String> {
     println!("-- input");
     line("/dev/uinput", writable("/dev/uinput"));
     line("UU_INPUT_BACKEND", std::env::var("UU_INPUT_BACKEND").unwrap_or_else(|_| "auto".into()));
+    line("gamepad", gamepad_state());
 
     println!("-- video");
     let selection = crate::video_select::selection();
