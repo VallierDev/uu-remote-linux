@@ -52,11 +52,28 @@ mod imp {
     const REL_WHEEL: u16 = 0x08;
     const ABS_X: u16 = 0x00;
     const ABS_Y: u16 = 0x01;
+    const ABS_Z: u16 = 0x02;
+    const ABS_RX: u16 = 0x03;
+    const ABS_RY: u16 = 0x04;
+    const ABS_RZ: u16 = 0x05;
+    const ABS_HAT0X: u16 = 0x10;
+    const ABS_HAT0Y: u16 = 0x11;
     pub const BTN_LEFT: u16 = 0x110;
     pub const BTN_RIGHT: u16 = 0x111;
     pub const BTN_MIDDLE: u16 = 0x112;
     pub const BTN_SIDE: u16 = 0x113;
     pub const BTN_EXTRA: u16 = 0x114;
+    const BTN_SOUTH: u16 = 0x130;
+    const BTN_EAST: u16 = 0x131;
+    const BTN_NORTH: u16 = 0x133; // kernel BTN_X: xpad reports the physical left face button here
+    const BTN_WEST: u16 = 0x134;  // kernel BTN_Y: physical top face button
+    const BTN_TL: u16 = 0x136;
+    const BTN_TR: u16 = 0x137;
+    const BTN_SELECT: u16 = 0x13a;
+    const BTN_START: u16 = 0x13b;
+    const BTN_MODE: u16 = 0x13c;
+    const BTN_THUMBL: u16 = 0x13d;
+    const BTN_THUMBR: u16 = 0x13e;
     pub const ABS_MAX: i32 = 65535;
 
     const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
@@ -79,6 +96,10 @@ mod imp {
     #[repr(C)]
     struct InputEvent { time: libc::timeval, kind: u16, code: u16, value: i32 }
 
+    /// XInput state exactly as the viewer sends it: already Y-inverted and trigger-scaled (0..=255).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct GamepadState { pub buttons: u16, pub lt: u8, pub rt: u8, pub lx: i16, pub ly: i16, pub rx: i16, pub ry: i16 }
+
     struct Device(File);
     impl Drop for Device {
         fn drop(&mut self) { unsafe { libc::ioctl(self.0.as_raw_fd(), UI_DEV_DESTROY); } }
@@ -88,18 +109,24 @@ mod imp {
             if unsafe { libc::ioctl(self.0.as_raw_fd(), request, value) } < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
         }
         fn create(name: &str, product: u16, configure: impl FnOnce(&Device) -> std::io::Result<()>) -> std::io::Result<Self> {
+            Self::create_id(name, 0x06 /* BUS_VIRTUAL */, 0x1d6b, product, 1, configure)
+        }
+        fn create_id(name: &str, bustype: u16, vendor: u16, product: u16, version: u16, configure: impl FnOnce(&Device) -> std::io::Result<()>) -> std::io::Result<Self> {
             let file = OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open("/dev/uinput")?;
             let device = Device(file);
             configure(&device)?;
-            let mut setup = UinputSetup { id: InputId { bustype: 0x06 /* BUS_VIRTUAL */, vendor: 0x1d6b, product, version: 1 }, name: [0; 80], ff_effects_max: 0 };
+            let mut setup = UinputSetup { id: InputId { bustype, vendor, product, version }, name: [0; 80], ff_effects_max: 0 };
             setup.name[..name.len().min(79)].copy_from_slice(&name.as_bytes()[..name.len().min(79)]);
             if unsafe { libc::ioctl(device.0.as_raw_fd(), UI_DEV_SETUP, &setup) } < 0 { return Err(std::io::Error::last_os_error()); }
             device.ioctl(UI_DEV_CREATE, 0)?;
             Ok(device)
         }
         fn abs(&self, code: u16) -> std::io::Result<()> {
+            self.abs_range(code, 0, ABS_MAX, 0)
+        }
+        fn abs_range(&self, code: u16, minimum: i32, maximum: i32, flat: i32) -> std::io::Result<()> {
             self.ioctl(UI_SET_ABSBIT, code.into())?;
-            let setup = UinputAbsSetup { code, _pad: 0, absinfo: AbsInfo { value: 0, minimum: 0, maximum: ABS_MAX, fuzz: 0, flat: 0, resolution: 0 } };
+            let setup = UinputAbsSetup { code, _pad: 0, absinfo: AbsInfo { value: 0, minimum, maximum, fuzz: 0, flat, resolution: 0 } };
             if unsafe { libc::ioctl(self.0.as_raw_fd(), UI_ABS_SETUP, &setup) } < 0 { return Err(std::io::Error::last_os_error()); }
             Ok(())
         }
@@ -197,6 +224,193 @@ mod imp {
         }
     }
 
+    /// XInput button bit → evdev key; the four dpad bits drive ABS_HAT0X/Y instead.
+    /// Face mapping follows xpad: A→SOUTH, B→EAST, X→NORTH (0x133), Y→WEST (0x134).
+    const GAMEPAD_BUTTONS: [(u16, u16); 11] = [
+        (0x0010, BTN_START), (0x0020, BTN_SELECT), (0x0040, BTN_THUMBL), (0x0080, BTN_THUMBR),
+        (0x0100, BTN_TL), (0x0200, BTN_TR), (0x0400, BTN_MODE),
+        (0x1000, BTN_SOUTH), (0x2000, BTN_EAST), (0x4000, BTN_NORTH), (0x8000, BTN_WEST),
+    ];
+    fn slot(index: u8) -> Option<usize> { (index < 4).then_some(usize::from(index)) }
+    /// Opposing directions are not set by real controllers; keep a deterministic negative value
+    /// when a viewer reports the full mask.
+    fn hat(buttons: u16, negative: u16, positive: u16) -> i32 {
+        if buttons & negative != 0 { -1 } else { i32::from(buttons & positive != 0) }
+    }
+
+    /// XInput pads in the four ViGEm-equivalent slots. A slot device is created on the first
+    /// connect or update for its index and survives disconnect (no udev/SDL hotplug storm;
+    /// the official host's missing target auto-connects too, RVA 0x5dfba0).
+    pub struct Gamepads {
+        pads: Mutex<[Option<Device>; 4]>,
+        last: Mutex<[Option<GamepadState>; 4]>,
+        #[cfg(test)]
+        recorder: Option<File>,
+    }
+
+    impl Gamepads {
+        pub fn new() -> std::io::Result<Self> {
+            drop(OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open("/dev/uinput")?);
+            Ok(Self { pads: Mutex::new([const { None }; 4]), last: Mutex::new([None; 4]), #[cfg(test)] recorder: None })
+        }
+        #[cfg(test)]
+        pub fn recording_for_test() -> (Self, File) {
+            let path = std::env::temp_dir().join(format!("uu-uinput-gamepad-test-{}-{}", std::process::id(), rand::random::<u64>()));
+            let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            let reader = file.try_clone().unwrap();
+            (Self { pads: Mutex::new([const { None }; 4]), last: Mutex::new([None; 4]), recorder: Some(file) }, reader)
+        }
+        fn create_pad(&self) -> std::io::Result<Device> {
+            #[cfg(test)]
+            if let Some(recorder) = &self.recorder { return Ok(Device(recorder.try_clone()?)); }
+            // xpad identity 045e:028e: SDL2's built-in controller DB maps it and Steam/Proton expect
+            // Xbox, matching the ViGEm XUSB device the official Windows host presents.
+            Device::create_id("Microsoft X-Box 360 pad", 0x03 /* BUS_USB */, 0x045e, 0x028e, 0x0114, |d| {
+                d.ioctl(UI_SET_EVBIT, EV_KEY.into())?;
+                for (_, code) in GAMEPAD_BUTTONS { d.ioctl(UI_SET_KEYBIT, code.into())?; }
+                d.ioctl(UI_SET_EVBIT, EV_ABS.into())?;
+                for (code, minimum, maximum, flat) in [
+                    (ABS_X, -32768, 32767, 128), (ABS_Y, -32768, 32767, 128),
+                    (ABS_RX, -32768, 32767, 128), (ABS_RY, -32768, 32767, 128),
+                    (ABS_Z, 0, 255, 0), (ABS_RZ, 0, 255, 0),
+                    (ABS_HAT0X, -1, 1, 0), (ABS_HAT0Y, -1, 1, 0),
+                ] { d.abs_range(code, minimum, maximum, flat)?; }
+                Ok(())
+            })
+        }
+        pub fn ensure_slot(&self, index: u8) -> std::io::Result<()> {
+            let Some(i) = slot(index) else { return Ok(()) };
+            let mut pads = self.pads.lock().unwrap();
+            if pads[i].is_none() {
+                match self.create_pad() {
+                    Ok(device) => { pads[i] = Some(device); self.last.lock().unwrap()[i] = Some(GamepadState::default()); }
+                    Err(e) => {
+                        static FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                        if FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            log::warn!("Gamepad device creation failed: {}", e.kind());
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
+        }
+        /// Diff against the last emitted state: only button/axis changes become events, one SYN frame.
+        /// Values pass through verbatim — the viewer already inverted Y and scaled the triggers.
+        pub fn emit_state(&self, index: u8, state: GamepadState) {
+            let Some(i) = slot(index) else { return; };
+            if self.ensure_slot(index).is_err() { return; }
+            let mut pads = self.pads.lock().unwrap();
+            let Some(device) = pads[i].as_mut() else { return; };
+            let mut last = self.last.lock().unwrap();
+            let previous = last[i].unwrap_or_default();
+            let mut events = Vec::new();
+            for (bit, code) in GAMEPAD_BUTTONS {
+                let (was, now) = (previous.buttons & bit != 0, state.buttons & bit != 0);
+                if was != now { events.push((EV_KEY, code, i32::from(now))); }
+            }
+            for (code, was, now) in [
+                (ABS_X, i32::from(previous.lx), i32::from(state.lx)),
+                (ABS_Y, i32::from(previous.ly), i32::from(state.ly)),
+                (ABS_RX, i32::from(previous.rx), i32::from(state.rx)),
+                (ABS_RY, i32::from(previous.ry), i32::from(state.ry)),
+                (ABS_Z, i32::from(previous.lt), i32::from(state.lt)),
+                (ABS_RZ, i32::from(previous.rt), i32::from(state.rt)),
+                (ABS_HAT0X, hat(previous.buttons, 0x0004, 0x0008), hat(state.buttons, 0x0004, 0x0008)),
+                (ABS_HAT0Y, hat(previous.buttons, 0x0001, 0x0002), hat(state.buttons, 0x0001, 0x0002)),
+            ] {
+                if was != now { events.push((EV_ABS, code, now)); }
+            }
+            if events.is_empty() { last[i] = Some(state); return; }
+            match device.emit(&events) {
+                Ok(()) => last[i] = Some(state),
+                Err(e) => {
+                    static FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    if FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        log::warn!("Gamepad injection failed: {}", e.kind());
+                    }
+                }
+            }
+        }
+        /// Release every mapped button and zero all axes; the cached state follows.
+        pub fn neutral(&self, index: u8) {
+            let Some(i) = slot(index) else { return; };
+            let mut pads = self.pads.lock().unwrap();
+            let mut last = self.last.lock().unwrap();
+            if let Some(device) = pads[i].as_mut() {
+                let mut events: Vec<(u16, u16, i32)> = GAMEPAD_BUTTONS.iter().map(|&(_, code)| (EV_KEY, code, 0)).collect();
+                events.extend([
+                    (EV_ABS, ABS_X, 0), (EV_ABS, ABS_Y, 0), (EV_ABS, ABS_RX, 0), (EV_ABS, ABS_RY, 0),
+                    (EV_ABS, ABS_Z, 0), (EV_ABS, ABS_RZ, 0), (EV_ABS, ABS_HAT0X, 0), (EV_ABS, ABS_HAT0Y, 0),
+                ]);
+                if let Err(e) = device.emit(&events) {
+                    static FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    if FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        log::warn!("Gamepad release failed: {}", e.kind());
+                    }
+                }
+            }
+            last[i] = Some(GamepadState::default());
+        }
+        pub fn sweep(&self) { for index in 0..4 { self.neutral(index); } }
+    }
+
+    #[cfg(test)]
+    mod gamepad_tests {
+        use super::*;
+
+        #[test]
+        fn every_xinput_bit_maps_to_a_unique_evdev_event() {
+            let mut seen = std::collections::BTreeSet::new();
+            for &(bit, code) in &GAMEPAD_BUTTONS {
+                let (gamepads, mut file) = Gamepads::recording_for_test();
+                gamepads.emit_state(0, GamepadState { buttons: bit, ..Default::default() });
+                assert_eq!(Devices::recorded_events_for_test(&mut file), [(EV_KEY, code, 1), (EV_SYN, SYN_REPORT, 0)], "bit {bit:#06x}");
+                assert!(seen.insert((EV_KEY, code, 1)), "duplicate button mapping for bit {bit:#06x}");
+            }
+            for (bit, axis, value) in [(0x0001, ABS_HAT0Y, -1), (0x0002, ABS_HAT0Y, 1), (0x0004, ABS_HAT0X, -1), (0x0008, ABS_HAT0X, 1)] {
+                let (gamepads, mut file) = Gamepads::recording_for_test();
+                gamepads.emit_state(0, GamepadState { buttons: bit, ..Default::default() });
+                assert_eq!(Devices::recorded_events_for_test(&mut file), [(EV_ABS, axis, value), (EV_SYN, SYN_REPORT, 0)], "bit {bit:#06x}");
+                assert!(seen.insert((EV_ABS, axis, value)), "duplicate dpad mapping for bit {bit:#06x}");
+            }
+            // 11 buttons + 4 hat directions; Guide (0x0400) included like the official XUSB report.
+            assert_eq!(seen.len(), 15);
+        }
+
+        #[test]
+        fn combo_buttons_and_stick_values_stay_in_one_syn_frame() {
+            let (gamepads, mut file) = Gamepads::recording_for_test();
+            gamepads.emit_state(0, GamepadState { buttons: 0x400F, ..Default::default() });
+            assert_eq!(Devices::recorded_events_for_test(&mut file), [
+                (EV_KEY, BTN_NORTH, 1), (EV_ABS, ABS_HAT0X, -1), (EV_ABS, ABS_HAT0Y, -1), (EV_SYN, SYN_REPORT, 0),
+            ]);
+            // ly passes through verbatim: the viewer already inverted Y.
+            let (gamepads, mut file) = Gamepads::recording_for_test();
+            gamepads.emit_state(0, GamepadState { lx: -32768, ly: 32767, ..Default::default() });
+            assert_eq!(Devices::recorded_events_for_test(&mut file), [
+                (EV_ABS, ABS_X, -32768), (EV_ABS, ABS_Y, 32767), (EV_SYN, SYN_REPORT, 0),
+            ]);
+        }
+
+        #[test]
+        fn repeated_updates_emit_only_transitions_and_zeroed_state_releases() {
+            let (gamepads, mut file) = Gamepads::recording_for_test();
+            let state = |buttons, lx| GamepadState { buttons, lx, ..Default::default() };
+            gamepads.emit_state(0, state(0x1000, 0));
+            gamepads.emit_state(0, state(0x1000, 0));
+            gamepads.emit_state(0, state(0x3000, 120));
+            gamepads.emit_state(0, state(0, 0));
+            gamepads.emit_state(0, state(0, 0));
+            assert_eq!(Devices::recorded_events_for_test(&mut file), [
+                (EV_KEY, BTN_SOUTH, 1), (EV_SYN, SYN_REPORT, 0),
+                (EV_KEY, BTN_EAST, 1), (EV_ABS, ABS_X, 120), (EV_SYN, SYN_REPORT, 0),
+                (EV_KEY, BTN_SOUTH, 0), (EV_KEY, BTN_EAST, 0), (EV_ABS, ABS_X, 0), (EV_SYN, SYN_REPORT, 0),
+            ]);
+        }
+    }
+
     #[cfg(test)]
     mod reset_acceptance {
         use super::*;
@@ -250,9 +464,19 @@ mod imp {
         pub fn button(&self, _: u16, _: bool) -> std::io::Result<()> { Ok(()) }
         pub fn wheel(&self, _: i32, _: i32) -> std::io::Result<()> { Ok(()) }
     }
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct GamepadState { pub buttons: u16, pub lt: u8, pub rt: u8, pub lx: i16, pub ly: i16, pub rx: i16, pub ry: i16 }
+    pub struct Gamepads;
+    impl Gamepads {
+        pub fn new() -> std::io::Result<Self> { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "uinput requires Linux")) }
+        pub fn ensure_slot(&self, _: u8) -> std::io::Result<()> { Ok(()) }
+        pub fn emit_state(&self, _: u8, _: GamepadState) {}
+        pub fn neutral(&self, _: u8) {}
+        pub fn sweep(&self) {}
+    }
 }
 
-pub use imp::{Devices, ABS_MAX, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
+pub use imp::{Devices, GamepadState, Gamepads, ABS_MAX, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
 
 /// X11 button ordinal (1 left, 2 middle, 3 right, 8/9 side) → evdev button code.
 pub fn button_code(x11_button: i32) -> Option<u16> {
