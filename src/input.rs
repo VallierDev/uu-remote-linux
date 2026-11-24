@@ -1274,8 +1274,9 @@ mod kernel_pointer_tests {
             }
         }
         let events = crate::uinput::Devices::recorded_events_for_test(&mut file);
+        // ABS_Y/ABS_RY flip: wire (XInput) up=+32767/-100, kernel (evdev) reads up=-.
         assert_eq!(&events[..7], &[
-            (1, 0x130, 1), (3, 0, -32768), (3, 1, 32767), (3, 3, 100), (3, 4, -100), (3, 2, 128), (0, 0, 0),
+            (1, 0x130, 1), (3, 0, -32768), (3, 1, -32767), (3, 3, 100), (3, 4, 100), (3, 2, 128), (0, 0, 0),
         ]);
         // Disconnect releases without destroying the slot device.
         assert!(events[7..].contains(&(1, 0x130, 0)));

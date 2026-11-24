@@ -291,7 +291,7 @@ started a second full host server instead, so check that a subcommand exists in 
   lock window; `unlock_with` kills such a greeter when the session is still locked 2 s after `unlock-session`.
 - GNOME closes the portal session on lock; capture/input must share one portal session and be rebuilt after
   unlock. Portal input/clipboard permissions are persisted per desktop (0600 file); a revoked permission asks again.
-- Gamepad `gpd_update` values inject verbatim: the viewer already inverted Y and scaled triggers, so any host-side flip or rescale is a double negation. Face buttons follow xpad (X=BTN_NORTH 0x133, Y=BTN_WEST 0x134 — 0x132 is BTN_C, not a face button). FF event codes and uapi layouts are pinned by tests (`EV_UINPUT 0x0101`, `UI_FF_UPLOAD 1`, `UI_FF_ERASE 2`; ff_effect 48 / uinput_ff_upload 104 / uinput_ff_erase 12 bytes) — changing the structs must go together with the test, or the ioctls corrupt instead of failing to compile.
+- Gamepad `gpd_update` values are XInput-convention (up=positive Y); the kernel evdev gamepad reads up=negative, so ABS_Y/ABS_RY flip sign (xpad does the same for real hardware), saturating -32768→+32767; X, triggers and dpad hats match both conventions. Face buttons follow xpad (X=BTN_NORTH 0x133, Y=BTN_WEST 0x134 — 0x132 is BTN_C, not a face button). FF event codes and uapi layouts are pinned by tests (`EV_UINPUT 0x0101`, `UI_FF_UPLOAD 1`, `UI_FF_ERASE 2`; ff_effect 48 / uinput_ff_upload 104 / uinput_ff_erase 12 bytes) — changing the structs must go together with the test, or the ioctls corrupt instead of failing to compile.
 
 ## 9. Debugging checklist
 

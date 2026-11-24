@@ -319,6 +319,11 @@ mod imp {
     fn hat(buttons: u16, negative: u16, positive: u16) -> i32 {
         if buttons & negative != 0 { -1 } else { i32::from(buttons & positive != 0) }
     }
+    /// XInput wire convention: up is positive. Kernel evdev gamepads: up is negative
+    /// (Documentation/input/gamepad), so Y translates with a sign flip — the xpad driver
+    /// does the same for real Xbox hardware. X matches both conventions. -(-32768)
+    /// would overflow the kernel range, so it saturates to +32767.
+    fn evdev_y(value: i16) -> i32 { if value == -32768 { 32767 } else { -i32::from(value) } }
 
     /// `ff_effects_max` and the EV_FF/FFBIT registration follow UU_GAMEPAD_RUMBLE.
     #[derive(Debug, PartialEq, Eq)]
@@ -454,7 +459,7 @@ mod imp {
             Ok(())
         }
         /// Diff against the last emitted state: only button/axis changes become events, one SYN frame.
-        /// Values pass through verbatim — the viewer already inverted Y and scaled the triggers.
+        /// X is verbatim, Y flips per evdev_y (XInput up=+ vs kernel up=-), triggers/dpad match both.
         pub fn emit_state(&self, index: u8, state: GamepadState) {
             let Some(i) = slot(index) else { return; };
             if self.ensure_slot(index).is_err() { return; }
@@ -467,17 +472,19 @@ mod imp {
                 let (was, now) = (previous.buttons & bit != 0, state.buttons & bit != 0);
                 if was != now { events.push((EV_KEY, code, i32::from(now))); }
             }
-            for (code, was, now) in [
-                (ABS_X, i32::from(previous.lx), i32::from(state.lx)),
-                (ABS_Y, i32::from(previous.ly), i32::from(state.ly)),
-                (ABS_RX, i32::from(previous.rx), i32::from(state.rx)),
-                (ABS_RY, i32::from(previous.ry), i32::from(state.ry)),
-                (ABS_Z, i32::from(previous.lt), i32::from(state.lt)),
-                (ABS_RZ, i32::from(previous.rt), i32::from(state.rt)),
-                (ABS_HAT0X, hat(previous.buttons, 0x0004, 0x0008), hat(state.buttons, 0x0004, 0x0008)),
-                (ABS_HAT0Y, hat(previous.buttons, 0x0001, 0x0002), hat(state.buttons, 0x0001, 0x0002)),
+            for (code, was, now, emit) in [
+                (ABS_X, i32::from(previous.lx), i32::from(state.lx), i32::from(state.lx)),
+                (ABS_Y, i32::from(previous.ly), i32::from(state.ly), evdev_y(state.ly)),
+                (ABS_RX, i32::from(previous.rx), i32::from(state.rx), i32::from(state.rx)),
+                (ABS_RY, i32::from(previous.ry), i32::from(state.ry), evdev_y(state.ry)),
+                (ABS_Z, i32::from(previous.lt), i32::from(state.lt), i32::from(state.lt)),
+                (ABS_RZ, i32::from(previous.rt), i32::from(state.rt), i32::from(state.rt)),
+                (ABS_HAT0X, hat(previous.buttons, 0x0004, 0x0008), hat(state.buttons, 0x0004, 0x0008), hat(state.buttons, 0x0004, 0x0008)),
+                (ABS_HAT0Y, hat(previous.buttons, 0x0001, 0x0002), hat(state.buttons, 0x0001, 0x0002), hat(state.buttons, 0x0001, 0x0002)),
             ] {
-                if was != now { events.push((EV_ABS, code, now)); }
+                // Diff in wire space (XInput) so a -32768 -> +32767 slam still emits, even though
+                // both saturate to the same kernel value.
+                if was != now { events.push((EV_ABS, code, emit)); }
             }
             if events.is_empty() { last[i] = Some(state); return; }
             match device.emit(&events) {
@@ -599,11 +606,34 @@ mod imp {
             assert_eq!(Devices::recorded_events_for_test(&mut file), [
                 (EV_KEY, BTN_NORTH, 1), (EV_ABS, ABS_HAT0X, -1), (EV_ABS, ABS_HAT0Y, -1), (EV_SYN, SYN_REPORT, 0),
             ]);
-            // ly passes through verbatim: the viewer already inverted Y.
+            // XInput wire up is positive; the kernel reads up negative, so ly flips (xpad-style).
             let (gamepads, mut file) = Gamepads::recording_for_test();
             gamepads.emit_state(0, GamepadState { lx: -32768, ly: 32767, ..Default::default() });
             assert_eq!(Devices::recorded_events_for_test(&mut file), [
-                (EV_ABS, ABS_X, -32768), (EV_ABS, ABS_Y, 32767), (EV_SYN, SYN_REPORT, 0),
+                (EV_ABS, ABS_X, -32768), (EV_ABS, ABS_Y, -32767), (EV_SYN, SYN_REPORT, 0),
+            ]);
+        }
+
+        #[test]
+        fn y_axes_flip_xinput_up_positive_to_kernel_up_negative_with_saturation() {
+            let (gamepads, mut file) = Gamepads::recording_for_test();
+            gamepads.emit_state(0, GamepadState { ly: 32767, ry: 32767, ..Default::default() });
+            assert_eq!(Devices::recorded_events_for_test(&mut file), [
+                (EV_ABS, ABS_Y, -32767), (EV_ABS, ABS_RY, -32767), (EV_SYN, SYN_REPORT, 0),
+            ]);
+            // XInput -32768 (full down) saturates to +32767 instead of overflowing the kernel range.
+            let (gamepads, mut file) = Gamepads::recording_for_test();
+            gamepads.emit_state(0, GamepadState { ly: -32768, ry: -32768, ..Default::default() });
+            assert_eq!(Devices::recorded_events_for_test(&mut file), [
+                (EV_ABS, ABS_Y, 32767), (EV_ABS, ABS_RY, 32767), (EV_SYN, SYN_REPORT, 0),
+            ]);
+            // Wire-space diff: -32768 -> +32767 must still emit although both saturate to +32767.
+            let (gamepads, mut file) = Gamepads::recording_for_test();
+            gamepads.emit_state(0, GamepadState { ly: -32768, ry: -32768, ..Default::default() });
+            gamepads.emit_state(0, GamepadState { ly: 32767, ry: 32767, ..Default::default() });
+            assert_eq!(Devices::recorded_events_for_test(&mut file), [
+                (EV_ABS, ABS_Y, 32767), (EV_ABS, ABS_RY, 32767), (EV_SYN, SYN_REPORT, 0),
+                (EV_ABS, ABS_Y, -32767), (EV_ABS, ABS_RY, -32767), (EV_SYN, SYN_REPORT, 0),
             ]);
         }
 

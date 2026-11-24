@@ -98,8 +98,11 @@ verbatim from the Windows evidence above, nothing re-invented:
   device the official Windows host presents. Face buttons follow xpad: A→BTN_SOUTH, B→BTN_EAST,
   X→BTN_NORTH (0x133), Y→BTN_WEST (0x134). A first update without connect auto-creates the slot
   (RVA 0x5dfba0 behavior); disconnect releases without destroying the device, so udev/SDL see no
-  hotplug storm. Stick and trigger values pass through verbatim — the viewer already inverted Y
-  and scaled triggers; flipping again would be the classic double-negation bug. `release_held()`
+  hotplug storm. Stick values translate XInput → evdev, not copy: X passes through verbatim, but Y
+  flips sign (XInput wire is up=positive; the kernel evdev gamepad spec reads up=negative, and xpad
+  flips Y for real Xbox hardware the same way), saturating -32768→+32767; triggers (0..255) and dpad
+  hats match both conventions. The diff cache compares wire values, so a -32768→+32767 slam still
+  emits. `release_held()`
   sweeps all four slots, covering a SIGKILLed viewer that sends no disconnect.
 - Kernel gamepads are independent of `UU_INPUT_BACKEND`: X11 sessions keep XTest for keys/mouse
   while gamepads go through the kernel, so the feature works on every desktop backend.
