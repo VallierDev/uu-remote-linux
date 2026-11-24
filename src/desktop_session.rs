@@ -30,6 +30,8 @@ pub struct PortalDesktop {
     opening: Arc<Mutex<()>>,
     locked: watch::Receiver<Option<bool>>,
     capture_while_locked: bool,
+    #[cfg(test)]
+    remembered_clipboard: Option<bool>,
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -166,7 +168,9 @@ impl PortalDesktop {
     pub fn new(screen: Arc<ScreenCapture>) -> Self {
         Self { state: watch::channel(State { waiting: screen.init_error.is_some(), screen }).0,
             opening: Arc::new(Mutex::new(())), locked: crate::session_lock::watch_locked(),
-            capture_while_locked: capture_while_locked() }
+            capture_while_locked: capture_while_locked(),
+            #[cfg(test)]
+            remembered_clipboard: None }
     }
     pub fn begin(&self) {
         // GNOME closes the Portal session on lock; a cached screen with a dead session
@@ -191,6 +195,13 @@ impl PortalDesktop {
     pub fn capture_allowed(&self, locked: Option<bool>) -> bool {
         attempt_allowed(locked, self.capture_while_locked)
     }
+    /// Whether this desktop previously granted Portal clipboard permission (read from the
+    /// persisted marker when no in-process `PortalSession` is loaded yet).
+    pub fn remembered_clipboard(&self) -> bool {
+        #[cfg(test)]
+        if let Some(granted) = self.remembered_clipboard { return granted; }
+        crate::portal::remembered_clipboard_granted()
+    }
     #[cfg(test)]
     pub fn with_lock_state(screen: Arc<ScreenCapture>, locked: watch::Receiver<Option<bool>>) -> Self {
         Self::with_lock_state_and_capture(screen, locked, false)
@@ -199,7 +210,12 @@ impl PortalDesktop {
     pub fn with_lock_state_and_capture(screen: Arc<ScreenCapture>, locked: watch::Receiver<Option<bool>>,
         capture_while_locked: bool) -> Self {
         Self { state: watch::channel(State { waiting: screen.init_error.is_some(), screen }).0,
-            opening: Arc::new(Mutex::new(())), locked, capture_while_locked }
+            opening: Arc::new(Mutex::new(())), locked, capture_while_locked, remembered_clipboard: Some(false) }
+    }
+    #[cfg(test)]
+    pub fn with_remembered_clipboard(mut self, granted: bool) -> Self {
+        self.remembered_clipboard = Some(granted);
+        self
     }
     #[cfg(test)]
     pub fn publish_test_screen(&self, screen: Arc<ScreenCapture>) {

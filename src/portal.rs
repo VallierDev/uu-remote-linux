@@ -351,6 +351,14 @@ mod native {
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
             // before new damage can leave a static desktop permanently blank (#2).
             let handle = Arc::new(Handle(handle));
+            if !virtual_output {
+                let clipboard_supported = unsafe { uu_portal_clipboard_supported(handle.0.as_ptr()) != 0 };
+                if let Some(dir) = directory.as_deref() {
+                    if super::permissions::save_clipboard_granted(dir, key, clipboard_supported).is_err() {
+                        log::warn!("Portal clipboard capability cache could not be saved");
+                    }
+                }
+            }
             // The engine records what it actually requested; a backend can refuse the mode the
             // environment or a runtime switch asked for.
             let available = unsafe { uu_portal_cursor_modes(handle.0.as_ptr()) };
@@ -1201,6 +1209,12 @@ static ACTIVE: std::sync::Mutex<Option<std::sync::Weak<PortalSession>>> = std::s
 pub fn permissions_directory() -> Option<std::path::PathBuf> { permissions::directory() }
 pub fn monitor_key(connector: &str) -> String { permissions::monitor_key(connector) }
 pub fn permission_exists(dir: &std::path::Path, key: &str) -> bool { permissions::exists(dir, key) }
+#[cfg(unix)]
+pub fn remembered_clipboard_granted() -> bool {
+    permissions::existing_directory().is_some_and(|dir| permissions::clipboard_granted(&dir, permissions::desktop_key()))
+}
+#[cfg(not(unix))]
+pub fn remembered_clipboard_granted() -> bool { false }
 pub fn register(session: &Arc<PortalSession>) {
     *ACTIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(session));
 }
