@@ -377,6 +377,41 @@ async fn gamepad_control_input_is_fire_and_forget_and_keeps_keyboard_dispatch() 
     }).await.expect("gamepad CONTROL regression exceeded deadline");
 }
 
+#[test]
+fn gpd_vibration_json_matches_the_official_builder_shape() {
+    assert_eq!(gamepad_vibration_json(0, 255, 128),
+        r#"{"action":"gpd_vibration","index":0,"left_motor":255,"right_motor":128}"#);
+}
+
+#[tokio::test]
+async fn desktop_rumble_reaches_control_as_raw_json() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let input = Arc::new(InputInjector::without_desktop());
+        // The production bind happens at CONTROL channel registration (desktop=true).
+        let (host, mut viewer) = connect(input.clone(), true, None, &["CONTROL_DATA_CHANNEL"]).await;
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        input.send_gamepad_rumble_for_test(0, 255, 128);
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (channel, message) = viewer.messages.recv().await.expect("peer stopped responding");
+                if channel == "CONTROL_DATA_CHANNEL" && message.first() == Some(&b'{') { break message; }
+            }
+        }).await.expect("rumble JSON did not arrive");
+        assert_eq!(first.as_slice(), br#"{"action":"gpd_vibration","index":0,"left_motor":255,"right_motor":128}"#);
+        input.send_gamepad_rumble_for_test(1, 0, 0);
+        let second = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (channel, message) = viewer.messages.recv().await.expect("peer stopped responding");
+                if channel == "CONTROL_DATA_CHANNEL" && message.first() == Some(&b'{') { break message; }
+            }
+        }).await.expect("second rumble JSON did not arrive");
+        assert_eq!(second.as_slice(), br#"{"action":"gpd_vibration","index":1,"left_motor":0,"right_motor":0}"#);
+        host.pc.close().await.unwrap();
+        viewer.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("desktop rumble regression exceeded deadline");
+}
+
 #[tokio::test]
 async fn capture_desktop_on_a_port_mapping_peer_promotes_it_once() {
     tokio::time::timeout(Duration::from_secs(25), async {

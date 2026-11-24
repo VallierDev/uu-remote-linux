@@ -128,7 +128,7 @@ impl Controller {
 #[derive(Default)]
 struct CmdState { held: bool, pending: bool, passthrough: bool, combos: std::collections::BTreeMap<i32, bool> }
 
-pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, gamepads: Option<crate::uinput::Gamepads>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag>, pointer_wake: tokio::sync::Notify }
+pub struct InputInjector { mac_controller: std::sync::atomic::AtomicBool, cmd: std::sync::Mutex<CmdState>, serial:std::sync::Mutex<()>, owner:std::sync::Mutex<DesktopOwner>, shortcuts: std::sync::Mutex<Shortcuts>, uinput: Option<crate::uinput::Devices>, gamepads: Option<crate::uinput::Gamepads>, gamepad_rumble: std::sync::Arc<crate::uinput::RumbleOut>, uinput_pointer: bool, screen: std::sync::Mutex<(u32,u32)>, portal_failures: std::sync::atomic::AtomicUsize, portal_outcomes: [std::sync::atomic::AtomicUsize; 3], portal:std::sync::Mutex<Option<std::sync::Arc<crate::portal::PortalSession>>>, backend: crate::desktop_backend::DesktopBackend, pending: std::sync::Mutex<PendingPointer>, held: std::sync::Mutex<HeldInput>, touch: std::sync::Mutex<TouchDrag>, pointer_wake: tokio::sync::Notify }
 
 fn active_output_count(json: &[u8]) -> Option<usize> {
     let data: serde_json::Value = serde_json::from_slice(json).ok()?;
@@ -149,9 +149,6 @@ fn single_portal_output() -> bool {
 /// input on its virtual-output share, so without uinput nobody could operate the desktop.
 static UINPUT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn uinput_ready() -> bool { UINPUT_READY.load(std::sync::atomic::Ordering::Acquire) }
-/// The kernel gamepad backend opened /dev/uinput; without it gpd_* updates are dropped.
-static GAMEPAD_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn gamepad_ready() -> bool { GAMEPAD_READY.load(std::sync::atomic::Ordering::Acquire) }
 
 impl InputInjector {
     pub fn new() -> Self {
@@ -169,8 +166,9 @@ impl InputInjector {
         else if backend == crate::desktop_backend::DesktopBackend::Portal { log::info!("Input pointer backend: portal (monitor-local coordinates)"); }
         // Independent of uinput::wanted(): X11 keeps XTest for keyboard/pointer, but a gamepad is
         // kernel-only and the official clients blind-send gpd_* with no negotiation.
+        let gamepad_rumble = std::sync::Arc::new(crate::uinput::RumbleOut::default());
         let gamepads = if std::env::var("UU_GAMEPAD").as_deref() == Ok("0") { None } else {
-            match crate::uinput::Gamepads::new() {
+            match crate::uinput::Gamepads::new(gamepad_rumble.clone()) {
                 Ok(gamepads) => { log::info!("Gamepad backend: uinput (kernel virtual gamepad)"); Some(gamepads) }
                 Err(e) => {
                     log::warn!("Gamepad unavailable ({}): gamepad input will be dropped. The udev uinput rule enables it.", e.kind());
@@ -178,8 +176,7 @@ impl InputInjector {
                 }
             }
         };
-        if gamepads.is_some() { GAMEPAD_READY.store(true, std::sync::atomic::Ordering::Release); }
-        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, gamepads, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
+        Self { mac_controller: std::sync::atomic::AtomicBool::new(false), cmd: std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()), owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts: std::sync::Mutex::new(Shortcuts::default()), uinput, gamepads, gamepad_rumble, uinput_pointer, screen: std::sync::Mutex::new((0,0)), portal_failures: std::sync::atomic::AtomicUsize::new(0), portal_outcomes: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)), portal:std::sync::Mutex::new(None), backend, pending: std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()), touch:std::sync::Mutex::new(TouchDrag::default()), pointer_wake: tokio::sync::Notify::new() }
     }
 
     pub fn bind_portal(&self,session:Option<std::sync::Arc<crate::portal::PortalSession>>) {
@@ -313,6 +310,8 @@ impl InputInjector {
     pub fn wire_gamepad_disconnect(&self, index: u8) {
         if let Some(gamepads) = &self.gamepads { gamepads.neutral(index); }
     }
+    /// The current desktop peer binds this sink; pad reader threads push motor bytes into it.
+    pub fn gamepad_rumble(&self) -> &std::sync::Arc<crate::uinput::RumbleOut> { &self.gamepad_rumble }
     pub fn mouse_button(&self, button: i32, is_press: bool) {
         let _serial=self.serial.lock().unwrap();
         // The worker cannot consume the wake and flush until this transition is published.
@@ -1379,11 +1378,15 @@ impl InputInjector {
     pub fn portal_input_counts_for_test(&self) -> [usize; 3] {
         std::array::from_fn(|i| self.portal_outcomes[i].load(std::sync::atomic::Ordering::Relaxed))
     }
+    pub fn send_gamepad_rumble_for_test(&self, index: u8, left: u8, right: u8) {
+        self.gamepad_rumble.send(index, left, right);
+    }
     pub fn without_desktop() -> Self {
         Self { mac_controller:std::sync::atomic::AtomicBool::new(false),
             cmd:std::sync::Mutex::new(CmdState::default()), serial:std::sync::Mutex::new(()),
             owner:std::sync::Mutex::new(DesktopOwner::default()), shortcuts:std::sync::Mutex::new(Shortcuts::default()),
-            uinput:None, gamepads:None, uinput_pointer:false, screen:std::sync::Mutex::new((0,0)), portal_failures:std::sync::atomic::AtomicUsize::new(0),
+            uinput:None, gamepads:None, gamepad_rumble:std::sync::Arc::new(crate::uinput::RumbleOut::default()),
+            uinput_pointer:false, screen:std::sync::Mutex::new((0,0)), portal_failures:std::sync::atomic::AtomicUsize::new(0),
             portal_outcomes:std::array::from_fn(|_|std::sync::atomic::AtomicUsize::new(0)),
             portal:std::sync::Mutex::new(None), backend:crate::desktop_backend::DesktopBackend::Portal,
             pending:std::sync::Mutex::new(PendingPointer::default()), held:std::sync::Mutex::new(HeldInput::default()),

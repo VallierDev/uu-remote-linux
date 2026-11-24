@@ -37,6 +37,12 @@ fn is_capture_setting_message(data: &[u8]) -> bool {
     }).is_some_and(|rpc| rpc.iter().any(|field| matches!(field.number, 2 | 3 | 4 | 6)))
 }
 
+/// Raw official gpd_vibration object (RVA 0x5df5d0 builder order). Sent without a protobuf
+/// envelope: the viewer feeds CONTROL bytes straight to its native_rumble decoder.
+fn gamepad_vibration_json(index: u8, left_motor: u8, right_motor: u8) -> String {
+    format!(r#"{{"action":"gpd_vibration","index":{index},"left_motor":{left_motor},"right_motor":{right_motor}}}"#)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SessionContext {
     pub client_id: Option<String>,
@@ -616,6 +622,19 @@ impl WebRtcSession {
                         let closing=closing.input();
                         Box::pin(async move {if let Some(session)=closing {session.disconnected();}})
                     }));
+                }
+                // Desktop rumble: rebind per CONTROL connection so the latest desktop peer wins,
+                // mirroring the viewer's per-peer rumble gating. Raw gpd_vibration JSON, no
+                // protobuf envelope: the viewer's rtc.rs decodes message.data directly.
+                if desktop && label == "CONTROL_DATA_CHANNEL" {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u8, u8, u8)>();
+                    inp.gamepad_rumble().bind(tx);
+                    let chan = d.clone();
+                    tokio::spawn(async move {
+                        while let Some((index, left, right)) = rx.recv().await {
+                            if chan.send(&bytes::Bytes::from(gamepad_vibration_json(index, left, right))).await.is_err() { break; }
+                        }
+                    });
                 }
                 // Ordered outbound queue for protocol replies produced outside this callback.
                 // webrtc-rs announces the channel before handle_open (ready_state Connecting);

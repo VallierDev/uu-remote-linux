@@ -33,6 +33,26 @@ pub fn text_plan(text: &str) -> Vec<TextKey> {
     { let _ = text; Vec::new() }
 }
 
+/// Rumble sink of the latest desktop peer: pad reader threads push `(index, left, right)`,
+/// webrtc forwards it as raw `gpd_vibration` JSON on CONTROL. Rebinding is the desktop-peer gate.
+#[derive(Default)]
+pub struct RumbleOut(std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u8, u8, u8)>>>);
+impl RumbleOut {
+    pub fn bind(&self, sender: tokio::sync::mpsc::UnboundedSender<(u8, u8, u8)>) { *self.0.lock().unwrap() = Some(sender); }
+    pub fn send(&self, index: u8, left: u8, right: u8) {
+        let sender = self.0.lock().unwrap().clone();
+        let dropped = sender.is_none_or(|sender| sender.send((index, left, right)).is_err());
+        if dropped {
+            static DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !DROPPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::info!("Gamepad rumble dropped: no CONTROL peer");
+            }
+        }
+    }
+}
+/// XInput rumble defaults on; `UU_GAMEPAD_RUMBLE=0` keeps a plain pad without FF slots.
+pub fn rumble_enabled() -> bool { std::env::var("UU_GAMEPAD_RUMBLE").as_deref() != Ok("0") }
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::fs::{File, OpenOptions};
@@ -45,6 +65,11 @@ mod imp {
     const EV_KEY: u16 = 0x01;
     const EV_REL: u16 = 0x02;
     const EV_ABS: u16 = 0x03;
+    const EV_FF: u16 = 0x15;
+    const EV_UINPUT: u16 = 0x0101;
+    const UI_FF_UPLOAD: u16 = 1;
+    const UI_FF_ERASE: u16 = 2;
+    const FF_RUMBLE: u16 = 0x50;
     const SYN_REPORT: u16 = 0;
     const REL_X: u16 = 0x00;
     const REL_Y: u16 = 0x01;
@@ -84,6 +109,17 @@ mod imp {
     const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
     const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
     const UI_ABS_SETUP: libc::c_ulong = 0x401c_5504;
+    /// Linux _IOC: dir << 30 | size << 16 | 'U' << 8 | nr; dir 1 = write, 3 = read|write.
+    const fn ioc(dir: u64, size: u64, nr: u64) -> libc::c_ulong {
+        ((dir << 30) | (size << 16) | (0x55 << 8) | nr) as libc::c_ulong
+    }
+    const fn iow(size: u64, nr: u64) -> libc::c_ulong { ioc(1, size, nr) }
+    const fn iowr(size: u64, nr: u64) -> libc::c_ulong { ioc(3, size, nr) }
+    const UI_SET_FFBIT: libc::c_ulong = iow(std::mem::size_of::<libc::c_int>() as u64, 107);
+    const UI_BEGIN_FF_UPLOAD: libc::c_ulong = iowr(std::mem::size_of::<UinputFfUpload>() as u64, 200);
+    const UI_END_FF_UPLOAD: libc::c_ulong = iow(std::mem::size_of::<UinputFfUpload>() as u64, 201);
+    const UI_BEGIN_FF_ERASE: libc::c_ulong = iowr(std::mem::size_of::<UinputFfErase>() as u64, 202);
+    const UI_END_FF_ERASE: libc::c_ulong = iow(std::mem::size_of::<UinputFfErase>() as u64, 203);
 
     #[repr(C)]
     struct InputId { bustype: u16, vendor: u16, product: u16, version: u16 }
@@ -95,6 +131,43 @@ mod imp {
     struct UinputAbsSetup { code: u16, _pad: u16, absinfo: AbsInfo }
     #[repr(C)]
     struct InputEvent { time: libc::timeval, kind: u16, code: u16, value: i32 }
+
+    // Hand-mirrored linux/input.h + linux/uinput.h FF uapi (POD). Sizes are pinned by a test:
+    // a layout slip here would corrupt the UI_BEGIN_FF_* ioctls.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FfTrigger { button: u16, interval: u16 }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FfReplay { length: u16, delay: u16 }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FfEnvelope { attack_length: u16, attack_level: u16, fade_length: u16, fade_level: u16 }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FfRumble { strong_magnitude: u16, weak_magnitude: u16 }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FfPeriodic {
+        waveform: u16, period: u16, magnitude: i16, offset: i16, phase: u16,
+        envelope: FfEnvelope, custom_len: u32, custom_data: *mut i16,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union FfEffectUnion {
+        constant: [u16; 5],
+        ramp: [u16; 6],
+        periodic: FfPeriodic,
+        condition: [[u16; 6]; 2],
+        rumble: FfRumble,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FfEffect { type_: u16, id: i16, direction: u16, trigger: FfTrigger, replay: FfReplay, u: FfEffectUnion }
+    #[repr(C)]
+    struct UinputFfUpload { request_id: u32, retval: i32, effect: FfEffect, old: FfEffect }
+    #[repr(C)]
+    struct UinputFfErase { request_id: u32, retval: i32, effect_id: u32 }
 
     /// XInput state exactly as the viewer sends it: already Y-inverted and trigger-scaled (0..=255).
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,10 +185,19 @@ mod imp {
             Self::create_id(name, 0x06 /* BUS_VIRTUAL */, 0x1d6b, product, 1, configure)
         }
         fn create_id(name: &str, bustype: u16, vendor: u16, product: u16, version: u16, configure: impl FnOnce(&Device) -> std::io::Result<()>) -> std::io::Result<Self> {
-            let file = OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open("/dev/uinput")?;
+            Self::create_full(name, bustype, vendor, product, version, false, 0, configure)
+        }
+        /// Pads open read+write: FF upload/erase requests arrive as reads on the same fd.
+        fn create_id_ff(name: &str, bustype: u16, vendor: u16, product: u16, version: u16, ff_effects_max: u32, configure: impl FnOnce(&Device) -> std::io::Result<()>) -> std::io::Result<Self> {
+            Self::create_full(name, bustype, vendor, product, version, true, ff_effects_max, configure)
+        }
+        fn create_full(name: &str, bustype: u16, vendor: u16, product: u16, version: u16, readable: bool, ff_effects_max: u32, configure: impl FnOnce(&Device) -> std::io::Result<()>) -> std::io::Result<Self> {
+            let mut options = OpenOptions::new();
+            options.write(true).read(readable);
+            let file = options.custom_flags(libc::O_NONBLOCK).open("/dev/uinput")?;
             let device = Device(file);
             configure(&device)?;
-            let mut setup = UinputSetup { id: InputId { bustype, vendor, product, version }, name: [0; 80], ff_effects_max: 0 };
+            let mut setup = UinputSetup { id: InputId { bustype, vendor, product, version }, name: [0; 80], ff_effects_max };
             setup.name[..name.len().min(79)].copy_from_slice(&name.as_bytes()[..name.len().min(79)]);
             if unsafe { libc::ioctl(device.0.as_raw_fd(), UI_DEV_SETUP, &setup) } < 0 { return Err(std::io::Error::last_os_error()); }
             device.ioctl(UI_DEV_CREATE, 0)?;
@@ -238,20 +320,72 @@ mod imp {
         if buttons & negative != 0 { -1 } else { i32::from(buttons & positive != 0) }
     }
 
+    /// `ff_effects_max` and the EV_FF/FFBIT registration follow UU_GAMEPAD_RUMBLE.
+    #[derive(Debug, PartialEq, Eq)]
+    struct PadSetup { ff_effects_max: u32, ev_ff: bool }
+    fn pad_setup(rumble: bool) -> PadSetup {
+        PadSetup { ff_effects_max: if rumble { 16 } else { 0 }, ev_ff: rumble }
+    }
+
+    /// Force-feedback state for one pad. Only FF_RUMBLE is forwarded; the motor mapping follows
+    /// the official Windows host (RVA 0x5df5d0 builds {index,left_motor,right_motor} from ViGEm
+    /// XUSB feedback): left_motor = strong (low-frequency/heavy), right_motor = weak.
+    #[derive(Default)]
+    struct RumbleCore { effects: std::collections::BTreeMap<i32, (u16, u16)>, active: Option<i32> }
+    impl RumbleCore {
+        fn uploaded(&mut self, id: i32, strong: u16, weak: u16) { self.effects.insert(id, (strong, weak)); }
+        fn played(&mut self, id: i32, repeats: i32) -> Option<(u8, u8)> {
+            if repeats <= 0 { return self.stopped(id); }
+            let &(strong, weak) = self.effects.get(&id)?;
+            self.active = Some(id);
+            Some(((strong >> 8) as u8, (weak >> 8) as u8))
+        }
+        fn stopped(&mut self, id: i32) -> Option<(u8, u8)> {
+            if self.active == Some(id) { self.active = None; Some((0, 0)) } else { None }
+        }
+        fn erased(&mut self, id: i32) -> Option<(u8, u8)> {
+            self.effects.remove(&id);
+            self.stopped(id)
+        }
+    }
+    /// FF_RUMBLE payload of an upload; other effect types are acknowledged and not stored.
+    fn upload_rumble(effect: &FfEffect) -> Option<(i32, u16, u16)> {
+        if effect.type_ != FF_RUMBLE { return None; }
+        // SAFETY: the kernel fills `u` for the effect type it reports; FF_RUMBLE selects `rumble`.
+        let rumble = unsafe { effect.u.rumble };
+        Some((i32::from(effect.id), rumble.strong_magnitude, rumble.weak_magnitude))
+    }
+
     /// XInput pads in the four ViGEm-equivalent slots. A slot device is created on the first
     /// connect or update for its index and survives disconnect (no udev/SDL hotplug storm;
     /// the official host's missing target auto-connects too, RVA 0x5dfba0).
     pub struct Gamepads {
         pads: Mutex<[Option<Device>; 4]>,
         last: Mutex<[Option<GamepadState>; 4]>,
+        readers: Mutex<[Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>; 4]>,
+        #[cfg_attr(test, allow(dead_code))]  // read only by the non-test reader spawn
+        rumble: std::sync::Arc<super::RumbleOut>,
+        ff: bool,
         #[cfg(test)]
         recorder: Option<File>,
     }
 
+    impl Drop for Gamepads {
+        fn drop(&mut self) {
+            // Set every stop flag before joining; readers may sit in poll(500 ms). Take the
+            // handles out first so the readers lock is not held during the joins.
+            let readers = std::mem::replace(&mut *self.readers.lock().unwrap(), std::array::from_fn(|_| None));
+            for (stop, _) in readers.iter().flatten() { stop.store(true, std::sync::atomic::Ordering::Release); }
+            for (_, join) in readers.into_iter().flatten() { let _ = join.join(); }
+        }
+    }
+
     impl Gamepads {
-        pub fn new() -> std::io::Result<Self> {
-            drop(OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open("/dev/uinput")?);
-            Ok(Self { pads: Mutex::new([const { None }; 4]), last: Mutex::new([None; 4]), #[cfg(test)] recorder: None })
+        pub fn new(rumble: std::sync::Arc<super::RumbleOut>) -> std::io::Result<Self> {
+            drop(OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open("/dev/uinput")?);
+            Ok(Self { pads: Mutex::new([const { None }; 4]), last: Mutex::new([None; 4]),
+                readers: Mutex::new([const { None }; 4]), rumble, ff: super::rumble_enabled(),
+                #[cfg(test)] recorder: None })
         }
         #[cfg(test)]
         pub fn recording_for_test() -> (Self, File) {
@@ -259,14 +393,17 @@ mod imp {
             let file = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path).unwrap();
             std::fs::remove_file(path).unwrap();
             let reader = file.try_clone().unwrap();
-            (Self { pads: Mutex::new([const { None }; 4]), last: Mutex::new([None; 4]), recorder: Some(file) }, reader)
+            (Self { pads: Mutex::new([const { None }; 4]), last: Mutex::new([None; 4]),
+                readers: Mutex::new([const { None }; 4]), rumble: Default::default(), ff: false,
+                recorder: Some(file) }, reader)
         }
         fn create_pad(&self) -> std::io::Result<Device> {
             #[cfg(test)]
             if let Some(recorder) = &self.recorder { return Ok(Device(recorder.try_clone()?)); }
+            let setup = pad_setup(self.ff);
             // xpad identity 045e:028e: SDL2's built-in controller DB maps it and Steam/Proton expect
             // Xbox, matching the ViGEm XUSB device the official Windows host presents.
-            Device::create_id("Microsoft X-Box 360 pad", 0x03 /* BUS_USB */, 0x045e, 0x028e, 0x0114, |d| {
+            Device::create_id_ff("Microsoft X-Box 360 pad", 0x03 /* BUS_USB */, 0x045e, 0x028e, 0x0114, setup.ff_effects_max, |d| {
                 d.ioctl(UI_SET_EVBIT, EV_KEY.into())?;
                 for (_, code) in GAMEPAD_BUTTONS { d.ioctl(UI_SET_KEYBIT, code.into())?; }
                 d.ioctl(UI_SET_EVBIT, EV_ABS.into())?;
@@ -276,6 +413,10 @@ mod imp {
                     (ABS_Z, 0, 255, 0), (ABS_RZ, 0, 255, 0),
                     (ABS_HAT0X, -1, 1, 0), (ABS_HAT0Y, -1, 1, 0),
                 ] { d.abs_range(code, minimum, maximum, flat)?; }
+                if setup.ev_ff {
+                    d.ioctl(UI_SET_EVBIT, EV_FF.into())?;
+                    d.ioctl(UI_SET_FFBIT, FF_RUMBLE.into())?;
+                }
                 Ok(())
             })
         }
@@ -284,7 +425,23 @@ mod imp {
             let mut pads = self.pads.lock().unwrap();
             if pads[i].is_none() {
                 match self.create_pad() {
-                    Ok(device) => { pads[i] = Some(device); self.last.lock().unwrap()[i] = Some(GamepadState::default()); }
+                    Ok(device) => {
+                        #[cfg(not(test))]
+                        if self.ff {
+                            let spawned = device.0.try_clone().and_then(|file| {
+                                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let thread_stop = stop.clone();
+                                let rumble = self.rumble.clone();
+                                let join = std::thread::Builder::new().name(format!("uu-gamepad-{index}"))
+                                    .spawn(move || reader_loop(file, index, rumble, thread_stop))?;
+                                self.readers.lock().unwrap()[i] = Some((stop, join));
+                                Ok(())
+                            });
+                            if let Err(e) = spawned { log::warn!("Gamepad rumble reader unavailable: {}", e.kind()); }
+                        }
+                        pads[i] = Some(device);
+                        self.last.lock().unwrap()[i] = Some(GamepadState::default());
+                    }
                     Err(e) => {
                         static FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                         if FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -356,6 +513,62 @@ mod imp {
         pub fn sweep(&self) { for index in 0..4 { self.neutral(index); } }
     }
 
+    /// Reads FF upload/erase requests for one pad. The fd was opened read+write for this.
+    #[cfg_attr(test, allow(dead_code))]
+    fn reader_loop(file: File, index: u8, rumble: std::sync::Arc<super::RumbleOut>,
+                   stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let fd = file.as_raw_fd();
+        let mut core = RumbleCore::default();
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            let mut pollfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let ready = unsafe { libc::poll(&mut pollfd, 1, 500) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) { continue; }
+                break;
+            }
+            if ready == 0 { continue; }
+            loop {
+                let mut event: InputEvent = unsafe { std::mem::zeroed() };
+                let read = unsafe { libc::read(fd, (&mut event as *mut InputEvent).cast(), std::mem::size_of::<InputEvent>()) };
+                if read == 0 { return; }
+                if read < 0 {
+                    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) { continue; }
+                    break;
+                }
+                if read as usize != std::mem::size_of::<InputEvent>() { break; }
+                handle_ff_event(fd, index, &rumble, &mut core, event);
+            }
+        }
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    fn handle_ff_event(fd: std::os::unix::io::RawFd, index: u8, rumble: &super::RumbleOut,
+                       core: &mut RumbleCore, event: InputEvent) {
+        match (event.kind, event.code) {
+            (EV_UINPUT, UI_FF_UPLOAD) => {
+                let mut upload: UinputFfUpload = unsafe { std::mem::zeroed() };
+                upload.request_id = event.value as u32;
+                if unsafe { libc::ioctl(fd, UI_BEGIN_FF_UPLOAD, &mut upload) } < 0 { return; }
+                if let Some((id, strong, weak)) = upload_rumble(&upload.effect) { core.uploaded(id, strong, weak); }
+                upload.retval = 0;
+                unsafe { libc::ioctl(fd, UI_END_FF_UPLOAD, &mut upload) };
+            }
+            (EV_UINPUT, UI_FF_ERASE) => {
+                let mut erase: UinputFfErase = unsafe { std::mem::zeroed() };
+                erase.request_id = event.value as u32;
+                if unsafe { libc::ioctl(fd, UI_BEGIN_FF_ERASE, &mut erase) } < 0 { return; }
+                if let Some((left, right)) = core.erased(erase.effect_id as i32) { rumble.send(index, left, right); }
+                erase.retval = 0;
+                unsafe { libc::ioctl(fd, UI_END_FF_ERASE, &mut erase) };
+            }
+            (EV_FF, effect) => {
+                let update = if event.value > 0 { core.played(i32::from(effect as i16), event.value) } else { core.stopped(i32::from(effect as i16)) };
+                if let Some((left, right)) = update { rumble.send(index, left, right); }
+            }
+            _ => {}
+        }
+    }
+
     #[cfg(test)]
     mod gamepad_tests {
         use super::*;
@@ -408,6 +621,61 @@ mod imp {
                 (EV_KEY, BTN_EAST, 1), (EV_ABS, ABS_X, 120), (EV_SYN, SYN_REPORT, 0),
                 (EV_KEY, BTN_SOUTH, 0), (EV_KEY, BTN_EAST, 0), (EV_ABS, ABS_X, 0), (EV_SYN, SYN_REPORT, 0),
             ]);
+        }
+
+        #[test]
+        fn ff_uapi_layout_and_ioctl_numbers_match_the_kernel() {
+            assert_eq!(std::mem::size_of::<FfEffect>(), 48);
+            assert_eq!(std::mem::size_of::<UinputFfUpload>(), 104);
+            assert_eq!(std::mem::size_of::<UinputFfErase>(), 12);
+            assert_eq!(std::mem::size_of::<FfPeriodic>(), 32);
+            assert_eq!(UI_SET_FFBIT, 0x4004_556b);
+            assert_eq!(UI_BEGIN_FF_UPLOAD, 0xC068_55C8);
+            assert_eq!(UI_END_FF_UPLOAD, 0x4068_55C9);
+            assert_eq!(UI_BEGIN_FF_ERASE, 0xC00C_55CA);
+            assert_eq!(UI_END_FF_ERASE, 0x400C_55CB);
+            assert_eq!((EV_UINPUT, UI_FF_UPLOAD, UI_FF_ERASE), (0x0101, 1, 2));
+        }
+
+        #[test]
+        fn rumble_core_forwards_rumble_bytes_and_clears_only_the_active_effect() {
+            let mut core = RumbleCore::default();
+            core.uploaded(7, 0xFF00, 0x8000);
+            assert_eq!(core.played(7, 1), Some((0xFF, 0x80)));
+            assert_eq!(core.played(7, 2), Some((0xFF, 0x80)), "repeat re-emits the same bytes");
+            assert_eq!(core.played(8, 1), None, "unknown id emits nothing");
+            assert_eq!(core.stopped(8), None, "stopping a non-active id emits nothing");
+            assert_eq!(core.stopped(7), Some((0, 0)));
+            assert_eq!(core.stopped(7), None, "a second stop is ignored");
+            core.uploaded(9, 0x1000, 0x0200);
+            assert_eq!(core.played(9, 1), Some((0x10, 0x02)));
+            assert_eq!(core.played(9, 0), Some((0, 0)), "repeats=0 on the active id is a stop");
+            assert_eq!(core.played(9, 0), None);
+            assert_eq!(core.erased(9), None, "erasing a non-active id emits nothing");
+            assert_eq!(core.played(9, 1), None, "erased effects are gone");
+            core.uploaded(11, 0x1200, 0x3400);
+            assert_eq!(core.played(11, 1), Some((0x12, 0x34)));
+            assert_eq!(core.erased(11), Some((0, 0)), "erasing the active effect stops it");
+            assert_eq!(core.erased(11), None);
+        }
+
+        #[test]
+        fn non_rumble_uploads_are_not_stored_or_played() {
+            let mut effect: FfEffect = unsafe { std::mem::zeroed() };
+            effect.type_ = 0x52; // FF_CONSTANT
+            effect.id = 5;
+            assert_eq!(upload_rumble(&effect), None);
+            effect.type_ = FF_RUMBLE;
+            effect.u.rumble = FfRumble { strong_magnitude: 0x1200, weak_magnitude: 0x3400 };
+            assert_eq!(upload_rumble(&effect), Some((5, 0x1200, 0x3400)));
+            let mut core = RumbleCore::default();
+            assert_eq!(core.played(5, 1), None, "an unuploaded id has no effect");
+        }
+
+        #[test]
+        fn rumble_capability_controls_ff_slots_and_registration() {
+            assert_eq!(pad_setup(false), PadSetup { ff_effects_max: 0, ev_ff: false });
+            assert_eq!(pad_setup(true), PadSetup { ff_effects_max: 16, ev_ff: true });
         }
     }
 
@@ -468,7 +736,7 @@ mod imp {
     pub struct GamepadState { pub buttons: u16, pub lt: u8, pub rt: u8, pub lx: i16, pub ly: i16, pub rx: i16, pub ry: i16 }
     pub struct Gamepads;
     impl Gamepads {
-        pub fn new() -> std::io::Result<Self> { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "uinput requires Linux")) }
+        pub fn new(_: std::sync::Arc<super::RumbleOut>) -> std::io::Result<Self> { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "uinput requires Linux")) }
         pub fn ensure_slot(&self, _: u8) -> std::io::Result<()> { Ok(()) }
         pub fn emit_state(&self, _: u8, _: GamepadState) {}
         pub fn neutral(&self, _: u8) {}
