@@ -439,7 +439,7 @@ pub async fn run(session:&mut Session,window:&mut Window,decoder:&mut dyn super:
         Err(e)=>{ log::warn!("Type IPC not started: {e}"); None }
     };
     let mut native_gamepad=if super::native_gamepad::enabled(){
-        if window.mac{return Err(crate::i18n::s("原生手柄实验仅支持 Windows 被控端","Native gamepad experiment requires a Windows host").into())}
+        if window.mac{return Err(crate::i18n::s("原生手柄实验仅支持 Windows/Linux 被控端","Native gamepad experiment requires a Windows or Linux host").into())}
         Some(super::native_gamepad::NativeGamepad::new(&window._sdl,session.peer.rumble.clone())?)
     }else{None};
     let mut command_open=true;let mut requested=false;let mut type_requested=false;let mut restored=false;
