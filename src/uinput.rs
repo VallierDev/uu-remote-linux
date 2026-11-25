@@ -352,15 +352,18 @@ mod imp {
         if length_ms == 0 { None } else { Some(base + std::time::Duration::from_millis(u64::from(length_ms))) }
     }
     impl RumbleCore {
-        /// A re-upload of the effect under the running playback applies immediately: the game
-        /// changed the magnitudes with EVIOCSFF and never sends another EV_FF, so keeping the
-        /// old bytes would leave stale motor state refreshing on the viewer (a zeroed
-        /// continuous effect would vibrate forever). Timing state is untouched; a delayed
-        /// (not yet started) playback just picks the new parameters up at its start.
-        fn uploaded(&mut self, id: i32, effect: RumbleEffect) -> Option<(u8, u8)> {
-            let playing = self.active.as_ref().is_some_and(|play| play.id == id && matches!(play.phase, Phase::Playing(_)));
+        /// A re-upload of the effect under the running playback applies immediately (the game
+        /// changed it with EVIOCSFF and never sends another EV_FF): the new magnitudes go out
+        /// at once — keeping stale bytes refreshing would leave a zeroed continuous effect
+        /// vibrating forever — and the running repetition re-arms from the upload moment, so a
+        /// re-uploaded `length` governs the end (0 = until stopped) instead of the old value.
+        /// The delay applies at the next repetition boundary as usual. A delayed (pending)
+        /// playback just picks the new parameters up at its scheduled start.
+        fn uploaded(&mut self, id: i32, effect: RumbleEffect, now: std::time::Instant) -> Option<(u8, u8)> {
             self.effects.insert(id, effect);
-            playing.then(|| ((effect.strong >> 8) as u8, (effect.weak >> 8) as u8))
+            let play = self.active.as_mut().filter(|play| play.id == id && matches!(play.phase, Phase::Playing(_)))?;
+            play.phase = Phase::Playing(motor_deadline(now, effect.length));
+            Some(((effect.strong >> 8) as u8, (effect.weak >> 8) as u8))
         }
         /// EV_FF value > 0 arms the effect (latest wins). delay=0 starts at once; delay>0 defers
         /// the start to advance() once the delay passes. Arming a delayed playback replaces the
@@ -530,11 +533,16 @@ mod imp {
                                 log::warn!("Gamepad rumble reader unavailable: {}", e.kind());
                                 // A pad advertising FF with nobody answering UI_FF_UPLOAD wedges the
                                 // game's EVIOCSFF ioctl for the fd's lifetime (uinput's completion
-                                // wait has no timeout): fall back to a rumble-less pad, so the game
-                                // sees no force feedback instead of hanging.
+                                // wait has no timeout). The usual cause of the failed spawn is fd
+                                // exhaustion, which the rumble-less recreation below hits too; that
+                                // failure must not publish the unusable FF device. Drop it and
+                                // report the slot uncreated, so the next update retries cleanly.
                                 match self.create_pad(false) {
                                     Ok(plain) => device = plain,
-                                    Err(retry) => log::warn!("Gamepad rumble-less recreation failed: {}", retry.kind()),
+                                    Err(retry) => {
+                                        log::warn!("Gamepad rumble-less recreation failed: {}", retry.kind());
+                                        return Err(retry);
+                                    }
                                 }
                             }
                         }
@@ -658,7 +666,7 @@ mod imp {
                 if unsafe { libc::ioctl(fd, UI_BEGIN_FF_UPLOAD, &mut upload) } < 0 { return; }
                 if let Some((id, effect)) = upload_rumble(&upload.effect) {
                     // A re-upload under the running playback applies immediately.
-                    if let Some((left, right)) = core.uploaded(id, effect) { rumble.send(index, left, right); }
+                    if let Some((left, right)) = core.uploaded(id, effect, std::time::Instant::now()) { rumble.send(index, left, right); }
                 }
                 upload.retval = 0;
                 unsafe { libc::ioctl(fd, UI_END_FF_UPLOAD, &mut upload) };
@@ -778,20 +786,20 @@ mod imp {
             // length 0 = plays until stopped; the original semantics for continuous rumble.
             let infinite = RumbleEffect { strong: 0xFF00, weak: 0x8000, ..Default::default() };
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(7, infinite), None);
+            assert_eq!(core.uploaded(7, infinite, now), None);
             assert_eq!(core.played(7, 1, now), Some((0xFF, 0x80)));
             assert_eq!(core.played(7, 2, now), Some((0xFF, 0x80)), "re-arming re-emits the same bytes");
             assert_eq!(core.played(8, 1, now), None, "unknown id emits nothing");
             assert_eq!(core.stopped(8), None, "stopping a non-active id emits nothing");
             assert_eq!(core.stopped(7), Some((0, 0)));
             assert_eq!(core.stopped(7), None, "a second stop is ignored");
-            assert_eq!(core.uploaded(9, RumbleEffect { strong: 0x1000, weak: 0x0200, ..Default::default() }), None);
+            assert_eq!(core.uploaded(9, RumbleEffect { strong: 0x1000, weak: 0x0200, ..Default::default() }, now), None);
             assert_eq!(core.played(9, 1, now), Some((0x10, 0x02)));
             assert_eq!(core.stopped(9), Some((0, 0)), "EV_FF value 0 on the active id is a stop");
             assert_eq!(core.stopped(9), None);
             assert_eq!(core.erased(9), None, "erasing a non-active id emits nothing");
             assert_eq!(core.played(9, 1, now), None, "erased effects are gone");
-            assert_eq!(core.uploaded(11, RumbleEffect { strong: 0x1200, weak: 0x3400, ..Default::default() }), None);
+            assert_eq!(core.uploaded(11, RumbleEffect { strong: 0x1200, weak: 0x3400, ..Default::default() }, now), None);
             assert_eq!(core.played(11, 1, now), Some((0x12, 0x34)));
             assert_eq!(core.erased(11), Some((0, 0)), "erasing the active effect stops it");
             assert_eq!(core.erased(11), None);
@@ -803,7 +811,7 @@ mod imp {
             let mut core = RumbleCore::default();
             // A 100 ms explosion pulse started once must expire on its own (the kernel does not
             // synthesize the stop; without this the motors run until the next event).
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 0 }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 0 }, t0), None);
             assert_eq!(core.played(1, 1, t0), Some((0x80, 0x00)));
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(99)), None, "still inside the pulse");
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(100)), Some((0, 0)), "the pulse expires");
@@ -814,7 +822,7 @@ mod imp {
         fn rumble_replay_delay_defers_the_start() {
             let t0 = std::time::Instant::now();
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 50 }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 50 }, t0), None);
             assert_eq!(core.played(1, 1, t0), None, "the delay holds the start");
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(49)), None);
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(50)), Some((0x80, 0x00)));
@@ -825,14 +833,14 @@ mod imp {
         fn rumble_repeats_run_back_to_back_and_stop_after_the_last() {
             let t0 = std::time::Instant::now();
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 0 }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 0 }, t0), None);
             assert_eq!(core.played(1, 3, t0), Some((0x80, 0x00)));
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(100)), None, "repeat 2 keeps the motors on");
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(200)), None, "repeat 3 keeps the motors on");
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(300)), Some((0, 0)), "the last repeat ends the playback");
             // The reader shortens its poll to the deadline so the expiry lands on time.
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 0 }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 0 }, t0), None);
             core.played(1, 1, t0);
             assert_eq!(core.poll_ms(t0, 500), 100);
             assert_eq!(core.poll_ms(t0 + std::time::Duration::from_millis(99), 500), 1, "1 ms before the deadline");
@@ -845,7 +853,7 @@ mod imp {
         fn rumble_repeats_with_a_delay_go_silent_between_repetitions() {
             let t0 = std::time::Instant::now();
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 40 }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 40 }, t0), None);
             assert_eq!(core.played(1, 2, t0), None);
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(40)), Some((0x80, 0x00)), "repeat 1 starts");
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(140)), Some((0, 0)), "the delay gap silences the motors");
@@ -858,7 +866,7 @@ mod imp {
         fn erasing_a_pending_playback_stops_it_before_the_start() {
             let t0 = std::time::Instant::now();
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 50 }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 50 }, t0), None);
             assert_eq!(core.played(1, 1, t0), None);
             assert_eq!(core.erased(1), Some((0, 0)), "the pending start must not survive the erase");
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(100)), None, "no motor bytes after the erased start");
@@ -868,28 +876,45 @@ mod imp {
         fn re_uploaded_magnitudes_apply_to_a_playing_effect_immediately() {
             let t0 = std::time::Instant::now();
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, ..Default::default() }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, ..Default::default() }, t0), None);
             assert_eq!(core.played(1, 1, t0), Some((0x80, 0x00)));
             // The game re-uploads (EVIOCSFF) without a new EV_FF: the new bytes go out at once.
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x4000, weak: 0x4000, ..Default::default() }), Some((0x40, 0x40)));
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x4000, weak: 0x4000, ..Default::default() }, t0), Some((0x40, 0x40)));
             // Zeroing a playing continuous effect ends the refresh instead of vibrating forever.
-            assert_eq!(core.uploaded(1, RumbleEffect::default()), Some((0, 0)));
+            assert_eq!(core.uploaded(1, RumbleEffect::default(), t0), Some((0, 0)));
             assert_eq!(core.stopped(1), Some((0, 0)));
             // A delayed (pending) playback picks re-uploaded parameters up at its start, not before.
-            assert_eq!(core.uploaded(2, RumbleEffect { strong: 0x9000, weak: 0, length: 100, delay: 50 }), None);
+            assert_eq!(core.uploaded(2, RumbleEffect { strong: 0x9000, weak: 0, length: 100, delay: 50 }, t0), None);
             assert_eq!(core.played(2, 1, t0), None);
-            assert_eq!(core.uploaded(2, RumbleEffect { strong: 0x1200, weak: 0x3400, length: 100, delay: 50 }), None);
+            assert_eq!(core.uploaded(2, RumbleEffect { strong: 0x1200, weak: 0x3400, length: 100, delay: 50 }, t0), None);
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(50)), Some((0x12, 0x34)));
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(150)), Some((0, 0)));
+        }
+
+        #[test]
+        fn re_uploaded_replay_length_applies_to_the_active_playback() {
+            let t0 = std::time::Instant::now();
+            let mut core = RumbleCore::default();
+            // A continuous effect (length 0) re-uploaded mid-play as a 100 ms pulse ends by itself.
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, ..Default::default() }, t0), None);
+            assert_eq!(core.played(1, 1, t0), Some((0x80, 0x00)));
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, ..Default::default() }, t0 + std::time::Duration::from_millis(20)), Some((0x80, 0x00)));
+            assert_eq!(core.advance(t0 + std::time::Duration::from_millis(119)), None, "inside the re-armed pulse");
+            assert_eq!(core.advance(t0 + std::time::Duration::from_millis(120)), Some((0, 0)), "the re-uploaded length ends the playback");
+            // A finite effect re-uploaded with length 0 no longer stops at the old deadline.
+            assert_eq!(core.played(1, 1, t0 + std::time::Duration::from_millis(200)), Some((0x80, 0x00)));
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, ..Default::default() }, t0 + std::time::Duration::from_millis(220)), Some((0x80, 0x00)));
+            assert_eq!(core.advance(t0 + std::time::Duration::from_millis(400)), None, "no old deadline left to fire");
+            assert_eq!(core.stopped(1), Some((0, 0)));
         }
 
         #[test]
         fn arming_a_delayed_effect_stops_the_previous_playback() {
             let t0 = std::time::Instant::now();
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, ..Default::default() }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, ..Default::default() }, t0), None);
             assert_eq!(core.played(1, 1, t0), Some((0x80, 0x00)));
-            assert_eq!(core.uploaded(2, RumbleEffect { strong: 0x9000, weak: 0x0900, length: 100, delay: 500 }), None);
+            assert_eq!(core.uploaded(2, RumbleEffect { strong: 0x9000, weak: 0x0900, length: 100, delay: 500 }, t0), None);
             // The 100 ms pulse's expiry died with the replacement; without this stop the motors
             // would run until the delayed start at +500 instead of stopping at +100.
             assert_eq!(core.played(2, 1, t0 + std::time::Duration::from_millis(50)), Some((0, 0)));
@@ -903,7 +928,7 @@ mod imp {
         fn overslept_repeats_end_on_the_original_schedule() {
             let t0 = std::time::Instant::now();
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, ..Default::default() }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, ..Default::default() }, t0), None);
             assert_eq!(core.played(1, 3, t0), Some((0x80, 0x00)));
             // The reader woke 50 ms after the whole playback should have ended: the drain consumes
             // the three overdue boundaries back-to-back (t=100, 200, 300) and the motors stop
@@ -918,7 +943,7 @@ mod imp {
         fn a_fully_elapsed_delayed_pulse_is_not_replayed() {
             let t0 = std::time::Instant::now();
             let mut core = RumbleCore::default();
-            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 50 }), None);
+            assert_eq!(core.uploaded(1, RumbleEffect { strong: 0x8000, weak: 0x0080, length: 100, delay: 50 }, t0), None);
             assert_eq!(core.played(1, 1, t0), None);
             // Should have run 50..150; the reader woke at 200: no start is replayed.
             assert_eq!(core.advance(t0 + std::time::Duration::from_millis(200)), None);
