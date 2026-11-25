@@ -484,10 +484,10 @@ mod imp {
                 readers: Mutex::new([const { None }; 4]), rumble: Default::default(), ff: false,
                 recorder: Some(file) }, reader)
         }
-        fn create_pad(&self) -> std::io::Result<Device> {
+        fn create_pad(&self, rumble: bool) -> std::io::Result<Device> {
             #[cfg(test)]
             if let Some(recorder) = &self.recorder { return Ok(Device(recorder.try_clone()?)); }
-            let setup = pad_setup(self.ff);
+            let setup = pad_setup(rumble);
             // xpad identity 045e:028e: SDL2's built-in controller DB maps it and Steam/Proton expect
             // Xbox, matching the ViGEm XUSB device the official Windows host presents.
             Device::create_id_ff("Microsoft X-Box 360 pad", 0x03 /* BUS_USB */, 0x045e, 0x028e, 0x0114, setup.ff_effects_max, |d| {
@@ -511,8 +511,10 @@ mod imp {
             let Some(i) = slot(index) else { return Ok(()) };
             let mut pads = self.pads.lock().unwrap();
             if pads[i].is_none() {
-                match self.create_pad() {
+                match self.create_pad(self.ff) {
                     Ok(device) => {
+                        #[cfg(not(test))]
+                        let mut device = device;
                         #[cfg(not(test))]
                         if self.ff {
                             let spawned = device.0.try_clone().and_then(|file| {
@@ -524,7 +526,17 @@ mod imp {
                                 self.readers.lock().unwrap()[i] = Some((stop, join));
                                 Ok(())
                             });
-                            if let Err(e) = spawned { log::warn!("Gamepad rumble reader unavailable: {}", e.kind()); }
+                            if let Err(e) = spawned {
+                                log::warn!("Gamepad rumble reader unavailable: {}", e.kind());
+                                // A pad advertising FF with nobody answering UI_FF_UPLOAD wedges the
+                                // game's EVIOCSFF ioctl for the fd's lifetime (uinput's completion
+                                // wait has no timeout): fall back to a rumble-less pad, so the game
+                                // sees no force feedback instead of hanging.
+                                match self.create_pad(false) {
+                                    Ok(plain) => device = plain,
+                                    Err(retry) => log::warn!("Gamepad rumble-less recreation failed: {}", retry.kind()),
+                                }
+                            }
                         }
                         pads[i] = Some(device);
                         self.last.lock().unwrap()[i] = Some(GamepadState::default());

@@ -110,7 +110,9 @@ verbatim from the Windows evidence above, nothing re-invented:
   answers `UI_FF_UPLOAD`/`UI_FF_ERASE` and forwards `EV_FF` play/stop as the official
   `gpd_vibration` JSON — raw bytes on CONTROL, no protobuf envelope, since the viewer feeds
   CONTROL bytes straight to its decoder. left_motor = ff_rumble strong (low-frequency) >> 8,
-  right_motor = weak >> 8, matching the ViGEm mapping at 0x5df5d0. The latest desktop CONTROL
+  right_motor = weak >> 8, matching the ViGEm mapping at 0x5df5d0 (the >>8 shift is byte
+  semantics, not a rescale: kernel magnitudes below 256 map to a zero motor, so the faintest
+  official-side rumble levels read as off, exactly as the Windows host's u8 fields do). The latest desktop CONTROL
   peer owns the outbound sink, mirroring the viewer's per-peer rumble gating. Finite effects
   honor ff_replay length/delay and the EV_FF repeat count: uinput leaves playback scheduling
   to this userspace driver, so the reader thread schedules start, expiry, inter-repeat gap and
