@@ -111,7 +111,12 @@ verbatim from the Windows evidence above, nothing re-invented:
   `gpd_vibration` JSON — raw bytes on CONTROL, no protobuf envelope, since the viewer feeds
   CONTROL bytes straight to its decoder. left_motor = ff_rumble strong (low-frequency) >> 8,
   right_motor = weak >> 8, matching the ViGEm mapping at 0x5df5d0. The latest desktop CONTROL
-  peer owns the outbound sink, mirroring the viewer's per-peer rumble gating.
+  peer owns the outbound sink, mirroring the viewer's per-peer rumble gating. Finite effects
+  honor ff_replay length/delay and the EV_FF repeat count: uinput leaves playback scheduling
+  to this userspace driver, so the reader thread schedules start, expiry, inter-repeat gap and
+  stop transitions (a one-shot 100 ms pulse stops on its own instead of running forever); a
+  promoted tool peer binds the sink when its DesktopRole activates, and the sink drains from
+  CONTROL's on_open so pre-open events queue instead of dying.
 - `UU_GAMEPAD=0` disables host gamepad input entirely. Logs carry indexes, counts and error kinds
   only — never button bitmaps, stick values or motor strengths.
 

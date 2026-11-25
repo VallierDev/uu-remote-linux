@@ -413,6 +413,34 @@ async fn desktop_rumble_reaches_control_as_raw_json() {
 }
 
 #[tokio::test]
+async fn a_promoted_tool_peer_receives_the_rumble_binding() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let input = Arc::new(InputInjector::without_desktop());
+        let (host, mut viewer) = connect(input.clone(), false, None, &["CONTROL_DATA_CHANNEL"]).await;
+        let (requests, mut requested) = mpsc::unbounded_channel();
+        host.on_desktop_request(move || { let _ = requests.send(()); });
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        // The Mac viewer opens the desktop on an existing tool peer: the rumble sink must
+        // follow the DesktopRole activation, not the original offer type.
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(5, 0, 3, &[8, 4])).await;
+        tokio::time::timeout(Duration::from_secs(5), requested.recv()).await.unwrap().unwrap();
+        host.promote(None);
+        assert!(host.role.is_desktop());
+        input.send_gamepad_rumble_for_test(0, 200, 100);
+        let message = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (channel, message) = viewer.messages.recv().await.expect("peer stopped responding");
+                if channel == "CONTROL_DATA_CHANNEL" && message.first() == Some(&b'{') { break message; }
+            }
+        }).await.expect("promoted-peer rumble JSON did not arrive");
+        assert_eq!(message.as_slice(), br#"{"action":"gpd_vibration","index":0,"left_motor":200,"right_motor":100}"#);
+        host.pc.close().await.unwrap();
+        viewer.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("promoted rumble regression exceeded deadline");
+}
+
+#[tokio::test]
 async fn capture_desktop_on_a_port_mapping_peer_promotes_it_once() {
     tokio::time::timeout(Duration::from_secs(25), async {
         let input = Arc::new(InputInjector::without_desktop());
