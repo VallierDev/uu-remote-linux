@@ -68,6 +68,7 @@ mod native {
         fn uu_portal_clipboard_poll(portal: *mut c_void, text: *mut u8, capacity: usize) -> i32;
         fn uu_portal_close(portal: *mut c_void);
         fn uu_portal_alive(portal: *mut c_void) -> i32;
+        fn uu_portal_restore_sent() -> i32;
         fn uu_portal_capture_alive(portal: *mut c_void) -> i32;
         fn uu_portal_wait_frame(portal: *mut c_void, timeout_us: i64) -> i32;
         fn uu_portal_input_dispatch(portal: *mut c_void);
@@ -163,6 +164,48 @@ mod native {
         }
     }
     pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, clipboard_write: Mutex<()>, end_generation: Arc<std::sync::atomic::AtomicU64>, installed: std::sync::atomic::AtomicBool }
+    /// Whether a failed open means the portal has already seen (and therefore spent) the
+    /// single-use restore token. Codes 1 (no bus), 2 (no interface) and 8 (allocation) fail
+    /// inside the engine before anything is sent, and 13 is this side giving up (screen locked,
+    /// viewer gone). In all of those the cached grant is still valid, while a token-less retry
+    /// would put a consent dialog on an unattended screen. Only a fallback for engines that
+    /// predate `uu_portal_restore_sent`: code 5 (timeout) and 3 (invalid reply) also happen at
+    /// CreateSession, before the token is ever submitted.
+    fn token_spent(code: i32) -> bool { !matches!(code, 1 | 2 | 8 | 13) }
+
+    /// Whether a failed open leaves the cached restore grant valid. `submitted` is the engine's
+    /// word on whether SelectDevices carried the token; `None` means an old engine that cannot
+    /// report it, falling back to the error code.
+    fn keep_restore_grant(submitted: Option<bool>, code: i32) -> bool {
+        match submitted { Some(sent) => !sent, None => !token_spent(code) }
+    }
+
+    #[cfg(test)]
+    mod restore_grant_tests {
+        use super::keep_restore_grant;
+        // The regression Codex measured: CreateSession (portal_engine.c) answers 5 (timeout)
+        // or 3 (invalid session handle) before SelectDevices ever carries the token, so the
+        // two-strike code rule discarded a grant the portal had never seen. The engine's
+        // submission flag keeps it.
+        #[test] fn create_session_timeout_keeps_the_cached_grant() {
+            for code in [3, 5, 13] { assert!(keep_restore_grant(Some(false), code), "code {code} before submission keeps the grant"); }
+        }
+        #[test] fn cancellation_before_dbus_submission_keeps_the_cached_grant() {
+            assert!(keep_restore_grant(Some(false), 13), "a cancel before request() submits the token must keep the grant");
+        }
+        // Once SelectDevices carried the token the portal may have consumed it: discard and
+        // retry without, regardless of code — including the cancels that land mid-dialog.
+        #[test] fn submitted_failures_discard_the_grant() {
+            for code in [0, 3, 4, 5, 9, 13, 15] { assert!(!keep_restore_grant(Some(true), code), "code {code} after submission spent the token"); }
+        }
+        // Engines without uu_portal_restore_sent keep the previous code-based rule:
+        // 1 bus, 2 interface, 8 allocation never reached the portal; the rest are treated as spent.
+        #[test] fn unknown_engines_fall_back_to_codes() {
+            for code in [1, 2, 8, 13] { assert!(keep_restore_grant(None, code), "code {code} never reached the portal"); }
+            for code in [0, 3, 4, 5, 9, 15] { assert!(!keep_restore_grant(None, code), "code {code} assumed at the portal"); }
+        }
+    }
+
     impl Session {
         fn install_capture_proof(&self) {
             self.installed.store(true, std::sync::atomic::Ordering::Release);
@@ -269,7 +312,6 @@ mod native {
             }
             // engine-plugins: libuu-portal.so (or one of its libraries) may be missing on this host.
             crate::engine_plugin::load(crate::engine_plugin::Engine::Portal).map_err(|_| super::PortalError { code: 15 })?;
-            let (mut error, mut width, mut height) = (0, 0, 0);
             let directory = super::permissions::directory();
             let key = super::permissions::desktop_key();
             let wanted = if virtual_output { None } else { monitor.map(str::to_owned).or_else(crate::wayland::portal_monitor) };
@@ -311,13 +353,6 @@ mod native {
             extern "C" fn save_token(token: *const libc::c_char, data: *mut c_void) {
                 save_detailed(token, data, 0, 0, 0);
             }
-            let restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
-            let failed = |code: i32, cache: &TokenCache| {
-                if let (Some(dir), Some((k, value)), false) = (directory.as_deref(), taken.as_ref(), cache.rotation.received()) {
-                    if super::permissions::save(dir, k, value).is_err() { log::warn!("Portal permission cache could not be restored"); }
-                }
-                super::PortalError { code }
-            };
             // Release packages can temporarily have an older libuu-portal.so than the host.
             #[cfg(feature = "engine-plugins")]
             let detailed = crate::engine_plugin::symbol(crate::engine_plugin::Engine::Portal, "uu_portal_open_detailed\0") != 0;
@@ -330,42 +365,96 @@ mod native {
                 && !std::env::var("UU_PORTAL_DMABUF").is_ok_and(|v| v == "0") {
                 prefer_dmabuf = true;
             }
-            let pointer = if detailed {
-                // Virtual shares can wait for consent too; cancel them like monitor opens.
-                let cancel = cancelled;
-                let callback = cancel.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
-                let cancel_data = cancel.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
-                unsafe { uu_portal_open_detailed(
-                    restore, save_detailed, &mut cache as *mut _ as *mut c_void, callback, cancel_data,
-                    i32::from(prefer_dmabuf), if virtual_output { 4 } else { 1 },
-                    &mut error, &mut width, &mut height,
-                ) }
-            } else {
-                #[allow(unused_mut)]
-                let mut pointer: *mut c_void = std::ptr::null_mut();
-                #[cfg(feature = "inproc-av")]
-                if prefer_dmabuf {
-                    let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
-                    let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
-                    pointer = unsafe { uu_portal_open_persist_capture(
-                        restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
-                        &mut error, &mut width, &mut height,
-                    ) };
-                    if pointer.is_null() && error != 0 { return Err(failed(error, &cache)); }
-                    if pointer.is_null() { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
-                }
-                if !pointer.is_null() { pointer } else { unsafe {
-                    if virtual_output {
-                        uu_portal_open_virtual(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
-                    } else if let Some(cancelled) = cancelled {
-                        uu_portal_open_persist_cancellable(restore, save_token, &mut cache as *mut _ as *mut c_void,
-                            is_cancelled, cancelled as *const _ as *mut c_void, &mut error, &mut width, &mut height)
+            // One engine attempt with a given restore token. Reusable because a rejected token
+            // needs an immediate second attempt without one.
+            macro_rules! engine_open {
+                ($restore:expr) => {{
+                    let (mut error, mut width, mut height) = (0, 0, 0);
+                    let pointer = if detailed {
+                        // Virtual shares can wait for consent too; cancel them like monitor opens.
+                        let cancel = cancelled;
+                        let callback = cancel.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
+                        let cancel_data = cancel.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
+                        unsafe { uu_portal_open_detailed(
+                            $restore, save_detailed, &mut cache as *mut _ as *mut c_void, callback, cancel_data,
+                            i32::from(prefer_dmabuf), if virtual_output { 4 } else { 1 },
+                            &mut error, &mut width, &mut height,
+                        ) }
                     } else {
-                        uu_portal_open_persist(restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
-                    }
-                } }
+                        #[allow(unused_mut)]
+                        let mut pointer: *mut c_void = std::ptr::null_mut();
+                        #[allow(unused_mut)]
+                        let mut dmabuf_failed = false;
+                        #[cfg(feature = "inproc-av")]
+                        if prefer_dmabuf {
+                            let callback = cancelled.map(|_| is_cancelled as extern "C" fn(*mut c_void) -> i32);
+                            let cancel_data = cancelled.map_or(std::ptr::null_mut(), |value| value as *const _ as *mut c_void);
+                            pointer = unsafe { uu_portal_open_persist_capture(
+                                $restore, save_token, &mut cache as *mut _ as *mut c_void, callback, cancel_data, 1,
+                                &mut error, &mut width, &mut height,
+                            ) };
+                            if pointer.is_null() && error != 0 { dmabuf_failed = true; }
+                            if pointer.is_null() && !dmabuf_failed { log::warn!("Portal engine lacks DMA-BUF initialization; falling back to legacy initialization"); }
+                        }
+                        if !dmabuf_failed && pointer.is_null() { unsafe {
+                            if virtual_output {
+                                uu_portal_open_virtual($restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
+                            } else if let Some(cancelled) = cancelled {
+                                uu_portal_open_persist_cancellable($restore, save_token, &mut cache as *mut _ as *mut c_void,
+                                    is_cancelled, cancelled as *const _ as *mut c_void, &mut error, &mut width, &mut height)
+                            } else {
+                                uu_portal_open_persist($restore, save_token, &mut cache as *mut _ as *mut c_void, &mut error, &mut width, &mut height)
+                            }
+                        } } else { pointer }
+                    };
+                    (pointer, error, width, height)
+                }};
+            }
+            let mut restore = token.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
+            let failed = |code: i32, cache: &TokenCache, save_grant: bool| {
+                // A single-use restore token is consumed by the portal when it validates it, so a
+                // rejection (expiry, permission-store reset, rotation drift) leaves no valid grant.
+                // Writing the dead token back poisons every later attempt with an instant rejection
+                // and no dialog - no picture, nothing to click, an unattended host bricks itself
+                // (seen live on GNOME). But a portal that refuses every session outright is not the
+                // token's fault; only the caller knows which case this was.
+                if let (Some(dir), Some((k, value)), false, true) = (directory.as_deref(), taken.as_ref(), cache.rotation.received(), save_grant) {
+                    if super::permissions::save(dir, k, value).is_err() { log::warn!("Portal permission cache could not be restored"); }
+                }
+                super::PortalError { code }
             };
-            let Some(handle) = NonNull::new(pointer) else { return Err(failed(if error == 0 { 15 } else { error }, &cache)) };
+            // Release packages can ship an older libuu-portal.so without the submission flag;
+            // then the error code is all we have.
+            #[cfg(feature = "engine-plugins")]
+            let reports_submission = crate::engine_plugin::symbol(crate::engine_plugin::Engine::Portal, "uu_portal_restore_sent\0") != 0;
+            #[cfg(not(feature = "engine-plugins"))]
+            let reports_submission = true;
+            let (mut pointer, mut error, mut width, mut height) = engine_open!(restore);
+            // Self-heal a dead consent: retry once without the restore token so the portal pops
+            // its consent dialog and issues a fresh one. Failures after Start carry a returned
+            // token (rotation.received()), which excludes them from this retry.
+            if pointer.is_null() && !restore.is_null() && !cache.rotation.received() {
+                let submitted = reports_submission.then(|| unsafe { uu_portal_restore_sent() != 0 });
+                if !keep_restore_grant(submitted, error) {
+                    log::warn!("Portal request failed with a restore token; discarding it and retrying once without restore (a consent dialog may appear)");
+                    restore = std::ptr::null();
+                    (pointer, error, width, height) = engine_open!(restore);
+                } else {
+                    // Nothing was submitted, so the grant this attempt borrowed is still good.
+                    // Put it back rather than trading a valid consent for a dialog nobody can see.
+                    log::warn!("Portal request failed with code {error} before the restore token was submitted; keeping the cached consent");
+                    return Err(failed(error, &cache, true));
+                }
+            }
+            let Some(handle) = NonNull::new(pointer) else {
+                // The retry carried no token, so its outcome tells the two failure shapes apart:
+                // a fast code 3 means the portal refuses every session (seen wedged live on GNOME
+                // after heavy session churn) - keep the grant, a portal restart will then restore
+                // silently. A consent timeout (5) or cancel (13) means the dialog did open, i.e.
+                // the portal is healthy and the token was genuinely dead: leave it discarded.
+                let wedged = restore.is_null() && taken.is_some() && error == 3;
+                return Err(failed(if error == 0 { 15 } else { error }, &cache, wedged));
+            };
             let (mut x, mut y) = (0, 0);
             let granted = (!virtual_output && unsafe { uu_portal_stream_position(handle.as_ptr(), &mut x, &mut y) } == 0)
                 .then(|| crate::wayland::portal_monitor_at(x, y)).flatten();

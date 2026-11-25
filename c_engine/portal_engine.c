@@ -145,9 +145,20 @@ static void close_request(struct uu_portal *p, const char *path) {
         NULL, NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, NULL);
     if (r) g_variant_unref(r);
 }
+/* Whether the last open_persist() on this thread submitted the restore token to the portal
+ * (SelectDevices). CreateSession can fail with code 5/3 before anything carried the token, and
+ * error codes alone cannot tell "spent" from "never sent"; the host reads this after a failed
+ * open to decide whether discarding the cached grant is justified. open_persist runs entirely
+ * on the calling thread, so a thread-local suffices. */
+static _Thread_local int g_restore_sent;
+/* Mirrors the open_persist gate exactly: a failed version read (0) or a backend that predates
+ * persistence never adds the restore_token option, so it cannot have spent the cached grant. */
+static int restore_token_offered(guint version, const char *restore) {
+    return version >= 2 && restore && *restore;
+}
 /* Subscribe before invocation, using the documented handle_token path. */
 static GVariant *request(struct uu_portal *p, const char *interface, const char *method,
-    GVariantBuilder *options, int mode, int *error) {
+    GVariantBuilder *options, int mode, int restore_token, int *error) {
     if (open_cancelled(p)) { *error = 13; return NULL; }
     char token[64];
     snprintf(token, sizeof(token), "uu_%u_%u", (unsigned)getpid(), atomic_fetch_add(&token_sequence, 1));
@@ -162,6 +173,7 @@ static GVariant *request(struct uu_portal *p, const char *interface, const char 
     GVariant *args = mode == 0 ? g_variant_new("(@a{sv})", g_variant_builder_end(options)) :
         mode == 1 ? g_variant_new("(o@a{sv})", p->session, g_variant_builder_end(options)) :
         g_variant_new("(os@a{sv})", p->session, "", g_variant_builder_end(options));
+    if (restore_token) g_restore_sent = 1;
     GVariant *reply = g_dbus_connection_call_sync(p->bus, DEST, PATH, interface, method, args,
         G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, 10000, NULL, NULL);
     char *actual = NULL;
@@ -617,7 +629,7 @@ static void save_restore_token(struct uu_portal *p, void (*save_token)(const cha
 static struct uu_portal *open_persist(const char *restore, void (*save_token)(const char *, void *),
     uu_portal_save_detailed_fn save_detailed, void *save_data, uu_portal_cancelled_fn cancelled, void *cancel_data,
     int prefer_dmabuf, int *error, uint32_t *width, uint32_t *height, uint32_t source_types) {
-    *error = 0; *width = *height = 0;
+    *error = 0; *width = *height = 0; g_restore_sent = 0;
     struct uu_portal *p = calloc(1, sizeof(*p));
     if (!p) { *error = 8; return NULL; }
     p->cancelled = cancelled;
@@ -647,7 +659,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
     char token[64]; snprintf(token, sizeof(token), "uu_session_%u_%u", (unsigned)getpid(), atomic_fetch_add(&token_sequence, 1));
     g_variant_builder_add(&options, "{sv}", "session_handle_token", g_variant_new_string(token));
-    results = request(p, REMOTE, "CreateSession", &options, 0, error);
+    results = request(p, REMOTE, "CreateSession", &options, 0, 0, error);
     if (!results) goto done;
     const char *handle = NULL;
     if (g_variant_lookup(results, "session_handle", "&s", &handle)) p->session = g_strdup(handle);
@@ -660,12 +672,15 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     p->available = remote_property(p, "AvailableDeviceTypes");
     g_variant_builder_add(&options, "{sv}", "types", g_variant_new_uint32(3 | (p->available & 4)));
     guint version = remote_property(p, "version");
+    int restore_offered = restore_token_offered(version, restore);
     if (version >= 2) {
         g_variant_builder_add(&options, "{sv}", "persist_mode", g_variant_new_uint32(2));
-        if (restore && *restore) g_variant_builder_add(&options, "{sv}", "restore_token", g_variant_new_string(restore));
+        if (restore_offered) {
+            g_variant_builder_add(&options, "{sv}", "restore_token", g_variant_new_string(restore));
+        }
     }
 
-    results = request(p, REMOTE, "SelectDevices", &options, 1, error);
+    results = request(p, REMOTE, "SelectDevices", &options, 1, restore_offered, error);
     if (!results) goto done;
     g_variant_unref(results);
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
@@ -689,7 +704,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
         g_variant_builder_add(&options, "{sv}", "cursor_mode", g_variant_new_uint32(2));
         p->cursor_applied = 2;
     }
-    results = request(p, SCREEN, "SelectSources", &options, 1, error);
+    results = request(p, SCREEN, "SelectSources", &options, 1, 0, error);
     if (!results) goto done;
     g_variant_unref(results);
     if (has_interface(p, CLIPBOARD)) {
@@ -702,7 +717,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
         if (reply) g_variant_unref(reply);
     }
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    results = request(p, REMOTE, "Start", &options, 2, error);
+    results = request(p, REMOTE, "Start", &options, 2, 0, error);
     if (!results) goto done;
     gboolean clipboard_enabled=FALSE;
     g_variant_lookup(results,"clipboard_enabled","b",&clipboard_enabled);
@@ -778,6 +793,7 @@ struct uu_portal *uu_portal_open(int *error, uint32_t *width, uint32_t *height) 
     return uu_portal_open_restore(NULL, error, width, height);
 }
 const char *uu_portal_restore_token(struct uu_portal *p) { return p ? p->restore_token : NULL; }
+int uu_portal_restore_sent(void) { return g_restore_sent; }
 static gboolean quit_dbus_loop(gpointer data) { g_main_loop_quit(data); return G_SOURCE_REMOVE; }
 void uu_portal_close(struct uu_portal *p) {
     if (!p) return;

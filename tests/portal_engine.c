@@ -345,7 +345,7 @@ static void cancellable_waits(void) {
 
     GVariantBuilder options;
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
-    assert(!request(&p, REMOTE, "Start", &options, 2, &error));
+    assert(!request(&p, REMOTE, "Start", &options, 2, 0, &error));
     assert(error == 13);
     g_variant_builder_clear(&options);
 
@@ -435,8 +435,17 @@ static void rotated_token_callback(void) {
     save_restore_token(&p, NULL, saved_token_with_position, &calls);
     assert(calls == 1);
 }
+static void restore_offer_gate(void) {
+    /* The version<2 / failed-read cases must not report the token as submitted. */
+    assert(!restore_token_offered(0, "grant"));
+    assert(!restore_token_offered(1, "grant"));
+    assert(!restore_token_offered(2, NULL));
+    assert(!restore_token_offered(2, ""));
+    assert(restore_token_offered(2, "grant"));
+}
 int main(void) {
     rotated_token_callback();
+    restore_offer_gate();
     portal_renegotiation_timeout();
     portal_renegotiation_recovery();
     portal_renegotiation_event_order_and_healthy_states();
