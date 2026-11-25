@@ -30,12 +30,14 @@ pub fn detect() -> Option<&'static dyn Backend> {
     if cfg!(test) { return None; }
     if super::kde::Kde::detected() { return Some(&super::kde::Kde); }
     if super::gnome::detected() { return Some(&super::gnome::Gnome); }
+    if super::x11::detected() { return Some(&super::x11::X11); }
     None
 }
 pub fn named(name: &str) -> Option<&'static dyn Backend> {
     match name {
         super::kde::NAME => Some(&super::kde::Kde),
         super::gnome::NAME => Some(&super::gnome::Gnome),
+        super::x11::NAME => Some(&super::x11::X11),
         _ => None,
     }
 }
