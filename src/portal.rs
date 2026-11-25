@@ -29,6 +29,22 @@ pub struct DmaFrame {
     pub modifier: u64,
 }
 pub enum DmaCapture<T> { Frame(T), Pending, Cpu, Blank, Unavailable(i32) }
+
+/// Fresh (changed) frames delivered by the current portal capture; reset only when a handle is
+/// installed and bumped by both capture paths (CPU `capture_changed` and the native DMA-BUF
+/// one) so every encoder — libx264, VAAPI, NVENC — publishes readiness. Discarded candidate
+/// opens leave the installed session's proof intact. Privacy auto waits for `> 0` as proof the
+/// capture produces content before hiding the screen.
+static FRESH_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Fresh frames of the current portal capture; see `FRESH_FRAMES`.
+pub fn fresh_frames() -> u64 { FRESH_FRAMES.load(std::sync::atomic::Ordering::Relaxed) }
+/// Restart the proof only when a handle becomes the installed capture source. A candidate open
+/// that is later discarded must not erase the old session's evidence.
+fn mark_installed_capture() { FRESH_FRAMES.store(0, std::sync::atomic::Ordering::Relaxed); }
+/// A frame counts toward privacy only while its session is the installed capture source.
+fn note_capture_frame(installed: bool, frames: &std::sync::atomic::AtomicU64) {
+    if installed { frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+}
 #[cfg(unix)]
 #[path = "portal_permissions.rs"]
 mod permissions;
@@ -101,7 +117,9 @@ mod native {
     }
     /// Like `replace_handle`, but carries the viewer's clipboard text before the old session
     /// closes. Clipboard writers wait from before the swap until the carry-over finishes.
-    fn replace_handle_carrying(current: &Mutex<Arc<Handle>>, clipboard_write: &Mutex<()>, locked: MutexGuard<'_, Arc<Handle>>, prepare: impl FnOnce() -> Result<Option<Arc<Handle>>, String>) -> Result<bool, String> {
+    /// `on_installed` runs after the swap while the handle mutex is still held — the same
+    /// exclusion captures use to publish their frame proof.
+    fn replace_handle_carrying(current: &Mutex<Arc<Handle>>, clipboard_write: &Mutex<()>, locked: MutexGuard<'_, Arc<Handle>>, prepare: impl FnOnce() -> Result<Option<Arc<Handle>>, String>, on_installed: impl FnOnce()) -> Result<bool, String> {
         drop(locked);
         let Some(replacement) = prepare()? else { return Ok(false); };
         let _clipboard = clipboard_write.lock().map_err(|_| "Portal clipboard lock poisoned")?;
@@ -109,7 +127,9 @@ mod native {
         let (old, installed) = {
             let mut handle = current.lock().map_err(|_| "Portal session lock poisoned")?;
             let old = std::mem::replace(&mut *handle, replacement);
-            (old, Arc::clone(&*handle))
+            let installed = Arc::clone(&*handle);
+            on_installed();
+            (old, installed)
         };
         unsafe { uu_portal_clipboard_copy(old.0.as_ptr(), installed.0.as_ptr()) };
         drop(old);
@@ -142,8 +162,15 @@ mod native {
             was_locked.store(false, std::sync::atomic::Ordering::Release);
         }
     }
-    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, clipboard_write: Mutex<()>, end_generation: Arc<std::sync::atomic::AtomicU64> }
+    pub struct Session { handle: Mutex<Arc<Handle>>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, clipboard_write: Mutex<()>, end_generation: Arc<std::sync::atomic::AtomicU64>, installed: std::sync::atomic::AtomicBool }
     impl Session {
+        fn install_capture_proof(&self) {
+            self.installed.store(true, std::sync::atomic::Ordering::Release);
+            super::mark_installed_capture();
+        }
+        fn note_frame(&self) {
+            super::note_capture_frame(self.installed.load(std::sync::atomic::Ordering::Acquire), &super::FRESH_FRAMES);
+        }
         fn take_lock_observation(&self) -> Result<bool, String> {
             // A recovery in progress must see the lock even if another capture
             // observes unlock and would otherwise reset only the old handle.
@@ -181,6 +208,9 @@ mod native {
             self.size.store(pack(size.0, size.1), std::sync::atomic::Ordering::Release);
             let previous_handle = std::mem::replace(&mut *handle, next);
             let installed = Arc::clone(&*handle);
+            // Under the handle mutex: a capture publishes its frame proof while holding that
+            // lock, so the reset cannot erase the first frame taken after the swap.
+            self.install_capture_proof();
             drop(handle);
             if unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) } < 0 {
                 log::warn!("Portal clipboard ownership could not be carried over");
@@ -357,7 +387,7 @@ mod native {
             let applied = unsafe { uu_portal_cursor_mode(handle.0.as_ptr()) };
             if applied > 0 { super::CURSOR_MODE.store(if applied == 2 { 2 } else { 1 }, std::sync::atomic::Ordering::Release); }
             if available > 0 { super::CURSOR_EMBED.store(if available & 2 != 0 { 2 } else { 1 }, std::sync::atomic::Ordering::Release); }
-            Ok(Self { handle: Mutex::new(handle), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()), end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
+            Ok(Self { handle: Mutex::new(handle), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), clipboard_write: Mutex::new(()), end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)), installed: std::sync::atomic::AtomicBool::new(false) })
         }
         /// Frame pixels of the monitor the stream currently follows.
         pub fn size(&self) -> (u32, u32) {
@@ -515,7 +545,9 @@ mod native {
             }
         }
         pub fn open() -> Result<Self, String> {
-            Self::open_inner(None, None, false, false).map_err(|error| error.to_string())
+            let session = Self::open_inner(None, None, false, false).map_err(|error| error.to_string())?;
+            session.install_capture_proof();
+            Ok(session)
         }
         #[cfg(test)]
         pub(crate) fn test_lock_watch(&mut self, locked: tokio::sync::watch::Receiver<Option<bool>>) {
@@ -541,7 +573,9 @@ mod native {
             Ok(true)
         }
         pub fn open_cancellable(cancelled: &std::sync::atomic::AtomicBool) -> Result<Self, super::PortalError> {
-            Self::open_inner(Some(cancelled), None, false, false)
+            let session = Self::open_inner(Some(cancelled), None, false, false)?;
+            session.install_capture_proof();
+            Ok(session)
         }
         pub fn recover(&self, cancelled: &std::sync::atomic::AtomicBool) -> Result<bool, super::PortalError> {
             use std::sync::atomic::Ordering;
@@ -586,6 +620,7 @@ mod native {
                 if cancelled.load(Ordering::Acquire) { return Err(super::PortalError { code: 13 }); }
                 let previous_handle = std::mem::replace(&mut *handle, replacement_handle);
                 let installed = Arc::clone(&*handle);
+                self.install_capture_proof();
                 drop(handle);
                 unsafe { uu_portal_clipboard_copy(previous_handle.0.as_ptr(), installed.0.as_ptr()) };
                 drop(clipboard);
@@ -647,6 +682,7 @@ mod native {
                         fn drop(&mut self) { unsafe { uu_portal_dmabuf_release(self.0) }; }
                     }
                     let _lease = Lease(handle.0.as_ptr());
+                    if code == 0 { self.note_frame(); }
                     let encoded = encode(&frame, code == 0)?;
                     *version = Some(super::FrameVersion(identity, revision));
                     Ok(super::DmaCapture::Frame(encoded))
@@ -712,7 +748,7 @@ mod native {
                         return Ok(None);
                     }
                     replacement.handle.into_inner().map(Some).map_err(|_| "Portal session lock poisoned".into())
-                })? {
+                }, || self.install_capture_proof())? {
                     *version = None;
                     log::info!("Portal capture session restored after stream loss");
                 }
@@ -730,7 +766,11 @@ mod native {
             let mut revision = version.filter(|v| v.0 == identity).map_or(0, |v| v.1);
             let code = unsafe { uu_portal_capture_since(handle.0.as_ptr(), frame.as_mut_ptr(), frame.len(), &mut revision) };
             match code {
-                0 | 12 => { *version = Some(super::FrameVersion(identity, revision)); Ok(code == 0) }
+                0 | 12 => {
+                    *version = Some(super::FrameVersion(identity, revision));
+                    if code == 0 { self.note_frame(); }
+                    Ok(code == 0)
+                }
                 9 | 10 => Ok(blank_changed(frame, version)),
                 _ => Err(super::error(code)),
             }
@@ -838,6 +878,7 @@ mod native {
                     monitor: Mutex::new(None), virtual_output: false.into(),
                     clipboard_write: Mutex::new(()),
                     end_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    installed: std::sync::atomic::AtomicBool::new(false),
                 }))
             }
 
@@ -863,6 +904,20 @@ mod native {
             assert!(original.session().check_geometry(same.session()).is_ok());
             assert!(original.session().check_geometry(width_changed.session()).is_err());
             assert!(original.session().check_geometry(height_changed.session()).is_err());
+        }
+
+        #[test]
+        fn a_candidate_publishes_privacy_readiness_only_after_installation() {
+            let candidate = Fixture::new((1920, 1080));
+            let frames = std::sync::atomic::AtomicU64::new(1);
+
+            super::super::note_capture_frame(candidate.session().installed.load(std::sync::atomic::Ordering::Acquire), &frames);
+            assert_eq!(frames.load(std::sync::atomic::Ordering::Acquire), 1, "a discarded candidate must leave the installed session's proof intact");
+
+            candidate.session().install_capture_proof();
+            assert!(candidate.session().installed.load(std::sync::atomic::Ordering::Acquire));
+            super::super::note_capture_frame(candidate.session().installed.load(std::sync::atomic::Ordering::Acquire), &frames);
+            assert_eq!(frames.load(std::sync::atomic::Ordering::Acquire), 2, "the installed capture must publish its first fresh frame");
         }
 
         /// upgrade_touch() holds the recovery mutex for as long as its consent dialog can wait
