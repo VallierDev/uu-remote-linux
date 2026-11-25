@@ -18,6 +18,12 @@ pub enum ControlInput {
     /// Official Windows host `text_input {content}` (KeyboardMouseRunner::execTextInput): text typed by the
     /// mobile clients' own input method. Never logged.
     TextInput { text: String },
+    /// Official Windows host GamepadManager (0x5dde60 dispatcher): connect/disconnect read `index`
+    /// as a byte; `gpd_update` is the 0x5ddb30 state decoder. Slots 0..=3 are the host's XInput cap;
+    /// a higher index is a known action this host does not implement.
+    GamepadConnect { index: u8 },
+    GamepadDisconnect { index: u8 },
+    GamepadUpdate { index: u8, buttons: u16, lt: u8, rt: u8, lx: i16, ly: i16, rx: i16, ry: i16 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +43,22 @@ fn integer(v: &Value, name: &str) -> Result<i32, String> {
 fn coordinate(v: &Value, name: &str) -> Result<f64, String> {
     v.get(name).and_then(Value::as_f64).filter(|n| n.is_finite())
         .ok_or_else(|| format!("CONTROL field {name} must be a finite number"))
+}
+
+/// Official 0x5ddb30 state decoder field widths: `index` and triggers are bytes, `buttons` u16,
+/// thumb values signed 16-bit. `Ok(None)` is a known gamepad action for a slot above the XInput cap.
+fn gamepad_index(v: &Value) -> Result<Option<u8>, String> {
+    let index = u8::try_from(integer(v, "index")?).map_err(|_| "CONTROL field index must be a byte".to_owned())?;
+    Ok((index <= 3).then_some(index))
+}
+fn gamepad_u8(v: &Value, name: &str) -> Result<u8, String> {
+    u8::try_from(integer(v, name)?).map_err(|_| format!("CONTROL field {name} must be a byte"))
+}
+fn gamepad_u16(v: &Value, name: &str) -> Result<u16, String> {
+    u16::try_from(integer(v, name)?).map_err(|_| format!("CONTROL field {name} must be a u16"))
+}
+fn gamepad_i16(v: &Value, name: &str) -> Result<i16, String> {
+    i16::try_from(integer(v, name)?).map_err(|_| format!("CONTROL field {name} must be an i16"))
 }
 
 pub fn decode_control(data: &[u8]) -> Result<ControlMessage, String> {
@@ -69,6 +91,27 @@ pub fn decode_control(data: &[u8]) -> Result<ControlMessage, String> {
         "mouse_scroll" => ControlInput::MouseScroll {
             dx: integer(&v, "delta_x")?, dy: integer(&v, "delta_y")?,
         },
+        "gpd_connect" => match gamepad_index(&v)? {
+            Some(index) => ControlInput::GamepadConnect { index },
+            None => return Ok(ControlMessage::Unsupported(v)),
+        },
+        "gpd_disconnect" => match gamepad_index(&v)? {
+            Some(index) => ControlInput::GamepadDisconnect { index },
+            None => return Ok(ControlMessage::Unsupported(v)),
+        },
+        "gpd_update" => {
+            let Some(index) = gamepad_index(&v)? else { return Ok(ControlMessage::Unsupported(v)); };
+            ControlInput::GamepadUpdate {
+                index,
+                buttons: gamepad_u16(&v, "buttons")?,
+                lt: gamepad_u8(&v, "left_trigger")?,
+                rt: gamepad_u8(&v, "right_trigger")?,
+                lx: gamepad_i16(&v, "left_thumb_x")?,
+                ly: gamepad_i16(&v, "left_thumb_y")?,
+                rx: gamepad_i16(&v, "right_thumb_x")?,
+                ry: gamepad_i16(&v, "right_thumb_y")?,
+            }
+        }
         _ => return Ok(ControlMessage::Unsupported(v)),
     };
     Ok(ControlMessage::Input(event))
@@ -107,6 +150,45 @@ mod tests {
         assert!(decode_control(br#"{"action":"kbd_press","key":2147483648}"#).is_err());
         assert!(decode_control(br#"{"action":"kbd_press","key":1.5}"#).is_err());
         assert!(decode_control(&[0xff, 0x08]).is_err());
+    }
+
+    #[test]
+    fn decodes_official_gamepad_wire_fields() {
+        assert_eq!(decode_control(br#"{"action":"gpd_connect","index":0}"#).unwrap(),
+            ControlMessage::Input(ControlInput::GamepadConnect { index: 0 }));
+        assert_eq!(decode_control(br#"{"action":"gpd_disconnect","index":3}"#).unwrap(),
+            ControlMessage::Input(ControlInput::GamepadDisconnect { index: 3 }));
+        assert_eq!(decode_control(br#"{"action":"gpd_update","index":0,"buttons":4096,"left_trigger":128,"right_trigger":255,"left_thumb_x":-32768,"left_thumb_y":32767,"right_thumb_x":100,"right_thumb_y":-100}"#).unwrap(),
+            ControlMessage::Input(ControlInput::GamepadUpdate {
+                index: 0, buttons: 4096, lt: 128, rt: 255, lx: -32768, ly: 32767, rx: 100, ry: -100,
+            }));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unrepresentable_gamepad_updates() {
+        let base = || serde_json::json!({"action":"gpd_update","index":0,"buttons":0,"left_trigger":0,
+            "right_trigger":0,"left_thumb_x":0,"left_thumb_y":0,"right_thumb_x":0,"right_thumb_y":0});
+        // 0x5ddb30: every state field is required.
+        for field in ["index","buttons","left_trigger","right_trigger","left_thumb_x","left_thumb_y","right_thumb_x","right_thumb_y"] {
+            let mut value = base();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(decode_control(&serde_json::to_vec(&value).unwrap()).is_err(), "missing {field}");
+        }
+        for (field, value) in [("buttons", 65536), ("buttons", -1), ("left_trigger", 256), ("right_trigger", -1),
+            ("left_thumb_x", -32769), ("left_thumb_y", 32768)] {
+            let mut json = base();
+            json[field] = value.into();
+            assert!(decode_control(&serde_json::to_vec(&json).unwrap()).is_err(), "field {field}={value}");
+        }
+        let mut json = base();
+        json["buttons"] = serde_json::json!(1.5);
+        assert!(decode_control(&serde_json::to_vec(&json).unwrap()).is_err());
+        let mut json = base();
+        json["index"] = 4.into();
+        assert!(matches!(decode_control(&serde_json::to_vec(&json).unwrap()).unwrap(), ControlMessage::Unsupported(_)));
+        assert!(matches!(decode_control(br#"{"action":"gpd_connect","index":4}"#).unwrap(), ControlMessage::Unsupported(_)));
+        assert!(matches!(decode_control(br#"{"action":"gpd_disconnect","index":4}"#).unwrap(), ControlMessage::Unsupported(_)));
+        assert!(decode_control(br#"{"action":"gpd_connect","index":-1}"#).is_err());
     }
 
     #[test]

@@ -37,6 +37,29 @@ fn is_capture_setting_message(data: &[u8]) -> bool {
     }).is_some_and(|rpc| rpc.iter().any(|field| matches!(field.number, 2 | 3 | 4 | 6)))
 }
 
+/// Raw official gpd_vibration object (RVA 0x5df5d0 builder order). Sent without a protobuf
+/// envelope: the viewer feeds CONTROL bytes straight to its native_rumble decoder.
+fn gamepad_vibration_json(index: u8, left_motor: u8, right_motor: u8) -> String {
+    format!(r#"{{"action":"gpd_vibration","index":{index},"left_motor":{left_motor},"right_motor":{right_motor}}}"#)
+}
+
+/// Binds this peer as the latest-wins rumble sink and returns the forwarder task. The caller
+/// picks when to spawn it: channel registration defers it to on_open, because webrtc-rs
+/// announces the channel before handle_open and send() returns ErrClosedPipe until Open —
+/// a drain started at announcement would fail once and drop the connection's only receiver.
+/// promote() spawns it immediately: CONTROL is already open there.
+fn rumble_forwarder(inp: &std::sync::Arc<crate::input::InputInjector>, chan: &std::sync::Arc<RTCDataChannel>)
+    -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u8, u8, u8)>();
+    inp.gamepad_rumble().bind(tx);
+    let chan = chan.clone();
+    Box::pin(async move {
+        while let Some((index, left, right)) = rx.recv().await {
+            if chan.send(&bytes::Bytes::from(gamepad_vibration_json(index, left, right))).await.is_err() { break; }
+        }
+    })
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SessionContext {
     pub client_id: Option<String>,
@@ -51,6 +74,9 @@ pub struct SessionContext {
 pub struct DesktopRole {
     active: tokio::sync::watch::Sender<bool>,
     input: std::sync::Mutex<Option<Arc<crate::input::DesktopInputSession>>>,
+    /// The peer's CONTROL channel: promote() binds the rumble sink through it, because a peer
+    /// offered as a tool never ran the desktop-time registration binding.
+    control: std::sync::Mutex<Option<Arc<RTCDataChannel>>>,
     stream: std::sync::Mutex<Option<DesktopStream>>,
     /// The running stream of a promoted peer; aborted on demotion so a quick re-promotion
     /// never leaves two encoders on one track.
@@ -63,7 +89,7 @@ pub struct DesktopRole {
 }
 impl DesktopRole {
     fn new(desktop: bool) -> Self {
-        Self { active: tokio::sync::watch::channel(desktop).0, input: Default::default(),
+        Self { active: tokio::sync::watch::channel(desktop).0, input: Default::default(), control: Default::default(),
             stream: Default::default(), stream_task: Default::default(), screen: Default::default(), tracking: Default::default(), request: Default::default() }
     }
     pub fn is_desktop(&self) -> bool { *self.active.borrow() }
@@ -611,11 +637,20 @@ impl WebRtcSession {
                 let rich_state=Arc::new(std::sync::Mutex::new(crate::clipboard_rich::State::default()));
                 let clipboard_enabled = shared_clipboard_ready.clone();
                 if label=="CONTROL_DATA_CHANNEL" {
+                    *channel_role.control.lock().unwrap() = Some(d.clone());
                     let closing=channel_role.clone();
                     d.on_close(Box::new(move || {
                         let closing=closing.input();
                         Box::pin(async move {if let Some(session)=closing {session.disconnected();}})
                     }));
+                }
+                // Desktop rumble: bind at registration so the latest desktop peer wins, but the
+                // drain starts from the on_open below (announcement precedes handle_open and
+                // send() fails until Open). Raw gpd_vibration JSON, no protobuf envelope: the
+                // viewer's rtc.rs decodes message.data directly.
+                let mut rumble_open_drain: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>> = None;
+                if desktop && label == "CONTROL_DATA_CHANNEL" {
+                    rumble_open_drain = Some(rumble_forwarder(&inp, &d));
                 }
                 // Ordered outbound queue for protocol replies produced outside this callback.
                 // webrtc-rs announces the channel before handle_open (ready_state Connecting);
@@ -681,7 +716,16 @@ impl WebRtcSession {
                         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
                     };
                     if !matches!(label.as_str(), "CONTROL_DATA_CHANNEL" | "TEXT_DATA_CHANNEL") { tokio::spawn(start_drain()); }
-                    else { open_drain = Some(Box::new(start_drain)); }
+                    else {
+                        let rumble = rumble_open_drain;
+                        open_drain = Some(Box::new(move || {
+                            let rumble = rumble;
+                            Box::pin(async move {
+                                tokio::spawn(start_drain());
+                                if let Some(rumble) = rumble { tokio::spawn(rumble); }
+                            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+                        }));
+                    }
                 }
                 let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
                 if matches!(label.as_str(),"CONTROL_DATA_CHANNEL"|"TEXT_DATA_CHANNEL") {
@@ -1594,10 +1638,11 @@ impl WebRtcSession {
                                         if !crate::wayland::input_ready() {return;}
                                         use crate::control_protocol::ControlInput;
                                         // Separate receipt budgets keep motion floods from hiding clicks.
-                                        static RECEIPTS: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+                                        static RECEIPTS: [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
                                         let (slot, kind) = match &event {
                                             ControlInput::MouseButton {..} | ControlInput::MouseClick {..} => (0, "button"),
                                             ControlInput::Keyboard {..} | ControlInput::KeyboardClick {..} | ControlInput::TextInput {..} => (1, "keyboard"),
+                                            ControlInput::GamepadConnect {..} | ControlInput::GamepadDisconnect {..} | ControlInput::GamepadUpdate {..} => (3, "gamepad"),
                                             _ => (2, "motion"),
                                         };
                                         if RECEIPTS[slot].fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
@@ -1625,6 +1670,9 @@ impl WebRtcSession {
                                                         ControlInput::KeyboardClick {key} => {input_worker.windows_key_event(*key, true);input_worker.windows_key_event(*key, false);},
                                                         ControlInput::MouseButton {button,pressed} => input_worker.wire_mouse_button(*button,*pressed),
                                                         ControlInput::MouseClick {button} => {input_worker.wire_mouse_button(*button,true);input_worker.wire_mouse_button(*button,false);},
+                                                        ControlInput::GamepadConnect {index} => input_worker.wire_gamepad_connect(*index),
+                                                        ControlInput::GamepadDisconnect {index} => input_worker.wire_gamepad_disconnect(*index),
+                                                        ControlInput::GamepadUpdate {index,buttons,lt,rt,lx,ly,rx,ry} => input_worker.wire_gamepad_update(*index, crate::uinput::GamepadState { buttons:*buttons, lt:*lt, rt:*rt, lx:*lx, ly:*ly, rx:*rx, ry:*ry }),
                                                         _ => {}
                                                     }
                                                 });
@@ -1728,6 +1776,12 @@ impl WebRtcSession {
             if self.pc.connection_state() == RTCPeerConnectionState::Connected { session.connected(); }
             *self.role.input.lock().unwrap() = Some(session);
             self.role.active.send_replace(true);
+            // The registration-time rumble binding only ran for peers offered as desktops;
+            // follow the DesktopRole activation instead of the original offer type. CONTROL
+            // is already open here, so the forwarder starts immediately.
+            if let Some(channel) = self.role.control.lock().unwrap().clone() {
+                tokio::spawn(rumble_forwarder(&self.input, &channel));
+            }
         }
         let stream = self.role.stream.lock().unwrap().clone();
         let task = stream.and_then(|stream| stream.spawn(self.role.screen.lock().unwrap().clone(), self.role.active.subscribe()));

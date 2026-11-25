@@ -338,6 +338,109 @@ async fn locked_control_unlock_requests_and_tools_work_without_a_video_frame() {
 }
 
 #[tokio::test]
+async fn gamepad_control_input_is_fire_and_forget_and_keeps_keyboard_dispatch() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let input = Arc::new(InputInjector::without_desktop());
+        let mut screen = ScreenCapture::unavailable("synthetic gamepad desktop".into());
+        screen.backend = crate::desktop_backend::DesktopBackend::Portal;
+        screen.init_error = None;
+        let (_lock, locked) = tokio::sync::watch::channel(Some(true));
+        let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(Arc::new(screen), locked));
+        let (host, mut viewer) = connect(input.clone(), true, Some(portal), &["CONTROL_DATA_CHANNEL"]).await;
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        // Drain initialization traffic that may still be queued.
+        while tokio::time::timeout(Duration::from_millis(100), viewer.messages.recv()).await.is_ok() {}
+        for message in [
+            br#"{"action":"gpd_connect","index":0}"#.as_slice(),
+            br#"{"action":"gpd_update","index":0,"buttons":4096,"left_trigger":128,"right_trigger":255,"left_thumb_x":-32768,"left_thumb_y":32767,"right_thumb_x":100,"right_thumb_y":-100}"#.as_slice(),
+            br#"{"action":"gpd_disconnect","index":0}"#.as_slice(),
+        ] {
+            send(&viewer, "CONTROL_DATA_CHANNEL", message.to_vec()).await;
+        }
+        // Official clients blind-send gpd_*; none of it is acknowledged.
+        assert!(tokio::time::timeout(Duration::from_millis(300), viewer.messages.recv()).await.is_err(),
+            "gamepad input produced a reply");
+        // The same peer still dispatches keyboard input to the bound desktop path.
+        let before = input.portal_input_counts_for_test();
+        send(&viewer, "CONTROL_DATA_CHANNEL", br#"{"action":"kbd_press","key":65}"#.to_vec()).await;
+        send(&viewer, "CONTROL_DATA_CHANNEL", br#"{"action":"kbd_release","key":65}"#.to_vec()).await;
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(330, 0, 3, &[8, 0])).await;
+        loop {
+            let response = receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 3).await;
+            let args: serde_json::Value = serde_json::from_slice(body(body(&response, 3).unwrap(), 2).unwrap()).unwrap();
+            if args["seq"] == 330 { break; }
+        }
+        assert_eq!(input.portal_input_counts_for_test()[2] - before[2], 2, "keyboard input stopped after gamepad messages");
+        host.pc.close().await.unwrap();
+        viewer.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("gamepad CONTROL regression exceeded deadline");
+}
+
+#[test]
+fn gpd_vibration_json_matches_the_official_builder_shape() {
+    assert_eq!(gamepad_vibration_json(0, 255, 128),
+        r#"{"action":"gpd_vibration","index":0,"left_motor":255,"right_motor":128}"#);
+}
+
+#[tokio::test]
+async fn desktop_rumble_reaches_control_as_raw_json() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let input = Arc::new(InputInjector::without_desktop());
+        // The production bind happens at CONTROL channel registration (desktop=true).
+        let (host, mut viewer) = connect(input.clone(), true, None, &["CONTROL_DATA_CHANNEL"]).await;
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        input.send_gamepad_rumble_for_test(0, 255, 128);
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (channel, message) = viewer.messages.recv().await.expect("peer stopped responding");
+                if channel == "CONTROL_DATA_CHANNEL" && message.first() == Some(&b'{') { break message; }
+            }
+        }).await.expect("rumble JSON did not arrive");
+        assert_eq!(first.as_slice(), br#"{"action":"gpd_vibration","index":0,"left_motor":255,"right_motor":128}"#);
+        input.send_gamepad_rumble_for_test(1, 0, 0);
+        let second = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (channel, message) = viewer.messages.recv().await.expect("peer stopped responding");
+                if channel == "CONTROL_DATA_CHANNEL" && message.first() == Some(&b'{') { break message; }
+            }
+        }).await.expect("second rumble JSON did not arrive");
+        assert_eq!(second.as_slice(), br#"{"action":"gpd_vibration","index":1,"left_motor":0,"right_motor":0}"#);
+        host.pc.close().await.unwrap();
+        viewer.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("desktop rumble regression exceeded deadline");
+}
+
+#[tokio::test]
+async fn a_promoted_tool_peer_receives_the_rumble_binding() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let input = Arc::new(InputInjector::without_desktop());
+        let (host, mut viewer) = connect(input.clone(), false, None, &["CONTROL_DATA_CHANNEL"]).await;
+        let (requests, mut requested) = mpsc::unbounded_channel();
+        host.on_desktop_request(move || { let _ = requests.send(()); });
+        receive(&mut viewer.messages, "CONTROL_DATA_CHANNEL", 13).await;
+        // The Mac viewer opens the desktop on an existing tool peer: the rumble sink must
+        // follow the DesktopRole activation, not the original offer type.
+        send(&viewer, "CONTROL_DATA_CHANNEL", crate::initialization::envelope(5, 0, 3, &[8, 4])).await;
+        tokio::time::timeout(Duration::from_secs(5), requested.recv()).await.unwrap().unwrap();
+        host.promote(None);
+        assert!(host.role.is_desktop());
+        input.send_gamepad_rumble_for_test(0, 200, 100);
+        let message = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (channel, message) = viewer.messages.recv().await.expect("peer stopped responding");
+                if channel == "CONTROL_DATA_CHANNEL" && message.first() == Some(&b'{') { break message; }
+            }
+        }).await.expect("promoted-peer rumble JSON did not arrive");
+        assert_eq!(message.as_slice(), br#"{"action":"gpd_vibration","index":0,"left_motor":200,"right_motor":100}"#);
+        host.pc.close().await.unwrap();
+        viewer.pc.close().await.unwrap();
+        viewer.router.lock().await.stop().await.unwrap();
+    }).await.expect("promoted rumble regression exceeded deadline");
+}
+
+#[tokio::test]
 async fn capture_desktop_on_a_port_mapping_peer_promotes_it_once() {
     tokio::time::timeout(Duration::from_secs(25), async {
         let input = Arc::new(InputInjector::without_desktop());

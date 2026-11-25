@@ -85,6 +85,54 @@ Markers (no payload values): RUMBLE_SUPPORTED/UNAVAILABLE describe SDL capabilit
 RUMBLE_RECEIVED means a valid active-session message arrived; RUMBLE_APPLIED means SDL returned
 success for a nonzero effect; RUMBLE_OUTPUT_FAILED means the output API failed. All have DECKPAD_ prefix.
 
+## Linux host implementation / Linux 被控端实现
+
+This repository's host side implements the same protocol surface; message shapes are reused
+verbatim from the Windows evidence above, nothing re-invented:
+
+- `gpd_connect` / `gpd_disconnect` / `gpd_update` decode in `src/control_protocol.rs`; all eight
+  update fields required exactly like RVA 0x5ddb30. `index` above 3 is a known-but-unsupported
+  slot (this host caps at the four XInput slots) and lands in the existing Unsupported logging.
+- Updates inject through `/dev/uinput` as a kernel Xbox 360 pad (`src/uinput.rs`): xpad identity
+  045e:028e so SDL2's built-in controller DB and Steam/Proton recognize it, like the ViGEm XUSB
+  device the official Windows host presents. Face buttons follow xpad: A→BTN_SOUTH, B→BTN_EAST,
+  X→BTN_NORTH (0x133), Y→BTN_WEST (0x134). A first update without connect auto-creates the slot
+  (RVA 0x5dfba0 behavior); disconnect releases without destroying the device, so udev/SDL see no
+  hotplug storm. Stick values translate XInput → evdev, not copy: X passes through verbatim, but Y
+  flips sign (XInput wire is up=positive; the kernel evdev gamepad spec reads up=negative, and xpad
+  flips Y for real Xbox hardware the same way), saturating -32768→+32767; triggers (0..255) and dpad
+  hats match both conventions. The diff cache compares wire values, so a -32768→+32767 slam still
+  emits. `release_held()`
+  sweeps all four slots, covering a SIGKILLed viewer that sends no disconnect.
+- Kernel gamepads are independent of `UU_INPUT_BACKEND`: X11 sessions keep XTest for keys/mouse
+  while gamepads go through the kernel, so the feature works on every desktop backend.
+- Rumble: pads register `FF_RUMBLE` (16 effects) unless `UU_GAMEPAD_RUMBLE=0`; a per-pad reader
+  answers `UI_FF_UPLOAD`/`UI_FF_ERASE` and forwards `EV_FF` play/stop as the official
+  `gpd_vibration` JSON — raw bytes on CONTROL, no protobuf envelope, since the viewer feeds
+  CONTROL bytes straight to its decoder. left_motor = ff_rumble strong (low-frequency) >> 8,
+  right_motor = weak >> 8, matching the ViGEm mapping at 0x5df5d0 (the >>8 shift is byte
+  semantics, not a rescale: kernel magnitudes below 256 map to a zero motor, so the faintest
+  official-side rumble levels read as off, exactly as the Windows host's u8 fields do). The latest desktop CONTROL
+  peer owns the outbound sink, mirroring the viewer's per-peer rumble gating. Finite effects
+  honor ff_replay length/delay and the EV_FF repeat count: uinput leaves playback scheduling
+  to this userspace driver, so the reader thread schedules start, expiry, inter-repeat gap and
+  stop transitions (a one-shot 100 ms pulse stops on its own instead of running forever); a
+  promoted tool peer binds the sink when its DesktopRole activates, and the sink drains from
+  CONTROL's on_open so pre-open events queue instead of dying.
+- `UU_GAMEPAD=0` disables host gamepad input entirely. Logs carry indexes, counts and error kinds
+  only — never button bitmaps, stick values or motor strengths.
+
+Kernel event codes (`EV_UINPUT 0x0101`, `UI_FF_UPLOAD 1`, `UI_FF_ERASE 2`) and struct layouts
+(ff_effect 48, uinput_ff_upload 104, uinput_ff_erase 12 bytes) are pinned by tests, so an ioctl
+or layout mismatch fails loudly instead of corrupting force-feedback ioctls.
+
+The host side still needs real-machine acceptance (official mobile virtual gamepad, SDL viewer
+against this host, a game with rumble); the automated suite covers decode, bit/axis mapping,
+transition diffing, release sweep, uapi layout and the raw JSON forwarder.
+
+被控端协议面与上述 Windows 证据逐字段一致；本仓自动测试覆盖解码、映射、差分注入、断连
+清扫与震动回传出站，实机验收（官方手机虚拟手柄、SDL 控制端连本被控端、带震动的游戏）待补。
+
 ## Validation / 验证
 
 Use the CI checks on the current PR head as the automated validation record.

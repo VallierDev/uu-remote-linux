@@ -89,6 +89,7 @@ Protocol strings and messages that come from the UU servers are shown as the ser
 | Port mapping | The official "port mapping" tool: forwards a local port on the viewer to an address reachable from the Linux host (e.g. 127.0.0.1:22); `UU_PORT_MAPPING=0` disables it |
 | Reconnects | Every tool window has its own connection; they do not disturb each other |
 | Headless servers | Goes online without a monitor with terminal, file transfer and port mapping; an Xvfb virtual desktop gives a full remote desktop (see below) |
+| Virtual gamepads (experimental) | The official mobile clients' virtual gamepad and controllers forwarded by the SDL viewer are injected as kernel Xbox 360 pads (uinput, up to 4, works on X11 sessions too); in-game rumble returns via `gpd_vibration` (see below) |
 
 Desktop connection boundaries and host startup clear stale input; delayed events
 from an old desktop cannot affect its replacement. X11 clears pressed state on
@@ -372,6 +373,10 @@ X11 keeps XTest by default because it handles held keys correctly on high-latenc
 
 ASCII text mapping through uinput requires X11/XWayland XKB; unmappable text keeps the existing text/clipboard path.
 
+### Virtual gamepads (experimental)
+
+The official mobile clients' virtual gamepad, and physical controllers forwarded by the SDL viewer (`UU_VIEWER_NATIVE_GAMEPAD=1`), arrive as `gpd_*` messages on the existing desktop CONTROL channel; the host injects them as kernel Xbox 360 pads (udev shows "Microsoft X-Box 360 pad"; SDL2/Steam recognize the built-in xpad mapping). Up to 4 pads, and it works on X11 sessions too — the keyboard/mouse backend stays as-is, gamepads go through the kernel independently. Two-motor in-game rumble returns to the client as official `gpd_vibration`. Requires the /dev/uinput access from step 5; `UU_GAMEPAD=0` disables the feature entirely, `UU_GAMEPAD_RUMBLE=0` disables rumble only. See [docs/deckpad-native-gamepad.md](docs/deckpad-native-gamepad.md) for protocol evidence.
+
 ## Remote assistance and the main window (experimental)
 
 As in the official client, this host shows a **device ID** and a **verification code**; whoever you give them to can
@@ -461,6 +466,8 @@ Common environment variables:
 | `UU_X11_OUTPUT` | Initial X11 monitor name (`xrandr --listmonitors`); default: the primary |
 | `UU_WAYLAND_NO_VIRTUAL_KEYBOARD=1` | Native Wayland skips the virtual keyboard (e.g. Denial reserves it for its input method); keys go through uinput. Without wlr-virtual-pointer the pointer also uses uinput (#72) |
 | `UU_INPUT_BACKEND` | `auto` (default: uinput on Wayland when accessible) / `uinput` / `native` |
+| `UU_GAMEPAD` | Host virtual gamepads: default ON; `=0` drops `gpd_*` input. Needs /dev/uinput access (the uaccess rule above); works on X11 sessions too |
+| `UU_GAMEPAD_RUMBLE` | Gamepad rumble forwarding: default ON; `=0` registers no force feedback on the virtual pads (games see no rumble) |
 | `UU_PORTAL_CURSOR_MODE` | Startup cursor mode: `embedded` draws the compositor pointer into the stream; hidden by default. The host switches at runtime as the viewer sends relative or absolute motion. A switch rebuilds the portal session and interrupts picture and input for a moment |
 | `UU_TERMINAL_SHORTCUTS=0` | Disable the Ctrl+V paste rewrite in terminal windows |
 | `UU_VIDEO_ENCODER` | `cpu`: libx264; `vaapi`: opt-in Intel/AMD; `nvenc`: force NVENC; unset or `auto`: a background probe (one synthetic IDR per candidate, 3 s each). With an NVIDIA driver the order is NVENC then CPU; without one the only candidate is CPU and the probe is skipped. A session that starts before the probe finishes uses the previous rule (NVENC if NVIDIA is present, else CPU). On a self-built `--features inproc-av` binary, a process-only failure of NVENC when the in-process engine would try it first on X11 is logged `native_unprobed` and keeps the previous NVENC choice (Wayland, portal, and KMS fall back to CPU). The skipped CPU-only probe is logged `not probed (only candidate)`. A successful probe and that CPU-only skip stay cached while NVIDIA presence matches the report. A later desktop connection whose presence differs starts one background re-probe and still uses the cached encoder until the new result is stored. A hardware-candidate failure (NVENC failed, CPU chosen) is kept for 10 minutes; the next desktop connection after that starts the same re-probe and still uses the cached encoder until the new result is stored. Explicit `cpu` / `vaapi` / `nvenc` does not start the probe. Another failure restarts the 10 minutes. `native_unprobed` is not a temporary failure. A non-`auto` `video_encoder` in `host_settings.json` wins. VAAPI stays out of auto until #33 |
@@ -763,7 +770,7 @@ numbers, sizes and states only, never keystrokes, clipboard or file contents, co
 
 ### Native gamepad and rumble (experimental)
 
-The SDL viewer forwards one mapped controller and ordinary two-motor rumble through the existing desktop CONTROL channel to a Windows host.
+The SDL viewer forwards one mapped controller and ordinary two-motor rumble through the existing desktop CONTROL channel to a Windows host or to this project's Linux host.
 Default OFF: set `UU_VIEWER_NATIVE_GAMEPAD=1` to enable input; `UU_VIEWER_NATIVE_RUMBLE=0` disables feedback independently.
 Guide forwarding, multiple controllers and adaptive triggers are unsupported; suspend, forced exit and network recovery are not comprehensively verified.
 One reporting user tested input, phone-hotspot WAN, reconnect and rumble on one Windows/Steam Deck pair.
