@@ -206,6 +206,14 @@ started a second full host server instead, so check that a subcommand exists in 
   `{"seq":<request seq>}` and **its own** FeatureFlag. The viewer only uses features the host declares:
   `1 ff_capture_setting=4`, `2 ff_simple_action=2`, `3 ff_system_metrics=2`, `6 ff_file_transfer_ftp=2`,
   `8 ff_clipboard=3` (when the clipboard bridge is ready). Do not declare versions you don't implement.
+  Mac UU 4.48.4 latches `ff_clipboard` from the **first** Echo reply only (replayed or host-initiated
+  Echoes are acknowledged but do not enable clipboard sync, #211) and blocks `SimpleAction 15` (auto
+  unlock) until that first Echo is answered. On an unlocked Portal desktop, the host holds the initial
+  Mac Echo (up to 60 s overall while Portal consent waits, 8 s after Portal is ready), coalesces to
+  the latest `seq`, and latches the result. On a locked Portal desktop, it answers immediately using
+  any confirmed Portal clipboard grant (in-memory session or `<desktop>.clipboard` marker in
+  `portal-permissions/`, while TEXT still gates clipboard access until unlock); unknown lock state,
+  unavailability, or timeout fall back without clipboard.
 - RPC = Message 21 `RpcRequest {1 header{1 request_id}, <case>}`, answered with Message 22
   `RpcResponse {1 header (same id), <case>}`. Cases used: 2 capture_setting, 3 fps, 4 video_quality,
   6 resolution, 8 file transfer, 9 clipboard, 15 send_video_track, 16–20 plugins, 21 virtual audio policy,
@@ -298,7 +306,7 @@ started a second full host server instead, so check that a subcommand exists in 
 - Connection: `Offer for connection: capture_type=`, `PeerConnection State changed`, `ICE path: ... route=`.
 - Video: `Desktop encoder: ... fps= cq= maxrate=`, `Desktop latest-frame stats`, `Video feedback totals`.
 - Viewer requests: `CONTROL message: fields=[..] simple_action=..` (numbers only), `Capture setting request`,
-  `SimpleAction N (...) received`.
+  `SimpleAction N (...) received`, `CONTROL Mac Portal Echo answered: ... clipboard=.. reason=`.
 - Features: `File transfer ...`, `Terminal frame`, `Native desktop clipboard text received: bytes=`,
   `Desktop audio started`, `Auto unlock result`, `Auto lock after remote session`.
 - When the viewer "does nothing" after a menu click, first check whether any message arrived; usually the

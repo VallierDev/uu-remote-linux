@@ -1,6 +1,9 @@
-//! CONTROL lifecycle regressions: an early Echo must be answered while the Portal
-//! session is still pending, capture settings must be deferred (never dropped, never
-//! blocking Echo/unlock) until the desktop is ready, and tool peers must apply
+//! CONTROL lifecycle regressions: most viewers get an early Echo while Portal is
+//! pending. Mac desktop viewers on an unlocked Portal briefly wait (with a bounded
+//! fallback) for a usable Portal clipboard without blocking other CONTROL messages;
+//! locked connects answer immediately (unblocking auto-unlock) using any remembered
+//! Portal clipboard grant; unknown/unavailable fall back immediately; and the first
+//! decision is latched. Capture settings wait for the desktop, and tool peers apply
 //! settings against the nominal screen without waiting for a desktop at all.
 //! Local SCTP peers only; no cloud, desktop consent, audio or power operations.
 use super::*;
@@ -23,12 +26,17 @@ async fn connect(desktop: bool, portal: Option<Arc<crate::desktop_session::Porta
 
 async fn connect_channels(desktop: bool, portal: Option<Arc<crate::desktop_session::PortalDesktop>>, labels: &[&str])
     -> (WebRtcSession, Viewer) {
+    connect_as(desktop, portal, labels, crate::input::Controller::Other).await
+}
+
+async fn connect_as(desktop: bool, portal: Option<Arc<crate::desktop_session::PortalDesktop>>, labels: &[&str],
+    controller: crate::input::Controller) -> (WebRtcSession, Viewer) {
     let input = Arc::new(InputInjector::without_desktop());
     let (host_setting, viewer_setting, router) = crate::test_network::virtual_network().await;
     let screen = Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into()));
     let host = WebRtcSession::new(screen, input, crate::signaling::SignalingClient::disconnected(),
         desktop, crate::session_ice::SessionIce::virtual_net(host_setting), portal,
-        crate::input::Controller::Other).await.unwrap();
+        controller).await.unwrap();
     let pc = Arc::new(APIBuilder::new().with_setting_engine(viewer_setting).build().new_peer_connection(RTCConfiguration::default()).await.unwrap());
     let (tx, messages) = mpsc::unbounded_channel();
     let mut channels = HashMap::new();
@@ -113,6 +121,15 @@ fn echo_advertises_clipboard(message: &[u8]) -> bool {
         })
     })
 }
+/// The `seq` echoed in SimpleAction.args JSON (`{"seq":N}`).
+fn echo_request_seq(message: &[u8]) -> Option<u64> {
+    let args = body(message, 3).and_then(|action| decode_wire(action).ok())
+        .and_then(|action| action.into_iter().find_map(|field| match (field.number, field.value) {
+            (2, WireValue::Bytes(bytes)) => Some(bytes), _ => None,
+        }))?;
+    serde_json::from_slice::<serde_json::Value>(args).ok()?.get("seq")?.as_u64()
+}
+
 fn ready_screen() -> Arc<ScreenCapture> {
     let mut screen = ScreenCapture::unavailable("synthetic ready desktop".into());
     screen.backend = crate::desktop_backend::DesktopBackend::Portal;
@@ -121,6 +138,491 @@ fn ready_screen() -> Arc<ScreenCapture> {
     screen.width = 1920;
     screen.height = 1080;
     Arc::new(screen)
+}
+
+async fn local_control_pair() -> (
+    Arc<RTCPeerConnection>,
+    Arc<RTCDataChannel>,
+    Arc<RTCPeerConnection>,
+    Messages,
+    Arc<Mutex<webrtc::util::vnet::router::Router>>,
+) {
+    let (host_setting, viewer_setting, router) = crate::test_network::virtual_network().await;
+    let host_pc = Arc::new(APIBuilder::new().with_setting_engine(host_setting).build()
+        .new_peer_connection(RTCConfiguration::default()).await.unwrap());
+    let viewer_pc = Arc::new(APIBuilder::new().with_setting_engine(viewer_setting).build()
+        .new_peer_connection(RTCConfiguration::default()).await.unwrap());
+    let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+    host_pc.on_data_channel(Box::new(move |channel| {
+        let host_tx = host_tx.clone();
+        Box::pin(async move { let _ = host_tx.send(channel); })
+    }));
+    let (msg_tx, messages) = mpsc::unbounded_channel();
+    let viewer_dc = viewer_pc.create_data_channel("CONTROL_DATA_CHANNEL", None).await.unwrap();
+    viewer_dc.on_message(Box::new(move |message| {
+        let _ = msg_tx.send(("CONTROL_DATA_CHANNEL".into(), message.data.to_vec()));
+        Box::pin(async {})
+    }));
+    let mut gathered = viewer_pc.gathering_complete_promise().await;
+    viewer_pc.set_local_description(viewer_pc.create_offer(None).await.unwrap()).await.unwrap();
+    gathered.recv().await;
+    host_pc.set_remote_description(viewer_pc.local_description().await.unwrap()).await.unwrap();
+    let mut gathered = host_pc.gathering_complete_promise().await;
+    host_pc.set_local_description(host_pc.create_answer(None).await.unwrap()).await.unwrap();
+    gathered.recv().await;
+    viewer_pc.set_remote_description(host_pc.local_description().await.unwrap()).await.unwrap();
+    let host_dc = tokio::time::timeout(Duration::from_secs(8), host_rx.recv()).await
+        .expect("host CONTROL channel timed out").expect("host CONTROL channel missing");
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while host_dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+            || viewer_dc.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("local SCTP CONTROL pair did not open");
+    (host_pc, host_dc, viewer_pc, messages, router)
+}
+
+#[test]
+fn portal_clipboard_echo_decision_covers_ready_lock_unavailable_and_waiting_states() {
+    let pending = crate::desktop_session::State {
+        screen: Arc::new(ScreenCapture::unavailable("pending".into())),
+        waiting: true,
+    };
+    let terminal = crate::desktop_session::State {
+        screen: Arc::new(ScreenCapture::unavailable("denied".into())),
+        waiting: false,
+    };
+    let ready_no_portal = crate::desktop_session::State {
+        screen: ready_screen(),
+        waiting: false,
+    };
+    assert_eq!(
+        portal_clipboard_echo_decision(None, &PortalClipboardState::Pending, &pending, true),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "lock_unknown" },
+    );
+    assert_eq!(
+        portal_clipboard_echo_decision(Some(true), &PortalClipboardState::Pending, &pending, false),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "lock_state" },
+    );
+    assert_eq!(
+        portal_clipboard_echo_decision(Some(true), &PortalClipboardState::Pending, &pending, true),
+        MacPortalEchoDecision::Reply { clipboard: true, reason: "locked_remembered_clipboard" },
+    );
+    assert_eq!(
+        portal_clipboard_echo_decision(Some(true), &PortalClipboardState::Unavailable, &pending, true),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "bridge_unavailable" },
+    );
+    assert_eq!(
+        portal_clipboard_echo_decision(Some(true), &PortalClipboardState::Pending, &terminal, true),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "portal_unavailable" },
+    );
+    assert_eq!(
+        portal_clipboard_echo_decision(Some(false), &PortalClipboardState::Pending, &pending, true),
+        MacPortalEchoDecision::Wait,
+    );
+    assert_eq!(
+        portal_clipboard_echo_decision(Some(false), &PortalClipboardState::Unavailable, &pending, false),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "bridge_unavailable" },
+    );
+    assert_eq!(
+        portal_clipboard_echo_decision(Some(false), &PortalClipboardState::Pending, &terminal, false),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "portal_unavailable" },
+    );
+    assert_eq!(
+        portal_clipboard_echo_decision(Some(false), &PortalClipboardState::Pending, &ready_no_portal, true),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "no_portal_session" },
+    );
+
+    // Exercise the native-session branches of the real decision function directly.
+    let base = PortalClipboardSnapshot {
+        locked: Some(false),
+        waiting: false,
+        init_error: false,
+        has_portal: true,
+        clipboard_supported: true,
+        remembered_clipboard: true,
+        bridge_unavailable: false,
+        bridge_matches_current: true,
+        clipboard_ready: true,
+    };
+    assert_eq!(
+        decide_mac_portal_echo(base),
+        MacPortalEchoDecision::Reply { clipboard: true, reason: "bridge_ready" },
+    );
+    assert_eq!(
+        decide_mac_portal_echo(PortalClipboardSnapshot { locked: Some(true), ..base }),
+        MacPortalEchoDecision::Reply { clipboard: true, reason: "locked_remembered_clipboard" },
+    );
+    assert_eq!(
+        decide_mac_portal_echo(PortalClipboardSnapshot { locked: Some(true), remembered_clipboard: false, ..base }),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "lock_state" },
+    );
+    assert_eq!(
+        decide_mac_portal_echo(PortalClipboardSnapshot { locked: Some(true), clipboard_supported: false, ..base }),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "clipboard_unsupported" },
+    );
+    assert_eq!(
+        decide_mac_portal_echo(PortalClipboardSnapshot { clipboard_supported: false, ..base }),
+        MacPortalEchoDecision::Reply { clipboard: false, reason: "clipboard_unsupported" },
+    );
+    assert_eq!(
+        decide_mac_portal_echo(PortalClipboardSnapshot { bridge_matches_current: false, ..base }),
+        MacPortalEchoDecision::Wait,
+    );
+    assert_eq!(
+        decide_mac_portal_echo(PortalClipboardSnapshot { clipboard_ready: false, ..base }),
+        MacPortalEchoDecision::Wait,
+    );
+    assert_eq!(
+        decide_mac_portal_echo(PortalClipboardSnapshot { waiting: true, ..base }),
+        MacPortalEchoDecision::Wait,
+    );
+
+    let (tx, rx) = tokio::sync::watch::channel(PortalClipboardState::Pending);
+    {
+        let _guard = PortalClipboardPendingGuard(Some(tx));
+        assert!(matches!(*rx.borrow(), PortalClipboardState::Pending));
+    }
+    assert!(matches!(*rx.borrow(), PortalClipboardState::Unavailable));
+}
+
+#[tokio::test]
+async fn mac_echo_answers_locked_and_unknown_immediately_while_unlocked_waits() {
+    tokio::time::timeout(Duration::from_secs(25), async {
+        // 1. Unknown lock state (None) must fail closed without hanging Echo, even with a remembered grant.
+        {
+            let (_lock_state, locked) = tokio::sync::watch::channel(None);
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked)
+                .with_remembered_clipboard(true));
+            let (host, mut viewer) = connect_as(true, Some(portal), &["CONTROL_DATA_CHANNEL"],
+                crate::input::Controller::Mac).await;
+            viewer.channels["CONTROL_DATA_CHANNEL"].send(&echo_request(3).into()).await.unwrap();
+            let echo = receive(&mut viewer.messages, 3, Duration::from_secs(3)).await
+                .expect("unknown lock state stalled Mac Echo");
+            assert_eq!(echo_request_seq(&echo), Some(3));
+            assert!(!echo_advertises_clipboard(&echo));
+            viewer.pc.close().await.unwrap();
+            host.pc.close().await.unwrap();
+            viewer.router.lock().await.stop().await.unwrap();
+        }
+
+        // 2. Locked cold connection without a remembered clipboard grant answers immediately with false
+        //    so Mac can proceed to auto-unlock without waiting.
+        {
+            let (_lock_state, locked) = tokio::sync::watch::channel(Some(true));
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked));
+            let (host, mut viewer) = connect_as(true, Some(portal), &["CONTROL_DATA_CHANNEL"],
+                crate::input::Controller::Mac).await;
+            viewer.channels["CONTROL_DATA_CHANNEL"].send(&echo_request(4).into()).await.unwrap();
+            let echo = receive(&mut viewer.messages, 3, Duration::from_secs(3)).await
+                .expect("locked desktop without remembered grant stalled Mac Echo");
+            assert_eq!(echo_request_seq(&echo), Some(4));
+            assert!(!echo_advertises_clipboard(&echo));
+            viewer.pc.close().await.unwrap();
+            host.pc.close().await.unwrap();
+            viewer.router.lock().await.stop().await.unwrap();
+        }
+
+        // 3. Locked cold connection WITH a remembered Portal clipboard grant answers immediately with
+        //    clipboard=true (unblocking auto-unlock and letting Mac latch ff_clipboard) and latches it.
+        {
+            let (_lock_state, locked) = tokio::sync::watch::channel(Some(true));
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked)
+                .with_remembered_clipboard(true));
+            let (host, mut viewer) = connect_as(true, Some(portal), &["CONTROL_DATA_CHANNEL"],
+                crate::input::Controller::Mac).await;
+            let control = viewer.channels["CONTROL_DATA_CHANNEL"].clone();
+            control.send(&echo_request(5).into()).await.unwrap();
+            let echo = receive(&mut viewer.messages, 3, Duration::from_secs(3)).await
+                .expect("locked desktop with remembered grant stalled Mac Echo");
+            assert_eq!(echo_request_seq(&echo), Some(5));
+            assert!(echo_advertises_clipboard(&echo),
+                "remembered locked Portal grant must advertise ff_clipboard immediately");
+            control.send(&echo_request(6).into()).await.unwrap();
+            let follow = receive(&mut viewer.messages, 3, Duration::from_secs(3)).await
+                .expect("post-latch locked Echo was not answered");
+            assert_eq!(echo_request_seq(&follow), Some(6));
+            assert!(echo_advertises_clipboard(&follow));
+            viewer.pc.close().await.unwrap();
+            host.pc.close().await.unwrap();
+            viewer.router.lock().await.stop().await.unwrap();
+        }
+
+        // 4. Unlocked pending Portal waits without blocking CONTROL queries, coalesces
+        //    requests, falls back once clipboard is known unavailable, and latches.
+        {
+            let (_lock_state, locked) = tokio::sync::watch::channel(Some(false));
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked));
+            let (host, mut viewer) = connect_as(true, Some(portal.clone()), &["CONTROL_DATA_CHANNEL"],
+                crate::input::Controller::Mac).await;
+            let control = viewer.channels["CONTROL_DATA_CHANNEL"].clone();
+            assert!(receive(&mut viewer.messages, 15, Duration::from_secs(3)).await.is_some());
+            control.send(&echo_request(3).into()).await.unwrap();
+            control.send(&echo_request(4).into()).await.unwrap();
+            assert!(receive(&mut viewer.messages, 3, Duration::from_millis(250)).await.is_none());
+            let query = crate::initialization::envelope(5, 0, 16, &[8, 1]);
+            control.send(&query.into()).await.unwrap();
+            assert!(receive(&mut viewer.messages, 15, Duration::from_secs(3)).await.is_some(),
+                "waiting for clipboard blocked secure desktop query");
+
+            portal.publish_test_screen(ready_screen());
+            let echo = receive(&mut viewer.messages, 3, Duration::from_secs(3)).await
+                .expect("unavailable Portal clipboard stalled Mac Echo");
+            assert_eq!(echo_request_seq(&echo), Some(4));
+            assert!(!echo_advertises_clipboard(&echo));
+            assert!(receive(&mut viewer.messages, 3, Duration::from_millis(200)).await.is_none(),
+                "stale coalesced Echo request was also answered");
+
+            control.send(&echo_request(6).into()).await.unwrap();
+            let follow = receive(&mut viewer.messages, 3, Duration::from_secs(3)).await
+                .expect("post-latch Echo was not answered");
+            assert_eq!(echo_request_seq(&follow), Some(6));
+            assert!(!echo_advertises_clipboard(&follow));
+            viewer.pc.close().await.unwrap();
+            host.pc.close().await.unwrap();
+            viewer.router.lock().await.stop().await.unwrap();
+        }
+
+        // 5. Locking mid-wait immediately releases the held Echo using the remembered grant flag.
+        for remembered in [false, true] {
+            let (lock_state, locked) = tokio::sync::watch::channel(Some(false));
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked)
+                .with_remembered_clipboard(remembered));
+            let (host, mut viewer) = connect_as(true, Some(portal), &["CONTROL_DATA_CHANNEL"],
+                crate::input::Controller::Mac).await;
+            let control = viewer.channels["CONTROL_DATA_CHANNEL"].clone();
+            control.send(&echo_request(8).into()).await.unwrap();
+            assert!(receive(&mut viewer.messages, 3, Duration::from_millis(200)).await.is_none());
+            lock_state.send_replace(Some(true));
+            let echo = receive(&mut viewer.messages, 3, Duration::from_secs(3)).await
+                .expect("lock mid-wait did not release Mac Echo");
+            assert_eq!(echo_request_seq(&echo), Some(8));
+            assert_eq!(echo_advertises_clipboard(&echo), remembered);
+            viewer.pc.close().await.unwrap();
+            host.pc.close().await.unwrap();
+            viewer.router.lock().await.stop().await.unwrap();
+        }
+    }).await.expect("Mac Portal Echo fallback regression exceeded deadline");
+}
+
+#[tokio::test]
+async fn mac_portal_echo_coalesces_to_latest_and_latches_when_bridge_ready() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (host_pc, host_dc, viewer_pc, mut messages, router) = local_control_pair().await;
+        let (lock_state, locked) = tokio::sync::watch::channel(Some(false));
+        let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+            Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked));
+        let (_bridge_tx, bridge_rx) = tokio::sync::watch::channel(PortalClipboardState::Pending);
+        let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_check = ready.clone();
+        let task = tokio::spawn(reply_when_portal_clipboard_ready_with(
+            host_dc,
+            Arc::new(AtomicU64::new(1)),
+            req_rx,
+            bridge_rx,
+            portal,
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            move |locked, _, _| {
+                if locked != Some(false) {
+                    MacPortalEchoDecision::Reply { clipboard: false, reason: "lock_state" }
+                } else if ready_check.load(Ordering::Acquire) {
+                    MacPortalEchoDecision::Reply { clipboard: true, reason: "bridge_ready" }
+                } else {
+                    MacPortalEchoDecision::Wait
+                }
+            },
+        ));
+
+        req_tx.send(3).unwrap();
+        req_tx.send(4).unwrap();
+        req_tx.send(6).unwrap();
+        assert!(receive(&mut messages, 3, Duration::from_millis(200)).await.is_none());
+
+        // Flip readiness without touching any watch: the periodic poll must still wake it.
+        ready.store(true, Ordering::Release);
+        let echo = receive(&mut messages, 3, Duration::from_secs(3)).await
+            .expect("ready bridge did not trigger coalesced Echo reply");
+        assert_eq!(echo_request_seq(&echo), Some(6));
+        assert!(echo_advertises_clipboard(&echo), "ready Mac Portal Echo must advertise ff_clipboard");
+        assert!(receive(&mut messages, 3, Duration::from_millis(200)).await.is_none(),
+            "coalesced Echo emitted more than one reply");
+
+        // Mid-session lock or transient clipboard loss must not stall subsequent Echoes.
+        ready.store(false, Ordering::Release);
+        lock_state.send_replace(Some(true));
+        req_tx.send(7).unwrap();
+        req_tx.send(8).unwrap();
+        let first = receive(&mut messages, 3, Duration::from_secs(3)).await
+            .expect("post-latch Echo 7 stalled");
+        let second = receive(&mut messages, 3, Duration::from_secs(3)).await
+            .expect("post-latch Echo 8 stalled");
+        assert_eq!(echo_request_seq(&first), Some(7));
+        assert_eq!(echo_request_seq(&second), Some(8));
+        assert!(echo_advertises_clipboard(&first));
+        assert!(echo_advertises_clipboard(&second));
+
+        drop(req_tx);
+        let _ = task.await;
+        viewer_pc.close().await.unwrap();
+        host_pc.close().await.unwrap();
+        router.lock().await.stop().await.unwrap();
+    }).await.expect("Mac Portal ready Echo regression exceeded deadline");
+}
+
+#[tokio::test]
+async fn mac_portal_echo_uses_two_stage_timeout_for_consent_then_bridge() {
+    use std::sync::atomic::AtomicU64;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        // 1. While Portal consent is pending (state.waiting), bridge_wait does not fire;
+        //    once Portal becomes ready (!state.waiting), bridge_wait starts and falls back.
+        {
+            let (host_pc, host_dc, viewer_pc, mut messages, router) = local_control_pair().await;
+            let (_lock_state, locked) = tokio::sync::watch::channel(Some(false));
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked));
+            let (_bridge_tx, bridge_rx) = tokio::sync::watch::channel(PortalClipboardState::Pending);
+            let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(reply_when_portal_clipboard_ready_with(
+                host_dc,
+                Arc::new(AtomicU64::new(1)),
+                req_rx,
+                bridge_rx,
+                portal.clone(),
+                Duration::from_millis(120),
+                Duration::from_secs(5),
+                |_, _, _| MacPortalEchoDecision::Wait,
+            ));
+
+            req_tx.send(11).unwrap();
+            // Longer than bridge_wait (120 ms): must stay pending while Portal consent waits.
+            assert!(receive(&mut messages, 3, Duration::from_millis(260)).await.is_none(),
+                "bridge_wait expired while Portal consent was still waiting");
+
+            // Portal becomes ready (!waiting): bridge_wait (120 ms) now expires and falls back.
+            req_tx.send(12).unwrap();
+            portal.publish_test_screen(ready_screen());
+            let echo = receive(&mut messages, 3, Duration::from_secs(2)).await
+                .expect("post-ready bridge_wait did not fall back");
+            assert_eq!(echo_request_seq(&echo), Some(12));
+            assert!(!echo_advertises_clipboard(&echo));
+
+            req_tx.send(13).unwrap();
+            let follow = receive(&mut messages, 3, Duration::from_secs(2)).await
+                .expect("post-timeout Echo was not answered immediately");
+            assert_eq!(echo_request_seq(&follow), Some(13));
+            assert!(!echo_advertises_clipboard(&follow));
+
+            drop(req_tx);
+            let _ = task.await;
+            viewer_pc.close().await.unwrap();
+            host_pc.close().await.unwrap();
+            router.lock().await.stop().await.unwrap();
+        }
+
+        // 2. Total timeout still bounds an unanswered Portal consent dialog.
+        {
+            let (host_pc, host_dc, viewer_pc, mut messages, router) = local_control_pair().await;
+            let (_lock_state, locked) = tokio::sync::watch::channel(Some(false));
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked));
+            let (_bridge_tx, bridge_rx) = tokio::sync::watch::channel(PortalClipboardState::Pending);
+            let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(reply_when_portal_clipboard_ready_with(
+                host_dc,
+                Arc::new(AtomicU64::new(1)),
+                req_rx,
+                bridge_rx,
+                portal,
+                Duration::from_secs(5),
+                Duration::from_millis(150),
+                |_, _, _| MacPortalEchoDecision::Wait,
+            ));
+
+            req_tx.send(21).unwrap();
+            let echo = receive(&mut messages, 3, Duration::from_secs(2)).await
+                .expect("total consent timeout did not fall back");
+            assert_eq!(echo_request_seq(&echo), Some(21));
+            assert!(!echo_advertises_clipboard(&echo));
+
+            drop(req_tx);
+            let _ = task.await;
+            viewer_pc.close().await.unwrap();
+            host_pc.close().await.unwrap();
+            router.lock().await.stop().await.unwrap();
+        }
+    }).await.expect("Mac Portal two-stage timeout regression exceeded deadline");
+}
+
+#[tokio::test]
+async fn mac_portal_echo_worker_exits_on_channel_close_even_while_sender_lives() {
+    use std::sync::atomic::AtomicU64;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        // 1. Before any Echo arrives.
+        {
+            let (host_pc, host_dc, viewer_pc, _messages, router) = local_control_pair().await;
+            let (_lock_state, locked) = tokio::sync::watch::channel(Some(false));
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked));
+            let (_bridge_tx, bridge_rx) = tokio::sync::watch::channel(PortalClipboardState::Pending);
+            let (_req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(reply_when_portal_clipboard_ready_with(
+                host_dc,
+                Arc::new(AtomicU64::new(1)),
+                req_rx,
+                bridge_rx,
+                portal,
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                |_, _, _| MacPortalEchoDecision::Wait,
+            ));
+            viewer_pc.close().await.unwrap();
+            host_pc.close().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), task).await
+                .expect("pre-Echo worker leaked after channel close").unwrap();
+            router.lock().await.stop().await.unwrap();
+        }
+
+        // 2. After the first Echo has been latched.
+        {
+            let (host_pc, host_dc, viewer_pc, mut messages, router) = local_control_pair().await;
+            let (_lock_state, locked) = tokio::sync::watch::channel(Some(false));
+            let portal = Arc::new(crate::desktop_session::PortalDesktop::with_lock_state(
+                Arc::new(ScreenCapture::unavailable("synthetic pending desktop".into())), locked));
+            let (_bridge_tx, bridge_rx) = tokio::sync::watch::channel(PortalClipboardState::Pending);
+            let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+            let task = tokio::spawn(reply_when_portal_clipboard_ready_with(
+                host_dc,
+                Arc::new(AtomicU64::new(1)),
+                req_rx,
+                bridge_rx,
+                portal,
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                |_, _, _| MacPortalEchoDecision::Reply { clipboard: true, reason: "bridge_ready" },
+            ));
+            req_tx.send(1).unwrap();
+            let echo = receive(&mut messages, 3, Duration::from_secs(3)).await
+                .expect("initial Echo reply missing");
+            assert_eq!(echo_request_seq(&echo), Some(1));
+            assert!(echo_advertises_clipboard(&echo));
+            // Keep `req_tx` alive to mimic `on_message` retaining the sender if `on_close` misses.
+            viewer_pc.close().await.unwrap();
+            host_pc.close().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), task).await
+                .expect("post-latch worker leaked after channel close").unwrap();
+            drop(req_tx);
+            router.lock().await.stop().await.unwrap();
+        }
+    }).await.expect("Mac Portal Echo worker exit regression exceeded deadline");
 }
 
 /// A Portal screen whose session reports clipboard support, for the refresh path.

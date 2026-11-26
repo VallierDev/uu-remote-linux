@@ -2,7 +2,7 @@
 use std::{fs::{self, OpenOptions}, io::{Read, Write}, path::{Path, PathBuf}};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-pub fn directory() -> Option<PathBuf> {
+fn checked_directory(create: bool) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
         .filter(|p| p.is_absolute()).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
     let dir = base.join("uuremote/portal-permissions");
@@ -12,11 +12,17 @@ pub fn directory() -> Option<PathBuf> {
             if meta.file_type().is_symlink() { return None; }
         }
     }
-    fs::create_dir_all(&dir).ok()?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).ok()?;
+    if create {
+        fs::create_dir_all(&dir).ok()?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).ok()?;
+    }
     let meta = fs::symlink_metadata(&dir).ok()?;
-    (meta.is_dir() && meta.uid() == unsafe { libc::getuid() }).then_some(dir)
+    (meta.is_dir() && meta.uid() == unsafe { libc::getuid() } && meta.mode() & 0o077 == 0).then_some(dir)
 }
+
+pub fn directory() -> Option<PathBuf> { checked_directory(true) }
+
+pub fn existing_directory() -> Option<PathBuf> { checked_directory(false) }
 
 pub fn desktop_key() -> &'static str {
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
@@ -31,6 +37,27 @@ pub fn pending_key(key: &str) -> String { format!("{key}.pending") }
 
 pub fn exists(dir: &Path, key: &str) -> bool {
     dir.join(key).exists() || dir.join(pending_key(key)).exists()
+}
+
+/// Non-secret desktop-wide Portal clipboard grant hint (`gnome.clipboard` / `kde.clipboard`).
+/// Used when a Mac viewer connects while locked and cannot wait for Portal to reopen.
+pub fn clipboard_key(desktop: &str) -> String { format!("{desktop}.clipboard") }
+
+pub fn clipboard_granted(dir: &Path, desktop: &str) -> bool {
+    let path = dir.join(clipboard_key(desktop));
+    let Ok(mut file) = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else { return false; };
+    if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } || meta.mode() & 0o077 != 0 || meta.len() > 16 {
+        return false;
+    }
+    let mut value = String::new();
+    file.read_to_string(&mut value).is_ok() && value.trim() == "1"
+}
+
+pub fn save_clipboard_granted(dir: &Path, desktop: &str, granted: bool) -> std::io::Result<()> {
+    save(dir, &clipboard_key(desktop), if granted { "1" } else { "0" })
 }
 
 pub struct Rotation {
@@ -178,6 +205,29 @@ mod tests {
         assert!(!dir.join(pending_key("gnome")).exists());
         fresh.finish("gnome", true).unwrap();
         assert_eq!(take(&dir, "gnome").as_deref(), Some("fresh-grant"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clipboard_grant_marker_is_private_and_rejects_symlinks_and_loose_modes() {
+        let dir = std::env::temp_dir().join(format!("uu-portal-clip-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!clipboard_granted(&dir, "gnome"));
+        save_clipboard_granted(&dir, "gnome", true).unwrap();
+        let path = dir.join(clipboard_key("gnome"));
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert!(clipboard_granted(&dir, "gnome"));
+        assert!(!clipboard_granted(&dir, "kde"));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!clipboard_granted(&dir, "gnome"));
+
+        save_clipboard_granted(&dir, "gnome", false).unwrap();
+        assert!(!clipboard_granted(&dir, "gnome"));
+
+        save_clipboard_granted(&dir, "gnome", true).unwrap();
+        std::os::unix::fs::symlink(&path, dir.join(clipboard_key("kde"))).unwrap();
+        assert!(!clipboard_granted(&dir, "kde"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

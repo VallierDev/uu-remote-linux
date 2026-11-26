@@ -175,8 +175,243 @@ fn track_session(end_pc: Arc<RTCPeerConnection>, actions: Arc<crate::system_acti
 
 type EchoReplay = (Arc<std::sync::atomic::AtomicU64>, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicBool>);
 
+const MAC_PORTAL_ECHO_BRIDGE_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+const MAC_PORTAL_ECHO_TOTAL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Clone)]
+enum PortalClipboardState {
+    Pending,
+    Ready(Arc<crate::portal::PortalSession>),
+    Unavailable,
+}
+
+type PortalClipboardBridge = tokio::sync::watch::Sender<PortalClipboardState>;
+
+struct PortalClipboardPendingGuard(Option<PortalClipboardBridge>);
+impl Drop for PortalClipboardPendingGuard {
+    fn drop(&mut self) {
+        if let Some(bridge) = &self.0 {
+            bridge.send_if_modified(|state| {
+                if matches!(state, PortalClipboardState::Pending) {
+                    *state = PortalClipboardState::Unavailable;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacPortalEchoDecision {
+    Wait,
+    Reply { clipboard: bool, reason: &'static str },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PortalClipboardSnapshot {
+    locked: Option<bool>,
+    waiting: bool,
+    init_error: bool,
+    has_portal: bool,
+    clipboard_supported: bool,
+    remembered_clipboard: bool,
+    bridge_unavailable: bool,
+    bridge_matches_current: bool,
+    clipboard_ready: bool,
+}
+
+fn decide_mac_portal_echo(snapshot: PortalClipboardSnapshot) -> MacPortalEchoDecision {
+    if snapshot.locked.is_none() {
+        return MacPortalEchoDecision::Reply { clipboard: false, reason: "lock_unknown" };
+    }
+    if snapshot.bridge_unavailable {
+        return MacPortalEchoDecision::Reply { clipboard: false, reason: "bridge_unavailable" };
+    }
+    if !snapshot.waiting && snapshot.init_error {
+        return MacPortalEchoDecision::Reply { clipboard: false, reason: "portal_unavailable" };
+    }
+    if !snapshot.waiting && !snapshot.init_error {
+        if !snapshot.has_portal {
+            return MacPortalEchoDecision::Reply { clipboard: false, reason: "no_portal_session" };
+        }
+        if !snapshot.clipboard_supported {
+            return MacPortalEchoDecision::Reply { clipboard: false, reason: "clipboard_unsupported" };
+        }
+        if snapshot.locked == Some(false) && snapshot.bridge_matches_current && snapshot.clipboard_ready {
+            return MacPortalEchoDecision::Reply { clipboard: true, reason: "bridge_ready" };
+        }
+    }
+    if snapshot.locked == Some(true) {
+        return if snapshot.remembered_clipboard {
+            MacPortalEchoDecision::Reply { clipboard: true, reason: "locked_remembered_clipboard" }
+        } else {
+            MacPortalEchoDecision::Reply { clipboard: false, reason: "lock_state" }
+        };
+    }
+    MacPortalEchoDecision::Wait
+}
+
+fn portal_clipboard_echo_decision(
+    locked: Option<bool>,
+    bridge: &PortalClipboardState,
+    state: &crate::desktop_session::State,
+    persisted_clipboard: bool,
+) -> MacPortalEchoDecision {
+    let current = state.screen.portal.as_ref();
+    let bridge_matches_current = match (bridge, current) {
+        (PortalClipboardState::Ready(installed), Some(current)) => Arc::ptr_eq(installed, current),
+        _ => false,
+    };
+    let clipboard_supported = current.is_some_and(|session| session.clipboard_supported());
+    let remembered_clipboard = if current.is_some() { clipboard_supported } else { persisted_clipboard };
+    decide_mac_portal_echo(PortalClipboardSnapshot {
+        locked,
+        waiting: state.waiting,
+        init_error: state.screen.init_error.is_some(),
+        has_portal: current.is_some(),
+        clipboard_supported,
+        remembered_clipboard,
+        bridge_unavailable: matches!(bridge, PortalClipboardState::Unavailable),
+        bridge_matches_current,
+        clipboard_ready: bridge_matches_current && current.is_some_and(|session| session.clipboard_ready()),
+    })
+}
+
+/// Mac UU 4.48.4 latches `ff_clipboard` from the first Echo reply only (#211), and
+/// blocks `SimpleAction 15` (auto-unlock) until that first Echo is answered.
+/// - Unlocked: hold the first Echo until TEXT installs a usable Portal bridge (up to
+///   60 s overall while Portal consent waits, and 8 s once Portal is ready).
+/// - Locked: reply immediately so auto-unlock runs without delay, advertising
+///   clipboard only when this desktop already has a confirmed Portal clipboard grant
+///   (in-memory session or persisted marker); TEXT keeps clipboard gated until unlock.
+/// - Unknown lock state, unavailability, or timeout: fall back immediately without
+///   clipboard. The decided capability is latched for all later Echoes on this peer.
+async fn reply_when_portal_clipboard_ready(
+    channel: Arc<RTCDataChannel>,
+    sequence: Arc<std::sync::atomic::AtomicU64>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<u64>,
+    bridge: tokio::sync::watch::Receiver<PortalClipboardState>,
+    desktop: Arc<crate::desktop_session::PortalDesktop>,
+) {
+    let mut persisted: Option<bool> = None;
+    let hint = desktop.clone();
+    reply_when_portal_clipboard_ready_with(
+        channel, sequence, requests, bridge, desktop,
+        MAC_PORTAL_ECHO_BRIDGE_WAIT, MAC_PORTAL_ECHO_TOTAL_WAIT,
+        move |locked, bridge, state| {
+            let persisted_clipboard = if locked == Some(true) && state.screen.portal.is_none() {
+                *persisted.get_or_insert_with(|| hint.remembered_clipboard())
+            } else {
+                false
+            };
+            portal_clipboard_echo_decision(locked, bridge, state, persisted_clipboard)
+        },
+    ).await;
+}
+
+async fn recv_echo_while_open(
+    channel: &RTCDataChannel,
+    requests: &mut tokio::sync::mpsc::UnboundedReceiver<u64>,
+) -> Option<u64> {
+    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+    if channel.ready_state() != RTCDataChannelState::Open { return None; }
+    let period = std::time::Duration::from_millis(200);
+    let mut health = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            seq = requests.recv() => return seq,
+            _ = health.tick() => {
+                if channel.ready_state() != RTCDataChannelState::Open { return None; }
+            }
+        }
+    }
+}
+
+async fn reply_when_portal_clipboard_ready_with<F>(
+    channel: Arc<RTCDataChannel>,
+    sequence: Arc<std::sync::atomic::AtomicU64>,
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<u64>,
+    mut bridge: tokio::sync::watch::Receiver<PortalClipboardState>,
+    desktop: Arc<crate::desktop_session::PortalDesktop>,
+    bridge_wait: std::time::Duration,
+    total_wait: std::time::Duration,
+    mut decide: F,
+) where
+    F: FnMut(Option<bool>, &PortalClipboardState, &crate::desktop_session::State) -> MacPortalEchoDecision,
+{
+    use std::sync::atomic::Ordering;
+    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+    let mut locked = desktop.lock_state();
+    let mut portal = desktop.subscribe();
+    let Some(mut latest) = recv_echo_while_open(&channel, &mut requests).await else { return; };
+    let total_deadline = tokio::time::Instant::now() + total_wait;
+    let mut bridge_deadline: Option<tokio::time::Instant> = None;
+    let period = std::time::Duration::from_millis(100);
+    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (clipboard, reason) = loop {
+        while let Ok(newer) = requests.try_recv() { latest = newer; }
+        if channel.ready_state() != RTCDataChannelState::Open { return; }
+        let state = portal.borrow_and_update().clone();
+        let decision = decide(*locked.borrow_and_update(), &bridge.borrow_and_update().clone(), &state);
+        if let MacPortalEchoDecision::Reply { clipboard, reason } = decision {
+            break (clipboard, reason);
+        }
+        let now = tokio::time::Instant::now();
+        if !state.waiting && bridge_deadline.is_none() {
+            bridge_deadline = Some((now + bridge_wait).min(total_deadline));
+        }
+        let (deadline, timeout_reason) = match bridge_deadline {
+            Some(until) if until < total_deadline => (until, "bridge_timeout"),
+            _ => (total_deadline, "timeout"),
+        };
+        if now >= deadline {
+            break (false, timeout_reason);
+        }
+        tokio::select! {
+            update = locked.changed() => if update.is_err() { break (false, "lock_closed"); },
+            update = bridge.changed() => if update.is_err() { break (false, "bridge_closed"); },
+            update = portal.changed() => if update.is_err() { break (false, "portal_closed"); },
+            newer = requests.recv() => match newer {
+                Some(seq) => latest = seq,
+                None => return,
+            },
+            _ = poll.tick() => {},
+            _ = tokio::time::sleep_until(deadline) => {},
+        }
+    };
+    while let Ok(newer) = requests.try_recv() { latest = newer; }
+    if channel.ready_state() != RTCDataChannelState::Open { return; }
+    let send = |request_seq: u64| {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let message = crate::control_protocol::encode_echo_response_with_clipboard(
+            sequence.fetch_add(1, Ordering::Relaxed), timestamp, request_seq, clipboard);
+        let channel = channel.clone();
+        async move { channel.send(&bytes::Bytes::from(message)).await }
+    };
+    if let Err(error) = send(latest).await {
+        log::warn!("CONTROL Mac Portal Echo failed: {error}");
+        return;
+    }
+    log::info!("CONTROL Mac Portal Echo answered: request_seq={latest} clipboard={clipboard} reason={reason}");
+    // Mac UU 4.48.4 latches ff_clipboard from the first reply; answer later Echoes immediately.
+    while let Some(request_seq) = recv_echo_while_open(&channel, &mut requests).await {
+        if channel.ready_state() != RTCDataChannelState::Open { return; }
+        if let Err(error) = send(request_seq).await {
+            log::warn!("CONTROL Mac Portal Echo failed: {error}");
+            return;
+        }
+        log::info!("CONTROL Mac Portal Echo answered: request_seq={request_seq} clipboard={clipboard}");
+    }
+}
+
 /// A promoted tool peer starts its TEXT clipboard after the viewer's echo was answered without
-/// ff_clipboard; declare it again on CONTROL once the bridge is ready, as the Portal path does.
+/// ff_clipboard; declare it again on CONTROL once the bridge is ready (non-Mac Portal peers do
+/// the same; Mac UU 4.48.4 latches ff_clipboard from the first Echo reply only).
 fn replay_clipboard_echo(channel: Arc<RTCDataChannel>, sequence: Arc<std::sync::atomic::AtomicU64>,
     (echo_request, echo_seen, clipboard_ready): EchoReplay, role: Arc<DesktopRole>) {
     tokio::spawn(async move {
@@ -543,6 +778,9 @@ impl WebRtcSession {
                     && state.screen.portal.as_ref().is_some_and(|session| session.clipboard_supported())
             });
         let text_clipboard_ready = Arc::new(std::sync::atomic::AtomicBool::new(portal_clipboard_supported));
+        let mac_portal_bridge: Option<PortalClipboardBridge> =
+            (desktop && controller == crate::input::Controller::Mac && portal_desktop.is_some())
+                .then(|| tokio::sync::watch::channel(PortalClipboardState::Pending).0);
         let last_echo_request = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let echo_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Same watcher the desktop session uses: the manager's when Portal owns the
@@ -606,6 +844,7 @@ impl WebRtcSession {
             let desktop_pc = desktop_pc.clone();
             let out_sequence = control_sequence.clone();
             let shared_clipboard_ready = text_clipboard_ready.clone();
+            let mac_portal_bridge = mac_portal_bridge.clone();
             let last_echo_request = last_echo_request.clone();
             let echo_seen = echo_seen.clone();
             let channel_lock_state = channel_lock_state.clone();
@@ -636,10 +875,17 @@ impl WebRtcSession {
                 let clipboard_rpc_assembly = Arc::new(std::sync::Mutex::new(crate::clipboard_protocol::Assembly::default()));
                 let rich_state=Arc::new(std::sync::Mutex::new(crate::clipboard_rich::State::default()));
                 let clipboard_enabled = shared_clipboard_ready.clone();
+                let (deferred_echo, deferred_requests) = if label == "CONTROL_DATA_CHANNEL" && mac_portal_bridge.is_some() {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    (Some(tx), Some(rx))
+                } else { (None, None) };
+                let control_closed = deferred_echo.as_ref().map(|_| Arc::new(tokio::sync::Notify::new()));
                 if label=="CONTROL_DATA_CHANNEL" {
                     *channel_role.control.lock().unwrap() = Some(d.clone());
                     let closing=channel_role.clone();
+                    let control_closed = control_closed.clone();
                     d.on_close(Box::new(move || {
+                        if let Some(closed) = &control_closed { closed.notify_one(); }
                         let closing=closing.input();
                         Box::pin(async move {if let Some(session)=closing {session.disconnected();}})
                     }));
@@ -916,6 +1162,7 @@ impl WebRtcSession {
                     let initial_sequence = out_sequence.clone();
                     let clipboard_sink = clipboard_input.clone();
                     let clipboard_ready = clipboard_enabled.clone();
+                    let mac_portal_bridge = mac_portal_bridge.clone();
                     let clipboard_mobile = controller.is_mobile();
                     let last_echo_request = last_echo_request.clone();
                     let echo_seen = echo_seen.clone();
@@ -939,6 +1186,7 @@ impl WebRtcSession {
                         let screen = open_screen.clone();
                         let clipboard_sink = clipboard_sink.clone();
                         let clipboard_ready = clipboard_ready.clone();
+                        let mac_portal_bridge = mac_portal_bridge.clone();
                         let rich_outgoing=rich_outgoing.clone();
                         let portal_desktop = open_desktop.clone();
                         let owner = open_owner.clone();
@@ -946,10 +1194,23 @@ impl WebRtcSession {
                         let pc = desktop_pc.upgrade();
                         let text_out = open_text_out.clone();
                         Box::pin(async move {
+                          if let (Some(requests), Some(bridge), Some(desktop), Some(closed)) =
+                              (deferred_requests, &mac_portal_bridge, &portal_desktop, control_closed)
+                          {
+                              let reply = reply_when_portal_clipboard_ready(
+                                  channel.clone(), sequence.clone(), requests, bridge.subscribe(), desktop.clone());
+                              tokio::spawn(async move {
+                                  tokio::select! {
+                                      _ = closed.notified() => {},
+                                      _ = reply => {},
+                                  }
+                              });
+                          }
                           // Permission dialogs and first-frame waits must not occupy the
                           // channel-open callback or delay CONTROL message dispatch.
                           tokio::spawn(async move {
                           if channel.label() == "TEXT_DATA_CHANNEL" {
+                            let _mac_portal_pending = PortalClipboardPendingGuard(mac_portal_bridge.clone());
                             loop {
                               if !role.is_desktop() && !role.wait_desktop(&channel).await { return; }
                               let screen = if let Some(desktop) = &portal_desktop {
@@ -999,6 +1260,12 @@ impl WebRtcSession {
                                       log::info!("Held clipboard text applied: bytes={}",text.len());
                                       sink.send_replace(Some(text));
                                   }
+                                  if let Some(bridge) = &mac_portal_bridge {
+                                      bridge.send_replace(match screen.portal.clone() {
+                                          Some(session) => PortalClipboardState::Ready(session),
+                                          None => PortalClipboardState::Unavailable,
+                                      });
+                                  }
                                   let mut updates = bridge.outgoing;
                                   let mut health = tokio::time::interval(std::time::Duration::from_millis(200));
                                   let mut active = role.active.subscribe();
@@ -1046,6 +1313,9 @@ impl WebRtcSession {
                                       }
                                   }
                                   clipboard_cleanup.lock().unwrap().0=None;
+                                  if let Some(bridge) = &mac_portal_bridge {
+                                      bridge.send_replace(PortalClipboardState::Unavailable);
+                                  }
                                   clipboard_ready.store(false,std::sync::atomic::Ordering::Relaxed);
                               }
                               if channel.ready_state() != webrtc::data_channel::data_channel_state::RTCDataChannelState::Open { return; }
@@ -1083,6 +1353,7 @@ impl WebRtcSession {
                                 let sequence = sequence.clone();
                                 let echo_request = last_echo_request.clone();
                                 let clipboard_ready = clipboard_ready.clone();
+                                let replay_echo = mac_portal_bridge.is_none();
                                 tokio::spawn(async move {
                                     let mut health = tokio::time::interval(std::time::Duration::from_millis(100));
                                     loop {
@@ -1099,7 +1370,7 @@ impl WebRtcSession {
                                         clipboard_ready.store(supported, std::sync::atomic::Ordering::Release);
                                         // echo_seen is published after the request seq, so reading it
                                         // first guarantees a non-stale sequence for the replay.
-                                        if supported && echo_seen.load(std::sync::atomic::Ordering::Acquire) {
+                                        if replay_echo && supported && echo_seen.load(std::sync::atomic::Ordering::Acquire) {
                                             let request_seq = echo_request.load(std::sync::atomic::Ordering::Acquire);
                                             let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                                             let response = crate::control_protocol::encode_echo_response_with_clipboard(
@@ -1303,6 +1574,7 @@ impl WebRtcSession {
                     let lock_for_message = channel_lock_state.clone();
                     let echo_for_message = last_echo_request.clone();
                     let echo_seen_for_message = echo_seen.clone();
+                    let deferred_echo = deferred_echo.clone();
                     let capture_requests = capture_tx.clone();
 
                     Box::pin(async move {
@@ -1613,6 +1885,12 @@ impl WebRtcSession {
                                         if action == 0 {
                                             echo_for_message.store(seq, std::sync::atomic::Ordering::Release);
                                             echo_seen_for_message.store(true, std::sync::atomic::Ordering::Release);
+                                            if let Some(requests) = &deferred_echo {
+                                                if requests.send(seq).is_ok() {
+                                                    return;
+                                                }
+                                                log::warn!("CONTROL Mac Portal Echo worker closed; falling back to immediate reply");
+                                            }
                                             let response = crate::control_protocol::encode_echo_response_with_clipboard(
                                                 out_sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                                                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(), seq,
