@@ -214,6 +214,24 @@ static void *run_dbus(void *data) {
     g_main_context_pop_thread_default(p->context);
     return NULL;
 }
+/* Opt-in host app id (#266). xdg-desktop-portal derives an id only from app-<id>.service
+ * units, so a host under uuremote-native.service is "" and KDE's kde-authorized grant can
+ * never match it. org.freedesktop.host.portal.Registry (xdg-desktop-portal >= 1.19) binds an
+ * id to this connection; it must precede any portal call on it, so it runs once per process
+ * before the first one. Opt-in because restore grants are stored per app id: switching ids
+ * invalidates saved consent once. Failure (older portal, id already bound) is ignored. */
+static void register_app_id(GDBusConnection *bus) {
+    static atomic_int done;
+    if (atomic_exchange(&done, 1)) return;
+    const char *id = g_getenv("UU_PORTAL_APP_ID");
+    if (!id || !*id || strlen(id) > 255) return;
+    GVariantBuilder options; g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+    GError *failure = NULL;
+    GVariant *r = g_dbus_connection_call_sync(bus, DEST, PATH, "org.freedesktop.host.portal.Registry",
+        "Register", g_variant_new("(sa{sv})", id, &options), NULL, G_DBUS_CALL_FLAGS_NONE, 3000, NULL, &failure);
+    if (r) { g_variant_unref(r); fprintf(stderr, "uu-portal: registered host app id\n"); }
+    else { fprintf(stderr, "uu-portal: host app id registration unavailable\n"); g_clear_error(&failure); }
+}
 static int has_interface(struct uu_portal *p, const char *interface) {
     GVariant *r = g_dbus_connection_call_sync(p->bus, DEST, PATH, "org.freedesktop.DBus.Properties",
         "Get", g_variant_new("(ss)", interface, "version"), G_VARIANT_TYPE("(v)"),
@@ -651,6 +669,7 @@ static struct uu_portal *open_persist(const char *restore, void (*save_token)(co
     p->context = g_main_context_new(); g_main_context_push_thread_default(p->context);
     p->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
     if (!p->bus) { *error = 1; goto done; }
+    register_app_id(p->bus);
     if (open_cancelled(p)) { *error = 13; goto done; }
     int interfaces_available = has_interface(p, REMOTE) && has_interface(p, SCREEN);
     if (open_cancelled(p)) { *error = 13; goto done; }

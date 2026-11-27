@@ -117,6 +117,8 @@ GNOME Portal 的控制通道不再等待授权窗口或第一帧画面：先通�
 
 KDE Plasma（KWin）的 Portal 采集在锁屏后仍会继续。主机默认在锁屏时也打开采集，冷连接可以直接看到真实锁屏界面，并用远程键盘输入密码，不再只发黑帧（[#227](../../issues/227)、[#229](../../pull/229)）。`UU_LOCKED_CAPTURE=0` 关闭这一行为，回到黑帧和自动解锁的路径。KDE 判断依赖 systemd 用户环境里的 `XDG_CURRENT_DESKTOP` 或 `XDG_SESSION_DESKTOP`，两者都没有时回落到黑帧行为，可以手动设 `UU_LOCKED_CAPTURE=1` 开启。锁屏时 Portal 指针输入仍会被拦截，键盘通过 uinput 注入，可以输入密码。GNOME 不适用这一段，Mutter 在锁屏时关闭 Portal 会话，仍走上面的黑帧和自动解锁。
 
+**前提**：锁屏冷连接能出图，要求已保存的 Portal 授权仍有效，或该调用方在 KDE 里已被永久授权；否则 Portal 会弹出授权框，而授权框在锁屏界面之后无人可点，只能收到黑帧（[#266](../../issues/266)）。xdg-desktop-portal 只从 `app-<id>.service` 形式的单元名推出调用方 app_id，默认的 `uuremote-native.service` 得到的是空串。已验证的做法：把服务以 `app-uu\x2dremote\x2dlinux.service` 单元名运行（app_id 为 `uu-remote-linux`），再执行 `flatpak permission-set kde-authorized remote-desktop uu-remote-linux yes`。也可以试设 `UU_PORTAL_APP_ID=uu-remote-linux`，主机通过 Portal Registry（xdg-desktop-portal ≥ 1.19）注册这个 app_id，尚未实机验证。改变 app_id 后，之前保存的 Portal 授权会失效，需要在本机重新授权一次。
+
 无需修改现有熄屏和锁屏设置。桌面会话存活期间，主机全程持有 GNOME 的 idle 抑制：空闲熄屏锁屏会终止 Portal 会话、掐断画面和输入，所以抑制随会话一直持有，锁屏、断开、初始化失败，或画面中断且重开失败时释放（健康判定看帧是否真的在送达，不只看 Portal 会话对象是否存活）。没有桌面会话时仍按原策略熄屏和锁屏，手动锁屏也继续生效。锁屏时停止 Portal 输入。KDE 下继续传输真实锁屏画面，GNOME 下隐藏真实画面并发黑帧。独立终端、文件传输和端口映射连接不依赖画面初始化，也不会因桌面重连被关闭。这一恢复路径已覆盖自动化协议与生命周期回归测试，锁屏冷连接后的自动解锁与采集恢复已用官方 Mac 和 iPhone 4.42.0 客户端在 GNOME 实机验证，熄屏等其余场景仍待验收；不支持从整机挂起或休眠状态通过现有控制通道唤醒。
 
 锁屏状态优先通过系统 D-Bus 读取 logind 的 `LockedHint` 并监听变化，正常监测不按秒启动 `loginctl`。尚无图形会话时保持未知并继续监听，登录后由信号触发重新读取。每 30 秒通过 D-Bus 校验会话；D-Bus 异常时每 30 秒重试并使用带超时的 `loginctl` 回退查询，命令路径只解析一次。回退期间状态通知可能延迟；无法读取时保持未知。锁屏程序仍需正确上报 logind 状态，这不改变睡眠、锁屏或远程连接策略。
@@ -437,6 +439,7 @@ systemctl --user restart uuremote-native.service
 | `UU_VAAPI_BUFFER_MS` | VAAPI 的 VBV 缓冲（10–1000 ms，仅 `UU_VIDEO_ENCODER=vaapi` 时生效）；高分辨率下关键帧被压糊时用它换稳定画质 |
 | `UU_NVENC_BUFFER_MS` | NVENC 的 VBV 缓冲（10–1000 ms，仅 NVENC 生效，含进程内引擎）；默认与 libx264 相同，取 1 秒码率上限并限制在 500–8000 kbit，高分辨率关键帧不再被压糊、按 GOP 周期闪烁（#103）。弱网下想要更小的低延迟缓冲可设小值（如 `50`） |
 | `UU_VIDEO_FPS_ADAPT=1` | 弱网自适应帧率（默认关闭）：码率上限已降到 800k 仍持续拥塞时逐级降帧（60→45→30…），恢复后再升回。跨境/丢包链路上升级后仍花屏、发糊时建议开启（#259） |
+| `UU_PORTAL_APP_ID=uu-remote-linux` | 通过 Portal Registry 注册调用方 app_id（默认不注册，app_id 为空）。用于在 KDE 给这个 app_id 永久授权，锁屏冷连接时不再弹授权框；改变后需在本机重新授权一次（#266，实验性） |
 | `UU_FFMPEG_ROOT` | 使用指定目录下的 FFmpeg |
 | `UU_AUDIO=0` | 关闭声音转发；`UU_AUDIO_SOURCE` 指定 PulseAudio 采集源 |
 | `UU_LOGIN_WINDOW=0` | 凭证缺失时不自动弹出登录窗口 |
