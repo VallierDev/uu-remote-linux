@@ -23,6 +23,7 @@
   libayatana-appindicator,
   libxcb,
   libva,
+  x264,
   ffmpeg-full,
   wl-clipboard,
   writableTmpDirAsHomeHook,
@@ -94,6 +95,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
     libgbm
     libxcb
     libva
+    x264
   ];
 
   # Viewer audio tests decode through the ffmpeg CLI.
@@ -154,7 +156,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
       libgbm
       libayatana-appindicator
     ]
-    ++ lib.optional withInprocAv libva;
+    ++ lib.optionals withInprocAv [ libva x264 ];
   };
 
   meta = {
