@@ -19,7 +19,10 @@ impl Marshal for NewFrame {
     }
 }
 pub fn new_frame() -> HeaderExtension {
-    HeaderExtension::Custom { uri: NEW_FRAME_URI.into(), extension: Box::new(NewFrame(true)) }
+    is_new_frame(true)
+}
+pub fn is_new_frame(is_new: bool) -> HeaderExtension {
+    HeaderExtension::Custom { uri: NEW_FRAME_URI.into(), extension: Box::new(NewFrame(is_new)) }
 }
 
 #[derive(Debug)]
