@@ -175,6 +175,19 @@ fn set_video_pref() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `uuremote-server set-unlock on|off`: host-side fallback unlock for viewers without auto
+/// unlock (official Windows client). No SIGUSR2: the fallback re-reads host_settings on every
+/// desktop connection, so the next connection already sees the new value.
+fn set_unlock() -> Result<(), Box<dyn std::error::Error>> {
+    let on = std::env::args().nth(2).unwrap_or_default().trim().eq_ignore_ascii_case("on");
+    if let Err(e) = system_actions::merge_save(|settings| settings.local_unlock = on) {
+        eprintln!("set-unlock: {e}");
+        std::process::exit(1);
+    }
+    println!("local_unlock={on}, takes effect the next time a desktop connection starts");
+    Ok(())
+}
+
 /// Signal the host recorded in host.pid only when `/proc/<pid>/exe` is exactly
 /// `canonicalize(current_exe())`. A filename match is not enough: an older host
 /// has no SIGUSR2 handler, and the default action terminates the process.
@@ -202,7 +215,7 @@ fn same_host_binary(proc_exe: &std::path::Path, own: &std::path::Path) -> bool {
     proc_exe == own
 }
 
-/// Explicit command words for set-encoder / set-codec. Empty and whitespace are illegal.
+/// Explicit command words for set-encoder / set-codec / set-unlock. Empty and whitespace are illegal.
 pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() { return false; }
@@ -210,19 +223,20 @@ pub(crate) fn cli_pref_ok(which: &str, value: &str) -> bool {
     match which {
         "set-encoder" => matches!(value.as_str(), "auto" | "cpu" | "vaapi" | "nvenc"),
         "set-codec" => matches!(value.as_str(), "auto" | "h264" | "h265" | "hevc"),
+        "set-unlock" => matches!(value.as_str(), "on" | "off"),
         _ => false,
     }
 }
 
-const SUBCOMMANDS: [&str; 20] = ["privacy-guard", "privacy-wallpaper", "privacy-screen-probe", "doctor", "show", "assist", "set-encoder", "set-codec", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
+const SUBCOMMANDS: [&str; 21] = ["privacy-guard", "privacy-wallpaper", "privacy-screen-probe", "doctor", "show", "assist", "set-encoder", "set-codec", "set-unlock", "desktop-input-probe", "virtual-audio-probe", "login", "unlock-check", "desktop-probe", "desktop-video-probe", "desktop-audio-probe", "wayland-capture",
     "wayland-input-probe", "wayland-text-probe", "clipboard-acceptance", "portal-acceptance"];
 
-/// Unknown arguments and illegal set-encoder / set-codec values exit 2 (never start a second host).
+/// Unknown arguments and illegal set-* values exit 2 (never start a second host).
 /// help / -h / --help exit 0 so main prints usage instead of starting the host.
 pub(crate) fn reject_cli(arg: Option<&str>, argc: usize, value_ok: bool) -> Option<i32> {
     if matches!(arg, Some("help" | "-h" | "--help")) { return Some(0); }
     if arg.is_some_and(|a| !SUBCOMMANDS.contains(&a)) { return Some(2); }
-    if matches!(arg, Some("set-encoder" | "set-codec")) && (argc != 3 || !value_ok) { return Some(2); }
+    if matches!(arg, Some("set-encoder" | "set-codec" | "set-unlock")) && (argc != 3 || !value_ok) { return Some(2); }
     None
 }
 
@@ -247,6 +261,11 @@ mod cli_exit_tests {
         assert!(!super::cli_pref_ok("set-encoder", "bogus"));
         assert!(super::cli_pref_ok("set-encoder", " NVENC "));
         assert!(super::cli_pref_ok("set-codec", "hevc"));
+        assert_eq!(super::reject_cli(Some("set-unlock"), 3, super::cli_pref_ok("set-unlock", "ON")), None);
+        assert_eq!(super::reject_cli(Some("set-unlock"), 2, true), Some(2));
+        assert_eq!(super::reject_cli(Some("set-unlock"), 3, super::cli_pref_ok("set-unlock", "yes")), Some(2));
+        assert!(super::cli_pref_ok("set-unlock", " off "));
+        assert!(!super::cli_pref_ok("set-unlock", "1"));
         assert_eq!(super::reject_cli(Some("set-encoder"), 3, super::cli_pref_ok("set-encoder", "")), Some(2));
         assert_eq!(super::reject_cli(Some("set-codec"), 3, super::cli_pref_ok("set-codec", "  ")), Some(2));
     }
@@ -419,7 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // An unknown argument must never fall through to starting a second full host server.
     let arg1 = std::env::args().nth(1);
     let value_ok = match arg1.as_deref() {
-        Some(which @ ("set-encoder" | "set-codec")) => cli_pref_ok(which, &std::env::args().nth(2).unwrap_or_default()),
+        Some(which @ ("set-encoder" | "set-codec" | "set-unlock")) => cli_pref_ok(which, &std::env::args().nth(2).unwrap_or_default()),
         _ => true,
     };
     if let Some(code) = reject_cli(arg1.as_deref(), std::env::args().len(), value_ok) {
@@ -431,6 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if std::env::args().nth(1).as_deref() == Some("show") { return show_running_host(); }
     if matches!(std::env::args().nth(1).as_deref(), Some("set-encoder") | Some("set-codec")) { return set_video_pref(); }
+    if std::env::args().nth(1).as_deref() == Some("set-unlock") { return set_unlock(); }
     if assist_enabled && !unified {
         if std::env::args().len() > 2 { return Err("assist accepts no additional arguments; configure it with a private UU_CONFIG".into()); }
         assist::configure()?;

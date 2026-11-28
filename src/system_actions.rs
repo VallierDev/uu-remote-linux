@@ -32,6 +32,10 @@ pub(crate) struct Settings {
     #[serde(default)] auto_lock: bool,
     #[serde(default)] keep_mute: bool,
     #[serde(default)] mute_permanent: bool,
+    /// Host-side fallback unlock for viewers that never send AUTO_UNLOCK_SYSTEM (official Windows
+    /// client). Off by default; only `set-unlock` or a hand edit turns it on, and `save()` (the
+    /// viewer security menu) leaves the disk value untouched.
+    #[serde(default)] pub(crate) local_unlock: bool,
     /// "auto" or absent does not override the environment. A non-string value becomes None so a bad
     /// video field cannot drop auto_lock / mute when the document is loaded.
     #[serde(default, deserialize_with = "lenient_string")] pub(crate) video_encoder: Option<String>,
@@ -64,6 +68,10 @@ pub(crate) fn settings_path() -> std::path::PathBuf { crate::config::path().with
 pub(crate) fn load_settings() -> Settings {
     std::fs::read(settings_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
+
+/// Read from disk on use: the fallback runs once per desktop connection, so a `set-unlock` takes
+/// effect on the next connection without restarting the host or a SIGUSR2 reload.
+pub(crate) fn local_unlock_enabled() -> bool { load_settings().local_unlock }
 
 /// Re-read, apply `patch`, write via a temp file and rename (mode 0600).
 pub(crate) fn merge_save(patch: impl FnOnce(&mut Settings)) -> Result<Settings, String> {
@@ -391,9 +399,9 @@ mod tests {
         let cfg = dir.join("config.json");
         std::env::set_var("UU_CONFIG", &cfg);
         let path = settings_path();
-        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":true,"mute_permanent":false}"#).unwrap();
+        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":true,"mute_permanent":false,"local_unlock":true}"#).unwrap();
         let saved = merge_save(|s| s.video_encoder = Some("vaapi".into())).unwrap();
-        assert!(saved.auto_lock && saved.keep_mute && !saved.mute_permanent);
+        assert!(saved.auto_lock && saved.keep_mute && !saved.mute_permanent && saved.local_unlock);
         assert_eq!(saved.video_encoder.as_deref(), Some("vaapi"));
         let again = merge_save(|s| s.video_codec = Some("h264".into())).unwrap();
         assert_eq!(again.video_encoder.as_deref(), Some("vaapi"));
@@ -403,7 +411,7 @@ mod tests {
         assert_eq!(mode, 0o600);
         // A mute/lock save must not drop video_* written after the in-memory copy was taken.
         let mut memory = load_settings();
-        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":true,"mute_permanent":false,"video_encoder":"nvenc","video_codec":"h265"}"#).unwrap();
+        std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":true,"mute_permanent":false,"local_unlock":true,"video_encoder":"nvenc","video_codec":"h265"}"#).unwrap();
         memory.keep_mute = false;
         save(&memory).unwrap();
         let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -411,6 +419,8 @@ mod tests {
         assert_eq!(disk["video_codec"], "h265");
         assert_eq!(disk["keep_mute"], false);
         assert_eq!(disk["auto_lock"], true);
+        // The security-menu save must not flip the CLI-owned local_unlock.
+        assert_eq!(disk["local_unlock"], true);
         // A non-string video field must not fail the whole document (security switches survive).
         std::fs::write(&path, br#"{"auto_lock":true,"keep_mute":false,"mute_permanent":true,"video_encoder":1,"video_codec":{"x":1}}"#).unwrap();
         let loaded = load_settings();
