@@ -772,9 +772,27 @@ impl InputInjector {
                         use std::io::Write;
                         let _ = stdin.write_all(text.as_bytes());
                     }
-                    if let Ok(status) = child.wait() {
-                        if status.success() {
-                            return true;
+                    // Locked KDE desktops reject clipboard clients; wl-copy then
+                    // waits forever.  Never block the input serialization lock on
+                    // it (the mobile text fallback runs under that lock).
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                if status.success() {
+                                    return true;
+                                }
+                                break;
+                            }
+                            Ok(None) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                            _ => {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                log::warn!("wl-copy did not finish within 1s; killed");
+                                break;
+                            }
                         }
                     }
                 }
@@ -906,6 +924,13 @@ impl InputInjector {
             }
         } else if self.backend==crate::desktop_backend::DesktopBackend::Portal {
             if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
+            // The lock screen rejects clipboard paste and wl-copy hangs there.
+            // ASCII text already took the uinput path above; anything left has
+            // no usable target while locked, so skip instead of blocking input.
+            if crate::session_lock::locked_now() == Some(true) {
+                log::info!("Desktop text input skipped: session is locked");
+                return;
+            }
             // Shift+Insert pastes the PRIMARY selection in VTE terminals, not the clipboard just set:
             // type what the active layout has as keys and paste only the rest.
             let typed=self.type_portal_keysyms(text);
