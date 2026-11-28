@@ -924,18 +924,17 @@ impl InputInjector {
             }
         } else if self.backend==crate::desktop_backend::DesktopBackend::Portal {
             if std::env::var("UU_WAYLAND_TEXT").is_ok_and(|v|v=="0") { return; }
-            // The lock screen rejects clipboard paste and wl-copy hangs there.
-            // ASCII text already took the uinput path above; anything left has
-            // no usable target while locked, so skip instead of blocking input.
-            if crate::session_lock::locked_now() == Some(true) {
-                log::info!("Desktop text input skipped: session is locked");
-                return;
-            }
             // Shift+Insert pastes the PRIMARY selection in VTE terminals, not the clipboard just set:
             // type what the active layout has as keys and paste only the rest.
             let typed=self.type_portal_keysyms(text);
             if typed==text.chars().count() {
                 log::info!("Desktop text input (Portal keysyms): chars={typed}");
+                return;
+            }
+            // The lock screen rejects clipboard paste and wl-copy hangs there:
+            // keep the keysyms typed above, skip only the clipboard fallback.
+            if crate::session_lock::locked_now() == Some(true) {
+                log::info!("Desktop text input clipboard fallback skipped: session is locked typed={typed}");
                 return;
             }
             let rest:String=text.chars().skip(typed).collect();
