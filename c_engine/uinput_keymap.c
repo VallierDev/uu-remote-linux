@@ -6,7 +6,13 @@
 
 static size_t text_plan(XkbDescPtr map, const XkbStateRec *state,
     const uint8_t *text, size_t length, UuTextKey *plan, size_t capacity) {
-    if (!map || !map->map || !map->map->modmap || !state || state->base_mods || state->latched_mods) return 0;
+    /* A stuck Mod4 (Super) does not change ASCII key/level mapping.  KWin can
+     * leave it pressed in XWayland after the lock screen grabbed the keyboard;
+     * rejecting the whole plan then sends mobile text to the clipboard-paste
+     * fallback, which hangs on a locked desktop.  Any other base modifier still
+     * means the mapping cannot be trusted. */
+    if (!map || !map->map || !map->map->modmap || !state ||
+        (state->base_mods & ~Mod4Mask) || state->latched_mods) return 0;
     /* Prove the XKB -> evdev offset from physical key names rather than assuming a US layout. */
     if (!map->names || !map->names->keys || map->min_key_code > 10 || map->max_key_code < 50 ||
         memcmp(map->names->keys[10].name,"AE01",4) ||
