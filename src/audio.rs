@@ -37,7 +37,7 @@ fn spawn_encoder(source: &str) -> Result<Child, String> {
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin",
             "-f", "pulse", "-fragment_size", "1920", "-i", source, "-vn",
             "-c:a", "libopus", "-ar", "48000", "-ac", "2", "-b:a", "128k", "-application", "lowdelay",
-            "-frame_duration", "20", "-page_duration", "20000", "-flush_packets", "1", "-f", "ogg", "pipe:1"])
+            "-frame_duration", "20", "-page_duration", "10000", "-flush_packets", "1", "-f", "ogg", "pipe:1"])
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
     command.spawn().map_err(|e| format!("Start audio encoder: {e}"))
 }
