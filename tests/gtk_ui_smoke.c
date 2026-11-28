@@ -81,6 +81,37 @@ static gboolean snapshot(GtkWidget *w, const char *path) {
 static const char *output;
 static int expected_mode, stage;
 #if defined(UI_VIEWER)
+static GtkWidget *named_button(GtkWidget *widget, const char *name) {
+    if (GTK_IS_BUTTON(widget) && !g_strcmp0(gtk_button_get_label(GTK_BUTTON(widget)), name)) return widget;
+    if (!GTK_IS_CONTAINER(widget)) return NULL;
+    GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+    GtkWidget *found = NULL;
+    for (GList *child = children; child && !found; child = child->next) found = named_button(child->data, name);
+    g_list_free(children); return found;
+}
+static GtkWidget *more_dialog(void) {
+    open_more();
+    GList *windows = gtk_window_list_toplevels(); GtkWidget *found = NULL;
+    for (GList *w = windows; w; w = w->next)
+        if (GTK_IS_DIALOG(w->data) && !g_strcmp0(gtk_window_get_title(GTK_WINDOW(w->data)), L("更多工具", "More tools"))) found = w->data;
+    g_list_free(windows); g_assert_nonnull(found); return found;
+}
+static void verify_independent_commands(void) {
+    char command[200]; while (uu_viewer_ui_take_command(command, sizeof command)) {}
+    show_device(0); g_unsetenv("UU_VIEWER_INDEPENDENT");
+    GtkWidget *dialog = more_dialog();
+    g_assert_null(named_button(dialog, L("独立远控", "Independent remote")));
+    gtk_widget_destroy(dialog); g_setenv("UU_VIEWER_INDEPENDENT", "1", TRUE);
+    dialog = more_dialog(); GtkWidget *open = named_button(dialog, L("独立远控", "Independent remote"));
+    g_assert_nonnull(open); gtk_button_clicked(GTK_BUTTON(open));
+    g_assert_true(uu_viewer_ui_take_command(command, sizeof command));
+    g_assert_cmpstr(command, ==, "connect\tdemo-workstation\tindependent");
+    dialog = more_dialog(); GtkWidget *settings = named_button(dialog, L("独立会话设置", "Independent session settings"));
+    g_assert_nonnull(settings); gtk_button_clicked(GTK_BUTTON(settings));
+    g_assert_true(uu_viewer_ui_take_command(command, sizeof command));
+    g_assert_cmpstr(command, ==, "connect\tdemo-workstation\tindependent-settings");
+    g_unsetenv("UU_VIEWER_INDEPENDENT");
+}
 static void verify_badge(void) {
     for (int i = 0; i < 2; i++) {
         show_device(i); // Fixture 0 is online, fixture 1 is offline.
@@ -125,6 +156,7 @@ static gboolean verify(gpointer unused) {
         if (!painted) return G_SOURCE_CONTINUE;
 #if defined(UI_VIEWER)
         verify_badge();
+    verify_independent_commands();
 #endif
         expected_mode = expected_mode == 2 ? 1 : 2;
         gtk_combo_box_set_active(GTK_COMBO_BOX(combo), expected_mode);
@@ -136,6 +168,7 @@ static gboolean verify(gpointer unused) {
     g_assert_cmpint(dark, ==, expected_mode == 2);
 #if defined(UI_VIEWER)
     verify_badge();
+    verify_independent_commands();
 #endif
     char *path = g_build_filename(g_get_user_config_dir(), "uuremote", "theme", NULL), *saved = NULL;
     g_assert_true(g_file_get_contents(path, &saved, NULL, NULL));

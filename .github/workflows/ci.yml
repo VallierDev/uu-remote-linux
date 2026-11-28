@@ -89,6 +89,10 @@ jobs:
           cargo test --locked --features native-viewer,viewer-sdl --bin uuremote-viewer viewer::hud::tests
           cargo test --locked --features native-viewer,viewer-sdl --bin uuremote-viewer readable_menus_render_and_click_at_multiple_scales
       - run: cargo build --locked --features native-viewer,viewer-sdl --bin uuremote-viewer
+      - name: Independent-session companion
+        run: |
+          python3 -m unittest discover -s contrib/independent-viewer -p 'test_*.py' -v
+          shellcheck contrib/independent-viewer/install.sh
 
   test-wayland:
     runs-on: ubuntu-24.04
