@@ -89,6 +89,31 @@ fn gop_frames(fps: u32, in_process: bool) -> u64 {
 }
 const MAX_ACCESS_UNIT: usize = 8 * 1024 * 1024;
 
+/// True when the unit carries at least one slice, i.e. an actual picture.
+///
+/// A unit holding only AUD/SPS/PPS/SEI is a parameter-set prefix emitted by
+/// encoders that do not repeat headers (the V4L2 M2M encoders do not); it
+/// belongs to the picture that follows it.
+fn has_slice_for(bytes: &[u8], codec: VideoCodec) -> bool {
+    match codec {
+        VideoCodec::H264 => !nal_offsets_for(bytes, 1, codec).is_empty()
+                         || !nal_offsets_for(bytes, 5, codec).is_empty(),
+        VideoCodec::H265 => {
+            let mut found = false;
+            let mut i = 0;
+            while i + 3 < bytes.len() {
+                let prefix = if bytes[i..].starts_with(&[0, 0, 0, 1]) { 4 }
+                    else if bytes[i..].starts_with(&[0, 0, 1]) { 3 } else { i += 1; continue };
+                if let Some(kind) = hevc_nal_kind(bytes, i + prefix) {
+                    if kind < 32 { found = true; break; }
+                }
+                i += prefix;
+            }
+            found
+        }
+    }
+}
+
 fn nal_offsets_for(bytes: &[u8], kind: u8, codec: VideoCodec) -> Vec<usize> {
     let mut result = Vec::new();
     let mut i = 0;
@@ -1007,6 +1032,9 @@ async fn read_encoder_with(
     } else { None };
     let mut stdout = child.stdout.take().ok_or("Encoder stdout missing")?;
     let mut pending = Vec::new();
+    // Parameter sets that arrived in an access unit of their own, waiting for the
+    // picture they belong to.
+    let mut prefix: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16384];
     let mut gate = DependencyGate::default();
     loop {
@@ -1019,7 +1047,20 @@ async fn read_encoder_with(
             if aud.len() < 2 { break; }
             let next = aud[1];
             if next > MAX_ACCESS_UNIT { return Err("Encoder access unit exceeds limit".into()); }
-            let frame: bytes::Bytes = pending.drain(..next).collect::<Vec<u8>>().into();
+            let mut unit: Vec<u8> = pending.drain(..next).collect();
+            if !has_slice_for(&unit, settings.codec) {
+                // Header-only unit: hold it for the picture that follows instead of
+                // dropping the parameter sets together with it.
+                prefix.extend_from_slice(&unit);
+                if prefix.len() > MAX_ACCESS_UNIT { prefix.clear(); }
+                continue;
+            }
+            let frame: bytes::Bytes = if prefix.is_empty() {
+                unit.into()
+            } else {
+                prefix.extend_from_slice(&unit);
+                std::mem::take(&mut prefix).into()
+            };
             let sequence = sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let permit=if wayland {Some(permits_rx.recv().await.ok_or("Capture producer stopped")?)} else {None};
             gate.submit(&latest, Arc::new(CompleteFrame { source_generation: settings.source_generation, source_id: settings.source_id,
